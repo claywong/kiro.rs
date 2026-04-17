@@ -5,6 +5,7 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "credentialRpm": 5,
   "promptCacheTtlSeconds": 300,
   "compression": {
     "maxRequestBodyBytes": 4718592

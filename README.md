@@ -186,6 +186,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `credentialRpm` | number | - | 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流；`0` 或未配置表示使用内置默认策略 |
 
 完整配置示例：
 
@@ -208,7 +209,8 @@ docker-compose up
    "proxyUrl": "http://127.0.0.1:7890",
    "proxyUsername": "user",
    "proxyPassword": "pass",
-   "adminApiKey": "sk-admin-your-secret-key"
+   "adminApiKey": "sk-admin-your-secret-key",
+   "credentialRpm": 5
 }
 ```
 
