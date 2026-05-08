@@ -1,5 +1,10 @@
 # Changelog
 
+## [v1.1.28] - 2026-05-08
+
+### Fixed
+- **Docker pnpm 9.x build scripts 审批导致 install 失败** — 修复 pnpm 9.x 在 Docker 构建中因 lifecycle scripts 审批机制导致 `pnpm install` 失败的问题 (`.github/workflows/docker-build.yaml`)
+
 ## [v1.1.27] - 2026-05-08
 
 ### Fixed
