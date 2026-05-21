@@ -417,23 +417,6 @@ impl ComposeContext {
         })
     }
 
-    fn compose_pull(&self, image: &str) -> Result<String, AdminServiceError> {
-        let env = [("KIRO_RS_IMAGE", image)];
-        run_command_with_env(
-            "docker",
-            &[
-                "compose",
-                "--project-directory",
-                self.host_project_dir.as_str(),
-                "-f",
-                self.in_container_compose.as_str(),
-                "pull",
-                self.service.as_str(),
-            ],
-            &env,
-        )
-    }
-
     fn compose_up(&self, image: &str) -> Result<String, AdminServiceError> {
         let env = [("KIRO_RS_IMAGE", image)];
         run_command_with_env(
@@ -1216,7 +1199,7 @@ impl AdminService {
             }
         };
 
-        output.push_str(&ctx.compose_pull(image.as_str())?);
+        output.push_str(&run_command("docker", &["pull", image.as_str()])?);
         output.push_str(&ctx.compose_up(image.as_str())?);
 
         // 仅当成功应用了新镜像后再持久化 previous_image，避免回退指向并未真正
