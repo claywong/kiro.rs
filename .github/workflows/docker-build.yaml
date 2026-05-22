@@ -8,8 +8,11 @@ on:
       - '**.md'
       - 'docs/**'
       - '.gitignore'
+      - '.gitattributes'
       - 'LICENSE'
       - 'config.example.json'
+      - '.vscode/**'
+      - '.idea/**'
   workflow_dispatch:
     inputs:
       version:
