@@ -390,6 +390,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             authMethod,
             provider,
             authRegion: cred.region?.trim() || undefined,
+            startUrl: cred.startUrl?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,

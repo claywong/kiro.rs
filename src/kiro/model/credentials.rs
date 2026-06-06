@@ -46,7 +46,7 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
-    /// 身份提供商（KAM 导出字段：BuilderId / Enterprise / Github / Google / IAM_SSO）
+    /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
@@ -57,6 +57,10 @@ pub struct KiroCredentials {
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+
+    /// SSO Start URL（Enterprise / IAM Identity Center 账号专用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -150,6 +154,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("provider", &self.provider)
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
+            .field("start_url", &self.start_url)
             .field("priority", &self.priority)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
@@ -350,6 +355,23 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）。
+    ///
+    /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
+    /// - [`BUILDER_ID_PROFILE_ARN`] 占位符 → 返回 `None`（BuilderID / Enterprise / IdC
+    ///   账号没有可用 profileArn，发送占位符会被上游以 403 "Invalid token" 拒绝）。
+    pub fn effective_profile_arn(&self) -> Option<&str> {
+        match self.profile_arn.as_deref() {
+            Some(arn) if !is_placeholder_profile_arn(arn) => Some(arn),
+            _ => None,
+        }
+    }
+}
+
+/// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
+pub fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn == BUILDER_ID_PROFILE_ARN
 }
 
 #[cfg(test)]
@@ -409,6 +431,7 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -438,6 +461,36 @@ mod tests {
             KiroCredentials::default_credentials_path(),
             "credentials.json"
         );
+    }
+
+    #[test]
+    fn test_is_placeholder_profile_arn() {
+        assert!(is_placeholder_profile_arn(BUILDER_ID_PROFILE_ARN));
+        assert!(!is_placeholder_profile_arn(SOCIAL_PROFILE_ARN));
+        assert!(!is_placeholder_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123"
+        ));
+    }
+
+    #[test]
+    fn test_effective_profile_arn_skips_placeholder() {
+        // BuilderID 占位符 → None（不发送给上游）
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(cred.effective_profile_arn(), None);
+
+        // Social 共享 ARN → 原样返回
+        cred.profile_arn = Some(SOCIAL_PROFILE_ARN.to_string());
+        assert_eq!(cred.effective_profile_arn(), Some(SOCIAL_PROFILE_ARN));
+
+        // 真实 Enterprise ARN → 原样返回
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        cred.profile_arn = Some(real.to_string());
+        assert_eq!(cred.effective_profile_arn(), Some(real));
+
+        // 无 ARN → None
+        cred.profile_arn = None;
+        assert_eq!(cred.effective_profile_arn(), None);
     }
 
     #[test]
@@ -528,6 +581,7 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -560,6 +614,7 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -675,6 +730,7 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -154,7 +155,7 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = crate::kiro::kiro_version::effective(&config.kiro_version);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
@@ -320,6 +321,24 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
+/// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
+///
+/// 依据凭据的 SSO 区域选择主端点，并返回另一个端点作为 403 回退候选：
+/// - `eu-central-1` 或任何 `eu-*` 区域 → 主端点 `eu-central-1`
+/// - 其余区域 → 主端点 `us-east-1`
+///
+/// 这样导入的 Enterprise / IAM Identity Center (IdC) 账号即使 SSO 区域不是
+/// `us-east-1`，也能命中正确的端点，避免 `403 {"message":"Invalid token"}`。
+fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
+    let primary_eu = sso_region == "eu-central-1" || sso_region.starts_with("eu-");
+    if primary_eu {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -329,24 +348,22 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
+    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
+    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
+    let profile_arn_query = credentials
+        .effective_profile_arn()
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default();
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -357,25 +374,49 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    let mut last_error: Option<String> = None;
+    for (idx, region) in candidates.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!(
+            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+            host, profile_arn_query
+        );
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+        let mut request = client
+            .get(&url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
 
-    let response = request.send().await?;
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let status = response.status();
-    if !status.is_success() {
+        let response = request.send().await?;
+
+        let status = response.status();
+        if status.is_success() {
+            let data: UsageLimitsResponse = response.json().await?;
+            return Ok(data);
+        }
+
         let body_text = response.text().await.unwrap_or_default();
+
+        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
+        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+            tracing::debug!(
+                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                region,
+                candidates[idx + 1]
+            );
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -386,8 +427,11 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
-    Ok(data)
+    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
+    bail!(
+        "权限不足，无法获取使用额度: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 /// 获取该凭据当前可用的模型列表
@@ -403,22 +447,20 @@ pub(crate) async fn get_available_models(
 ) -> anyhow::Result<ListAvailableModelsResponse> {
     tracing::debug!("正在获取可用模型列表...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
+    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 构建 URL（profileArn 可选）
-    let mut url = format!(
-        "https://{}/ListAvailableModels?origin=AI_EDITOR",
-        host
-    );
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
+    let profile_arn_query = credentials
+        .effective_profile_arn()
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default();
 
     // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
@@ -429,25 +471,49 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    let mut last_error: Option<String> = None;
+    for (idx, region) in candidates.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!(
+            "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+            host, profile_arn_query
+        );
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+        let mut request = client
+            .get(&url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
 
-    let response = request.send().await?;
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let status = response.status();
-    if !status.is_success() {
+        let response = request.send().await?;
+
+        let status = response.status();
+        if status.is_success() {
+            let data: ListAvailableModelsResponse = response.json().await?;
+            return Ok(data);
+        }
+
         let body_text = response.text().await.unwrap_or_default();
+
+        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
+        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+            tracing::debug!(
+                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                region,
+                candidates[idx + 1]
+            );
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取可用模型",
@@ -458,8 +524,11 @@ pub(crate) async fn get_available_models(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: ListAvailableModelsResponse = response.json().await?;
-    Ok(data)
+    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
+    bail!(
+        "权限不足，无法获取可用模型: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 /// 设置用户偏好（开启/关闭超额）
@@ -475,14 +544,14 @@ pub(crate) async fn set_user_preference(
 ) -> anyhow::Result<()> {
     tracing::debug!("正在设置用户偏好 overageStatus={}", overage_status);
 
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务，
+    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
-
-    let url = format!("https://{}/setUserPreference", host);
 
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -492,8 +561,8 @@ pub(crate) async fn set_user_preference(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    // 构建 body：profileArn 可选
-    let body = if let Some(profile_arn) = &credentials.profile_arn {
+    // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
+    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
         serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
             "profileArn": profile_arn,
@@ -504,27 +573,47 @@ pub(crate) async fn set_user_preference(
         })
     };
 
-    let mut request = client
-        .post(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("content-type", "application/json")
-        .header("Connection", "close")
-        .json(&body);
+    let mut last_error: Option<String> = None;
+    for (idx, region) in candidates.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/setUserPreference", host);
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+        let mut request = client
+            .post(&url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("content-type", "application/json")
+            .header("Connection", "close")
+            .json(&body);
 
-    let response = request.send().await?;
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let status = response.status();
-    if !status.is_success() {
+        let response = request.send().await?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
         let body_text = response.text().await.unwrap_or_default();
+
+        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
+        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+            tracing::debug!(
+                "setUserPreference 在 {} 返回 403，尝试备用端点 {}",
+                region,
+                candidates[idx + 1]
+            );
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         let error_msg = match status.as_u16() {
             400 => "请求参数错误，账号可能不支持超额",
             401 => "认证失败，Token 无效或已过期",
@@ -536,7 +625,11 @@ pub(crate) async fn set_user_preference(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    Ok(())
+    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
+    bail!(
+        "权限不足，无法设置用户偏好: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 // ============================================================================
@@ -616,6 +709,8 @@ pub struct CredentialEntrySnapshot {
     pub total_failure_count: u64,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO）
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -1785,6 +1880,11 @@ impl MultiTokenManager {
                             }
                         })
                     },
+                    provider: if e.credentials.is_api_key_credential() {
+                        None
+                    } else {
+                        e.credentials.provider.clone()
+                    },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
@@ -2101,6 +2201,36 @@ impl MultiTokenManager {
             if changed {
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                }
+            }
+        }
+
+        // 回填邮箱：仅在凭据尚无邮箱、且上游返回了邮箱时写入
+        if let Some(email) = usage_limits.email() {
+            let changed = {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    let is_empty = entry
+                        .credentials
+                        .email
+                        .as_deref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                    if is_empty {
+                        entry.credentials.email = Some(email.to_string());
+                        tracing::info!("凭据 #{} 邮箱已回填: {}", id, email);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if changed {
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("邮箱回填后持久化失败（不影响本次请求）: {}", e);
                 }
             }
         }
@@ -2485,21 +2615,16 @@ impl MultiTokenManager {
     ///
     /// # 返回
     /// - `Ok(())` - 删除成功
-    /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
+    /// - `Err(_)` - 凭据不存在或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
         let was_current = {
             let mut entries = self.entries.lock();
 
             // 查找凭据
-            let entry = entries
+            let _entry = entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
-            // 检查是否已禁用
-            if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
-            }
 
             // 记录是否是当前凭据
             let current_id = *self.current_id.lock();
@@ -2593,7 +2718,7 @@ impl MultiTokenManager {
 
             let entry = &mut entries[idx];
             entry.credentials.refresh_token = Some(new_refresh_token);
-            // 若调用方提供了 accessToken（来自 KAM 导出），则直接保留，无需立即调认证服务器
+            // 若调用方提供了 accessToken（来自导入/导出），则直接保留，无需立即调认证服务器
             // 否则清空，下次使用时系统会自动刷新
             entry.credentials.access_token = new_access_token;
             entry.credentials.expires_at = new_expires_at;
@@ -3426,6 +3551,63 @@ mod tests {
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_us_default() {
+        // 非 EU 区域 → 主端点 us-east-1，回退 eu-central-1
+        assert_eq!(
+            rest_api_region_candidates("us-east-1"),
+            ["us-east-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("us-east-2"),
+            ["us-east-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("ap-southeast-1"),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_eu() {
+        // EU 区域 → 主端点 eu-central-1，回退 us-east-1
+        assert_eq!(
+            rest_api_region_candidates("eu-central-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("eu-west-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("eu-north-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_uses_credential_auth_region() {
+        // Enterprise/IdC 账号导入时仅带 SSO region 字段（无 api_region），
+        // effective_auth_region 会回退到 credential.region，进而选对端点。
+        let config = Config::default(); // 默认 region = us-east-1
+
+        let mut eu_cred = KiroCredentials::default();
+        eu_cred.region = Some("eu-west-1".to_string());
+        let sso_region = eu_cred.effective_auth_region(&config);
+        assert_eq!(
+            rest_api_region_candidates(sso_region),
+            ["eu-central-1", "us-east-1"]
+        );
+
+        // 未配置任何 region 的凭据回退到 config 默认 us-east-1
+        let plain_cred = KiroCredentials::default();
+        let sso_region = plain_cred.effective_auth_region(&config);
+        assert_eq!(
+            rest_api_region_candidates(sso_region),
+            ["us-east-1", "eu-central-1"]
+        );
     }
 
     #[test]

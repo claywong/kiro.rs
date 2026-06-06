@@ -15,6 +15,7 @@ import {
   Globe,
   LogIn,
   Key,
+  Building2,
   Settings,
   UploadCloud,
   MoreHorizontal,
@@ -115,6 +116,7 @@ import {
   parseError,
   generateApiKey,
   formatNumber,
+  overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
 
@@ -128,6 +130,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
+  const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] = useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
@@ -275,10 +278,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
   const disabledCredentialCount =
     data?.credentials.filter((c) => c.disabled).length || 0;
-  const selectedDisabledCount = Array.from(selectedIds).filter((id) => {
-    const c = data?.credentials.find((x) => x.id === id);
-    return Boolean(c?.disabled);
-  }).length;
 
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
@@ -393,25 +392,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要删除的凭据");
       return;
     }
-    const disabledIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return Boolean(c?.disabled);
-    });
-    if (disabledIds.length === 0) {
-      toast.error("选中的凭据中没有已禁用项");
-      return;
-    }
-    const skipped = selectedIds.size - disabledIds.length;
-    const skippedText = skipped > 0 ? `（将跳过 ${skipped} 个未禁用凭据）` : "";
+    const ids = Array.from(selectedIds);
     if (
-      !confirm(
-        `确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`,
-      )
+      !confirm(`确定要删除 ${ids.length} 个凭据吗？此操作无法撤销。`)
     )
       return;
     let s = 0,
       f = 0;
-    for (const id of disabledIds) {
+    for (const id of ids) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(id, {
@@ -427,9 +415,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         });
       } catch {}
     }
-    const sk = skipped > 0 ? `，已跳过 ${skipped} 个未禁用凭据` : "";
-    if (f === 0) toast.success(`成功删除 ${s} 个已禁用凭据${sk}`);
-    else toast.warning(`删除已禁用凭据：成功 ${s} 个，失败 ${f} 个${sk}`);
+    if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
+    else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
   };
 
@@ -718,10 +705,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       if (ok > 0 && fail === 0) toast.success(`已为 ${ok} 个凭据开启超额`);
       else if (ok > 0 && fail > 0)
         toast.warning(
-          `成功 ${ok} 个，失败 ${fail} 个：${res.failureMessages?.[0] || ""}`,
+          `成功 ${ok} 个，失败 ${fail} 个：${overageFailureMessage(res.failureMessages?.[0])}`,
         );
       else if (fail > 0)
-        toast.error(`全部失败：${res.failureMessages?.[0] || ""}`);
+        toast.error(`全部失败：${overageFailureMessage(res.failureMessages?.[0])}`);
       else toast.info("没有需要操作的凭据");
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {
@@ -1163,12 +1150,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={handleBatchDelete}
                   size="sm"
                   variant="destructive"
-                  disabled={selectedDisabledCount === 0}
-                  title={
-                    selectedDisabledCount === 0
-                      ? "只能删除已禁用凭据"
-                      : undefined
-                  }
+                  disabled={selectedIds.size === 0}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   删除
@@ -1217,6 +1199,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <DropdownMenuItem onSelect={() => setIdcLoginDialogOpen(true)}>
                   <Key />
                   AWS SSO (IdC) 登录
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setEnterpriseLoginDialogOpen(true)}>
+                  <Building2 />
+                  Enterprise (IAM Identity Center) 登录
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>导入</DropdownMenuLabel>
@@ -1429,6 +1415,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <IdcLoginDialog
         open={idcLoginDialogOpen}
         onOpenChange={setIdcLoginDialogOpen}
+        onSuccess={() =>
+          queryClient.invalidateQueries({ queryKey: ["credentials"] })
+        }
+      />
+      <IdcLoginDialog
+        mode="enterprise"
+        open={enterpriseLoginDialogOpen}
+        onOpenChange={setEnterpriseLoginDialogOpen}
         onSuccess={() =>
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
