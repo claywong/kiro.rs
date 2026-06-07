@@ -17,7 +17,7 @@ use crate::admin::trace_db::SharedTraceStore;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::prompt_cache::SharedPromptCache;
+use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -44,7 +44,7 @@ pub struct AppState {
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层 prompt cache（基于 cache_control 断点的内存缓存）
-    pub prompt_cache: Option<SharedPromptCache>,
+    pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -63,7 +63,7 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            prompt_cache: None,
+            cache_meter: None,
             trace_store: None,
         }
     }
@@ -77,7 +77,7 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            prompt_cache: None,
+            cache_meter: None,
             trace_store: None,
         }
     }
@@ -101,9 +101,9 @@ impl AppState {
         self
     }
 
-    /// 注入 PromptCache
-    pub fn with_prompt_cache(mut self, cache: Option<SharedPromptCache>) -> Self {
-        self.prompt_cache = cache;
+    /// 注入 CacheMeter
+    pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
+        self.cache_meter = cache;
         self
     }
 

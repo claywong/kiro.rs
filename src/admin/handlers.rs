@@ -1044,6 +1044,12 @@ pub async fn list_traces(
                 "totalAttempts": r.total_attempts,
                 "durationMs": r.duration_ms,
                 "interruptedAfterBytes": r.interrupted_after_bytes,
+                "inputTokens": r.input_tokens,
+                "outputTokens": r.output_tokens,
+                "cacheCreationTokens": r.cache_creation_tokens,
+                "cacheReadTokens": r.cache_read_tokens,
+                "totalTokens": r.input_tokens + r.output_tokens
+                    + r.cache_creation_tokens + r.cache_read_tokens,
                 "attempts": attempts,
             })
         })

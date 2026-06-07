@@ -457,6 +457,16 @@ export interface TraceRecord {
   durationMs: number
   /** 流式中断时已发送字节数 */
   interruptedAfterBytes: number | null
+  /** 输入 token（互斥口径：未被缓存覆盖的部分） */
+  inputTokens: number
+  /** 输出 token（估算） */
+  outputTokens: number
+  /** 缓存创建 token */
+  cacheCreationTokens: number
+  /** 缓存读取 token */
+  cacheReadTokens: number
+  /** 总 token = input + output + cache_creation + cache_read */
+  totalTokens: number
   attempts: TraceAttempt[]
 }
 

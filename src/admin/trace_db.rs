@@ -71,6 +71,18 @@ pub struct TraceRecord {
     pub duration_ms: u64,
     /// 流式中断时已发送的字节数（区分完整失败 vs 半截中断）
     pub interrupted_after_bytes: Option<u64>,
+    /// 输入 token（互斥口径：未被缓存覆盖的部分）。无 usage 时为 0。
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// 输出 token（估算）。
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 缓存创建 token（互斥口径）。
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// 缓存读取 token（互斥口径）。
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -161,6 +173,7 @@ impl TraceStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_add_token_columns(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
@@ -172,6 +185,7 @@ impl TraceStore {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate_add_token_columns(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
@@ -221,8 +235,9 @@ impl TraceStore {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
-                 total_attempts, duration_ms, interrupted_after_bytes) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 total_attempts, duration_ms, interrupted_after_bytes, \
+                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -237,6 +252,10 @@ impl TraceStore {
                     rec.total_attempts as i64,
                     rec.duration_ms as i64,
                     rec.interrupted_after_bytes.map(|v| v as i64),
+                    rec.input_tokens as i64,
+                    rec.output_tokens as i64,
+                    rec.cache_creation_tokens as i64,
+                    rec.cache_read_tokens as i64,
                 ],
             )?;
             for a in &rec.attempts {
@@ -347,7 +366,8 @@ impl TraceStore {
         };
         let sql = format!(
             "SELECT trace_id, ts, key_id, model, is_stream, final_status, final_credential_id, \
-             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes \
+             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -369,6 +389,10 @@ impl TraceStore {
                 interrupted_after_bytes: row
                     .get::<_, Option<i64>>(11)?
                     .map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(12)? as u64,
+                output_tokens: row.get::<_, i64>(13)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(14)? as u64,
+                cache_read_tokens: row.get::<_, i64>(15)? as u64,
                 attempts: Vec::new(),
             })
         })?;
@@ -486,6 +510,25 @@ pub struct FailureStats {
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
 
+/// 给已存在的老 `traces` 表补 token 列（幂等）。
+///
+/// SCHEMA 用 `CREATE TABLE IF NOT EXISTS` 不会给已建表加列，所以升级到带 token 的
+/// 版本时，旧库里没有这些列。这里对每列做一次 `ADD COLUMN`，已存在时 SQLite 报
+/// "duplicate column name"，直接忽略即可——纯幂等，不依赖版本号。
+fn migrate_add_token_columns(conn: &Connection) {
+    const COLS: [&str; 4] = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+    ];
+    for col in COLS {
+        let sql = format!("ALTER TABLE traces ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0");
+        // 列已存在会返回 Err（duplicate column），是预期内的幂等结果，忽略。
+        let _ = conn.execute(&sql, []);
+    }
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          TEXT PRIMARY KEY,
@@ -500,7 +543,11 @@ CREATE TABLE IF NOT EXISTS traces (
     error_message     TEXT,
     total_attempts    INTEGER NOT NULL,
     duration_ms       INTEGER NOT NULL,
-    interrupted_after_bytes INTEGER
+    interrupted_after_bytes INTEGER,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -546,6 +593,10 @@ mod tests {
             total_attempts: 2,
             duration_ms: 1200,
             interrupted_after_bytes: None,
+            input_tokens: 1093,
+            output_tokens: 779,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 101760,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -591,6 +642,11 @@ mod tests {
         assert_eq!(out[0].trace_id, "t1");
         assert_eq!(out[0].attempts.len(), 2);
         assert_eq!(out[0].attempts[0].outcome, outcome::ACCOUNT_THROTTLED);
+        // token 分项往返
+        assert_eq!(out[0].input_tokens, 1093);
+        assert_eq!(out[0].output_tokens, 779);
+        assert_eq!(out[0].cache_read_tokens, 101760);
+        assert_eq!(out[0].cache_creation_tokens, 0);
     }
 
     #[test]
