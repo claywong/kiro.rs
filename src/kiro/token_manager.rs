@@ -37,7 +37,8 @@ use crate::kiro::fingerprint::Fingerprint;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpTokenResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::{DEFAULT_OVERAGE_CAP, UsageLimitsResponse};
 use crate::kiro::rate_limiter::{RateLimitConfig, RateLimiter};
@@ -249,7 +250,9 @@ pub(crate) async fn refresh_token_with_id(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp") {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -257,6 +260,102 @@ pub(crate) async fn refresh_token_with_id(
     } else {
         refresh_social_token(credentials, config, proxy).await
     }
+}
+
+/// 刷新外部 IdP（企业 SSO，如 Azure AD）Token
+///
+/// 通过 IdP 的 Token 端点使用 OAuth2 refresh_token 授权（public client，无 client secret）
+/// 续期。原始 scopes 中的 offline_access 才能拿到 refresh token。IdP 不返回 profileArn
+/// （由 ListAvailableProfiles 用 EXTERNAL_IDP token 类型单独解析），因此保持 profile_arn 不变。
+///
+/// Azure AD 会轮换 refresh token；有些 IdP 刷新时不返回新的 refresh token，
+/// 这种情况下保留原 refresh token。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新外部 IdP (企业 SSO) Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 tokenEndpoint"))?;
+
+    // SSRF 防护：刷新时携带 refresh token，token 端点必须通过 IdP 主机白名单校验，
+    // 防止把 refresh token POST 到内网或攻击者控制的主机。
+    crate::kiro::sso::validate_external_idp_endpoint(token_endpoint)?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut form: Vec<(&str, String)> = vec![
+        ("client_id", client_id.to_string()),
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref().filter(|s| !s.trim().is_empty()) {
+        form.push(("scope", scopes.to_string()));
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    let data: ExternalIdpTokenResponse = serde_json::from_str(&body_text).unwrap_or(
+        ExternalIdpTokenResponse {
+            access_token: None,
+            refresh_token: None,
+            expires_in: None,
+            error: None,
+            error_description: None,
+        },
+    );
+
+    let access_token = match data.access_token {
+        Some(t) if !t.is_empty() && status.is_success() => t,
+        _ => {
+            if let Some(err) = data.error {
+                bail!(
+                    "外部 IdP Token 刷新失败 (status {}): {}: {}",
+                    status,
+                    err,
+                    data.error_description.unwrap_or_default()
+                );
+            }
+            bail!("外部 IdP Token 刷新失败 (status {}): {}", status, body_text);
+        }
+    };
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(access_token);
+
+    // 部分 IdP 刷新时返回新的 refresh token，没有返回则保留原值
+    if let Some(new_refresh_token) = data.refresh_token.filter(|t| !t.is_empty()) {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!(expires_in = %expires_in, "外部 IdP Token 刷新成功");
+    } else {
+        tracing::info!("外部 IdP Token 刷新成功（无过期时间）");
+    }
+
+    Ok(new_credentials)
 }
 
 /// 刷新 Social Token
@@ -500,6 +599,161 @@ pub(crate) async fn get_usage_limits(
         anyhow::anyhow!("JSON 解析失败: {}", e)
     })?;
     Ok(data)
+}
+
+// ============================================================================
+// IdC / Enterprise profileArn 解析（对齐 chaogei/Kiro-account-manager 参考实现）
+//
+// Enterprise（IAM Identity Center）账号签发的 token 需要携带一个真实的
+// CodeWhisperer profileArn 才能调用数据面 / 额度端点，否则会返回
+// 403 "User is not authorized to make this call."。官方 Kiro IDE 在认证后
+// 通过 CodeWhisperer Runtime 的 ListAvailableProfiles 拿到可用 profile 列表，
+// 用户选择后存储 ARN；反代自动取第一个 profile。
+//
+// 参考实现：src/main/proxy/kiroApi.ts fetchEnterpriseProfileArn()
+//          src/main/kiroAuthSync.ts getEnterpriseFallbackArn()
+// ============================================================================
+
+/// IdC / Enterprise profileArn 解析结果（三态）。
+///
+/// 关键教训：早期实现对「空 profile 列表」也套用参考项目的兜底 ARN
+/// （账号 610548660232），但那个 ARN 属于参考项目作者的租户，独立租户的
+/// token 对它无权，反而触发 403 "bearer token invalid"。因此空列表必须
+/// 明确判定为 NoProfile（账号无可用 profile → 验活失败），而不是兜底。
+#[derive(Debug, Clone)]
+pub enum IdcProfileResolution {
+    /// 成功解析到真实 profileArn。
+    Resolved(String),
+    /// token 有效但账号没有任何可用 profile（ListAvailableProfiles 返回空列表）。
+    /// 说明该 SSO 用户未被分配 Q Developer / Kiro 应用 → 该账号不可用。
+    NoProfile,
+    /// 网络 / 临时错误，无法判定。调用方保持 profileArn 缺失，下次再试。
+    Unavailable,
+}
+
+/// 根据区域返回 CodeWhisperer Runtime 端点（ListAvailableProfiles 用）。
+fn codewhisperer_endpoint(region: &str) -> String {
+    if region.starts_with("eu-") {
+        "https://codewhisperer.eu-central-1.amazonaws.com".to_string()
+    } else {
+        "https://codewhisperer.us-east-1.amazonaws.com".to_string()
+    }
+}
+
+/// 判断凭据是否为 IdC / Enterprise（IAM Identity Center）类型。
+fn is_idc_credential(credentials: &KiroCredentials) -> bool {
+    credentials
+        .auth_method
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("idc"))
+}
+
+/// 通过 CodeWhisperer Runtime 的 ListAvailableProfiles 为 Enterprise/IdC 账号解析
+/// 真实 profileArn。
+///
+/// 返回：
+/// - `Resolved(arn)`：`profiles[0].arn`，账号可用；
+/// - `NoProfile`：HTTP 成功但 `profiles` 为空 → 该 SSO 用户没有可用的 Q Developer/Kiro
+///   应用 profile，账号不可用（**不再**套用兜底 ARN，那会导致 403 "bearer token invalid"）；
+/// - `Unavailable`：网络/构建/解析/非 2xx 等临时错误，无法判定，调用方保持缺失下次再试。
+async fn fetch_idc_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> IdcProfileResolution {
+    let region = credentials.effective_api_region(config);
+    let url = format!("{}/ListAvailableProfiles", codewhisperer_endpoint(region));
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let client = match build_client(proxy, 30, config.tls_backend) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("ListAvailableProfiles 构建 client 失败: {}", e);
+            return IdcProfileResolution::Unavailable;
+        }
+    };
+
+    let x_amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, config.kiro_version, machine_id
+    );
+
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("x-amz-user-agent", x_amz_user_agent)
+        .header("user-agent", user_agent)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .body("{}")
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("ListAvailableProfiles 请求失败: {}", e);
+            return IdcProfileResolution::Unavailable;
+        }
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        // 403 = 该账号 token 对 CodeWhisperer 无权限（无 Kiro/Q Developer 订阅或未分配应用）。
+        // 这属于账号本身不可用 → 判定 NoProfile，让验活流程标记该凭证无效。
+        if status.as_u16() == 403 {
+            tracing::warn!(
+                "ListAvailableProfiles 返回 403（账号未开通 Kiro/Q Developer 或未分配应用）→ 判定无可用 profile"
+            );
+            return IdcProfileResolution::NoProfile;
+        }
+        tracing::warn!(
+            "ListAvailableProfiles 失败 status={} body={}",
+            status,
+            body.chars().take(200).collect::<String>()
+        );
+        return IdcProfileResolution::Unavailable;
+    }
+
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("ListAvailableProfiles 响应解析失败: {}", e);
+            return IdcProfileResolution::Unavailable;
+        }
+    };
+
+    let arn = json
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|p| p.get("arn"))
+        .and_then(|a| a.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    match arn {
+        Some(arn) => {
+            tracing::info!("Enterprise/IdC profileArn 已解析: {}", arn);
+            IdcProfileResolution::Resolved(arn)
+        }
+        None => {
+            // HTTP 200 但 profiles 为空：账号没有任何可用 profile。
+            tracing::warn!(
+                "ListAvailableProfiles 返回空列表（账号无可用 Q Developer/Kiro profile）→ 判定无可用 profile"
+            );
+            IdcProfileResolution::NoProfile
+        }
+    }
 }
 
 // ============================================================================
@@ -2121,6 +2375,11 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    /// 获取当前全局代理配置（用于 SSO 登录等需要出站请求的场景）
+    pub fn current_proxy(&self) -> Option<ProxyConfig> {
+        self.proxy.read().clone()
+    }
+
     /// 获取缓存目录（凭据文件所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
         self.credentials_path
@@ -2630,6 +2889,78 @@ impl MultiTokenManager {
         }
     }
 
+    /// 批量导出凭据为可再导入的 JSON（KAM 原生嵌套格式）。
+    ///
+    /// - `ids` 为空时导出全部；否则仅导出匹配的 id（保持传入顺序）。
+    /// - 含真实 refreshToken / clientId / clientSecret / profileArn 等，可被本项目
+    ///   的 import-token-json 直接再导入。
+    /// - 返回形如 `{ version, exportedAt, accounts: [ { email, machineId, credentials: {...} } ] }`。
+    pub fn export_credentials(&self, ids: &[u64]) -> serde_json::Value {
+        let entries = self.entries.lock();
+        let selected: Vec<&CredentialEntry> = if ids.is_empty() {
+            entries.iter().collect()
+        } else {
+            // 按传入 id 顺序导出，跳过不存在的
+            ids.iter()
+                .filter_map(|id| entries.iter().find(|e| e.id == *id))
+                .collect()
+        };
+
+        let accounts: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|e| {
+                let c = &e.credentials;
+                // credentials 子对象：仅写非空字段
+                let mut cred = serde_json::Map::new();
+                let mut put = |k: &str, v: &Option<String>| {
+                    if let Some(s) = v.as_ref().filter(|s| !s.is_empty()) {
+                        cred.insert(k.to_string(), serde_json::Value::String(s.clone()));
+                    }
+                };
+                put("refreshToken", &c.refresh_token);
+                put("accessToken", &c.access_token);
+                put("clientId", &c.client_id);
+                put("clientSecret", &c.client_secret);
+                put("authMethod", &c.auth_method);
+                put("provider", &c.provider);
+                put("region", &c.region);
+                put("apiRegion", &c.api_region);
+                put("profileArn", &c.profile_arn);
+                put("issuerUrl", &c.issuer_url);
+                put("tokenEndpoint", &c.token_endpoint);
+                put("scopes", &c.scopes);
+                put("expiresAt", &c.expires_at);
+
+                let mut account = serde_json::Map::new();
+                account.insert("id".to_string(), serde_json::json!(e.id));
+                if let Some(email) = c.email.as_ref().filter(|s| !s.is_empty()) {
+                    account.insert("email".to_string(), serde_json::json!(email));
+                }
+                if let Some(mid) = c.machine_id.as_ref().filter(|s| !s.is_empty()) {
+                    account.insert("machineId".to_string(), serde_json::json!(mid));
+                }
+                if let Some(idp) = c.idp.as_ref().filter(|s| !s.is_empty()) {
+                    account.insert("idp".to_string(), serde_json::json!(idp));
+                }
+                account.insert("priority".to_string(), serde_json::json!(c.priority));
+                account.insert("disabled".to_string(), serde_json::json!(e.disabled));
+                account.insert(
+                    "credentials".to_string(),
+                    serde_json::Value::Object(cred),
+                );
+                serde_json::Value::Object(account)
+            })
+            .collect();
+
+        let exported_at = chrono::Utc::now().timestamp_millis();
+        serde_json::json!({
+            "version": "1.1.2",
+            "exportedAt": exported_at,
+            "source": "kiro-rs",
+            "accounts": accounts,
+        })
+    }
+
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
         {
@@ -2684,6 +3015,21 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.region = region;
             entry.credentials.api_region = api_region;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 缓存惰性解析出的 profileArn（external_idp 首次使用时由 ListAvailableProfiles 解析）。
+    /// 写入运行时凭据并持久化，使后续请求零往返直接命中。
+    pub fn set_profile_arn_for(&self, id: u64, profile_arn: String) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.profile_arn = Some(profile_arn);
         }
         self.persist_credentials()?;
         Ok(())
@@ -3050,7 +3396,7 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
             };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3061,6 +3407,44 @@ impl MultiTokenManager {
 
         let proxy = self.proxy.read().clone();
         let config = self.config.read().clone();
+
+        // IdC / Enterprise 账号：额度端点强制要求 profileArn，缺失会 403。
+        // 首次遇到时通过 ListAvailableProfiles 解析真实 ARN，存回凭据并持久化，
+        // 后续请求直接复用（对齐 chaogei/Kiro-account-manager 参考实现）。
+        if credentials.profile_arn.is_none() && is_idc_credential(&credentials) {
+            match fetch_idc_profile_arn(&credentials, &config, &token, proxy.as_ref()).await {
+                IdcProfileResolution::Resolved(arn) => {
+                    credentials.profile_arn = Some(arn.clone());
+                    let mut should_persist = false;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            if entry.credentials.profile_arn.as_deref() != Some(arn.as_str()) {
+                                entry.credentials.profile_arn = Some(arn);
+                                should_persist = true;
+                            }
+                        }
+                    }
+                    if should_persist {
+                        if let Err(e) = self.persist_credentials() {
+                            tracing::warn!("IdC profileArn 解析后持久化失败（不影响本次请求）: {}", e);
+                        }
+                    }
+                }
+                IdcProfileResolution::NoProfile => {
+                    // 账号没有任何可用 profile（token 有效但未分配 Q Developer/Kiro 应用）。
+                    // 直接判定该凭证不可用，让上层验活流程标记并给出明确原因。
+                    anyhow::bail!(
+                        "该账号无可用的 CodeWhisperer/Kiro profile（未开通 Q Developer 或未分配应用），无法使用"
+                    );
+                }
+                IdcProfileResolution::Unavailable => {
+                    // 临时错误：不改状态，继续尝试（下面 get_usage_limits 大概率也会失败并按原逻辑处理）。
+                    tracing::debug!("凭据 #{} profileArn 解析暂时不可用，保持缺失稍后重试", id);
+                }
+            }
+        }
+
         match get_usage_limits(&credentials, &config, &token, proxy.as_ref()).await {
             Ok(usage) => {
                 let subscription_title = usage.subscription_title().map(|title| title.to_string());
@@ -3175,7 +3559,14 @@ impl MultiTokenManager {
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
-        validated_cred.machine_id = new_cred.machine_id;
+        // 机器码：优先用导入/登录时携带的 machineId（如账号管理器导出的原生 UUID）；
+        // 缺失时（如 SSO 登录路径）随机生成一个固定 UUID 并持久化，避免退化到
+        // 「用 refreshToken 派生」——refreshToken 每次刷新都会变，会导致设备指纹漂移。
+        validated_cred.machine_id = new_cred
+            .machine_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
         validated_cred.email = new_cred.email;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.proxy_url = new_cred.proxy_url;
@@ -3314,23 +3705,19 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 检查是否存在具有相同 refreshToken 前缀的凭据
+    /// 检查是否存在具有相同 refreshToken 的凭据（用于批量导入去重）。
     ///
-    /// 用于批量导入时的去重检查，通过比较 refreshToken 前 32 字符判断是否重复
-    /// 使用 floor_char_boundary 安全截断，避免在多字节字符中间切割导致 panic
+    /// 必须比较**完整** refreshToken：Azure AD / external_idp（甚至同租户 IdC）签发的
+    /// refreshToken 有很长的公共固定前缀（如 `1.AUEB...` 头部数十字符都相同），
+    /// 仅比前缀会把不同账号误判为重复。此处用完整字符串（常量时间比较无必要，
+    /// 但用 == 完整比对即可保证正确性）。
     pub fn has_refresh_token_prefix(&self, refresh_token: &str) -> bool {
-        let prefix_len = floor_char_boundary(refresh_token, 32);
-        let new_prefix = &refresh_token[..prefix_len];
-
         let entries = self.entries.lock();
         entries.iter().any(|e| {
             e.credentials
                 .refresh_token
-                .as_ref()
-                .map(|rt| {
-                    let existing_prefix_len = floor_char_boundary(rt, 32);
-                    &rt[..existing_prefix_len] == new_prefix
-                })
+                .as_deref()
+                .map(|rt| rt == refresh_token)
                 .unwrap_or(false)
         })
     }

@@ -10,12 +10,14 @@ import { parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
   credentialId: number | null
+  /** 展示名称：优先邮箱，回退到 "凭据 #id" */
+  credentialLabel?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   forceRefresh?: boolean
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange, forceRefresh }: BalanceDialogProps) {
+export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChange, forceRefresh }: BalanceDialogProps) {
   const { data: balance, isLoading, isFetching, error } = useCredentialBalance(credentialId)
   const showLoading = isLoading || (forceRefresh && isFetching)
 
@@ -42,7 +44,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange, forceRefresh }
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credentialId} 余额信息
+            {credentialLabel || `凭据 #${credentialId}`} 余额信息
           </DialogTitle>
         </DialogHeader>
 

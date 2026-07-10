@@ -22,6 +22,10 @@ import type {
   UpdateProxyConfigRequest,
   GlobalConfigResponse,
   UpdateGlobalConfigRequest,
+  StartKiroSsoRequest,
+  StartKiroSsoResponse,
+  KiroSsoSessionRequest,
+  PollKiroSsoResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -256,6 +260,55 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
+// ===== Kiro SSO（企业 Azure 租户）浏览器登录 =====
+
+// 启动 SSO 登录：返回 signInUrl（在浏览器打开完成登录）+ sessionId（用于轮询）
+export async function startKiroSso(
+  req: StartKiroSsoRequest = {}
+): Promise<StartKiroSsoResponse> {
+  const { data } = await api.post<StartKiroSsoResponse>('/auth/kiro-sso/start', req)
+  return data
+}
+
+// 启动 AWS IAM Identity Center（Enterprise SSO）直连登录：填 Start URL + region，
+// 返回 signInUrl（AWS 登录页，在浏览器打开）+ sessionId（用于轮询）。复用同一套 poll/cancel。
+export async function startKiroIdc(req: {
+  startUrl: string
+  region?: string
+}): Promise<StartKiroSsoResponse> {
+  const { data } = await api.post<StartKiroSsoResponse>('/auth/kiro-idc/start', req)
+  return data
+}
+
+// 手动提交 IAM Identity Center 回调 URL（无 SSH 隧道场景）：解析 code+state 并投递，
+// 随后由 poll 完成 token 交换与落库。
+export async function submitKiroIdcCallback(
+  sessionId: string,
+  callbackUrl: string
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/auth/kiro-idc/callback', {
+    sessionId,
+    callbackUrl,
+  })
+  return data
+}
+
+// 轮询 SSO 登录状态：completed=false 表示仍在等待；completed=true 表示已捕获授权码并落库
+export async function pollKiroSso(sessionId: string): Promise<PollKiroSsoResponse> {
+  const { data } = await api.post<PollKiroSsoResponse>('/auth/kiro-sso/poll', {
+    sessionId,
+  } as KiroSsoSessionRequest)
+  return data
+}
+
+// 取消 SSO 登录：立即拆除回环监听并丢弃会话
+export async function cancelKiroSso(sessionId: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/auth/kiro-sso/cancel', {
+    sessionId,
+  } as KiroSsoSessionRequest)
+  return data
+}
+
 // 获取指定凭据统计
 export async function getCredentialStats(id: number): Promise<CredentialStatsResponse> {
   const { data } = await api.get<CredentialStatsResponse>(`/credentials/${id}/stats`)
@@ -282,6 +335,12 @@ export async function importTokenJson(
     '/credentials/import-token-json',
     req
   )
+  return data
+}
+
+// 批量导出凭据为可再导入的 JSON（KAM 原生嵌套格式）。ids 为空则导出全部。
+export async function exportCredentials(ids: number[] = []): Promise<unknown> {
+  const { data } = await api.post<unknown>('/credentials/export', { ids })
   return data
 }
 

@@ -55,6 +55,23 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP（企业 SSO，如 Azure AD）OAuth2 Token 端点（用于 refresh_token 刷新）
+    /// 仅 auth_method = "external_idp" 时使用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP OIDC Issuer URL（端点是从该 issuer 发现的）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 授予的 scopes（空格分隔），刷新时透传
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// 身份提供方名称（如 "AzureAD" / "Kiro SSO" / "BuilderId"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -405,6 +422,10 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: None,
             api_region: None,
@@ -527,6 +548,10 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             api_region: None,
@@ -561,6 +586,10 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: None,
             api_region: None,
@@ -681,6 +710,10 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             api_region: None,

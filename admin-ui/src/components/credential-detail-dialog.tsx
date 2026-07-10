@@ -267,7 +267,8 @@ export function CredentialDetailDialog({
       <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credential.id} 详情
+            {credential.email || credential.accountEmail || `凭据 #${credential.id}`}
+            <span className="ml-2 text-xs font-normal text-muted-foreground">#{credential.id} 详情</span>
           </DialogTitle>
         </DialogHeader>
 

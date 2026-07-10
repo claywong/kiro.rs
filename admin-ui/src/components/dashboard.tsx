@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2, Globe, ArrowUp, ArrowDown, Boxes } from 'lucide-react'
+import { RefreshCw, LogOut, LogIn, Moon, Sun, Server, Plus, Upload, Download, Trash2, RotateCcw, CheckCircle2, Globe, ArrowUp, ArrowDown, Boxes } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -8,13 +8,14 @@ import { Button } from '@/components/ui/button'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { KiroSsoLoginDialog } from '@/components/kiro-sso-login-dialog'
 import { ImportTokenJsonDialog } from '@/components/import-token-json-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyConfigDialog } from '@/components/proxy-config-dialog'
 import { GlobalConfigDialog } from '@/components/global-config-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 import { useCredentials, useCachedBalances, useDeleteCredential, useResetFailure, useForceRefreshToken, useProxyConfig, useGlobalConfig } from '@/hooks/use-credentials'
-import { getCredentialBalance } from '@/api/credentials'
+import { getCredentialBalance, exportCredentials } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import type { BalanceResponse } from '@/types/api'
@@ -31,6 +32,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [forceRefreshBalance, setForceRefreshBalance] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [ssoLoginDialogOpen, setSsoLoginDialogOpen] = useState(false)
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
@@ -350,6 +352,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  // 批量导出凭据为 JSON 文件（命名 kiro-accounts-YYYY-MM-DD.json）
+  const handleExport = async (ids: number[]) => {
+    try {
+      const payload = await exportCredentials(ids)
+      const count = Array.isArray((payload as { accounts?: unknown[] })?.accounts)
+        ? (payload as { accounts: unknown[] }).accounts.length
+        : 0
+      if (count === 0) {
+        toast.error('没有可导出的凭据')
+        return
+      }
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const now = new Date()
+      const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `kiro-accounts-${date}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success(`已导出 ${count} 个凭据`)
+    } catch (error) {
+      toast.error('导出失败: ' + extractErrorMessage(error))
+    }
+  }
+
   // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
     if (!data?.credentials || data.credentials.length === 0) {
@@ -479,10 +507,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     let successCount = 0
 
+    // 凭证展示名称：优先邮箱，回退到 "凭据 #id"
+    const labelOf = (id: number) => {
+      const c = data?.credentials.find(x => x.id === id)
+      return c?.email || c?.accountEmail || `凭据 #${id}`
+    }
+
     // 初始化结果，所有凭据状态为 pending
     const initialResults = new Map<number, VerifyResult>()
     ids.forEach(id => {
-      initialResults.set(id, { id, status: 'pending' })
+      initialResults.set(id, { id, label: labelOf(id), status: 'pending' })
     })
     setVerifyResults(initialResults)
     setVerifyDialogOpen(true)
@@ -500,7 +534,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       // 更新当前凭据状态为 verifying
       setVerifyResults(prev => {
         const newResults = new Map(prev)
-        newResults.set(id, { id, status: 'verifying' })
+        newResults.set(id, { id, label: labelOf(id), status: 'verifying' })
         return newResults
       })
 
@@ -516,6 +550,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           const newResults = new Map(prev)
           newResults.set(id, {
             id,
+            label: labelOf(id),
             status: 'success',
             usage: `${balance.currentUsage}/${balance.usageLimit}`
           })
@@ -527,6 +562,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           const newResults = new Map(prev)
           newResults.set(id, {
             id,
+            label: labelOf(id),
             status: 'failed',
             error: extractErrorMessage(error)
           })
@@ -710,6 +746,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
                   </Button>
+                  <Button onClick={() => handleExport(Array.from(selectedIds))} size="sm" variant="outline">
+                    <Download className="h-4 w-4 mr-2" />
+                    导出所选
+                  </Button>
                   <Button
                     onClick={handleBatchDelete}
                     size="sm"
@@ -741,6 +781,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
+                  onClick={() => handleExport([])}
+                  size="sm"
+                  variant="outline"
+                >
+                  <Download className="h-4 w-4 mr-2" />
+                  导出全部
+                </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <Button
                   onClick={handleClearAll}
                   size="sm"
                   variant="outline"
@@ -755,6 +805,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <Button variant="outline" onClick={() => setImportDialogOpen(true)} size="sm">
                 <Upload className="h-4 w-4 mr-2" />
                 导入凭据
+              </Button>
+              <Button variant="outline" onClick={() => setSsoLoginDialogOpen(true)} size="sm">
+                <LogIn className="h-4 w-4 mr-2" />
+                SSO 登录
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
@@ -817,6 +871,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 余额对话框 */}
       <BalanceDialog
         credentialId={selectedCredentialId}
+        credentialLabel={(() => {
+          const c = data?.credentials.find(x => x.id === selectedCredentialId)
+          return c?.email || c?.accountEmail || undefined
+        })()}
         open={balanceDialogOpen}
         onOpenChange={(open) => {
           setBalanceDialogOpen(open)
@@ -833,6 +891,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      {/* Kiro SSO（企业 / Azure 租户）浏览器登录对话框 */}
+      <KiroSsoLoginDialog
+        open={ssoLoginDialogOpen}
+        onOpenChange={setSsoLoginDialogOpen}
       />
 
       {/* 导入凭据对话框 */}

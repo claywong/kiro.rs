@@ -1,5 +1,61 @@
 # Changelog
 
+## [v1.1.38] - 2026-07-10
+
+本版聚焦**企业与外部身份提供方（IdP）账号接入**：新增 Kiro SSO 浏览器登录、AWS IAM Identity Center 直连登录、外部 IdP（Azure AD）登录与刷新全链路，修复企业租户账号全线 403 的 profileArn 问题；同时新增凭据批量导出，并修复 Azure AD 凭据导入被误判重复的 bug。
+
+### Added — 外部 IdP（Azure AD / 企业 Azure 租户）登录
+
+- **通过 `app.kiro.dev/signin` 托管门户的浏览器登录流程** — 门户在单个 PKCE 授权码流程下联合 Google/GitHub 与企业 IdP；当门户检测到邮箱属于外部 IdP 时，重定向到 `/signin/callback` 并携带 IdP 描述符（`issuer_url` / `client_id` / `scopes`），随后本地对该 IdP 驱动第二段 OIDC 授权码 + PKCE 流程（回环重定向到 `/oauth/callback`），在 IdP token 端点换取面向 CodeWhisperer 的 access token。这是企业 Azure 租户账号登录 Kiro 的唯一方式 (`src/kiro/sso.rs`)
+- **OIDC 端点发现** — 拿到 issuer 后请求 `/.well-known/openid-configuration` 解析 `authorization_endpoint` / `token_endpoint`；发现请求禁止跟随重定向，issuer 与两个已发现端点都要通过白名单校验 (`oidc_discover`, `src/kiro/sso.rs`)
+- **外部 IdP 授权码换取** — 作为 public client（无 client_secret）以 PKCE 换取授权码，请求 form 编码、响应 snake_case；登录结果标记 `auth_method="external_idp"` / `provider="AzureAD"`，并保存 `token_endpoint` / `issuer_url` / `scopes` 供后续刷新 (`exchange_external_idp_code`, `src/kiro/sso.rs`, `src/admin/service.rs`)
+- **SSRF / 开放重定向防护白名单** — 外部 IdP issuer 及端点主机必须为 https、非 IP 字面量，且命中已知企业 IdP 域后缀（`.microsoftonline.com` / `.us` / `.cn`、`.awsapps.com`）；前导点锚定子域边界，`login.microsoftonline.com` 在白名单内 (`validate_external_idp_endpoint`, `src/kiro/sso.rs`)
+
+### Added — 企业 IdC（AWS IAM Identity Center）设备/授权码登录
+
+- **AWS IAM Identity Center 直连登录（不经门户）** — `RegisterClient` 动态注册 public client（声明 `redirectUris` + `grantTypes=[authorization_code, refresh_token]` + `issuerUrl`）→ 浏览器 302 到 `https://oidc.{region}.amazonaws.com/authorize` → 回调 `/oauth/callback?code=...` → 在 `/token` 以 `authorization_code` + PKCE 换取 (`start_kiro_idc_login`, `idc_register_client`, `idc_authorize_url`, `exchange_idc_code`, `src/kiro/sso.rs`)
+- **兼容门户回传的 `login_option=awsidc` 描述符** — 带 `issuer_url` + `idc_region`、不带 `client_id` 时，在回环回调状态机里先于 `external_idp` 分支处理，避免误入外部 IdP 流程 (`handle_callback`, `src/kiro/sso.rs`)
+- **IdC 回环重定向固定使用 IP 字面量 `http://127.0.0.1:3128`** — AWS SSO OIDC 强制 public client 使用 loopback IP（`localhost` 会被拒），且 `RegisterClient` / `/authorize` / `/token` 三处 redirect_uri 必须完全一致 (`src/kiro/sso.rs`)
+- **手动回调兜底（远程服务器无 SSH 隧道场景）** — 用户可把浏览器地址栏完整的 `127.0.0.1:3128/oauth/callback?code=...` URL 粘回来，服务端解析 code + state、做反 CSRF 校验后投递，由现有 poll 循环完成换取（仅对 idc 会话开放）(`submit_kiro_idc_callback`, `src/kiro/sso.rs`)
+
+### Added — SSO 登录会话管理（Start / Poll / Cancel）
+
+- **以会话模式暴露的登录 API** — `start_kiro_sso` / `start_kiro_idc` 绑定固定回环端口监听器并返回登录 URL 与 sessionId；`poll_kiro_sso` 在捕获授权码前返回 pending、捕获后换取并落库；`cancel_kiro_sso` 立即拆除会话释放端口 (`src/kiro/sso.rs`, `src/admin/service.rs`, `src/admin/handlers.rs`)
+- **新增 admin 路由与类型** — `POST /auth/kiro-sso/start`、`/auth/kiro-idc/start`、`/auth/kiro-idc/callback`、`/auth/kiro-sso/poll`、`/auth/kiro-sso/cancel`，及请求/响应类型 `StartKiroSsoRequest` / `StartKiroIdcRequest` / `StartKiroSsoResponse` / `KiroSsoSessionRequest` / `SubmitKiroIdcCallbackRequest` / `PollKiroSsoResponse` (`src/admin/router.rs`, `src/admin/handlers.rs`, `src/admin/types.rs`)
+- **前端登录对话框** — 支持「社交/企业 Azure」与「IAM Identity Center」两种模式切换、自动打开浏览器 + 定时轮询、手动粘贴回调地址兜底，以及云服务器部署的 SSH 隧道命令提示（自动填充当前访问主机名）；配套 API 绑定 `startKiroSso` / `startKiroIdc` / `submitKiroIdcCallback` / `pollKiroSso` / `cancelKiroSso` (`admin-ui/src/components/kiro-sso-login-dialog.tsx`, `admin-ui/src/api/credentials.ts`)
+- **登录成功后自动验活** — 调 `get_usage_limits_for` 走完整链路（IdC 会先解析 profileArn 再查额度）；若账号无可用 profile 或被拒（403 等），回滚删除刚入库的凭证并返回明确错误，避免留下永远 403 的死凭证 (`poll_kiro_sso`, `src/admin/service.rs`)
+
+### Added — 凭据批量导出
+
+- **新增 `POST /api/admin/credentials/export`** — 批量导出凭据为可再导入的 KAM 原生嵌套 JSON（含 `refreshToken` / `clientId` / `clientSecret` / `profileArn` / `region` / `apiRegion` / `tokenEndpoint` / `issuerUrl` / `scopes` 等全部字段），请求体 `{"ids":[...]}`，为空则导出全部；导出结果可被导入器无损再吸收 (`src/admin/service.rs`, `src/admin/handlers.rs`, `src/admin/router.rs`)
+- **Admin UI 导出入口** — 工具栏新增「导出全部」常驻按钮与「导出所选」按钮（勾选凭据后出现），下载文件按 `kiro-accounts-YYYY-MM-DD.json` 命名 (`admin-ui/src/components/dashboard.tsx`, `admin-ui/src/api/credentials.ts`)
+
+### Fixed — Token 刷新增强
+
+- **外部 IdP token 刷新** — 新增 `refresh_external_idp_token`，走 IdP 的 `token_endpoint` 以 OAuth2 `refresh_token` 授权（public client，无 client_secret）续期，透传原始 scopes；刷新前对 token 端点做白名单校验防止 refresh token 外泄到内网/攻击者主机；兼容「IdP 刷新不返回新 refresh token」的情况（保留原值）(`src/kiro/token_manager.rs`)
+- **刷新路由分支** — `refresh_token_with_id` 新增 `external_idp` 分支路由到上述刷新逻辑，`idc` / `builder-id` / `iam` 继续走 AWS SSO OIDC 刷新 (`src/kiro/token_manager.rs`)
+- **标准 OAuth2 响应结构** — 新增 `ExternalIdpTokenResponse`（snake_case：`access_token` / `refresh_token` / `expires_in` / `error` / `error_description`），登录换取与刷新共用 (`src/kiro/model/token_refresh.rs`)
+- **修复设备指纹漂移** — SSO 登录路径缺失 `machineId` 时不再退化为「用 refreshToken 派生」（refreshToken 每次刷新都变），改为随机生成固定 UUID 并持久化 (`src/kiro/token_manager.rs`)
+
+### Fixed — profileArn 解析（企业/外部 IdP 账号 403 问题）
+
+- **修复企业租户账号全线 403 "User is not authorized to make this call."** — 旧逻辑对所有 SSO OIDC 凭据无条件剥离 profileArn，现改为只要凭据有真实 profileArn（social 自带 / IdC 经解析）就在数据面与额度端点携带；无 profileArn 才移除 body 中残留占位符 (`mcp_profile_arn_header_value`, `inject_profile_arn`, `src/kiro/endpoint/ide.rs`)
+- **外部 IdP token 必带 `TokenType: EXTERNAL_IDP` 请求头** — 否则 CodeWhisperer 不识别 token 类型、静默返回空 profile 列表并拒绝数据面调用；作用于数据面/流式/额度三处请求 (`is_external_idp_credentials`, `src/kiro/endpoint/ide.rs`)
+- **external_idp 账号 profileArn 惰性解析** — 企业 SSO 登录与刷新都不返回 profileArn，故在首次数据面调用前通过 `ListAvailableProfiles`（带 `TokenType: EXTERNAL_IDP` 头）跨候选 region 探测；解析成功写回本次上下文并持久化，后续请求零往返命中 (`src/kiro/profile_resolver.rs`, `KiroProvider::ensure_profile_arn`, `src/kiro/provider.rs`)
+- **跨 region 探测** — Azure 租户登录默认 region 为 us-east-1，但 profile 可能在其它 region（如 eu-central-1），按候选 region 列表逐个探测（可用 `KIRO_PROFILE_REGIONS` 覆盖）；Builder ID "unsupported" 错误跨 region 权威、短路，并以 24 小时冷却抑制反复探测 (`src/kiro/profile_resolver.rs`)
+- **IdC 账号 profileArn 三态判定** — 验活时经 `ListAvailableProfiles` 解析，区分 `Resolved` / `NoProfile` / `Unavailable`：空 profile 列表或 403 明确判为 `NoProfile`（账号不可用），不再套用参考项目的兜底 ARN（那会导致跨租户 403 "bearer token invalid"）；解析成功后持久化复用 (`fetch_idc_profile_arn`, `IdcProfileResolution`, `src/kiro/token_manager.rs`)
+
+### Fixed — 凭据导入
+
+- **修复 Azure AD / external_idp 凭据被误判"凭证已存在"** — 去重逻辑此前只比较 refreshToken 前 32 字符，而同租户同 client 的 Azure AD refreshToken 有很长公共固定前缀（如 `1.AUEB...` 头部数十字符相同），导致不同账号被误判重复而拒绝导入；改为比较**完整** refreshToken (`has_refresh_token_prefix`, `src/kiro/token_manager.rs`)
+- **多文件导入容错** — Admin 导入弹窗多选/拖入多个 `.json` 时改为逐文件解析：单个文件失败不再丢弃全部，跨文件按 refreshToken 自动去重，完成后汇总「成功 N/M 个文件、共 X 条凭据、哪些文件失败」(`admin-ui/src/components/import-token-json-dialog.tsx`)
+- **兼容 external_idp harvest bundle 导入** — 识别 Azure AD 登录 bundle（`token` 块内直接带 `clientId` / `tokenEndpoint` / `issuerUrl` / `scopes`、无 `clientRegistration`），展平后携带刷新所需字段落库；后端 `NestedCredentials` / `TokenJsonItem` 补齐对应字段与解析器，并对 external_idp 校验 `clientId` + `tokenEndpoint` (`admin-ui/src/components/import-token-json-dialog.tsx`, `src/admin/types.rs`, `src/admin/service.rs`)
+
+### Added — 凭据模型字段扩展
+
+- **`KiroCredentials` 新增四个可选字段** — `token_endpoint` / `issuer_url` / `scopes` / `provider`，分别用于外部 IdP 刷新的 token 端点、OIDC issuer、透传 scopes 与身份提供方名称（如 `AzureAD` / `Kiro SSO` / `BuilderId`）(`src/kiro/model/credentials.rs`)
+- **新增 `region_from_profile_arn`** — 从 `arn:aws:codewhisperer:<region>:...:profile/...` 解析 region，用于驱动数据面 region 选择 (`src/kiro/profile_resolver.rs`)
+
 ## [v1.1.37] - 2026-05-29
 
 ### Fixed

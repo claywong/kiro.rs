@@ -39,44 +39,60 @@ impl IdeEndpoint {
         )
     }
 
+    #[allow(dead_code)]
     fn is_aws_sso_oidc_credentials(credentials: &KiroCredentials) -> bool {
         let auth_method = credentials.auth_method.as_deref();
         matches!(auth_method, Some("builder-id") | Some("idc"))
             || (credentials.client_id.is_some() && credentials.client_secret.is_some())
     }
 
-    fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
-        if Self::is_aws_sso_oidc_credentials(credentials) {
-            return None;
-        }
+    /// 外部 IdP（企业 SSO，如 Azure AD）token 必须携带 TokenType: EXTERNAL_IDP 头，
+    /// 否则 CodeWhisperer 不识别 token 类型，会静默返回空 profile 列表并拒绝数据面调用。
+    /// 携带后，已开通的账号能解析出 profile，未开通的会得到明确的 403。
+    fn is_external_idp_credentials(credentials: &KiroCredentials) -> bool {
+        credentials
+            .auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"))
+    }
 
-        credentials.profile_arn.as_deref()
+    /// 决定请求实际应携带的 profileArn。
+    ///
+    /// 规则（对齐 chaogei/Kiro-account-manager 参考实现）：
+    /// - 凭据已有真实 profileArn（social 换取自带 / IdC 经 ListAvailableProfiles 解析）→ 使用它
+    /// - 无 profileArn（如未解析的 builder-id）→ 返回 None，不发送
+    ///
+    /// 关键修正：IdC / Enterprise 账号一旦解析出真实 profileArn，数据面与额度端点
+    /// 都必须携带，否则 CodeWhisperer 返回 403 "User is not authorized to make this call."。
+    /// 旧逻辑对所有 SSO OIDC 凭据无条件剥离 profileArn，导致企业租户账号全线 403。
+    fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
+        credentials
+            .profile_arn
+            .as_deref()
+            .filter(|s| !s.is_empty())
     }
 
     fn inject_profile_arn(
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
-        if Self::is_aws_sso_oidc_credentials(credentials) {
-            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
-            if let Some(obj) = request.as_object_mut() {
-                obj.remove("profileArn");
-            }
-            return Ok(serde_json::to_string(&request)?);
-        }
-
-        let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) else {
-            return Ok(request_body.to_string());
-        };
-
         let mut request: serde_json::Value = serde_json::from_str(request_body)?;
         let obj = request
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
-        obj.insert(
-            "profileArn".to_string(),
-            serde_json::Value::String(profile_arn.to_string()),
-        );
+
+        match Self::mcp_profile_arn_header_value(credentials) {
+            Some(profile_arn) => {
+                obj.insert(
+                    "profileArn".to_string(),
+                    serde_json::Value::String(profile_arn.to_string()),
+                );
+            }
+            None => {
+                // 无真实 profileArn：移除 body 里可能残留的占位符，避免发送无效值。
+                obj.remove("profileArn");
+            }
+        }
         Ok(serde_json::to_string(&request)?)
     }
 }
@@ -120,6 +136,8 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if Self::is_external_idp_credentials(ctx.credentials) {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -139,6 +157,8 @@ impl KiroEndpoint for IdeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if Self::is_external_idp_credentials(ctx.credentials) {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -184,6 +204,8 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
+        } else if Self::is_external_idp_credentials(ctx.credentials) {
+            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
         }
 
         Ok(UsageRequestParts { url, headers })

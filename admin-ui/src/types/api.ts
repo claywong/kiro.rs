@@ -206,6 +206,32 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+// ===== Kiro SSO（企业 Azure 租户）浏览器登录 =====
+
+export interface StartKiroSsoRequest {
+  region?: string | null
+}
+
+export interface StartKiroSsoResponse {
+  sessionId: string
+  signInUrl: string
+  // 建议轮询间隔（秒）
+  interval: number
+}
+
+export interface KiroSsoSessionRequest {
+  sessionId: string
+}
+
+export interface PollKiroSsoResponse {
+  success: boolean
+  completed: boolean
+  status?: string
+  credentialId?: number
+  email?: string
+  authMethod?: string
+}
+
 // ===== 账号信息（套餐/用量/邮箱等） =====
 
 export interface CreditBonus {
@@ -335,11 +361,18 @@ export interface CredentialAccountInfoResponse {
 export interface TokenJsonItem {
   provider?: string
   refreshToken?: string
+  accessToken?: string
   clientId?: string
   clientSecret?: string
   authMethod?: string
   priority?: number
   region?: string
+  apiRegion?: string
+  profileArn?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  email?: string
   machineId?: string
 }
 

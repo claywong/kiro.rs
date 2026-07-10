@@ -176,6 +176,50 @@ impl KiroProvider {
         client
     }
 
+    /// 惰性解析 external_idp 账号的 profileArn（企业 SSO 登录 / 刷新都不返回 profileArn）。
+    ///
+    /// 首次数据面调用前若 `ctx.credentials.profile_arn` 为空，则通过 ListAvailableProfiles
+    /// 跨候选 region 探测。解析成功后写回 `ctx.credentials`（使本次请求即刻带上 profileArn）
+    /// 并持久化到 token_manager（后续请求零往返命中）。软失败（不支持 / 空列表）不阻断请求。
+    async fn ensure_profile_arn(&self, ctx: &mut CallContext) {
+        // 仅 external_idp 且尚无 profileArn 时才需要解析；其它 auth_method 要么本就带 ARN，
+        // 要么（idc/builder-id）根本不应发送 profileArn。
+        let needs = ctx
+            .credentials
+            .auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"))
+            && ctx
+                .credentials
+                .profile_arn
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+        if !needs {
+            return;
+        }
+
+        let config = self.token_manager.config();
+        let global_proxy = self.global_proxy.read().clone();
+        let effective_proxy = ctx.credentials.effective_proxy(global_proxy.as_ref());
+
+        if let Some(arn) = crate::kiro::profile_resolver::resolve_profile_arn(
+            &ctx.credentials,
+            &config,
+            &ctx.token,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            // 写回本次请求上下文
+            ctx.credentials.profile_arn = Some(arn.clone());
+            // 持久化以便后续请求直接命中
+            if let Err(e) = self.token_manager.set_profile_arn_for(ctx.id, arn) {
+                tracing::warn!("[ProfileArn] 缓存 profileArn 失败（不影响本次请求）: {}", e);
+            }
+        }
+    }
+
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let default_endpoint = self.default_endpoint.read();
         let name = credentials.effective_endpoint_name(Some(default_endpoint.as_str()));
@@ -362,13 +406,16 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文
-            let ctx = match self.token_manager.acquire_context().await {
+            let mut ctx = match self.token_manager.acquire_context().await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // external_idp 账号首次使用前惰性解析 profileArn（写回 ctx + 持久化）
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config)
@@ -651,7 +698,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性
-            let ctx = match self
+            let mut ctx = match self
                 .token_manager
                 .acquire_context_for_user_excluding(user_id, &failed_ids)
                 .await
@@ -669,6 +716,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // external_idp 账号首次使用前惰性解析 profileArn（写回 ctx + 持久化）
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config)

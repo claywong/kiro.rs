@@ -76,6 +76,44 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
     if (!item || typeof item !== 'object') return item
     const obj = item as Record<string, unknown>
 
+    // Kiro 登录 harvest bundle 格式（企业 IdC 与 Azure AD external_idp 通用）：
+    //   { token: {accessToken,refreshToken,authMethod,region,authRegion,profileArn,apiRegion,
+    //             clientId,tokenEndpoint,issuerUrl,scopes,provider,...},
+    //     profile: {arn,name}, clientRegistration?: {clientId,clientSecret},
+    //     meta: {accountName,startUrl,region,...} }
+    // refreshToken 在 token.* 里；clientId/Secret 可能在 clientRegistration.*（IdC）
+    // 或直接在 token.*（external_idp，public client 无 secret）。展平成顶层扁平结构。
+    if (obj.token && typeof obj.token === 'object') {
+      const tok = obj.token as Record<string, unknown>
+      const reg = (obj.clientRegistration && typeof obj.clientRegistration === 'object'
+        ? obj.clientRegistration : {}) as Record<string, unknown>
+      const meta = (obj.meta && typeof obj.meta === 'object' ? obj.meta : {}) as Record<string, unknown>
+      const prof = (obj.profile && typeof obj.profile === 'object' ? obj.profile : {}) as Record<string, unknown>
+      const rt = typeof tok.refreshToken === 'string' ? tok.refreshToken.trim() : ''
+      if (rt) {
+        const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+        return {
+          refreshToken: rt,
+          accessToken: str(tok.accessToken),
+          // clientId：clientRegistration 优先（IdC），回退 token.clientId（external_idp）
+          clientId: str(reg.clientId) ?? str(tok.clientId),
+          clientSecret: str(reg.clientSecret) ?? str(tok.clientSecret),
+          authMethod: str(tok.authMethod) ?? str(meta.authMethod) ?? 'idc',
+          // 刷新用 authRegion（token 签发区），API 请求用 apiRegion（profile 所在区）
+          region: str(tok.authRegion) ?? str(tok.region) ?? str(meta.region),
+          apiRegion: str(tok.apiRegion),
+          profileArn: str(tok.profileArn) ?? str(prof.arn),
+          provider: str(tok.provider),
+          // external_idp（Azure AD）刷新必需的三个字段
+          tokenEndpoint: str(tok.tokenEndpoint) ?? str(meta.tokenEndpoint),
+          issuerUrl: str(tok.issuerUrl) ?? str(meta.issuerUrl),
+          scopes: str(tok.scopes) ?? str(meta.scopes),
+          email: str(tok.email) ?? str(meta.accountName) ?? str(obj.email),
+          machineId: str(obj.machineId) ?? str(tok.machineId),
+        }
+      }
+    }
+
     // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
     if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
       const nickname = typeof obj.nickname === 'string'
@@ -126,62 +164,73 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
     }
   }, [])
 
-  // 解析 JSON（兼容 Token JSON / KAM 导出 / 批量导入格式）
-  const parseJson = useCallback((text: string): TokenJsonItem[] | null => {
+  // 解析核心：返回 { items, error }，不弹 toast。供 parseJson（会弹 toast）
+  // 与 parseJsonSilent（多文件汇总时静默）共用。
+  const parseJsonCore = useCallback((text: string): { items: TokenJsonItem[] | null; error: string | null } => {
+    let parsed: unknown
     try {
-      const parsed = JSON.parse(text)
-
-      let rawItems: unknown[]
-
-      // KAM 标准导出格式：{ version, accounts: [...] }
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.accounts)) {
-        rawItems = parsed.accounts
-      } else if (Array.isArray(parsed)) {
-        rawItems = parsed
-      } else if (parsed && typeof parsed === 'object') {
-        rawItems = [parsed]
-      } else {
-        toast.error('JSON 格式无效')
-        return null
-      }
-
-      const validItems: TokenJsonItem[] = []
-      for (const item of rawItems) {
-        const normalized = normalizeKamAccount(item)
-        if (!normalized || typeof normalized !== 'object') continue
-        const obj = normalized as Record<string, unknown>
-
-        // KAM 嵌套格式：{ credentials: { refreshToken, ... } }
-        if (obj.credentials && typeof obj.credentials === 'object') {
-          const flat = flattenKamAccount(obj)
-          if (flat) validItems.push(flat)
-          continue
-        }
-
-        // 扁平格式：{ refreshToken, ... }
-        if (typeof obj.refreshToken === 'string' && obj.refreshToken.trim()) {
-          const tokenItem = { ...obj, refreshToken: obj.refreshToken.trim() } as TokenJsonItem
-          // 兼容旧批量导入的 authRegion 字段
-          if (!tokenItem.region && obj.authRegion) {
-            tokenItem.region = obj.authRegion as string
-          }
-          if (!tokenItem.authMethod && tokenItem.clientId && tokenItem.clientSecret) {
-            tokenItem.authMethod = 'idc'
-          }
-          validItems.push(tokenItem)
-        }
-      }
-
-      if (validItems.length === 0) {
-        toast.error('JSON 中没有找到有效的凭据（需要包含 refreshToken 字段）')
-        return null
-      }
-      return validItems
+      parsed = JSON.parse(text)
     } catch {
-      toast.error('JSON 格式无效')
-      return null
+      return { items: null, error: 'JSON 格式无效' }
     }
+
+    let rawItems: unknown[]
+    const p = parsed as Record<string, unknown>
+    // KAM 标准导出格式：{ version, accounts: [...] }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(p.accounts)) {
+      rawItems = p.accounts as unknown[]
+    } else if (Array.isArray(parsed)) {
+      rawItems = parsed
+    } else if (parsed && typeof parsed === 'object') {
+      rawItems = [parsed]
+    } else {
+      return { items: null, error: 'JSON 格式无效' }
+    }
+
+    const validItems: TokenJsonItem[] = []
+    for (const item of rawItems) {
+      const normalized = normalizeKamAccount(item)
+      if (!normalized || typeof normalized !== 'object') continue
+      const obj = normalized as Record<string, unknown>
+
+      // KAM 嵌套格式：{ credentials: { refreshToken, ... } }
+      if (obj.credentials && typeof obj.credentials === 'object') {
+        const flat = flattenKamAccount(obj)
+        if (flat) validItems.push(flat)
+        continue
+      }
+
+      // 扁平格式：{ refreshToken, ... }
+      if (typeof obj.refreshToken === 'string' && obj.refreshToken.trim()) {
+        const tokenItem = { ...obj, refreshToken: obj.refreshToken.trim() } as TokenJsonItem
+        // 兼容旧批量导入的 authRegion 字段
+        if (!tokenItem.region && obj.authRegion) {
+          tokenItem.region = obj.authRegion as string
+        }
+        if (!tokenItem.authMethod && tokenItem.clientId && tokenItem.clientSecret) {
+          tokenItem.authMethod = 'idc'
+        }
+        validItems.push(tokenItem)
+      }
+    }
+
+    if (validItems.length === 0) {
+      return { items: null, error: 'JSON 中没有找到有效的凭据（需要包含 refreshToken 字段）' }
+    }
+    return { items: validItems, error: null }
   }, [flattenKamAccount, normalizeKamAccount])
+
+  // 解析 JSON（兼容 Token JSON / KAM 导出 / 批量导入格式）；失败时弹 toast
+  const parseJson = useCallback((text: string): TokenJsonItem[] | null => {
+    const { items, error } = parseJsonCore(text)
+    if (error) toast.error(error)
+    return items
+  }, [parseJsonCore])
+
+  // 静默解析（多文件导入时用，不弹 toast，由调用方汇总）
+  const parseJsonSilent = useCallback((text: string): TokenJsonItem[] | null => {
+    return parseJsonCore(text).items
+  }, [parseJsonCore])
 
   const readJsonFiles = useCallback(async (files: FileList | File[]) => {
     const jsonFiles = Array.from(files).filter(file => file.name.endsWith('.json'))
@@ -194,34 +243,55 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
       return
     }
 
-    try {
-      const contents = await Promise.all(
-        jsonFiles.map(
-          file => new Promise<string>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = (event) => resolve((event.target?.result as string) || '')
-            reader.onerror = () => reject(new Error(`${file.name} 读取失败`))
-            reader.readAsText(file)
-          })
-        )
-      )
+    // 逐文件读取 + 解析：单个文件失败不影响其它文件（容错），
+    // 最后汇总成功/失败数量，并把所有成功解析的凭据合并去重后填入文本框。
+    const readOne = (file: File) =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = (event) => resolve((event.target?.result as string) || '')
+        reader.onerror = () => reject(new Error(`${file.name} 读取失败`))
+        reader.readAsText(file)
+      })
 
-      const mergedItems: TokenJsonItem[] = []
-      for (const content of contents) {
-        const items = parseJson(content)
-        if (!items) {
-          setJsonText('')
-          return
+    const mergedItems: TokenJsonItem[] = []
+    const seen = new Set<string>() // 按 refreshToken 去重，避免多文件/文件内重复
+    const failedFiles: string[] = []
+
+    for (const file of jsonFiles) {
+      try {
+        const content = await readOne(file)
+        // parseJson 内部会在失败时弹 toast；此处静默解析、自行汇总
+        const items = parseJsonSilent(content)
+        if (!items || items.length === 0) {
+          failedFiles.push(file.name)
+          continue
         }
-        mergedItems.push(...items)
+        for (const it of items) {
+          const key = it.refreshToken ?? ''
+          if (key && seen.has(key)) continue
+          if (key) seen.add(key)
+          mergedItems.push(it)
+        }
+      } catch {
+        failedFiles.push(file.name)
       }
-
-      setJsonText(JSON.stringify(mergedItems, null, 2))
-      toast.success(`已载入 ${jsonFiles.length} 个 JSON 文件，共 ${mergedItems.length} 条凭据`)
-    } catch (error) {
-      toast.error(extractErrorMessage(error))
     }
-  }, [parseJson])
+
+    if (mergedItems.length === 0) {
+      toast.error(`未从 ${jsonFiles.length} 个文件解析出有效凭据`)
+      return
+    }
+
+    setJsonText(JSON.stringify(mergedItems, null, 2))
+    if (failedFiles.length > 0) {
+      toast.warning(
+        `已载入 ${mergedItems.length} 条凭据（${jsonFiles.length - failedFiles.length}/${jsonFiles.length} 个文件成功）；` +
+        `失败：${failedFiles.join('、')}`
+      )
+    } else {
+      toast.success(`已载入 ${jsonFiles.length} 个 JSON 文件，共 ${mergedItems.length} 条凭据`)
+    }
+  }, [parseJsonSilent])
 
   // 文件拖放
   const handleDrop = useCallback((e: React.DragEvent) => {

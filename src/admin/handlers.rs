@@ -10,9 +10,12 @@ use futures::StreamExt;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, ImportTokenJsonRequest, OverageStatusResponse,
+        AddCredentialRequest, ExportCredentialsRequest, ImportTokenJsonRequest,
+        KiroSsoSessionRequest, OverageStatusResponse, PollKiroSsoResponse,
         SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetIdpRequest,
-        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateProxyConfigRequest,
+        SetPriorityRequest, SetRegionRequest, StartKiroIdcRequest, StartKiroSsoRequest,
+        StartKiroSsoResponse, SubmitKiroIdcCallbackRequest, SuccessResponse,
+        UpdateProxyConfigRequest,
     },
 };
 use crate::kiro::overage;
@@ -174,6 +177,18 @@ pub async fn import_token_json(
     Json(response)
 }
 
+/// POST /api/admin/credentials/export
+/// 批量导出凭据为可再导入的 JSON（KAM 原生嵌套格式）。请求体 `{ "ids": [1,2] }`，
+/// ids 为空则导出全部。
+pub async fn export_credentials(
+    State(state): State<AdminState>,
+    payload: Option<Json<ExportCredentialsRequest>>,
+) -> impl IntoResponse {
+    let ids = payload.map(|Json(p)| p.ids).unwrap_or_default();
+    let response = state.service.export_credentials(&ids);
+    Json(response)
+}
+
 /// GET /proxy - 获取全局代理配置
 pub async fn get_proxy_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_proxy_config())
@@ -289,6 +304,99 @@ pub async fn enable_overage_sse(
             .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/auth/kiro-sso/start - 启动 Kiro 托管门户登录
+pub async fn start_kiro_sso(
+    State(state): State<AdminState>,
+    body: Option<Json<StartKiroSsoRequest>>,
+) -> axum::response::Response {
+    // region 可选，空 body 也允许（与门户默认 us-east-1 一致）
+    let region = body.and_then(|Json(req)| req.region);
+    match state.service.start_kiro_sso(region).await {
+        Ok((session_id, sign_in_url)) => Json(StartKiroSsoResponse {
+            session_id,
+            sign_in_url,
+            interval: 2,
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/kiro-idc/start - 启动 AWS IAM Identity Center（Enterprise SSO）直连登录
+pub async fn start_kiro_idc(
+    State(state): State<AdminState>,
+    Json(req): Json<StartKiroIdcRequest>,
+) -> axum::response::Response {
+    match state.service.start_kiro_idc(req.start_url, req.region).await {
+        Ok((session_id, sign_in_url)) => Json(StartKiroSsoResponse {
+            session_id,
+            sign_in_url,
+            interval: 2,
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/kiro-idc/callback - 手动提交 IAM Identity Center 回调 URL（无 SSH 隧道场景）
+pub async fn submit_kiro_idc_callback(
+    State(state): State<AdminState>,
+    Json(req): Json<SubmitKiroIdcCallbackRequest>,
+) -> axum::response::Response {
+    match state
+        .service
+        .submit_kiro_idc_callback(&req.session_id, &req.callback_url)
+    {
+        Ok(()) => Json(SuccessResponse {
+            success: true,
+            message: "回调已提交，正在换取 token".to_string(),
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/kiro-sso/poll - 轮询 Kiro 托管门户登录状态
+pub async fn poll_kiro_sso(
+    State(state): State<AdminState>,
+    Json(req): Json<KiroSsoSessionRequest>,
+) -> axum::response::Response {
+    match state.service.poll_kiro_sso(&req.session_id).await {
+        Ok(None) => Json(PollKiroSsoResponse {
+            success: true,
+            completed: false,
+            status: Some("pending".to_string()),
+            credential_id: None,
+            email: None,
+            auth_method: None,
+        })
+        .into_response(),
+        Ok(Some((credential_id, email, auth_method))) => Json(PollKiroSsoResponse {
+            success: true,
+            completed: true,
+            status: None,
+            credential_id: Some(credential_id),
+            email,
+            auth_method: Some(auth_method),
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/kiro-sso/cancel - 取消进行中的 Kiro 托管门户登录
+pub async fn cancel_kiro_sso(
+    State(state): State<AdminState>,
+    Json(req): Json<KiroSsoSessionRequest>,
+) -> axum::response::Response {
+    state.service.cancel_kiro_sso(&req.session_id);
+    Json(SuccessResponse {
+        success: true,
+        message: "已取消".to_string(),
+    })
+    .into_response()
 }
 
 /// GET /api/admin/credentials/:id/overage/disable - 关闭 overage（SSE 流）

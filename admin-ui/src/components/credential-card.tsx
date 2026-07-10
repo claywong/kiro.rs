@@ -116,6 +116,9 @@ export function CredentialCard({
   const [overageRunning, setOverageRunning] = useState(false)
   const streamRef = useRef<{ close: () => void } | null>(null)
 
+  // 凭证展示名称：优先邮箱，回退到 "凭据 #id"（用于卡片标题、toast 等所有提示）
+  const credLabel = credential.email || credential.accountEmail || `凭据 #${credential.id}`
+
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
@@ -193,7 +196,7 @@ export function CredentialCard({
     const startedAt = Date.now()
     setVerifyReport({ status: 'verifying', startedAt })
     setShowVerifyDialog(true)
-    toast.info(`正在单独测活凭据 #${credential.id}`)
+    toast.info(`正在单独测活 ${credLabel}`)
 
     try {
       const result = await getCredentialBalance(credential.id)
@@ -203,7 +206,7 @@ export function CredentialCard({
         completedAt: Date.now(),
         balance: result,
       })
-      toast.success(`凭据 #${credential.id} 测活成功`)
+      toast.success(`${credLabel} 测活成功`)
     } catch (error) {
       setVerifyReport({
         status: 'failed',
@@ -211,7 +214,7 @@ export function CredentialCard({
         completedAt: Date.now(),
         error: extractErrorMessage(error),
       })
-      toast.error(`凭据 #${credential.id} 测活失败`)
+      toast.error(`${credLabel} 测活失败`)
     }
   }
 
@@ -263,7 +266,7 @@ export function CredentialCard({
             { id: credential.id, region, apiRegion },
             {
               onSuccess: () => {
-                toast.success(`凭据 #${credential.id} Endpoint / Region 已更新`)
+                toast.success(`${credLabel} Endpoint / Region 已更新`)
                 setEditingEndpointRegion(false)
               },
               onError: (err) => toast.error('Region 更新失败: ' + (err as Error).message),
@@ -291,7 +294,7 @@ export function CredentialCard({
       (ev: OverageEvent) => {
         if (ev.kind === 'done') {
           setOverageRunning(false)
-          toast.success(`凭据 #${credential.id} 已${targetEnabled ? '开启' : '关闭'} Overages`)
+          toast.success(`${credLabel} 已${targetEnabled ? '开启' : '关闭'} Overages`)
         } else if (ev.kind === 'error') {
           setOverageRunning(false)
           toast.error(`${targetEnabled ? '开启' : '关闭'} Overages 失败: ` + ev.message)
@@ -395,7 +398,8 @@ export function CredentialCard({
               />
               <div className="min-w-0 space-y-1">
                 <CardTitle className="flex min-w-0 items-center gap-2 text-base">
-                  <span className="truncate">凭据 #{credential.id}</span>
+                  <span className="truncate" title={credLabel}>{credLabel}</span>
+                  <span className="shrink-0 text-xs font-normal text-muted-foreground">#{credential.id}</span>
                   {credential.disabled && (
                     <Badge variant="destructive" className="text-[10px]">已禁用</Badge>
                   )}

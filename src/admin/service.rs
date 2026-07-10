@@ -83,6 +83,12 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
+    /// 批量导出凭据为可再导入的 JSON（KAM 原生嵌套格式）。
+    /// `ids` 为空则导出全部。
+    pub fn export_credentials(&self, ids: &[u64]) -> serde_json::Value {
+        self.token_manager.export_credentials(ids)
+    }
+
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
 
@@ -231,6 +237,151 @@ impl AdminService {
     /// 因此这里返回 Arc 而不是 &MultiTokenManager。
     pub fn token_manager_arc(&self) -> Arc<MultiTokenManager> {
         Arc::clone(&self.token_manager)
+    }
+
+    // ============ Kiro 托管门户登录（SSO）============
+
+    /// 启动 Kiro 托管门户登录：绑定回环监听器并返回 (session_id, sign_in_url)。
+    /// 操作者需在**同一主机**上用浏览器打开 sign_in_url（重定向目标为 127.0.0.1:3128）。
+    pub async fn start_kiro_sso(
+        &self,
+        region: Option<String>,
+    ) -> Result<(String, String), AdminServiceError> {
+        let tls_backend = self.config.read().tls_backend;
+        let proxy = self.token_manager.current_proxy();
+        crate::kiro::sso::start_kiro_sso_login(region, proxy, tls_backend)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 启动 AWS IAM Identity Center（Enterprise SSO）直连登录：RegisterClient + 返回 authorize URL。
+    /// 操作者需在同一主机浏览器打开返回的 URL（AWS 登录页），回调目标为 127.0.0.1:3128。
+    pub async fn start_kiro_idc(
+        &self,
+        start_url: String,
+        region: Option<String>,
+    ) -> Result<(String, String), AdminServiceError> {
+        let tls_backend = self.config.read().tls_backend;
+        let proxy = self.token_manager.current_proxy();
+        crate::kiro::sso::start_kiro_idc_login(start_url, region, proxy, tls_backend)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 手动提交 IAM Identity Center 回调 URL（无 SSH 隧道场景）。
+    /// 解析 code+state 并投递捕获，随后 poll 会完成 token 交换与落库。
+    pub fn submit_kiro_idc_callback(
+        &self,
+        session_id: &str,
+        callback_url: &str,
+    ) -> Result<(), AdminServiceError> {
+        crate::kiro::sso::submit_kiro_idc_callback(session_id, callback_url)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 取消进行中的 Kiro SSO 登录，立即释放回环端口。
+    pub fn cancel_kiro_sso(&self, session_id: &str) {
+        crate::kiro::sso::cancel_kiro_sso_login(session_id);
+    }
+
+    /// 轮询 Kiro SSO 登录状态。
+    ///
+    /// - 未完成：返回 `Ok(None)`
+    /// - 完成：换取 token、构建凭据、持久化并加入 token_manager，返回 `Ok(Some((id, email, auth_method)))`
+    pub async fn poll_kiro_sso(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(u64, Option<String>, String)>, AdminServiceError> {
+        use crate::kiro::sso::KiroSsoPollStatus;
+
+        let status = crate::kiro::sso::poll_kiro_sso_auth(session_id)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let result = match status {
+            KiroSsoPollStatus::Pending => return Ok(None),
+            KiroSsoPollStatus::Completed(r) => r,
+        };
+
+        // 构建凭据。external_idp 的 profileArn 在首次调用时由 ListAvailableProfiles 惰性解析；
+        // social 换取通常直接返回 profileArn。
+        let auth_method = result.auth_method.clone();
+        let email = result.email.clone();
+        let region = if result.region.trim().is_empty() {
+            None
+        } else {
+            Some(result.region.clone())
+        };
+
+        // idc（AWS SSO OIDC 设备授权）会返回 expires_in，据此算出绝对过期时间；
+        // social / external_idp 保持惰性（expires_at = None），沿用原逻辑。
+        let expires_at = if result.auth_method == "idc" && result.expires_in > 0 {
+            Some((chrono::Utc::now() + chrono::Duration::seconds(result.expires_in)).to_rfc3339())
+        } else {
+            None
+        };
+
+        let new_cred = KiroCredentials {
+            id: None,
+            access_token: Some(result.access_token).filter(|s| !s.is_empty()),
+            refresh_token: Some(result.refresh_token).filter(|s| !s.is_empty()),
+            kiro_api_key: None,
+            profile_arn: result.profile_arn,
+            expires_at,
+            auth_method: Some(result.auth_method),
+            client_id: result.client_id,
+            client_secret: result.client_secret,
+            token_endpoint: result.token_endpoint,
+            issuer_url: result.issuer_url,
+            scopes: result.scopes,
+            provider: Some(result.provider),
+            priority: 0,
+            region,
+            api_region: None,
+            machine_id: None,
+            endpoint: None,
+            idp: None,
+            overage_enabled: None,
+            email: email.clone(),
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
+            runtime_only: false,
+        };
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| self.classify_add_error(e))?;
+
+        // SSO 登录后自动验活：调 get_usage_limits_for 走一遍完整链路
+        // （IdC 会先解析 profileArn，再查额度）。若账号无可用 profile 或余额端点
+        // 拒绝（403 等），说明该账号不可用 —— 直接删除刚入库的凭证并返回错误，
+        // 避免留下一个永远 403 的死凭证。
+        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+            let reason = e.to_string();
+            if Self::is_credential_dead_error(&reason) {
+                tracing::warn!(
+                    "SSO 登录验活失败，账号不可用（id={}）：{}，回滚删除该凭证",
+                    credential_id,
+                    reason
+                );
+                if let Err(del_err) = self.token_manager.delete_credential(credential_id) {
+                    tracing::warn!("验活失败后删除凭证 #{} 出错: {}", credential_id, del_err);
+                }
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "账号验活失败，无法使用：{}",
+                    reason
+                )));
+            }
+            // 其它（临时/网络）错误：不阻断登录，凭证保留，后续自动重试。
+            tracing::warn!("SSO 登录后验活遇到临时错误（保留凭证，稍后重试）: {}", reason);
+        }
+
+        Ok(Some((credential_id, email, auth_method)))
     }
 
     /// 重置失败计数并重新启用
@@ -431,6 +582,10 @@ impl AdminService {
             auth_method: Some(effective_auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: req.priority,
             region: req.region,
             api_region: req.api_region,
@@ -687,10 +842,10 @@ impl AdminService {
         // 生成指纹（用于识别和去重）
         let fingerprint = Self::generate_fingerprint(&item);
 
-        // 验证必填字段
-        let refresh_token = match &item.refresh_token {
-            Some(rt) if !rt.is_empty() => rt.clone(),
-            _ => {
+        // 验证必填字段（顶层扁平优先，回退嵌套 credentials）
+        let refresh_token = match item.resolved_refresh_token() {
+            Some(rt) => rt,
+            None => {
                 return ImportItemResult {
                     index,
                     fingerprint,
@@ -704,13 +859,32 @@ impl AdminService {
         // 映射 authMethod
         let auth_method = Self::map_auth_method(&item);
 
+        let resolved_client_id = item.resolved_client_id();
+        let resolved_client_secret = item.resolved_client_secret();
+
         // IdC 需要 clientId 和 clientSecret
-        if auth_method == "idc" && (item.client_id.is_none() || item.client_secret.is_none()) {
+        if auth_method == "idc"
+            && (resolved_client_id.is_none() || resolved_client_secret.is_none())
+        {
             return ImportItemResult {
                 index,
                 fingerprint,
                 action: ImportAction::Invalid,
                 reason: Some(format!("{} 认证需要 clientId 和 clientSecret", auth_method)),
+                credential_id: None,
+            };
+        }
+
+        // external_idp（Azure AD）刷新走 IdP token 端点（public client，无 clientSecret），
+        // 依赖 tokenEndpoint + clientId，缺失则无法刷新。
+        if auth_method == "external_idp"
+            && (resolved_client_id.is_none() || item.resolved_token_endpoint().is_none())
+        {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Invalid,
+                reason: Some("external_idp 认证需要 clientId 和 tokenEndpoint".to_string()),
                 credential_id: None,
             };
         }
@@ -739,11 +913,11 @@ impl AdminService {
 
         // 实际添加凭据（trim + 空字符串转 None，与 set_region 逻辑一致）
         let region = item
-            .region
+            .resolved_region()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let api_region = item
-            .api_region
+            .resolved_api_region()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let new_cred = KiroCredentials {
@@ -751,19 +925,26 @@ impl AdminService {
             access_token: None,
             refresh_token: Some(refresh_token),
             kiro_api_key: None,
-            profile_arn: None,
+            // 原生格式若带了真实 profileArn 则保留，避免再次解析。
+            profile_arn: item.resolved_profile_arn(),
             expires_at: None,
             auth_method: Some(auth_method),
-            client_id: item.client_id,
-            client_secret: item.client_secret,
+            client_id: resolved_client_id,
+            client_secret: resolved_client_secret,
+            // external_idp（Azure AD）刷新依赖这三个字段，须保留
+            token_endpoint: item.resolved_token_endpoint(),
+            issuer_url: item.resolved_issuer_url(),
+            scopes: item.resolved_scopes(),
+            provider: item.resolved_provider(),
             priority: item.priority,
             region,
             api_region,
-            machine_id: item.machine_id,
+            // 原生格式顶层带的 machineId 会被保留；缺失时 add_credential 里会随机生成。
+            machine_id: item.resolved_machine_id(),
             endpoint: None,
-            idp: None,
+            idp: item.idp_hint().map(|s| s.to_string()),
             overage_enabled: None,
-            email: None,
+            email: item.resolved_email(),
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -792,16 +973,15 @@ impl AdminService {
 
     /// 生成凭据指纹（用于识别）
     fn generate_fingerprint(item: &TokenJsonItem) -> String {
-        // 使用 refreshToken 前 16 字符作为指纹
+        // 使用 refreshToken 前 16 字符作为指纹（顶层扁平优先，回退嵌套）
         // 使用 floor_char_boundary 安全截断，避免在多字节字符中间切割导致 panic
-        item.refresh_token
-            .as_ref()
+        item.resolved_refresh_token()
             .map(|rt| {
                 if rt.len() >= 16 {
-                    let end = floor_char_boundary(rt, 16);
+                    let end = floor_char_boundary(&rt, 16);
                     format!("{}...", &rt[..end])
                 } else {
-                    rt.clone()
+                    rt
                 }
             })
             .unwrap_or_else(|| "(empty)".to_string())
@@ -809,12 +989,13 @@ impl AdminService {
 
     /// 映射 provider/authMethod 到标准 authMethod
     fn map_auth_method(item: &TokenJsonItem) -> String {
-        // 优先使用 authMethod 字段
-        if let Some(auth) = &item.auth_method {
+        // 优先使用 authMethod 字段（顶层或嵌套 credentials）
+        if let Some(auth) = item.resolved_auth_method() {
             let auth_lower = auth.to_lowercase();
             return match auth_lower.as_str() {
                 "idc" | "builder-id" | "builderid" => "idc".to_string(),
                 "social" => "social".to_string(),
+                "external_idp" | "externalidp" => "external_idp".to_string(),
                 _ => auth_lower,
             };
         }
@@ -829,8 +1010,30 @@ impl AdminService {
             };
         }
 
+        // 再回退到 idp 字段（账号管理器原生格式的 "BuilderId" 等）
+        if let Some(idp) = item.idp_hint() {
+            let idp_lower = idp.to_lowercase();
+            return match idp_lower.as_str() {
+                "builderid" | "builder-id" | "idc" => "idc".to_string(),
+                "social" => "social".to_string(),
+                _ => "social".to_string(),
+            };
+        }
+
         // 默认 social
         "social".to_string()
+    }
+
+    /// 判断验活失败原因是否属于「账号本身不可用」（应删除/拒绝），
+    /// 而非临时/网络错误（应保留重试）。
+    fn is_credential_dead_error(reason: &str) -> bool {
+        let r = reason.to_lowercase();
+        r.contains("无可用")
+            || r.contains("no available")
+            || r.contains("not authorized")
+            || r.contains("bearer token")
+            || r.contains("invalid_grant")
+            || r.contains("subscription does not support")
     }
 
     /// 获取当前代理配置（脱敏）

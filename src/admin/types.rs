@@ -116,6 +116,69 @@ pub struct SetIdpRequest {
     pub idp: Option<String>,
 }
 
+// ============ Kiro 托管门户登录（SSO）============
+
+/// 启动 Kiro SSO 登录请求（region 可选，默认 us-east-1）
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartKiroSsoRequest {
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+/// 启动 AWS IAM Identity Center（Enterprise SSO）直连登录请求
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartKiroIdcRequest {
+    /// IAM Identity Center 的 Start URL（形如 https://d-xxxx.awsapps.com/start）
+    pub start_url: String,
+    /// 登录 region（可选，默认 us-east-1）
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+/// 启动 Kiro SSO 登录响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartKiroSsoResponse {
+    pub session_id: String,
+    pub sign_in_url: String,
+    /// 建议轮询间隔（秒）
+    pub interval: u64,
+}
+
+/// 轮询 / 取消 Kiro SSO 登录请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroSsoSessionRequest {
+    pub session_id: String,
+}
+
+/// 手动提交 IAM Identity Center 回调 URL 请求（无 SSH 隧道场景）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitKiroIdcCallbackRequest {
+    pub session_id: String,
+    /// 浏览器地址栏里的完整回调 URL（含 code + state），也兼容只粘贴 query 串
+    pub callback_url: String,
+}
+
+/// 轮询 Kiro SSO 登录响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollKiroSsoResponse {
+    pub success: bool,
+    pub completed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+}
+
 /// 修改凭据级代理请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,7 +371,33 @@ impl SuccessResponse {
 
 // ============ 批量导入 token.json ============
 
-/// 官方 token.json 格式（用于解析导入）
+/// 账号管理器原生导出格式里的嵌套 credentials 块。
+/// 例如 chaogei/Kiro-account-manager 导出的 `accounts[].credentials`。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedCredentials {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub region: Option<String>,
+    pub api_region: Option<String>,
+    pub auth_method: Option<String>,
+    pub profile_arn: Option<String>,
+    /// external_idp（Azure AD）刷新所需
+    pub token_endpoint: Option<String>,
+    pub issuer_url: Option<String>,
+    pub scopes: Option<String>,
+    pub provider: Option<String>,
+}
+
+/// 导入项：同时兼容两种 JSON 形态。
+///
+/// 1. **扁平格式**（kiro-rs 原生）：`refreshToken`/`clientId`/... 都在顶层。
+/// 2. **账号管理器原生嵌套格式**：refresh/client 等在 `credentials` 子对象里，
+///    `machineId`/`email`/`idp` 在顶层（见用户导出的 kiro-accounts-*.json）。
+///
+/// 解析后统一通过下面的访问器取值：顶层扁平字段优先，缺失时回退到嵌套 `credentials`。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenJsonItem {
@@ -322,6 +411,126 @@ pub struct TokenJsonItem {
     pub region: Option<String>,
     pub api_region: Option<String>,
     pub machine_id: Option<String>,
+    /// 顶层 profileArn（Kiro 企业 harvest bundle 带真实 ARN，须原样保留避免再次探测）
+    pub profile_arn: Option<String>,
+    /// external_idp（Azure AD）刷新所需字段（顶层扁平）
+    pub token_endpoint: Option<String>,
+    pub issuer_url: Option<String>,
+    pub scopes: Option<String>,
+    /// 顶层 email（账号管理器原生格式带）
+    pub email: Option<String>,
+    /// 顶层 idp（如 "BuilderId"），用于回退推断 authMethod
+    pub idp: Option<String>,
+    /// 嵌套凭据块（账号管理器原生格式）
+    pub credentials: Option<NestedCredentials>,
+}
+
+impl TokenJsonItem {
+    fn nested(&self) -> Option<&NestedCredentials> {
+        self.credentials.as_ref()
+    }
+
+    /// refreshToken：顶层优先，回退嵌套。
+    pub fn resolved_refresh_token(&self) -> Option<String> {
+        self.refresh_token
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.refresh_token.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_client_id(&self) -> Option<String> {
+        self.client_id
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.client_id.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_client_secret(&self) -> Option<String> {
+        self.client_secret
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.client_secret.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_region(&self) -> Option<String> {
+        self.region
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.region.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_auth_method(&self) -> Option<String> {
+        self.auth_method
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.auth_method.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_profile_arn(&self) -> Option<String> {
+        self.profile_arn
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.profile_arn.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// apiRegion：顶层优先（harvest bundle 里 profile 所在区可能不同于 auth region）
+    pub fn resolved_api_region(&self) -> Option<String> {
+        self.api_region
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.api_region.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// external_idp 刷新所需：tokenEndpoint（顶层优先，回退嵌套）
+    pub fn resolved_token_endpoint(&self) -> Option<String> {
+        self.token_endpoint
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.token_endpoint.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_issuer_url(&self) -> Option<String> {
+        self.issuer_url
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.issuer_url.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_scopes(&self) -> Option<String> {
+        self.scopes
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.scopes.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_provider(&self) -> Option<String> {
+        self.provider
+            .clone()
+            .or_else(|| self.nested().and_then(|c| c.provider.clone()))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_machine_id(&self) -> Option<String> {
+        self.machine_id.clone().filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_email(&self) -> Option<String> {
+        self.email.clone().filter(|s| !s.is_empty())
+    }
+
+    /// 回退推断用的 provider/idp 提示（authMethod/provider 都缺时用 idp）。
+    pub fn idp_hint(&self) -> Option<&str> {
+        self.idp.as_deref()
+    }
+}
+
+/// 批量导出凭据请求
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCredentialsRequest {
+    /// 要导出的凭据 id 列表；为空/省略则导出全部
+    #[serde(default)]
+    pub ids: Vec<u64>,
 }
 
 /// 批量导入请求

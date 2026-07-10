@@ -7,12 +7,13 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, disable_overage_sse, enable_overage_sse,
-        force_refresh_token, get_all_credentials, get_cached_balances, get_credential_balance,
-        get_global_config, get_overage_status, get_proxy_config, import_token_json,
-        reset_failure_count, set_credential_disabled, set_credential_endpoint, set_credential_idp,
-        set_credential_priority, set_credential_proxy, set_credential_region, update_global_config,
-        update_proxy_config,
+        add_credential, cancel_kiro_sso, delete_credential, disable_overage_sse,
+        enable_overage_sse, export_credentials, force_refresh_token, get_all_credentials,
+        get_cached_balances, get_credential_balance, get_global_config, get_overage_status,
+        get_proxy_config, import_token_json, poll_kiro_sso, reset_failure_count,
+        set_credential_disabled, set_credential_endpoint, set_credential_idp,
+        set_credential_priority, set_credential_proxy, set_credential_region, start_kiro_idc,
+        start_kiro_sso, submit_kiro_idc_callback, update_global_config, update_proxy_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -42,6 +43,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/balances/cached", get(get_cached_balances))
         .route("/credentials/import-token-json", post(import_token_json))
+        .route("/credentials/export", post(export_credentials))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
@@ -63,6 +65,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/global",
             get(get_global_config).put(update_global_config),
         )
+        .route("/auth/kiro-sso/start", post(start_kiro_sso))
+        .route("/auth/kiro-idc/start", post(start_kiro_idc))
+        .route("/auth/kiro-idc/callback", post(submit_kiro_idc_callback))
+        .route("/auth/kiro-sso/poll", post(poll_kiro_sso))
+        .route("/auth/kiro-sso/cancel", post(cancel_kiro_sso))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

@@ -175,7 +175,8 @@ export function CredentialAdvancedDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings2 className="h-4 w-4" />
-            凭据 #{credential.id} 高级设置
+            {credential.email || credential.accountEmail || `凭据 #${credential.id}`}
+            <span className="text-xs font-normal text-muted-foreground">#{credential.id} 高级设置</span>
           </DialogTitle>
           <DialogDescription>
             Web Portal Idp、凭据级代理、开启超额（仅 social 凭据支持）
