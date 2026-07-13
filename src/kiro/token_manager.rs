@@ -1314,8 +1314,14 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式（默认）：先取最高优先级层（priority 最小），
+                // 同层有多个凭据时按 success_count 均衡（least-used），
+                // 再平局按 id 保证确定性，避免固定压在同一个账号上。
+                let min_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let entry = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == min_priority)
+                    .min_by_key(|e| (e.success_count, e.id))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -1356,15 +1362,37 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
-                    entries
+                    let is_available = |e: &CredentialEntry| {
+                        !e.disabled
+                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                            && credential_matches_request(&e.credentials, model, group)
+                    };
+                    // 当前活跃凭据所在的最高优先级层若存在多个可用凭据，
+                    // 放开黏性交由 select_next_credential 做同层均衡；
+                    // 否则维持黏性，复用当前活跃凭据。
+                    let same_layer_available = entries
                         .iter()
-                        .find(|e| {
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && credential_matches_request(&e.credentials, model, group)
+                        .find(|e| e.id == current_id)
+                        .filter(|e| is_available(e))
+                        .map(|cur| {
+                            entries
+                                .iter()
+                                .filter(|e| {
+                                    e.credentials.priority == cur.credentials.priority
+                                        && is_available(e)
+                                })
+                                .count()
                         })
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .unwrap_or(0);
+
+                    if same_layer_available > 1 {
+                        None
+                    } else {
+                        entries
+                            .iter()
+                            .find(|e| e.id == current_id && is_available(e))
+                            .map(|e| (e.id, e.credentials.clone()))
+                    }
                 };
 
                 if let Some(hit) = current_hit {
@@ -4688,6 +4716,39 @@ mod tests {
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    #[test]
+    fn test_priority_mode_balances_within_same_priority_layer() {
+        // priority 模式下，两个同优先级（默认均为 0）的凭据应在层内按
+        // success_count 做 least-used 均衡，而非固定压在靠前的那个。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 初始平局按 id 取靠前的 A(id1)
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(1)
+        );
+
+        // A(id1) 成功两次后，同层应转向 success_count 更小的 B(id2)
+        manager.report_success(1);
+        manager.report_success(1);
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(2),
+            "priority 模式应在同优先级层内选 success_count 最小的凭据"
+        );
     }
 
     #[tokio::test]
