@@ -705,6 +705,20 @@ export function CredentialCard({
             <RotateCcw className="h-3 w-3 opacity-70" />
           </button>
         </div>
+
+        <div className="w-16 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            TTFT
+          </div>
+          <div
+            className="mt-0.5 text-sm font-medium tabular-nums"
+            title="各模型首字延迟 EWMA 均值"
+          >
+            {credential.ttftEwmaMs != null
+              ? `${(credential.ttftEwmaMs / 1000).toFixed(1)}s`
+              : "—"}
+          </div>
+        </div>
       </div>
 
       {/* 余额（大屏） */}
@@ -958,6 +972,17 @@ export function CredentialCard({
                   {credential.successCount}
                   <RotateCcw className="h-3 w-3 opacity-70" />
                 </button>
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">TTFT</dt>
+              <dd
+                className="min-w-0 truncate text-right font-medium tabular-nums"
+                title="各模型首字延迟 EWMA 均值"
+              >
+                {credential.ttftEwmaMs != null
+                  ? `${(credential.ttftEwmaMs / 1000).toFixed(1)}s`
+                  : "—"}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">

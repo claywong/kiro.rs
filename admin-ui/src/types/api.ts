@@ -36,6 +36,8 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 各模型 TTFT EWMA 的均值（毫秒），无样本时缺省 */
+  ttftEwmaMs?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
