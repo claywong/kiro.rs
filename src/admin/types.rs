@@ -74,6 +74,9 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 各模型 TTFT EWMA 的均值（毫秒）；无样本时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ewma_ms: Option<u64>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
