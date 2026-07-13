@@ -892,9 +892,23 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
-    /// 各模型的 TTFT（首字延迟，毫秒）EWMA 平滑值，key = model。
+    /// 各模型的 TTFT（首字延迟）EWMA 样本，key = model。
     /// 用于 priority 模式同层按响应最快调度。不持久化，重启后重新探测。
-    ttft_ewma: HashMap<String, f64>,
+    ttft_ewma: HashMap<String, TtftSample>,
+}
+
+/// 单个模型的 TTFT EWMA 样本：平滑值 + 最后更新时刻。
+///
+/// `updated_at` 用于调度时判定新鲜度：新鲜期取账号级风控冷却时长
+/// （`account_throttle_cooldown_secs`，运行时可改）。超过该时长未刷新的样本
+/// 视为陈旧，调度时当作"待重探"（等效 0，优先被选中跑一笔校准），
+/// 以此打破赢家通吃、让长期落选凭据的陈旧估计能自愈。
+#[derive(Debug, Clone, Copy)]
+struct TtftSample {
+    /// EWMA 平滑值（毫秒）
+    ewma: f64,
+    /// 最后一次上报时刻（进程内单调时钟）
+    updated_at: Instant,
 }
 
 /// TTFT EWMA 平滑系数（α=0.3，等效约最近 6 条样本）
@@ -1326,15 +1340,21 @@ impl MultiTokenManager {
             _ => {
                 // priority 模式（默认）：先取最高优先级层（priority 最小）。
                 // 同层多个凭据时，按该模型的 TTFT EWMA 最小（响应最快）调度；
-                // 无样本的账号视为最优（0），优先探测；
+                // 无样本或样本已过期（超过风控冷却时长）的账号视为最优（0），优先重探；
                 // 未指定模型时回退到 success_count（least-used）。
+                let ttft_ttl = StdDuration::from_secs(self.get_account_throttle_cooldown_secs());
                 let min_priority = available.iter().map(|e| e.credentials.priority).min()?;
                 let entry = available
                     .iter()
                     .filter(|e| e.credentials.priority == min_priority)
                     .min_by(|a, b| {
                         let key = |e: &&CredentialEntry| match model {
-                            Some(m) => e.ttft_ewma.get(m).copied().unwrap_or(0.0),
+                            Some(m) => e
+                                .ttft_ewma
+                                .get(m)
+                                .filter(|s| now.duration_since(s.updated_at) < ttft_ttl)
+                                .map(|s| s.ewma)
+                                .unwrap_or(0.0),
                             None => e.success_count as f64,
                         };
                         // 平局按 id 保证确定性
@@ -1935,15 +1955,42 @@ impl MultiTokenManager {
     /// 上报某凭据在指定模型上的 TTFT（首字延迟，毫秒），更新 EWMA 平滑值。
     ///
     /// 仅流式请求有 TTFT；用于 priority 模式同层按响应最快调度。不持久化。
+    ///
+    /// 新鲜样本（距上次上报 < 风控冷却时长）做 EWMA 平滑以抗抖动；
+    /// 陈旧样本（≥ 风控冷却时长）的旧值已不可信，直接用新样本重新起算，
+    /// 使一次重探即校准到真实水平，陈旧估计快速自愈。
     pub fn report_ttft(&self, id: u64, model: &str, ttft_ms: u64) {
+        let ttl = StdDuration::from_secs(self.get_account_throttle_cooldown_secs());
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             let sample = ttft_ms as f64;
-            entry
-                .ttft_ewma
-                .entry(model.to_string())
-                .and_modify(|v| *v = TTFT_EWMA_ALPHA * sample + (1.0 - TTFT_EWMA_ALPHA) * *v)
-                .or_insert(sample);
+            let now = Instant::now();
+            match entry.ttft_ewma.get_mut(model) {
+                Some(s) if now.duration_since(s.updated_at) < ttl => {
+                    s.ewma = TTFT_EWMA_ALPHA * sample + (1.0 - TTFT_EWMA_ALPHA) * s.ewma;
+                    s.updated_at = now;
+                }
+                _ => {
+                    entry.ttft_ewma.insert(
+                        model.to_string(),
+                        TtftSample {
+                            ewma: sample,
+                            updated_at: now,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// 测试专用：把某凭据某模型的 TTFT 样本时间戳往前拨 `age`，用于模拟样本陈旧。
+    #[cfg(test)]
+    fn age_ttft_sample(&self, id: u64, model: &str, age: StdDuration) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if let Some(s) = entry.ttft_ewma.get_mut(model) {
+                s.updated_at -= age;
+            }
         }
     }
 
@@ -2303,10 +2350,12 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    // 展示各模型 EWMA 的均值，反映最近一次测得的表现；
+                    // 不做 TTL 过滤（陈旧样本仅影响调度重探，不影响历史展示）。
                     ttft_ewma_ms: if e.ttft_ewma.is_empty() {
                         None
                     } else {
-                        let sum: f64 = e.ttft_ewma.values().sum();
+                        let sum: f64 = e.ttft_ewma.values().map(|s| s.ewma).sum();
                         Some((sum / e.ttft_ewma.len() as f64).round() as u64)
                     },
                 })
@@ -4834,6 +4883,53 @@ mod tests {
                 .map(|(id, _)| id),
             Some(1),
             "无 TTFT 样本时平局按 id 取靠前"
+        );
+    }
+
+    #[test]
+    fn test_priority_mode_ttft_sample_expires_triggers_reprobe() {
+        // 陈旧样本自愈：赢家长期占用后，落选者样本过期应触发重探，打破赢家通吃。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A(id1) 慢、B(id2) 快：稳态选 B
+        manager.report_ttft(1, "claude-sonnet-5", 3000);
+        manager.report_ttft(2, "claude-sonnet-5", 500);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(2),
+            "稳态应选更快的 B"
+        );
+
+        // A 的样本超过 TTL 未刷新 → 视为陈旧（当作 0），应被重探选中，
+        // 即便它历史 EWMA(3000) 远慢于新鲜的 B(500)。
+        // TTL 取账号级风控冷却时长（Config::default 下为默认值）。
+        let ttl = StdDuration::from_secs(manager.get_account_throttle_cooldown_secs());
+        manager.age_ttft_sample(1, "claude-sonnet-5", ttl + StdDuration::from_secs(1));
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(1),
+            "A 样本过期应触发重探（陈旧估计不再永久压制该凭据）"
+        );
+
+        // 重探后 A 实测其实很快(400 < 500)：刷新为新鲜样本，稳态回到择快，选 A
+        manager.report_ttft(1, "claude-sonnet-5", 400);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(1),
+            "重探校准后 A 实际更快，应稳态选 A"
         );
     }
 
