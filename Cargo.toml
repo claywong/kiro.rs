@@ -30,6 +30,8 @@ anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+# SQLite 请求日志存储（bundled：内置 sqlite，免系统依赖）
+rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1.10", features = ["v1", "v4", "v5", "fast-rng"] }  # v5 used to derive deterministic agentContinuationId from conversationId (multi-turn stability)
 fastrand = "2"
 sha2 = "0.10"

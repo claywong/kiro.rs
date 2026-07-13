@@ -14,8 +14,7 @@ use super::{
         KiroSsoSessionRequest, OverageStatusResponse, PollKiroSsoResponse,
         SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetIdpRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetRegionRequest, StartKiroIdcRequest,
-        StartKiroSsoRequest,
-        StartKiroSsoResponse, SubmitKiroIdcCallbackRequest, SuccessResponse,
+        StartKiroSsoRequest, StartKiroSsoResponse, SubmitKiroIdcCallbackRequest, SuccessResponse,
         UpdateProxyConfigRequest,
     },
 };
@@ -349,7 +348,11 @@ pub async fn start_kiro_idc(
     State(state): State<AdminState>,
     Json(req): Json<StartKiroIdcRequest>,
 ) -> axum::response::Response {
-    match state.service.start_kiro_idc(req.start_url, req.region).await {
+    match state
+        .service
+        .start_kiro_idc(req.start_url, req.region)
+        .await
+    {
         Ok((session_id, sign_in_url)) => Json(StartKiroSsoResponse {
             session_id,
             sign_in_url,
@@ -446,6 +449,47 @@ pub async fn disable_overage_sse(
             })),
         )
             .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/stats - 获取全局统计
+pub async fn get_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_global_stats())
+}
+
+/// GET /api/admin/cooldowns - 获取所有凭据冷却状态
+pub async fn get_cooldowns(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cooldown_statuses())
+}
+
+/// GET /api/admin/request-logs - 获取请求日志（支持 limit/before/status/credential_id 筛选）
+pub async fn get_request_logs(
+    State(state): State<AdminState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100)
+        .min(500);
+    let before = params.get("before").and_then(|v| v.parse::<i64>().ok());
+    let status = params.get("status").and_then(|v| v.parse::<i32>().ok());
+    let credential = params
+        .get("credential_id")
+        .and_then(|v| v.parse::<u64>().ok());
+
+    Json(
+        state
+            .service
+            .get_request_logs(limit, before, status, credential),
+    )
+}
+
+/// DELETE /api/admin/request-logs - 清空所有请求日志
+pub async fn clear_request_logs(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.clear_request_logs() {
+        Ok(count) => Json(serde_json::json!({ "success": true, "deleted": count })).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

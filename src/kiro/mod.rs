@@ -14,4 +14,5 @@ pub mod provider;
 pub mod rate_limiter;
 pub mod sso;
 pub mod token_manager;
+pub mod trace;
 pub mod web_portal;

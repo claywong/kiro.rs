@@ -79,6 +79,8 @@ pub struct AppState {
     pub compression_config: Arc<RwLock<CompressionConfig>>,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+    /// 请求日志数据库（可选，用于请求追踪）
+    pub trace_db: Option<Arc<crate::admin::trace_db::TraceDb>>,
 }
 
 impl AppState {
@@ -95,7 +97,14 @@ impl AppState {
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
             prompt_cache_runtime,
+            trace_db: None,
         }
+    }
+
+    /// 设置请求日志数据库
+    pub fn with_trace_db(mut self, trace_db: Arc<crate::admin::trace_db::TraceDb>) -> Self {
+        self.trace_db = Some(trace_db);
+        self
     }
 
     /// 设置 KiroProvider

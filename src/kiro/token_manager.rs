@@ -12,7 +12,7 @@
 //! - **优雅降级**: Token 刷新失败时使用现有 Token
 
 use anyhow::bail;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -180,10 +180,7 @@ fn mask_api_key(api_key: &str) -> String {
         return "……".to_string();
     }
     let prefix: String = trimmed.chars().take(4).collect();
-    let suffix: String = trimmed
-        .chars()
-        .skip(char_count.saturating_sub(4))
-        .collect();
+    let suffix: String = trimmed.chars().skip(char_count.saturating_sub(4)).collect();
     format!("{prefix}……{suffix}")
 }
 
@@ -333,7 +330,11 @@ async fn refresh_external_idp_token(
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
     ];
-    if let Some(scopes) = credentials.scopes.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(scopes) = credentials
+        .scopes
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         form.push(("scope", scopes.to_string()));
     }
 
@@ -347,15 +348,14 @@ async fn refresh_external_idp_token(
 
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
-    let data: ExternalIdpTokenResponse = serde_json::from_str(&body_text).unwrap_or(
-        ExternalIdpTokenResponse {
+    let data: ExternalIdpTokenResponse =
+        serde_json::from_str(&body_text).unwrap_or(ExternalIdpTokenResponse {
             access_token: None,
             refresh_token: None,
             expires_in: None,
             error: None,
             error_description: None,
-        },
-    );
+        });
 
     let access_token = match data.access_token {
         Some(t) if !t.is_empty() && status.is_success() => t,
@@ -860,6 +860,16 @@ struct CredentialEntry {
     fingerprint: Fingerprint,
     /// API 调用成功次数
     success_count: u64,
+    /// 累计最终失败次数（重试耗尽后；持久化）
+    total_failure_count: u64,
+    /// 今日请求量（本地时区日历日；持久化）
+    daily_count: u32,
+    /// 今日对应的本地日期 "YYYY-MM-DD"（跨日自动重置；持久化）
+    daily_date: String,
+    /// 累计输入 tokens（持久化）
+    total_input_tokens: u64,
+    /// 累计输出 tokens（持久化）
+    total_output_tokens: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希缓存（避免 snapshot 重复计算）
@@ -894,6 +904,16 @@ enum AutoHealReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    #[serde(default)]
+    failure_count: u64,
+    #[serde(default)]
+    daily_count: u32,
+    #[serde(default)]
+    daily_date: String,
+    #[serde(default)]
+    total_input_tokens: u64,
+    #[serde(default)]
+    total_output_tokens: u64,
     last_used_at: Option<String>,
 }
 
@@ -935,6 +955,14 @@ pub struct CredentialEntrySnapshot {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 累计最终失败次数（重试耗尽后）
+    pub total_failure_count: u64,
+    /// 今日请求量（本地时区日历日）
+    pub daily_count: u32,
+    /// 累计输入 tokens
+    pub total_input_tokens: u64,
+    /// 累计输出 tokens
+    pub total_output_tokens: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 凭据级 Region（用于 Token 刷新）
@@ -1265,6 +1293,11 @@ impl MultiTokenManager {
                     },
                     fingerprint,
                     success_count: 0,
+                    total_failure_count: 0,
+                    daily_count: 0,
+                    daily_date: String::new(),
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
                     last_used_at: None,
                     refresh_token_hash,
                     overage_enabled: cred.overage_enabled,
@@ -1393,7 +1426,10 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（"priority" 或 "balanced"）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("负载均衡模式必须是 'priority' 或 'balanced'，收到: {}", mode);
+            anyhow::bail!(
+                "负载均衡模式必须是 'priority' 或 'balanced'，收到: {}",
+                mode
+            );
         }
         self.config.write().load_balancing_mode = mode;
         Ok(())
@@ -2521,7 +2557,19 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.total_failure_count = s.failure_count;
+                entry.total_input_tokens = s.total_input_tokens;
+                entry.total_output_tokens = s.total_output_tokens;
                 entry.last_used_at = s.last_used_at.clone();
+                // 日请求量：仅当日日期匹配时恢复，否则从 0 开始
+                let today = Local::now().format("%Y-%m-%d").to_string();
+                if s.daily_date == today {
+                    entry.daily_count = s.daily_count;
+                    entry.daily_date = s.daily_date.clone();
+                } else {
+                    entry.daily_count = 0;
+                    entry.daily_date = today;
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -2545,6 +2593,11 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            failure_count: e.total_failure_count,
+                            daily_count: e.daily_count,
+                            daily_date: e.daily_date.clone(),
+                            total_input_tokens: e.total_input_tokens,
+                            total_output_tokens: e.total_output_tokens,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2610,14 +2663,38 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                // 日请求量：跨日重置（本地时区）
+                let today = Local::now().format("%Y-%m-%d").to_string();
+                if entry.daily_date != today {
+                    entry.daily_count = 0;
+                    entry.daily_date = today;
+                }
+                entry.daily_count += 1;
                 tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
+                    "凭据 #{} API 调用成功（累计 {} 次，今日 {} 次）",
                     id,
-                    entry.success_count
+                    entry.success_count,
+                    entry.daily_count
                 );
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 记录 token 用量（在成功请求后由 stream/handler 调用）
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    /// * `input_tokens` - 输入 tokens
+    /// * `output_tokens` - 输出 tokens
+    pub fn record_token_usage(&self, id: u64, input_tokens: u64, output_tokens: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.total_input_tokens += input_tokens;
+            entry.total_output_tokens += output_tokens;
+        }
+        // 保存留给下次 debounce flush
+        self.stats_dirty.store(true, Ordering::Relaxed);
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2641,6 +2718,7 @@ impl MultiTokenManager {
             }
 
             entry.failure_count += 1;
+            entry.total_failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
 
@@ -2998,6 +3076,10 @@ impl MultiTokenManager {
                         email: e.credentials.email.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
                         success_count: e.success_count,
+                        total_failure_count: e.total_failure_count,
+                        daily_count: e.daily_count,
+                        total_input_tokens: e.total_input_tokens,
+                        total_output_tokens: e.total_output_tokens,
                         last_used_at: e.last_used_at.clone(),
                         region: e.credentials.region.clone(),
                         api_region: e.credentials.api_region.clone(),
@@ -3072,10 +3154,7 @@ impl MultiTokenManager {
                 }
                 account.insert("priority".to_string(), serde_json::json!(c.priority));
                 account.insert("disabled".to_string(), serde_json::json!(e.disabled));
-                account.insert(
-                    "credentials".to_string(),
-                    serde_json::Value::Object(cred),
-                );
+                account.insert("credentials".to_string(), serde_json::Value::Object(cred));
                 serde_json::Value::Object(account)
             })
             .collect();
@@ -3399,10 +3478,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disable_reason == Some(DisableReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -3471,8 +3547,7 @@ impl MultiTokenManager {
         };
 
         // 检查是否需要刷新 token（API Key 凭据 is_token_expired 恒为 false）
-        let needs_refresh =
-            is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
         // API Key 凭据直接使用 kiro_api_key，无需刷新；OAuth 凭据按需刷新
         let token =
@@ -3563,7 +3638,10 @@ impl MultiTokenManager {
                     }
                     if should_persist {
                         if let Err(e) = self.persist_credentials() {
-                            tracing::warn!("IdC profileArn 解析后持久化失败（不影响本次请求）: {}", e);
+                            tracing::warn!(
+                                "IdC profileArn 解析后持久化失败（不影响本次请求）: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -3734,6 +3812,11 @@ impl MultiTokenManager {
                 disable_reason: None,
                 fingerprint,
                 success_count: 0,
+                total_failure_count: 0,
+                daily_count: 0,
+                daily_date: String::new(),
+                total_input_tokens: 0,
+                total_output_tokens: 0,
                 last_used_at: None,
                 refresh_token_hash: entry_secret_hash,
                 overage_enabled: None,

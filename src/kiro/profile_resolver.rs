@@ -171,9 +171,9 @@ enum ProbeError {
 impl ProbeError {
     fn message(&self) -> &str {
         match self {
-            ProbeError::Authoritative(m) | ProbeError::Transient(m) | ProbeError::Unsupported(m) => {
-                m
-            }
+            ProbeError::Authoritative(m)
+            | ProbeError::Transient(m)
+            | ProbeError::Unsupported(m) => m,
         }
     }
 }
@@ -372,9 +372,7 @@ mod tests {
     #[test]
     fn test_region_from_profile_arn() {
         assert_eq!(
-            region_from_profile_arn(
-                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC"
-            ),
+            region_from_profile_arn("arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC"),
             Some("eu-central-1".to_string())
         );
         assert_eq!(region_from_profile_arn("not-an-arn"), None);

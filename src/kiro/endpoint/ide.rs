@@ -75,10 +75,7 @@ impl IdeEndpoint {
     /// 都必须携带，否则 CodeWhisperer 返回 403 "User is not authorized to make this call."。
     /// 旧逻辑对所有 SSO OIDC 凭据无条件剥离 profileArn，导致企业租户账号全线 403。
     fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
-        credentials
-            .profile_arn
-            .as_deref()
-            .filter(|s| !s.is_empty())
+        credentials.profile_arn.as_deref().filter(|s| !s.is_empty())
     }
 
     fn inject_profile_arn(

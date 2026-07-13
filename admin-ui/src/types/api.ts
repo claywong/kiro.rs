@@ -36,6 +36,10 @@ export interface CredentialStatusItem {
 
   // ===== upstream 字段 =====
   successCount: number
+  /** 累计最终失败次数 */
+  totalFailureCount: number
+  /** 今日请求量（本地时区日历日） */
+  dailyCount: number
   lastUsedAt: string | null
   hasProxy: boolean
   /** 凭据级 Region（用于 Token 刷新） */
@@ -469,4 +473,67 @@ export interface UpdateGlobalConfigRequest {
   promptCacheAccountingEnabled?: boolean
   defaultEndpoint?: string
   compression?: UpdateCompressionConfigRequest
+}
+
+// ============ 全局统计 ============
+
+export interface GlobalStatsResponse {
+  totalCredentials: number
+  availableCredentials: number
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  todayRequests: number
+  totalInputTokens: number
+  totalOutputTokens: number
+}
+
+// ============ 冷却状态 ============
+
+export interface CooldownItem {
+  credentialId: number
+  email: string
+  reason: string
+  remainingMs: number
+  remainingSecs: number
+  triggerCount: number
+}
+
+export interface CooldownsResponse {
+  cooldowns: CooldownItem[]
+  total: number
+}
+
+// ============ 请求日志 ============
+
+export interface RequestAttempt {
+  tryNumber: number
+  credentialId: number
+  statusCode: number
+  outcome: string
+  durationMs: number
+  error?: string
+}
+
+export interface RequestLogItem {
+  id: number
+  ts: string
+  tsEpoch: number
+  path: string
+  model: string | null
+  isStream: boolean
+  finalStatus: number
+  finalCredentialId: number
+  durationMs: number
+  inputTokens: number | null
+  outputTokens: number | null
+  totalAttempts: number
+  error?: string | null
+  attempts: RequestAttempt[]
+}
+
+export interface RequestLogsResponse {
+  items: RequestLogItem[]
+  total: number
+  error?: string
 }

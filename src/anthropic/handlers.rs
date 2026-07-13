@@ -1252,7 +1252,7 @@ pub async fn post_messages(
             tool_name_map: tool_name_map.clone(),
             user_id: user_id.as_deref(),
         };
-        handle_stream_request(provider, stream_request).await
+        handle_stream_request(provider, stream_request, state.trace_db.clone()).await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
@@ -1268,20 +1268,35 @@ pub async fn post_messages(
             cache_profile: cache_profile.as_ref(),
             extract_thinking,
         };
-        handle_non_stream_request(provider, non_stream_request).await
+        handle_non_stream_request(provider, non_stream_request, state.trace_db.clone()).await
     }
 }
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     context: StreamRequestContext<'_>,
+    trace_db: Option<std::sync::Arc<crate::admin::trace_db::TraceDb>>,
 ) -> Response {
+    // 创建请求追踪器
+    let mut trace = Some(crate::kiro::trace::RequestTrace::new(
+        "/v1/messages",
+        Some(context.model.to_string()),
+        true,
+    ));
+
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api_stream(context.request_body, context.user_id)
+        .call_api_stream_traced(context.request_body, context.user_id, &mut trace)
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return map_kiro_provider_error_to_response(context.request_body, e),
+        Err(e) => {
+            // 记录失败的 trace（网关侧统一以 502 表示上游不可用）
+            if let (Some(t), Some(db)) = (trace, trace_db.as_ref()) {
+                let record = t.finish(502, None, None, Some(e.to_string()));
+                db.record(record).await;
+            }
+            return map_kiro_provider_error_to_response(context.request_body, e);
+        }
     };
 
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
@@ -1316,6 +1331,13 @@ async fn handle_stream_request(
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
+
+    // 记录请求追踪（流式请求在 API 调用成功后立即记录；
+    // output_tokens 需等流结束才能确定，此处仅记录 input_tokens）
+    if let (Some(t), Some(db)) = (trace, trace_db.as_ref()) {
+        let record = t.finish(200, Some(context.input_tokens), None, None);
+        db.record(record).await;
+    }
 
     // 创建 SSE 流
     let stream = create_sse_stream(api_result.response, ctx, initial_events);
@@ -1439,14 +1461,29 @@ fn create_sse_stream(
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     context: NonStreamRequestContext<'_>,
+    trace_db: Option<std::sync::Arc<crate::admin::trace_db::TraceDb>>,
 ) -> Response {
+    // 创建请求追踪器
+    let mut trace = Some(crate::kiro::trace::RequestTrace::new(
+        "/v1/messages",
+        Some(context.model.to_string()),
+        false,
+    ));
+
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api(context.request_body, context.user_id)
+        .call_api_traced(context.request_body, context.user_id, &mut trace)
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return map_kiro_provider_error_to_response(context.request_body, e),
+        Err(e) => {
+            // 记录失败的 trace（网关侧统一以 502 表示上游不可用）
+            if let (Some(t), Some(db)) = (trace, trace_db.as_ref()) {
+                let record = t.finish(502, None, None, Some(e.to_string()));
+                db.record(record).await;
+            }
+            return map_kiro_provider_error_to_response(context.request_body, e);
+        }
     };
 
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
@@ -1736,6 +1773,19 @@ async fn handle_non_stream_request(
         })
     };
 
+    // 记录 token 用量到凭据统计（用于 /stats 聚合）
+    provider.token_manager().record_token_usage(
+        api_result.credential_id,
+        billed_input_tokens.max(0) as u64,
+        output_tokens.max(0) as u64,
+    );
+
+    // 记录请求追踪（非流式：input/output tokens 均已确定）
+    if let (Some(t), Some(db)) = (trace, trace_db.as_ref()) {
+        let record = t.finish(200, Some(billed_input_tokens), Some(output_tokens), None);
+        db.record(record).await;
+    }
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1771,13 +1821,16 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     } else {
         None
     };
-    let has_model_thinking_suffix = suffix_budget_tokens.is_some() || model_lower.ends_with("-thinking");
+    let has_model_thinking_suffix =
+        suffix_budget_tokens.is_some() || model_lower.ends_with("-thinking");
 
     let client_budget_tokens = payload.thinking.as_ref().map(|t| t.budget_tokens);
     let budget_tokens = if let Some(tokens) = suffix_budget_tokens {
         tokens
     } else if has_model_thinking_suffix || payload.thinking.is_some() {
-        client_budget_tokens.filter(|tokens| *tokens > 0).unwrap_or(24576)
+        client_budget_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(24576)
     } else {
         return;
     };
@@ -2288,7 +2341,10 @@ mod tests {
             Some(24576)
         );
         assert_eq!(
-            default_payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            default_payload
+                .output_config
+                .as_ref()
+                .map(|c| c.effort.as_str()),
             Some("high")
         );
     }

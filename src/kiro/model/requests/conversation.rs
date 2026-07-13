@@ -281,6 +281,20 @@ pub enum Message {
     Assistant(HistoryAssistantMessage),
 }
 
+impl Message {
+    /// 创建用户消息（便捷构造，主要用于测试）
+    #[cfg(test)]
+    pub fn user(content: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self::User(HistoryUserMessage::new(content, model_id))
+    }
+
+    /// 创建助手消息（便捷构造，主要用于测试）
+    #[cfg(test)]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::Assistant(HistoryAssistantMessage::new(content))
+    }
+}
+
 /// 历史用户消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

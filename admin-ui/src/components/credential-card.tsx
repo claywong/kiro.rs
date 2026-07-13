@@ -455,7 +455,16 @@ export function CredentialCard({
             </div>
             <div className="flex items-center justify-between gap-3">
               <span className="text-muted-foreground">失败次数：</span>
-              <span className={credential.failureCount > 0 ? 'font-medium text-red-500' : 'font-medium'}>{formatInteger(credential.failureCount)}</span>
+              <span className={credential.failureCount > 0 ? 'font-medium text-red-500' : 'font-medium'}>
+                {formatInteger(credential.failureCount)}
+                {credential.totalFailureCount > credential.failureCount && (
+                  <span className="ml-1 text-xs text-muted-foreground">(累计 {formatInteger(credential.totalFailureCount)})</span>
+                )}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">今日请求：</span>
+              <span className="font-medium">{formatInteger(credential.dailyCount ?? 0)}</span>
             </div>
             <div className="flex items-center justify-between gap-3">
               <span className="text-muted-foreground">刷新失败：</span>

@@ -14,6 +14,9 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { ProxyConfigDialog } from '@/components/proxy-config-dialog'
 import { GlobalConfigDialog } from '@/components/global-config-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
+import { StatsPanel } from '@/components/stats-panel'
+import { RequestLogsPanel } from '@/components/request-logs-panel'
+import { CooldownsPanel } from '@/components/cooldowns-panel'
 import { useCredentials, useCachedBalances, useDeleteCredential, useResetFailure, useForceRefreshToken, useProxyConfig, useGlobalConfig } from '@/hooks/use-credentials'
 import { getCredentialBalance, exportCredentials } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -22,12 +25,14 @@ import type { BalanceResponse } from '@/types/api'
 
 type SortField = 'default' | 'id' | 'balance'
 type SortOrder = 'asc' | 'desc'
+type TabKey = 'credentials' | 'stats' | 'logs' | 'cooldowns'
 
 interface DashboardProps {
   onLogout: () => void
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activeTab, setActiveTab] = useState<TabKey>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [forceRefreshBalance, setForceRefreshBalance] = useState(false)
@@ -707,7 +712,37 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
-        {/* 凭据列表 */}
+        {/* Tab 导航 */}
+        <div className="mb-6 flex items-center gap-1 border-b">
+          {([
+            ['credentials', '凭据管理'],
+            ['stats', '统计概览'],
+            ['logs', '请求日志'],
+            ['cooldowns', '冷却状态'],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setActiveTab(key)}
+              className={`px-4 py-2 text-sm font-medium -mb-px border-b-2 transition-colors ${
+                activeTab === key
+                  ? 'border-primary text-foreground'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* 统计概览 Tab */}
+        {activeTab === 'stats' && <StatsPanel />}
+        {/* 请求日志 Tab */}
+        {activeTab === 'logs' && <RequestLogsPanel />}
+        {/* 冷却状态 Tab */}
+        {activeTab === 'cooldowns' && <CooldownsPanel />}
+
+        {/* 凭据管理 Tab（保留原有全部功能：排序/批量/导出/分页等） */}
+        {activeTab === 'credentials' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-4">
@@ -887,6 +922,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+        )}
       </main>
 
       {/* 余额对话框 */}

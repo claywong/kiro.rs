@@ -7,12 +7,13 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, cancel_kiro_sso, delete_credential, disable_overage_sse,
-        enable_overage_sse, export_credentials, force_refresh_token, get_all_credentials,
-        get_cached_balances, get_credential_balance, get_global_config, get_load_balancing_mode,
-        get_overage_status, get_proxy_config, import_token_json, poll_kiro_sso,
-        reset_failure_count, set_credential_disabled, set_credential_endpoint,
-        set_credential_idp, set_credential_priority, set_credential_proxy, set_credential_region,
+        add_credential, cancel_kiro_sso, clear_request_logs, delete_credential,
+        disable_overage_sse, enable_overage_sse, export_credentials, force_refresh_token,
+        get_all_credentials, get_cached_balances, get_cooldowns, get_credential_balance,
+        get_global_config, get_load_balancing_mode, get_overage_status, get_proxy_config,
+        get_request_logs, get_stats, import_token_json, poll_kiro_sso, reset_failure_count,
+        set_credential_disabled, set_credential_endpoint, set_credential_idp,
+        set_credential_priority, set_credential_proxy, set_credential_region,
         set_load_balancing_mode, start_kiro_idc, start_kiro_sso, submit_kiro_idc_callback,
         update_global_config, update_proxy_config,
     },
@@ -70,6 +71,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route("/stats", get(get_stats))
+        .route("/cooldowns", get(get_cooldowns))
+        .route(
+            "/request-logs",
+            get(get_request_logs).delete(clear_request_logs),
         )
         .route("/auth/kiro-sso/start", post(start_kiro_sso))
         .route("/auth/kiro-idc/start", post(start_kiro_idc))

@@ -51,6 +51,8 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 请求日志数据库（可选）
+    trace_db: Option<Arc<super::trace_db::TraceDb>>,
 }
 
 impl AdminService {
@@ -81,7 +83,14 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            trace_db: None,
         }
+    }
+
+    /// 设置请求日志数据库
+    pub fn with_trace_db(mut self, trace_db: Arc<super::trace_db::TraceDb>) -> Self {
+        self.trace_db = Some(trace_db);
+        self
     }
 
     /// 获取所有凭据状态
@@ -116,6 +125,8 @@ impl AdminService {
                     email: entry.email,
                     subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
+                    total_failure_count: entry.total_failure_count,
+                    daily_count: entry.daily_count,
                     last_used_at: entry.last_used_at.clone(),
                     region: entry.region,
                     api_region: entry.api_region,
@@ -381,7 +392,10 @@ impl AdminService {
                 )));
             }
             // 其它（临时/网络）错误：不阻断登录，凭证保留，后续自动重试。
-            tracing::warn!("SSO 登录后验活遇到临时错误（保留凭证，稍后重试）: {}", reason);
+            tracing::warn!(
+                "SSO 登录后验活遇到临时错误（保留凭证，稍后重试）: {}",
+                reason
+            );
         }
 
         Ok(Some((credential_id, email, auth_method)))
@@ -1323,6 +1337,110 @@ impl AdminService {
         if let Some(v) = src.max_request_body_bytes {
             target.max_request_body_bytes = v;
         }
+    }
+
+    /// 获取全局统计（从各凭据 StatsEntry 聚合）
+    pub fn get_global_stats(&self) -> serde_json::Value {
+        let snapshot = self.token_manager.snapshot();
+        let total = snapshot.total as u64;
+        let available = snapshot.available as u64;
+        let entries = &snapshot.entries;
+
+        let total_requests: u64 = entries
+            .iter()
+            .map(|e| e.success_count + e.total_failure_count)
+            .sum();
+        let total_success: u64 = entries.iter().map(|e| e.success_count).sum();
+        let total_failures: u64 = entries.iter().map(|e| e.total_failure_count).sum();
+        let today_requests: u64 = entries.iter().map(|e| e.daily_count as u64).sum();
+        let total_input_tokens: u64 = entries.iter().map(|e| e.total_input_tokens).sum();
+        let total_output_tokens: u64 = entries.iter().map(|e| e.total_output_tokens).sum();
+
+        serde_json::json!({
+            "totalCredentials": total,
+            "availableCredentials": available,
+            "totalRequests": total_requests,
+            "successRequests": total_success,
+            "failedRequests": total_failures,
+            "todayRequests": today_requests,
+            "totalInputTokens": total_input_tokens,
+            "totalOutputTokens": total_output_tokens,
+        })
+    }
+
+    /// 获取所有凭据的冷却状态
+    pub fn get_cooldown_statuses(&self) -> serde_json::Value {
+        let cooldowns = self.token_manager.cooldown_manager().get_all_cooldowns();
+        let snapshot = self.token_manager.snapshot();
+
+        let items: Vec<serde_json::Value> = cooldowns
+            .iter()
+            .map(|cd| {
+                let email = snapshot
+                    .entries
+                    .iter()
+                    .find(|e| e.id == cd.credential_id)
+                    .and_then(|e| e.email.as_deref())
+                    .unwrap_or("unknown");
+
+                serde_json::json!({
+                    "credentialId": cd.credential_id,
+                    "email": email,
+                    "reason": cd.reason.description(),
+                    "remainingMs": cd.remaining_ms,
+                    "remainingSecs": cd.remaining_ms / 1000,
+                    "triggerCount": cd.trigger_count,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "cooldowns": items,
+            "total": items.len(),
+        })
+    }
+
+    /// 获取请求日志（需要 TraceDb）
+    pub fn get_request_logs(
+        &self,
+        limit: u32,
+        before_ts_epoch: Option<i64>,
+        status_filter: Option<i32>,
+        credential_filter: Option<u64>,
+    ) -> serde_json::Value {
+        let trace_db = match &self.trace_db {
+            Some(db) => db,
+            None => {
+                return serde_json::json!({
+                    "items": [],
+                    "total": 0,
+                    "error": "请求日志功能未启用（TraceDb 未初始化）",
+                });
+            }
+        };
+
+        match trace_db.query_logs(limit, before_ts_epoch, status_filter, credential_filter) {
+            Ok(logs) => serde_json::json!({
+                "items": logs,
+                "total": logs.len(),
+            }),
+            Err(e) => serde_json::json!({
+                "items": [],
+                "total": 0,
+                "error": e.to_string(),
+            }),
+        }
+    }
+
+    /// 清空所有请求日志
+    pub fn clear_request_logs(&self) -> Result<u64, AdminServiceError> {
+        let trace_db = self
+            .trace_db
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("请求日志功能未启用".to_string()))?;
+        trace_db
+            .delete_all_logs()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 }
 

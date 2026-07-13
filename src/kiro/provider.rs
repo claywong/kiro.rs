@@ -23,6 +23,7 @@ use crate::kiro::endpoint::{
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::kiro::trace::{AttemptOutcome, RequestTrace, TraceRecord};
 
 /// API 调用结果
 pub struct ApiCallResult {
@@ -358,7 +359,33 @@ impl KiroProvider {
         request_body: &str,
         user_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false, user_id).await
+        self.call_api_with_retry(request_body, false, user_id, &mut None)
+            .await
+    }
+
+    /// 发送非流式 API 请求（带追踪）
+    ///
+    /// 与 [`call_api`] 相同，但会把每次重试的 attempt 数据写入传入的
+    /// `RequestTrace`，供上层生成请求日志。
+    pub async fn call_api_traced(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+        trace: &mut Option<RequestTrace>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, false, user_id, trace)
+            .await
+    }
+
+    /// 发送流式 API 请求（带追踪）
+    pub async fn call_api_stream_traced(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+        trace: &mut Option<RequestTrace>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, true, user_id, trace)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -379,7 +406,8 @@ impl KiroProvider {
         request_body: &str,
         user_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true, user_id).await
+        self.call_api_with_retry(request_body, true, user_id, &mut None)
+            .await
     }
 
     /// 发送 MCP API 请求
@@ -685,6 +713,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         user_id: Option<&str>,
+        trace: &mut Option<RequestTrace>,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let available = self.token_manager.available_count();
@@ -783,15 +812,28 @@ impl KiroProvider {
             let _request_for_log = request.try_clone();
 
             // 发送请求
+            let attempt_start = std::time::Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    let attempt_ms = attempt_start.elapsed().as_millis() as i64;
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
                         max_retries,
                         e
                     );
+                    // 记录网络错误 attempt
+                    if let Some(t) = trace.as_mut() {
+                        t.record_attempt(
+                            attempt as i32 + 1,
+                            ctx.id,
+                            0,
+                            AttemptOutcome::NetworkError,
+                            attempt_ms,
+                            Some(e.to_string()),
+                        );
+                    }
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
@@ -807,10 +849,22 @@ impl KiroProvider {
 
             let status = response.status();
             let retry_after = Self::parse_retry_after(response.headers());
+            let attempt_ms = attempt_start.elapsed().as_millis() as i64;
 
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                // 记录成功 attempt
+                if let Some(t) = trace.as_mut() {
+                    t.record_attempt(
+                        attempt as i32 + 1,
+                        ctx.id,
+                        status.as_u16() as i32,
+                        AttemptOutcome::Success,
+                        attempt_ms,
+                        None,
+                    );
+                }
                 tracing::info!(
                     credential_id = %ctx.id,
                     endpoint = %endpoint_name,
@@ -826,6 +880,26 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            // 记录失败 attempt（根据状态码分类；具体的冷却/禁用/切换逻辑仍由下方分支处理）
+            if let Some(t) = trace.as_mut() {
+                let outcome = match status.as_u16() {
+                    402 => AttemptOutcome::QuotaExhausted,
+                    429 => AttemptOutcome::AccountThrottled,
+                    401 | 403 => AttemptOutcome::AuthFailed,
+                    400 => AttemptOutcome::BadRequest,
+                    500..=599 => AttemptOutcome::Transient,
+                    _ => AttemptOutcome::Unknown,
+                };
+                t.record_attempt(
+                    attempt as i32 + 1,
+                    ctx.id,
+                    status.as_u16() as i32,
+                    outcome,
+                    attempt_ms,
+                    Some(TraceRecord::truncate_error(&body)),
+                );
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -958,7 +1032,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -1008,9 +1087,7 @@ impl KiroProvider {
                 //   - 跨请求：冷却让 acquire_context 直接零往返跳过限流号；全员限流时
                 //     token_manager 的 all-cooling 快路径带 Retry-After 快速 bail
                 let retry_secs = retry_after.map(|d| d.as_secs()).unwrap_or(0);
-                if let Some(cooldown) =
-                    Self::classify_429_cooldown(&body, retry_after)
-                {
+                if let Some(cooldown) = Self::classify_429_cooldown(&body, retry_after) {
                     let applied = self.token_manager.set_credential_cooldown_with_duration(
                         ctx.id,
                         crate::kiro::cooldown::CooldownReason::RateLimitExceeded,
@@ -1232,7 +1309,10 @@ impl KiroProvider {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
             return false;
         };
-        let matches = |s: &str| s.to_ascii_uppercase().contains("INSUFFICIENT_MODEL_CAPACITY");
+        let matches = |s: &str| {
+            s.to_ascii_uppercase()
+                .contains("INSUFFICIENT_MODEL_CAPACITY")
+        };
         value
             .get("reason")
             .and_then(|v| v.as_str())
@@ -1535,11 +1615,13 @@ mod tests {
         );
 
         // 有 Retry-After 时优先采用（clamp 到上限 300s）。
-        let with_retry = KiroProvider::classify_429_cooldown(suspicious, Some(Duration::from_secs(90)));
+        let with_retry =
+            KiroProvider::classify_429_cooldown(suspicious, Some(Duration::from_secs(90)));
         assert_eq!(with_retry, Some(Duration::from_secs(90)));
 
         // 超大 Retry-After 被 clamp 到 300s 上限，避免单号挂死太久。
-        let huge = KiroProvider::classify_429_cooldown(suspicious, Some(Duration::from_secs(99999)));
+        let huge =
+            KiroProvider::classify_429_cooldown(suspicious, Some(Duration::from_secs(99999)));
         assert_eq!(huge, Some(Duration::from_secs(300)));
     }
 

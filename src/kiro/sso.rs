@@ -169,11 +169,16 @@ static KIRO_SSO_SESSIONS: RwLock<Option<HashMap<String, Arc<KiroSsoSession>>>> =
 
 fn sessions_insert(session: Arc<KiroSsoSession>) {
     let mut guard = KIRO_SSO_SESSIONS.write();
-    guard.get_or_insert_with(HashMap::new).insert(session.id.clone(), session);
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(session.id.clone(), session);
 }
 
 fn sessions_get(id: &str) -> Option<Arc<KiroSsoSession>> {
-    KIRO_SSO_SESSIONS.read().as_ref().and_then(|m| m.get(id).cloned())
+    KIRO_SSO_SESSIONS
+        .read()
+        .as_ref()
+        .and_then(|m| m.get(id).cloned())
 }
 
 fn sessions_remove(id: &str) {
@@ -223,8 +228,8 @@ pub fn generate_account_id() -> String {
 /// issuer，以及把关两个已发现端点（浏览器被 302 到的 authorize URL 和授权码换取的 token 端点）。
 /// 凭据导入 / 刷新路径用它防止 SSRF / refresh token 外泄。
 pub fn validate_external_idp_endpoint(raw_url: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(raw_url.trim())
-        .map_err(|e| anyhow!("无效的外部 IdP URL: {}", e))?;
+    let parsed =
+        url::Url::parse(raw_url.trim()).map_err(|e| anyhow!("无效的外部 IdP URL: {}", e))?;
     if !parsed.scheme().eq_ignore_ascii_case("https") {
         bail!("外部 IdP URL 必须是 https");
     }
@@ -370,8 +375,7 @@ pub async fn start_kiro_idc_login(
     if start_url.is_empty() {
         bail!("请填写 IAM Identity Center 的 Start URL");
     }
-    validate_external_idp_endpoint(&start_url)
-        .map_err(|e| anyhow!("Start URL 校验失败: {}", e))?;
+    validate_external_idp_endpoint(&start_url).map_err(|e| anyhow!("Start URL 校验失败: {}", e))?;
 
     let region = region
         .map(|r| r.trim().to_string())
@@ -448,8 +452,7 @@ pub async fn start_kiro_idc_login(
 /// 轮询登录状态。捕获授权码前返回 Pending，捕获后换取并返回 Completed。
 /// 终态错误（超时、换取失败）以 Err 返回。
 pub async fn poll_kiro_sso_auth(session_id: &str) -> anyhow::Result<KiroSsoPollStatus> {
-    let session = sessions_get(session_id)
-        .ok_or_else(|| anyhow!("会话未找到或已过期"))?;
+    let session = sessions_get(session_id).ok_or_else(|| anyhow!("会话未找到或已过期"))?;
 
     // 在独立作用域内非阻塞读取，确保 parking_lot 锁在任何 .await 之前完全释放
     // （否则 !Send 的 guard 跨 await 会让整个 future 变成 !Send，无法作为 axum handler）。
@@ -498,8 +501,8 @@ pub async fn poll_kiro_sso_auth(session_id: &str) -> anyhow::Result<KiroSsoPollS
 ///
 /// 只对 idc 会话开放（社交/门户流程本就依赖浏览器直接命中回环，不走此路）。
 pub fn submit_kiro_idc_callback(session_id: &str, callback_url: &str) -> anyhow::Result<()> {
-    let session = sessions_get(session_id)
-        .ok_or_else(|| anyhow!("会话未找到或已过期，请重新发起登录"))?;
+    let session =
+        sessions_get(session_id).ok_or_else(|| anyhow!("会话未找到或已过期，请重新发起登录"))?;
 
     // 从粘贴的 URL 解析 query。允许用户粘贴完整 URL；也兼容只粘贴 "code=...&state=..." 的情况。
     let raw = callback_url.trim();
@@ -514,7 +517,12 @@ pub fn submit_kiro_idc_callback(session_id: &str, callback_url: &str) -> anyhow:
     let query: HashMap<String, String> = url::form_urlencoded::parse(query_str.as_bytes())
         .into_owned()
         .collect();
-    let get = |k: &str| query.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
+    let get = |k: &str| {
+        query
+            .get(k)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
 
     let code = get("code");
     let state_q = get("state");
@@ -717,7 +725,9 @@ async fn start_listener(session: Arc<KiroSsoSession>) -> anyhow::Result<()> {
     use axum::routing::any;
 
     let addrs = kiro_callback_bind_addrs();
-    let state = ListenerState { session: session.clone() };
+    let state = ListenerState {
+        session: session.clone(),
+    };
 
     let make_router = || {
         Router::new()
@@ -822,7 +832,12 @@ async fn handle_callback(
         })
         .unwrap_or_default();
 
-    let get = |k: &str| query.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
+    let get = |k: &str| {
+        query
+            .get(k)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
 
     // 临时诊断：打印回调 path 与全部参数键（值截断，避免泄露 code/token），用于确认门户对
     // IAM Identity Center start URL 实际回传的描述符结构（login_option 值、是否带 issuer_url 等）。
@@ -836,7 +851,11 @@ async fn handle_callback(
             })
             .collect();
         kv.sort();
-        tracing::warn!("[KiroSSO][DIAG] callback path={} query=[{}]", path, kv.join(" | "));
+        tracing::warn!(
+            "[KiroSSO][DIAG] callback path={} query=[{}]",
+            path,
+            kv.join(" | ")
+        );
     }
 
     // --- 企业 leg-1：外部 IdP 描述符（无 code）---
@@ -862,7 +881,11 @@ async fn handle_callback(
         // 门户回传的 region 键为 idc_region；回退到会话 region。
         let idc_region = {
             let r = get("idc_region");
-            if r.is_empty() { session.region.clone() } else { r }
+            if r.is_empty() {
+                session.region.clone()
+            } else {
+                r
+            }
         };
 
         if issuer_url.is_empty() {
@@ -882,7 +905,10 @@ async fn handle_callback(
             Ok(c) => c,
             Err(e) => {
                 session.deliver_error(format!("IAM Identity Center 初始化失败: {}", e));
-                return (StatusCode::INTERNAL_SERVER_ERROR, Html(kiro_callback_page(false)))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html(kiro_callback_page(false)),
+                )
                     .into_response();
             }
         };
@@ -891,15 +917,14 @@ async fn handle_callback(
         let redirect_uri = format!("{}{}", KIRO_REDIRECT_URI, KIRO_OAUTH_CALLBACK_PATH);
 
         // RegisterClient：授权码流程，声明 redirectUris + authorization_code/refresh_token。
-        let reg =
-            match idc_register_client(&client, &idc_region, &issuer_url, &redirect_uri).await {
-                Ok(r) => r,
-                Err(e) => {
-                    session.deliver_error(format!("IAM Identity Center 注册客户端失败: {}", e));
-                    return (StatusCode::BAD_GATEWAY, Html(kiro_callback_page(false)))
-                        .into_response();
-                }
-            };
+        let reg = match idc_register_client(&client, &idc_region, &issuer_url, &redirect_uri).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                session.deliver_error(format!("IAM Identity Center 注册客户端失败: {}", e));
+                return (StatusCode::BAD_GATEWAY, Html(kiro_callback_page(false))).into_response();
+            }
+        };
 
         let verifier = generate_code_verifier();
         let state2 = uuid::Uuid::new_v4().to_string();
@@ -1273,13 +1298,21 @@ async fn exchange_external_idp_code(
         .unwrap_or_default()
         .to_string();
     if !status.is_success() || access_token.is_empty() {
-        let err = json.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !err.is_empty() {
             let desc = json
                 .get("error_description")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            bail!("外部 IdP token 换取失败（status {}）: {}: {}", status, err, desc);
+            bail!(
+                "外部 IdP token 换取失败（status {}）: {}: {}",
+                status,
+                err,
+                desc
+            );
         }
         bail!("外部 IdP token 换取失败（status {}）: {}", status, body);
     }
@@ -1352,7 +1385,10 @@ async fn idc_register_client(
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
         // 透传 AWS 的 error_description，方便定位（常见：Start URL 无效、region 与实例不符）。
-        let err = json.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let desc = json
             .get("error_description")
             .and_then(|v| v.as_str())
@@ -1368,7 +1404,11 @@ async fn idc_register_client(
         if !desc.is_empty() {
             bail!(
                 "AWS 拒绝注册（{}）：{}。请确认 Start URL 正确、且 Region 与该 IAM Identity Center 实例所在区域一致。",
-                if err.is_empty() { "invalid_request" } else { err },
+                if err.is_empty() {
+                    "invalid_request"
+                } else {
+                    err
+                },
                 desc
             );
         }
@@ -1387,7 +1427,10 @@ async fn idc_register_client(
     if client_id.is_empty() || client_secret.is_empty() {
         bail!("RegisterClient 响应缺少 clientId/clientSecret");
     }
-    Ok(IdcRegisteredClient { client_id, client_secret })
+    Ok(IdcRegisteredClient {
+        client_id,
+        client_secret,
+    })
 }
 
 /// 构造 AWS SSO OIDC 的 /authorize URL（授权码 + PKCE）。scopes 用逗号分隔（对齐参考实现）。
@@ -1446,7 +1489,10 @@ async fn exchange_idc_code(
         .unwrap_or_default()
         .to_string();
     if !status.is_success() || access_token.is_empty() {
-        let err = json.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !err.is_empty() {
             let desc = json
                 .get("error_description")
