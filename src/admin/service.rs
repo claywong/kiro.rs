@@ -570,6 +570,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    ttft_ewma_ms: entry.ttft_ewma_ms,
                     balance,
                     balance_updated_at,
                 }
