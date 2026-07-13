@@ -986,6 +986,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 各模型 TTFT EWMA 的均值（毫秒）；无样本时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ewma_ms: Option<u64>,
 }
 
 /// 凭据管理器状态快照
@@ -2300,6 +2303,12 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    ttft_ewma_ms: if e.ttft_ewma.is_empty() {
+                        None
+                    } else {
+                        let sum: f64 = e.ttft_ewma.values().sum();
+                        Some((sum / e.ttft_ewma.len() as f64).round() as u64)
+                    },
                 })
                 .collect(),
             current_id,
