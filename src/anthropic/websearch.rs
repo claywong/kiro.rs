@@ -18,6 +18,41 @@ use uuid::Uuid;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebSearchCacheContext {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
+
+fn billed_input_tokens(
+    input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    input_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .saturating_sub(cache_read_input_tokens)
+        .max(0)
+}
+
+fn resolve_cache_usage(
+    cache_tracker: &crate::anthropic::cache_tracker::CacheTracker,
+    credential_id: u64,
+    profile: &crate::anthropic::cache_tracker::CacheProfile,
+) -> WebSearchCacheContext {
+    let result = cache_tracker.compute(credential_id, profile);
+    WebSearchCacheContext {
+        cache_creation_input_tokens: result.cache_creation_input_tokens,
+        cache_read_input_tokens: result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
+    }
+}
+
+const WEB_SEARCH_PREFIX: &str = "Perform a web search for the query: ";
+
 /// MCP 请求
 #[derive(Debug, Serialize)]
 pub struct McpRequest {
@@ -45,7 +80,9 @@ pub struct McpArguments {
 #[allow(dead_code)]
 pub struct McpResponse {
     pub error: Option<McpError>,
+    #[allow(dead_code)]
     pub id: String,
+    #[allow(dead_code)]
     pub jsonrpc: String,
     pub result: Option<McpResult>,
 }
@@ -63,6 +100,7 @@ pub struct McpError {
 pub struct McpResult {
     pub content: Vec<McpContent>,
     #[serde(rename = "isError")]
+    #[allow(dead_code)]
     pub is_error: bool,
 }
 
@@ -102,25 +140,133 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-/// 检查请求是否为纯 WebSearch 请求
+/// 检查请求是否包含 WebSearch 工具
 ///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 只要 tools 中出现 web_search（按 name 或 type 判断），就认为应走本地 WebSearch 处理。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
+        tools
+            .iter()
+            .any(|t| t.name == "web_search" || t.is_web_search())
     })
+}
+
+fn tool_choice_requests_web_search(req: &MessagesRequest) -> bool {
+    let Some(choice) = req.tool_choice.as_ref() else {
+        return false;
+    };
+
+    let Some(obj) = choice.as_object() else {
+        return false;
+    };
+
+    // Anthropic 常见形态：{"type":"tool","name":"web_search"}
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("tool_name").and_then(|v| v.as_str()));
+
+    if name != Some("web_search") {
+        return false;
+    }
+
+    // 若包含 type 字段，仅当 type=tool 才视为“强制调用”
+    match obj.get("type").and_then(|v| v.as_str()) {
+        Some("tool") => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn is_only_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.len() == 1
+            && tools
+                .first()
+                .is_some_and(|t| t.name == "web_search" || t.is_web_search())
+    })
+}
+
+fn extract_last_user_text(req: &MessagesRequest) -> Option<String> {
+    let msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| req.messages.last())?;
+
+    match &msg.content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let first_block = arr.first()?;
+            if first_block.get("type")?.as_str()? == "text" {
+                Some(first_block.get("text")?.as_str()?.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn request_explicit_web_search_prefix(req: &MessagesRequest) -> bool {
+    extract_last_user_text(req)
+        .map(|t| t.trim_start().starts_with(WEB_SEARCH_PREFIX))
+        .unwrap_or(false)
+}
+
+/// 判断当前请求是否应走“本地 WebSearch”处理。
+///
+/// 注意：`tools` 里包含 `web_search` 仅代表“可用工具”，并不代表这次一定要执行搜索。
+/// 若不加额外条件，容易把普通对话/任务指令误当成搜索查询，导致 MCP 侧返回 -32602。
+/// 本地 WebSearch 不经过 Kiro 上游链路，因此不会收到 meteringEvent，也不会返回 credit_* usage 字段。
+pub fn should_handle_websearch_request(req: &MessagesRequest) -> bool {
+    if !has_web_search_tool(req) {
+        return false;
+    }
+
+    // 1) tool_choice 强制选择 web_search
+    if tool_choice_requests_web_search(req) {
+        return true;
+    }
+
+    // 2) 兼容旧客户端：仅提供 web_search 单工具时，视为“纯 WebSearch 请求”
+    if is_only_web_search_tool(req) {
+        return true;
+    }
+
+    // 3) 兼容 Claude Code 风格前缀
+    request_explicit_web_search_prefix(req)
+}
+
+/// 从请求的 tools 列表中移除 web_search 工具。
+///
+/// 当请求包含混合工具（web_search + 其他工具）时，剔除 web_search 后转发上游。
+/// 若剔除后 tools 为空，则设为 None。
+pub fn strip_web_search_tools(req: &mut MessagesRequest) {
+    if let Some(tools) = req.tools.as_mut() {
+        tools.retain(|t| t.name != "web_search" && !t.is_web_search());
+        if tools.is_empty() {
+            req.tools = None;
+        }
+    }
 }
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
+/// 读取 messages 中最后一条 user 消息的第一个内容块（更符合多轮对话场景）
 /// 并去除 "Perform a web search for the query: " 前缀
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    // 优先取最后一条 user 消息，否则回退到最后一条消息
+    let msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| req.messages.last())?;
 
     // 提取文本内容
-    let text = match &first_msg.content {
+    let text = match &msg.content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
             // 获取第一个内容块
@@ -135,13 +281,12 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
     };
 
     // 去除前缀 "Perform a web search for the query: "
-    const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
-    } else {
-        text
-    };
+    let query = text
+        .strip_prefix(WEB_SEARCH_PREFIX)
+        .map(|s| s.to_string())
+        .unwrap_or(text);
 
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.is_empty() { None } else { Some(query) }
 }
 
@@ -183,7 +328,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     // tool_use_id 使用相同格式
     let tool_use_id = format!(
         "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
+        &Uuid::new_v4().to_string().replace('-', "")[..32]
     );
 
     let request = McpRequest {
@@ -220,9 +365,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_context: Option<WebSearchCacheContext>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_context,
+    );
 
     stream::iter(
         events
@@ -238,14 +390,32 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_context: Option<WebSearchCacheContext>,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
-    );
+    let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
+    let billed_input_tokens = cache_context
+        .map(|ctx| {
+            billed_input_tokens(
+                input_tokens,
+                ctx.cache_creation_input_tokens,
+                ctx.cache_read_input_tokens,
+            )
+        })
+        .unwrap_or(input_tokens);
 
     // 1. message_start
+    // 本地 WebSearch 的 usage 需要沿用外层预先计算的统计口径。
+    let mut message_start_usage = json!({
+        "input_tokens": billed_input_tokens,
+        "output_tokens": 0,
+    });
+    if let Some(cache_context) = cache_context {
+        message_start_usage["cache_creation_input_tokens"] =
+            json!(cache_context.cache_creation_input_tokens);
+        message_start_usage["cache_read_input_tokens"] =
+            json!(cache_context.cache_read_input_tokens);
+    }
     events.push(SseEvent::new(
         "message_start",
         json!({
@@ -257,12 +427,7 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
+                "usage": message_start_usage
             }
         }),
     ));
@@ -417,6 +582,19 @@ fn generate_websearch_events(
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
     let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let mut message_delta_usage = json!({
+        "input_tokens": billed_input_tokens,
+        "output_tokens": output_tokens,
+        "server_tool_use": {
+            "web_search_requests": 1
+        }
+    });
+    if let Some(cache_context) = cache_context {
+        message_delta_usage["cache_creation_input_tokens"] =
+            json!(cache_context.cache_creation_input_tokens);
+        message_delta_usage["cache_read_input_tokens"] =
+            json!(cache_context.cache_read_input_tokens);
+    }
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -424,12 +602,7 @@ fn generate_websearch_events(
             "delta": {
                 "stop_reason": "end_turn"
             },
-            "usage": {
-                "output_tokens": output_tokens,
-                "server_tool_use": {
-                    "web_search_requests": 1
-                }
-            }
+            "usage": message_delta_usage
         }),
     ));
 
@@ -474,6 +647,8 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
+    cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
+    cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
     input_tokens: i32,
 ) -> Response {
     // 1. 提取搜索查询
@@ -497,40 +672,148 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
+    let (search_results, final_cache_context) = match call_mcp_api(&provider, &mcp_request).await {
+        Ok(api_result) => {
+            let resolved_cache_context = match (cache_tracker, cache_profile) {
+                (Some(cache_tracker), Some(cache_profile)) => {
+                    let resolved_cache_context =
+                        resolve_cache_usage(cache_tracker, api_result.credential_id, cache_profile);
+                    tracing::info!(
+                        credential_id = api_result.credential_id,
+                        final_cache_creation_input_tokens =
+                            resolved_cache_context.cache_creation_input_tokens,
+                        final_cache_read_input_tokens =
+                            resolved_cache_context.cache_read_input_tokens,
+                        "Resolved cache usage for websearch request"
+                    );
+                    cache_tracker.update(api_result.credential_id, cache_profile);
+                    Some(resolved_cache_context)
+                }
+                _ => None,
+            };
+            (
+                parse_search_results(&api_result.response),
+                resolved_cache_context,
+            )
+        }
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            let fallback_cache_context = match (cache_tracker, cache_profile) {
+                (Some(_), Some(_)) => Some(WebSearchCacheContext::default()),
+                _ => None,
+            };
+            (None, fallback_cache_context)
         }
     };
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    if payload.stream {
+        let stream = create_websearch_sse_stream(
+            model,
+            query,
+            tool_use_id,
+            search_results,
+            input_tokens,
+            final_cache_context,
+        );
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    let summary = generate_search_summary(&query, &search_results);
+    let search_content = if let Some(ref results) = search_results {
+        results
+            .results
+            .iter()
+            .map(|r| {
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "page_age": null
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let billed_input_tokens = final_cache_context
+        .map(|ctx| {
+            billed_input_tokens(
+                input_tokens,
+                ctx.cache_creation_input_tokens,
+                ctx.cache_read_input_tokens,
+            )
+        })
+        .unwrap_or(input_tokens);
+
+    let mut usage = json!({
+        "input_tokens": billed_input_tokens,
+        "output_tokens": output_tokens,
+    });
+    if let Some(final_cache_context) = final_cache_context {
+        usage["cache_creation_input_tokens"] =
+            json!(final_cache_context.cache_creation_input_tokens);
+        usage["cache_read_input_tokens"] = json!(final_cache_context.cache_read_input_tokens);
+    }
+
+    let response_body = json!({
+        "id": format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": { "query": query }
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content
+            },
+            {
+                "type": "text",
+                "text": summary
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": usage
+    });
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+struct ParsedMcpCallResult {
+    response: McpResponse,
+    credential_id: u64,
 }
 
 /// 调用 Kiro MCP API
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
-) -> anyhow::Result<McpResponse> {
+) -> anyhow::Result<ParsedMcpCallResult> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let api_result = provider.call_mcp(&request_body).await?;
 
-    let body = response.text().await?;
+    let body = api_result.response.text().await?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
@@ -543,12 +826,178 @@ async fn call_mcp_api(
         );
     }
 
-    Ok(mcp_response)
+    Ok(ParsedMcpCallResult {
+        response: mcp_response,
+        credential_id: api_result.credential_id,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_cache_usage_uses_real_credential_id() {
+        use crate::anthropic::cache_tracker::CacheTracker;
+        use crate::anthropic::types::{CacheControl, Message, SystemMessage};
+
+        let long_text = "This is a cached websearch system block. ".repeat(100);
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("Perform a web search for the query: rust cache"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: format!("{}{}", long_text, long_text),
+                block_type: Some("text".to_string()),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let tracker = CacheTracker::new(std::time::Duration::from_secs(300));
+        let total = crate::token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let profile = tracker.build_profile(&payload, total);
+
+        let initial = resolve_cache_usage(&tracker, 7, &profile);
+        assert_eq!(initial.cache_read_input_tokens, 0);
+
+        tracker.update(7, &profile);
+        let resolved = resolve_cache_usage(&tracker, 7, &profile);
+        assert!(resolved.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_generate_websearch_events_uses_raw_usage_and_cache_context() {
+        let events = generate_websearch_events(
+            "claude-sonnet-4",
+            "rust",
+            "srvtoolu_test",
+            None,
+            123,
+            Some(WebSearchCacheContext {
+                cache_creation_input_tokens: 7,
+                cache_read_input_tokens: 9,
+                cache_creation_5m_input_tokens: 3,
+                cache_creation_1h_input_tokens: 4,
+            }),
+        );
+
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should have message_start");
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 107);
+        assert_eq!(
+            message_start.data["message"]["usage"]["cache_creation_input_tokens"],
+            7
+        );
+        assert_eq!(
+            message_start.data["message"]["usage"]["cache_read_input_tokens"],
+            9
+        );
+
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 107);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            7
+        );
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 9);
+    }
+
+    #[test]
+    fn test_generate_websearch_events_omits_cache_usage_when_disabled() {
+        let events =
+            generate_websearch_events("claude-sonnet-4", "rust", "srvtoolu_test", None, 123, None);
+
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should have message_start");
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 123);
+        assert!(
+            message_start.data["message"]["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(
+            message_delta.data["usage"]
+                .get("cache_read_input_tokens")
+                .is_none()
+        );
+        assert!(message_delta.data["usage"].get("cache_creation").is_none());
+    }
+
+    #[test]
+    fn test_websearch_failure_path_keeps_zero_cache_usage_when_accounting_enabled() {
+        let summary = generate_search_summary("rust", &None);
+        let output_tokens = (summary.len() as i32 + 3) / 4;
+        let cache_context = Some(WebSearchCacheContext::default());
+        let billed = billed_input_tokens(123, 0, 0);
+
+        let events = generate_websearch_events(
+            "claude-sonnet-4",
+            "rust",
+            "srvtoolu_test",
+            None,
+            123,
+            cache_context,
+        );
+
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should have message_start");
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+
+        assert_eq!(
+            message_start.data["message"]["usage"]["input_tokens"],
+            billed
+        );
+        assert_eq!(
+            message_start.data["message"]["usage"]["cache_creation_input_tokens"],
+            0
+        );
+        assert_eq!(
+            message_start.data["message"]["usage"]["cache_read_input_tokens"],
+            0
+        );
+        assert_eq!(message_delta.data["usage"]["input_tokens"], billed);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            0
+        );
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], output_tokens);
+    }
 
     #[test]
     fn test_has_web_search_tool_only_one() {
@@ -569,6 +1018,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -580,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_has_web_search_tool_multiple_tools() {
+    fn test_has_web_search_tool_when_multiple_tools() {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
@@ -599,6 +1049,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,6 +1057,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,
@@ -614,8 +1066,37 @@ mod tests {
             metadata: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
-        assert!(!has_web_search_tool(&req));
+        assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_has_web_search_tool_when_name_missing_but_type_matches() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "".to_string(), // 模拟客户端只传 type 的情况
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(8),
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(has_web_search_tool(&req));
     }
 
     #[test]
@@ -668,6 +1149,43 @@ mod tests {
 
         let query = extract_search_query(&req);
         assert_eq!(query, Some("What is the weather today?".to_string()));
+    }
+
+    #[test]
+    fn test_extract_search_query_uses_last_user_message() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("not a query"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("ok"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": "Perform a web search for the query: rust"
+                    }]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let query = extract_search_query(&req);
+        assert_eq!(query, Some("rust".to_string()));
     }
 
     #[test]

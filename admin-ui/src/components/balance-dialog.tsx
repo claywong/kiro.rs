@@ -10,12 +10,25 @@ import { parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
   credentialId: number | null
+  /** 展示名称：优先邮箱，回退到 "凭据 #id" */
+  credentialLabel?: string
   open: boolean
   onOpenChange: (open: boolean) => void
+  forceRefresh?: boolean
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChange, forceRefresh }: BalanceDialogProps) {
+  const { data: balance, isLoading, isFetching, error } = useCredentialBalance(credentialId)
+  const showLoading = isLoading || (forceRefresh && isFetching)
+
+  const totalLimit = balance?.usageLimit ?? 0
+  const baseLimit = balance?.overageEnabled
+    ? Math.max(0, totalLimit - (balance.overageCap ?? 0))
+    : totalLimit
+  const overageCap = balance?.overageEnabled ? (balance.overageCap ?? 0) : 0
+  const used = balance?.currentUsage ?? 0
+  const progress = totalLimit > 0 ? Math.min(100, (used / totalLimit) * 100) : 0
+  const overageUsed = Math.max(0, used - baseLimit)
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
@@ -31,11 +44,11 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credentialId} 余额信息
+            {credentialLabel || `凭据 #${credentialId}`} 余额信息
           </DialogTitle>
         </DialogHeader>
 
-        {isLoading && (
+        {showLoading && (
           <div className="flex items-center justify-center py-8">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
           </div>
@@ -72,13 +85,29 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>已使用: ${formatNumber(used)}</span>
+                <span>总限额: ${formatNumber(totalLimit)}</span>
               </div>
-              <Progress value={balance.usagePercentage} />
+              <Progress value={progress} />
               <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
+                {progress.toFixed(1)}% 已使用
               </div>
+              {balance.overageEnabled && (
+                <div className="rounded-md bg-muted p-2 text-xs space-y-1">
+                  <div className="flex justify-between">
+                    <span>基础额度</span>
+                    <span>${formatNumber(baseLimit)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>超额状态</span>
+                    <span>已开启（额外 ${formatNumber(overageCap)}）</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>已用超额</span>
+                    <span>${formatNumber(overageUsed)}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* 详细信息 */}

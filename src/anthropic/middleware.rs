@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -9,11 +10,58 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::CompressionConfig;
 
+use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
+
+#[derive(Clone)]
+pub(crate) struct PromptCacheSnapshot {
+    pub accounting_enabled: bool,
+    pub ttl_seconds: u64,
+    pub tracker: Arc<CacheTracker>,
+}
+
+pub struct PromptCacheRuntime {
+    accounting_enabled: bool,
+    ttl_seconds: u64,
+    tracker: Arc<CacheTracker>,
+}
+
+impl PromptCacheRuntime {
+    pub fn new(ttl_seconds: u64, accounting_enabled: bool) -> Self {
+        Self {
+            accounting_enabled,
+            ttl_seconds,
+            tracker: Arc::new(CacheTracker::new(Duration::from_secs(ttl_seconds))),
+        }
+    }
+
+    pub fn snapshot(&self) -> PromptCacheSnapshot {
+        PromptCacheSnapshot {
+            accounting_enabled: self.accounting_enabled,
+            ttl_seconds: self.ttl_seconds,
+            tracker: self.tracker.clone(),
+        }
+    }
+
+    pub fn update(&mut self, ttl_seconds: Option<u64>, accounting_enabled: Option<bool>) {
+        if let Some(value) = accounting_enabled {
+            self.accounting_enabled = value;
+        }
+
+        if let Some(value) = ttl_seconds
+            && self.ttl_seconds != value
+        {
+            self.ttl_seconds = value;
+            self.tracker = Arc::new(CacheTracker::new(Duration::from_secs(value)));
+        }
+    }
+}
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -25,22 +73,51 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// Profile ARN（可选，用于请求）
+    pub profile_arn: Option<String>,
+    /// 输入压缩配置（共享引用，支持热更新）
+    pub compression_config: Arc<RwLock<CompressionConfig>>,
+    /// Prompt Cache 运行时配置（共享引用，支持热更新）
+    pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            profile_arn: None,
+            compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
+            prompt_cache_runtime,
         }
     }
 
     /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
+    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
         self
+    }
+
+    /// 设置 Profile ARN
+    pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
+        self.profile_arn = Some(arn.into());
+        self
+    }
+
+    /// 设置压缩配置（接受共享引用）
+    pub fn with_compression_config(mut self, config: Arc<RwLock<CompressionConfig>>) -> Self {
+        self.compression_config = config;
+        self
+    }
+
+    pub fn prompt_cache_snapshot(&self) -> PromptCacheSnapshot {
+        self.prompt_cache_runtime.read().snapshot()
     }
 }
 

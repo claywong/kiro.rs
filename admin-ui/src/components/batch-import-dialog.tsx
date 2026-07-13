@@ -230,7 +230,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+              region: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
@@ -276,7 +276,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+            region: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,

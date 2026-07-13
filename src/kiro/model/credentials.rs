@@ -14,6 +14,10 @@ use crate::model::config::Config;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
+    /// 凭据是否仅用于运行时（不持久化到 credentials.json）
+    #[serde(skip)]
+    pub runtime_only: bool,
+
     /// 凭据唯一标识符（自增 ID）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
@@ -26,6 +30,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
 
+    /// Kiro API Key（headless 模式）
+    /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_api_key: Option<String>,
+
     /// Profile ARN
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
@@ -34,7 +43,7 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / api_key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
@@ -46,26 +55,41 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP（企业 SSO，如 Azure AD）OAuth2 Token 端点（用于 refresh_token 刷新）
+    /// 仅 auth_method = "external_idp" 时使用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP OIDC Issuer URL（端点是从该 issuer 发现的）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 授予的 scopes（空格分隔），刷新时透传
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// 身份提供方名称（如 "AzureAD" / "Kiro SSO" / "BuilderId"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
-    /// 凭据级 Region 配置（用于 OIDC token 刷新）
+    /// 凭据级 Region 配置（用于 Token 刷新及 API 请求默认值）
     /// 未配置时回退到 config.json 的全局 region
+    /// 兼容旧配置中的 authRegion 字段
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "authRegion")]
     pub region: Option<String>,
 
-    /// 凭据级 Auth Region（用于 Token 刷新）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_region: Option<String>,
-
-    /// 凭据级 API Region（用于 API 请求）
+    /// 凭据级 API Region（用于 API 请求，可单独覆盖 region）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID 配置（可选）
-    /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
+    /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 或 API Key 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
@@ -93,22 +117,23 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 凭据级端点名称（可选，未配置时回退到 config.defaultEndpoint）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Web Portal Idp 标识（用于 Cookie: Idp=<idp>，默认 "Google"）
+    /// 影响 UpdateBillingPreferences、GetUserInfo 等 web portal 接口的鉴权 cookie
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp: Option<String>,
+
+    /// 最近一次已知的超额开关状态（GetUserUsageAndLimits 返回值缓存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub overage_enabled: Option<bool>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
-
-    /// Kiro API Key（headless 模式）
-    /// 格式: ksk_xxxxxxxx
-    /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kiro_api_key: Option<String>,
-
-    /// 端点名称（可选）
-    ///
-    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
-    /// 端点名必须在启动时注册的端点 registry 中存在。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -133,6 +158,7 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
 /// - 数组格式（新格式，支持多凭据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum CredentialsConfig {
     /// 单个凭据（旧格式）
     Single(KiroCredentials),
@@ -183,36 +209,83 @@ impl CredentialsConfig {
         }
     }
 
+    /// 获取凭据数量
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        match self {
+            CredentialsConfig::Single(_) => 1,
+            CredentialsConfig::Multiple(creds) => creds.len(),
+        }
+    }
+
+    /// 判断是否为空
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CredentialsConfig::Single(_) => false,
+            CredentialsConfig::Multiple(creds) => creds.is_empty(),
+        }
+    }
+
     /// 判断是否为多凭据格式（数组格式）
     pub fn is_multiple(&self) -> bool {
         matches!(self, CredentialsConfig::Multiple(_))
     }
 }
 
+#[allow(dead_code)]
 impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
     /// 获取默认凭证文件路径
+    #[allow(dead_code)]
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
     }
 
     /// 获取有效的 Auth Region（用于 Token 刷新）
-    /// 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
+    /// 优先级：凭据.region > config.region
     pub fn effective_auth_region<'a>(&'a self, config: &'a Config) -> &'a str {
-        self.auth_region
+        self.region
             .as_deref()
-            .or(self.region.as_deref())
-            .unwrap_or(config.effective_auth_region())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&config.region)
     }
 
-    /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 获取有效的 API Region（用于 API 请求和额度查询）
+    /// 优先级：凭据.api_region > 凭据.region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.region.as_deref().filter(|s| !s.trim().is_empty()))
             .unwrap_or(config.effective_api_region())
+    }
+
+    /// 获取 Web Portal Idp 标识（用于 Cookie: Idp=<idp>）
+    ///
+    /// 优先使用凭据级 `idp` 字段；未设置时根据 `auth_method` 推断：
+    /// - social → "Google"（绝大多数用户为 Google 登录）
+    /// - idc / api_key → 留空（这两种凭据不应调用 web portal 接口）
+    pub fn effective_idp(&self) -> &str {
+        if let Some(idp) = self
+            .idp
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return idp;
+        }
+        match self
+            .auth_method
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("social") | None => "Google",
+            _ => "",
+        }
     }
 
     /// 获取有效的代理配置
@@ -234,6 +307,37 @@ impl KiroCredentials {
         }
     }
 
+    pub fn effective_endpoint_name<'a>(&'a self, default_endpoint: Option<&'a str>) -> &'a str {
+        self.endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(default_endpoint)
+            .unwrap_or("ide")
+    }
+
+    /// 从 JSON 字符串解析凭证
+    #[allow(dead_code)]
+    pub fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json_string)
+    }
+
+    /// 从文件加载凭证
+    #[allow(dead_code)]
+    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let content = fs::read_to_string(path.as_ref())?;
+        if content.is_empty() {
+            anyhow::bail!("凭证文件为空: {:?}", path.as_ref());
+        }
+        let credentials = Self::from_json(&content)?;
+        Ok(credentials)
+    }
+
+    /// 序列化为格式化的 JSON 字符串
+    #[allow(dead_code)]
+    pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
     pub fn canonicalize_auth_method(&mut self) {
         let auth_method = match &self.auth_method {
             Some(m) => m,
@@ -244,6 +348,16 @@ impl KiroCredentials {
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
         }
+    }
+
+    pub fn is_api_key_credential(&self) -> bool {
+        self.kiro_api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+            || self
+                .auth_method
+                .as_deref()
+                .is_some_and(|method| canonicalize_auth_method_value(method) == "api_key")
     }
 
     /// 检查凭据是否支持 Opus 模型
@@ -259,29 +373,6 @@ impl KiroCredentials {
             // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
             None => true,
         }
-    }
-
-    /// 检查是否为 API Key 凭据
-    ///
-    /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
-    pub fn is_api_key_credential(&self) -> bool {
-        self.kiro_api_key.is_some()
-            || self
-                .auth_method
-                .as_deref()
-                .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
-                .unwrap_or(false)
-    }
-}
-
-#[cfg(test)]
-impl KiroCredentials {
-    fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json_string)
-    }
-
-    fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
     }
 }
 
@@ -325,24 +416,30 @@ mod tests {
             id: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
+            kiro_api_key: None,
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: None,
-            auth_region: None,
             api_region: None,
             machine_id: None,
+            endpoint: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            runtime_only: false,
+            idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -443,24 +540,30 @@ mod tests {
             id: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
+            kiro_api_key: None,
             profile_arn: None,
             expires_at: None,
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
-            auth_region: None,
             api_region: None,
             machine_id: None,
+            endpoint: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            runtime_only: false,
+            idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -474,24 +577,30 @@ mod tests {
             id: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
+            kiro_api_key: None,
             profile_arn: None,
             expires_at: None,
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 0,
             region: None,
-            auth_region: None,
             api_region: None,
             machine_id: None,
+            endpoint: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            runtime_only: false,
+            idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -517,9 +626,11 @@ mod tests {
 
     #[test]
     fn test_machine_id_field_serialization() {
-        let mut creds = KiroCredentials::default();
-        creds.refresh_token = Some("test".to_string());
-        creds.machine_id = Some("b".repeat(64));
+        let creds = KiroCredentials {
+            refresh_token: Some("test".to_string()),
+            machine_id: Some("b".repeat(64)),
+            ..Default::default()
+        };
 
         let json = creds.to_pretty_json().unwrap();
         assert!(json.contains("machineId"));
@@ -527,9 +638,11 @@ mod tests {
 
     #[test]
     fn test_machine_id_field_none_not_serialized() {
-        let mut creds = KiroCredentials::default();
-        creds.refresh_token = Some("test".to_string());
-        creds.machine_id = None;
+        let creds = KiroCredentials {
+            refresh_token: Some("test".to_string()),
+            machine_id: None,
+            ..Default::default()
+        };
 
         let json = creds.to_pretty_json().unwrap();
         assert!(!json.contains("machineId"));
@@ -588,24 +701,30 @@ mod tests {
             id: Some(42),
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
+            kiro_api_key: None,
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            provider: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
-            auth_region: None,
             api_region: None,
             machine_id: Some("c".repeat(64)),
+            endpoint: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            runtime_only: false,
+            idp: None,
+            overage_enabled: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -619,18 +738,7 @@ mod tests {
         assert_eq!(parsed.machine_id, original.machine_id);
     }
 
-    // ============ auth_region / api_region 字段测试 ============
-
-    #[test]
-    fn test_auth_region_field_parsing() {
-        let json = r#"{
-            "refreshToken": "test_refresh",
-            "authRegion": "eu-central-1"
-        }"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
-        assert_eq!(creds.auth_region, Some("eu-central-1".to_string()));
-        assert_eq!(creds.api_region, None);
-    }
+    // ============ api_region 字段测试 ============
 
     #[test]
     fn test_api_region_field_parsing() {
@@ -640,110 +748,81 @@ mod tests {
         }"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.api_region, Some("ap-southeast-1".to_string()));
-        assert_eq!(creds.auth_region, None);
     }
 
     #[test]
-    fn test_auth_api_region_serialization() {
-        let mut creds = KiroCredentials::default();
-        creds.refresh_token = Some("test".to_string());
-        creds.auth_region = Some("eu-west-1".to_string());
-        creds.api_region = Some("us-west-2".to_string());
+    fn test_api_region_serialization() {
+        let creds = KiroCredentials {
+            refresh_token: Some("test".to_string()),
+            api_region: Some("us-west-2".to_string()),
+            ..Default::default()
+        };
 
         let json = creds.to_pretty_json().unwrap();
-        assert!(json.contains("authRegion"));
-        assert!(json.contains("eu-west-1"));
         assert!(json.contains("apiRegion"));
         assert!(json.contains("us-west-2"));
     }
 
     #[test]
-    fn test_auth_api_region_none_not_serialized() {
-        let mut creds = KiroCredentials::default();
-        creds.refresh_token = Some("test".to_string());
-        creds.auth_region = None;
-        creds.api_region = None;
+    fn test_api_region_none_not_serialized() {
+        let creds = KiroCredentials {
+            refresh_token: Some("test".to_string()),
+            api_region: None,
+            ..Default::default()
+        };
 
         let json = creds.to_pretty_json().unwrap();
-        assert!(!json.contains("authRegion"));
         assert!(!json.contains("apiRegion"));
     }
 
     #[test]
-    fn test_auth_api_region_roundtrip() {
-        let mut original = KiroCredentials::default();
-        original.refresh_token = Some("refresh".to_string());
-        original.region = Some("us-east-1".to_string());
-        original.auth_region = Some("eu-west-1".to_string());
-        original.api_region = Some("ap-northeast-1".to_string());
+    fn test_api_region_roundtrip() {
+        let original = KiroCredentials {
+            refresh_token: Some("refresh".to_string()),
+            region: Some("us-east-1".to_string()),
+            api_region: Some("ap-northeast-1".to_string()),
+            ..Default::default()
+        };
 
         let json = original.to_pretty_json().unwrap();
         let parsed = KiroCredentials::from_json(&json).unwrap();
 
         assert_eq!(parsed.region, original.region);
-        assert_eq!(parsed.auth_region, original.auth_region);
         assert_eq!(parsed.api_region, original.api_region);
     }
 
     #[test]
-    fn test_backward_compat_no_auth_api_region() {
-        // 旧格式 JSON 不包含 authRegion/apiRegion，应正常解析
+    fn test_backward_compat_no_api_region() {
+        // 旧格式 JSON 不包含 apiRegion，应正常解析
         let json = r#"{
             "refreshToken": "test_refresh",
             "region": "us-east-1"
         }"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.region, Some("us-east-1".to_string()));
-        assert_eq!(creds.auth_region, None);
         assert_eq!(creds.api_region, None);
     }
 
     // ============ effective_auth_region / effective_api_region 优先级测试 ============
 
     #[test]
-    fn test_effective_auth_region_credential_auth_region_highest() {
-        // 凭据.auth_region > 凭据.region > config.auth_region > config.region
+    fn test_effective_auth_region_credential_region_wins() {
+        // 凭据.region > config.region
         let mut config = Config::default();
         config.region = "config-region".to_string();
-        config.auth_region = Some("config-auth-region".to_string());
 
-        let mut creds = KiroCredentials::default();
-        creds.region = Some("cred-region".to_string());
-        creds.auth_region = Some("cred-auth-region".to_string());
-
-        assert_eq!(creds.effective_auth_region(&config), "cred-auth-region");
-    }
-
-    #[test]
-    fn test_effective_auth_region_fallback_to_credential_region() {
-        let mut config = Config::default();
-        config.region = "config-region".to_string();
-        config.auth_region = Some("config-auth-region".to_string());
-
-        let mut creds = KiroCredentials::default();
-        creds.region = Some("cred-region".to_string());
-        // auth_region 未设置
+        let creds = KiroCredentials {
+            region: Some("cred-region".to_string()),
+            ..Default::default()
+        };
 
         assert_eq!(creds.effective_auth_region(&config), "cred-region");
-    }
-
-    #[test]
-    fn test_effective_auth_region_fallback_to_config_auth_region() {
-        let mut config = Config::default();
-        config.region = "config-region".to_string();
-        config.auth_region = Some("config-auth-region".to_string());
-
-        let creds = KiroCredentials::default();
-        // auth_region 和 region 均未设置
-
-        assert_eq!(creds.effective_auth_region(&config), "config-auth-region");
     }
 
     #[test]
     fn test_effective_auth_region_fallback_to_config_region() {
         let mut config = Config::default();
         config.region = "config-region".to_string();
-        // config.auth_region 未设置
 
         let creds = KiroCredentials::default();
 
@@ -752,15 +831,32 @@ mod tests {
 
     #[test]
     fn test_effective_api_region_credential_api_region_highest() {
-        // 凭据.api_region > config.api_region > config.region
+        // 凭据.api_region > 凭据.region > config.api_region > config.region
         let mut config = Config::default();
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
-        let mut creds = KiroCredentials::default();
-        creds.api_region = Some("cred-api-region".to_string());
+        let creds = KiroCredentials {
+            region: Some("cred-region".to_string()),
+            api_region: Some("cred-api-region".to_string()),
+            ..Default::default()
+        };
 
         assert_eq!(creds.effective_api_region(&config), "cred-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_fallback_to_credential_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.api_region = Some("config-api-region".to_string());
+
+        let creds = KiroCredentials {
+            region: Some("cred-region".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(creds.effective_api_region(&config), "cred-region");
     }
 
     #[test]
@@ -785,29 +881,19 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_api_region_ignores_credential_region() {
-        // 凭据.region 不参与 api_region 的回退链
-        let mut config = Config::default();
-        config.region = "config-region".to_string();
-
-        let mut creds = KiroCredentials::default();
-        creds.region = Some("cred-region".to_string());
-
-        assert_eq!(creds.effective_api_region(&config), "config-region");
-    }
-
-    #[test]
-    fn test_auth_and_api_region_independent() {
-        // auth_region 和 api_region 互不影响
+    fn test_region_and_api_region_independent() {
+        // region 用于 auth，api_region 可单独覆盖 API 请求
         let mut config = Config::default();
         config.region = "default".to_string();
 
-        let mut creds = KiroCredentials::default();
-        creds.auth_region = Some("auth-only".to_string());
-        creds.api_region = Some("api-only".to_string());
+        let creds = KiroCredentials {
+            region: Some("eu-central-1".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
 
-        assert_eq!(creds.effective_auth_region(&config), "auth-only");
-        assert_eq!(creds.effective_api_region(&config), "api-only");
+        assert_eq!(creds.effective_auth_region(&config), "eu-central-1");
+        assert_eq!(creds.effective_api_region(&config), "us-east-1");
     }
 
     // ============ 凭据级代理优先级测试 ============
@@ -815,8 +901,10 @@ mod tests {
     #[test]
     fn test_effective_proxy_credential_overrides_global() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("socks5://cred:1080".to_string());
+        let creds = KiroCredentials {
+            proxy_url: Some("socks5://cred:1080".to_string()),
+            ..Default::default()
+        };
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
@@ -825,10 +913,12 @@ mod tests {
     #[test]
     fn test_effective_proxy_credential_with_auth() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("http://proxy:3128".to_string());
-        creds.proxy_username = Some("user".to_string());
-        creds.proxy_password = Some("pass".to_string());
+        let creds = KiroCredentials {
+            proxy_url: Some("http://proxy:3128".to_string()),
+            proxy_username: Some("user".to_string()),
+            proxy_password: Some("pass".to_string()),
+            ..Default::default()
+        };
 
         let result = creds.effective_proxy(Some(&global));
         let expected = ProxyConfig::new("http://proxy:3128").with_auth("user", "pass");
@@ -838,8 +928,10 @@ mod tests {
     #[test]
     fn test_effective_proxy_direct_bypasses_global() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("direct".to_string());
+        let creds = KiroCredentials {
+            proxy_url: Some("direct".to_string()),
+            ..Default::default()
+        };
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, None);
@@ -848,8 +940,10 @@ mod tests {
     #[test]
     fn test_effective_proxy_direct_case_insensitive() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("DIRECT".to_string());
+        let creds = KiroCredentials {
+            proxy_url: Some("DIRECT".to_string()),
+            ..Default::default()
+        };
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, None);

@@ -3,7 +3,13 @@
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
+  "defaultEndpoint": "ide",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "credentialRpm": 5,
+  "promptCacheTtlSeconds": 300,
+  "promptCacheAccountingEnabled": true,
+  "compression": {
+    "maxRequestBodyBytes": 4718592
+  }
 }

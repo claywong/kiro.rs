@@ -11,9 +11,17 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
-pub use ide::IdeEndpoint;
+pub use cli::{CLI_ENDPOINT_NAME, CliEndpoint};
+pub use ide::{IDE_ENDPOINT_NAME, IdeEndpoint};
+
+/// 额度查询请求所需的 URL 与 header 组合
+pub struct UsageRequestParts {
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+}
 
 /// Kiro 端点
 ///
@@ -38,12 +46,15 @@ pub trait KiroEndpoint: Send + Sync {
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
-    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> anyhow::Result<String>;
 
     /// 对已序列化的 MCP 请求体做端点特有加工（默认不变）
-    fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        body.to_string()
+    fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> anyhow::Result<String> {
+        Ok(body.to_string())
     }
+
+    /// 构造额度查询请求的 URL 与 header
+    fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts>;
 
     /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
     fn is_monthly_request_limit(&self, body: &str) -> bool {

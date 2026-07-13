@@ -16,6 +16,10 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 初始响应事件（流的第一帧，包含服务端分配的 conversationId）
+    InitialResponse,
+    /// 推理内容事件（thinking 模型的服务端推理流，对应 Anthropic 的 `thinking` content_block）
+    ReasoningContent,
     /// 未知事件类型
     Unknown,
 }
@@ -28,6 +32,8 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "initialResponseEvent" => Self::InitialResponse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
         }
     }
@@ -39,6 +45,8 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::InitialResponse => "initialResponseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -68,9 +76,19 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(()),
+    Metering(super::MeteringEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 推理内容（thinking 模型的服务端推理流）
+    ReasoningContent(super::ReasoningContentEvent),
+    /// 初始响应（首帧，含 conversationId）
+    InitialResponse {
+        /// 服务端分配的 conversationId（可能为空字符串）。
+        /// 预留：未来 stream handler 可用它做 server-authoritative
+        /// conversationId affinity（覆盖客户端生成的 UUID）。
+        #[allow(dead_code)]
+        conversation_id: String,
+    },
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -116,10 +134,32 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                let payload = super::MeteringEvent::from_frame(&frame)?;
+                Ok(Self::Metering(payload))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
+            }
+            EventType::InitialResponse => {
+                // Payload shape: `{"conversationId":""}` (may be populated by
+                // server). We just lift the id — no dedicated payload struct
+                // needed since the field is single-purpose.
+                let payload_str = frame.payload_as_str();
+                let conversation_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("conversationId")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_default();
+                Ok(Self::InitialResponse { conversation_id })
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::Unknown => Ok(Self::Unknown {}),
         }
@@ -182,5 +222,35 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    #[test]
+    fn test_parse_metering_event_payload() {
+        use crate::kiro::parser::header::{HeaderValue, Headers};
+
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("meteringEvent".to_string()),
+        );
+
+        let frame = Frame {
+            headers,
+            payload: br#"{"unit":"credit","unitPlural":"credits","usage":0.25}"#.to_vec(),
+        };
+
+        let event = Event::from_frame(frame).unwrap();
+        match event {
+            Event::Metering(metering) => {
+                assert_eq!(metering.unit, "credit");
+                assert_eq!(metering.unit_plural, "credits");
+                assert_eq!(metering.usage, 0.25);
+            }
+            other => panic!("expected metering event, got {other:?}"),
+        }
     }
 }

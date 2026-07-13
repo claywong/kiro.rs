@@ -23,36 +23,35 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
-  const [authRegion, setAuthRegion] = useState('')
+  const [region, setRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
+  const [endpoint, setEndpoint] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
-  const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
+  const isApiKey = authMethod === 'api_key'
 
   const resetForm = () => {
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
-    setAuthRegion('')
+    setRegion('')
     setApiRegion('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
     setMachineId('')
+    setEndpoint('')
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
-    setEndpoint('')
   }
-
-  const isApiKey = authMethod === 'api_key'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -77,19 +76,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     mutate(
       {
-        authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
-        authRegion: authRegion.trim() || undefined,
+        authMethod,
+        region: region.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
+        endpoint: endpoint.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
-        endpoint: endpoint.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -113,6 +112,37 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            {/* 凭据密钥 */}
+            {isApiKey ? (
+              <div className="space-y-2">
+                <label htmlFor="kiroApiKey" className="text-sm font-medium">
+                  Kiro API Key <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  id="kiroApiKey"
+                  type="password"
+                  placeholder="格式: ksk_xxxxxxxx"
+                  value={kiroApiKey}
+                  onChange={(e) => setKiroApiKey(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label htmlFor="refreshToken" className="text-sm font-medium">
+                  Refresh Token <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  id="refreshToken"
+                  type="password"
+                  placeholder="请输入 Refresh Token"
+                  value={refreshToken}
+                  onChange={(e) => setRefreshToken(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+            )}
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
@@ -148,40 +178,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
-            {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && (
-              <div className="space-y-2">
-                <label htmlFor="refreshToken" className="text-sm font-medium">
-                  Refresh Token <span className="text-red-500">*</span>
-                </label>
-                <Input
-                  id="refreshToken"
-                  type="password"
-                  placeholder="请输入 Refresh Token"
-                  value={refreshToken}
-                  onChange={(e) => setRefreshToken(e.target.value)}
-                  disabled={isPending}
-                />
-              </div>
-            )}
-
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
-                    value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
+                    id="region"
+                    placeholder="Region"
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
                     disabled={isPending}
                   />
                 </div>
                 <div>
                   <Input
                     id="apiRegion"
-                    placeholder="API Region"
+                    placeholder="API Region（可选覆盖）"
                     value={apiRegion}
                     onChange={(e) => setApiRegion(e.target.value)}
                     disabled={isPending}
@@ -189,12 +202,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                Region 用于 Token 刷新，留空使用全局配置。API Region 可单独覆盖 API 请求所用的 Region
               </p>
             </div>
 
             {/* IdC/Builder-ID/IAM 额外字段 */}
-            {authMethod === 'idc' && (
+            {authMethod === 'idc' && !isApiKey && (
               <>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">
@@ -260,20 +273,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
-            {/* 端点 */}
+            {/* Endpoint */}
             <div className="space-y-2">
               <label htmlFor="endpoint" className="text-sm font-medium">
-                端点
+                Endpoint
               </label>
-              <Input
+              <select
                 id="endpoint"
-                placeholder="留空使用默认端点（如 ide / cli）"
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
-              />
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">默认值</option>
+                <option value="ide">ide</option>
+                <option value="cli">cli</option>
+              </select>
               <p className="text-xs text-muted-foreground">
-                可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                留空时回退到全局 defaultEndpoint
               </p>
             </div>
 

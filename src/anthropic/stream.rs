@@ -7,26 +7,8 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
-
-/// 找到小于等于目标位置的最近有效UTF-8字符边界
-///
-/// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
-/// 这个函数从目标位置向前搜索，找到最近的有效字符边界。
-fn find_char_boundary(s: &str, target: usize) -> usize {
-    if target >= s.len() {
-        return s.len();
-    }
-    if target == 0 {
-        return 0;
-    }
-    // 从目标位置向前搜索有效的字符边界
-    let mut pos = target;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
+use crate::common::utf8::floor_char_boundary;
+use crate::kiro::model::events::{Event, MeteringEvent};
 
 /// 需要跳过的包裹字符
 ///
@@ -34,10 +16,7 @@ fn find_char_boundary(s: &str, target: usize) -> usize {
 /// - 反引号 (`)：行内代码
 /// - 双引号 (")：字符串
 /// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = &[
-    b'`', b'"', b'\'', b'\\', b'#', b'!', b'@', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'-',
-    b'_', b'=', b'+', b'[', b']', b'{', b'}', b';', b':', b'<', b'>', b',', b'.', b'?', b'/',
-];
+const QUOTE_CHARS: &[u8] = b"`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/";
 
 /// 检查指定位置的字符是否是引用字符
 fn is_quote_char(buffer: &str, pos: usize) -> bool {
@@ -268,6 +247,22 @@ impl BlockState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinalUsage<'a> {
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_usage: Option<CacheUsageBreakdown>,
+    metering: Option<&'a MeteringEvent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheUsageBreakdown {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
+
 /// SSE 状态管理器
 ///
 /// 确保 SSE 事件序列符合 Claude API 规范：
@@ -331,9 +326,40 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// stop_reason 优先级（索引越小优先级越高）
+    ///
+    /// `error` 是 Anthropic 非标准但被 Anthropic SDK 客户端识别的 stop reason：
+    /// 上游流中断、Smithy exception 等异常路径走这条，让客户端知道这一轮 assistant
+    /// 内容是异常截断的，而不是被当成 end_turn 写回 history 污染后续对话。
+    const STOP_REASON_PRIORITY: &'static [&'static str] = &[
+        "error",
+        "model_context_window_exceeded",
+        "max_tokens",
+        "tool_use",
+        "end_turn",
+    ];
+
+    /// 获取 stop_reason 的优先级（越小越高，未知原因返回 usize::MAX）
+    fn stop_reason_priority(reason: &str) -> usize {
+        Self::STOP_REASON_PRIORITY
+            .iter()
+            .position(|&r| r == reason)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// 设置 stop_reason（高优先级原因可覆盖低优先级原因）
+    ///
+    /// 优先级从高到低：model_context_window_exceeded > max_tokens > tool_use > end_turn
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
+        let reason = reason.into();
+        let new_priority = Self::stop_reason_priority(&reason);
+        let should_set = match &self.stop_reason {
+            None => true,
+            Some(current) => new_priority < Self::stop_reason_priority(current),
+        };
+        if should_set {
+            self.stop_reason = Some(reason);
+        }
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -394,7 +420,7 @@ impl SseStateManager {
         // 检查块是否已存在
         if let Some(block) = self.active_blocks.get_mut(&index) {
             if block.started {
-                tracing::debug!("块 {} 已启动，跳过重复的 content_block_start", index);
+                tracing::trace!("块 {} 已启动，跳过重复的 content_block_start", index);
                 return events;
             }
             block.started = true;
@@ -454,11 +480,7 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
-    pub fn generate_final_events(
-        &mut self,
-        input_tokens: i32,
-        output_tokens: i32,
-    ) -> Vec<SseEvent> {
+    pub fn generate_final_events(&mut self, usage: FinalUsage<'_>) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 关闭所有未关闭的块
@@ -478,6 +500,24 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut usage_json = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            });
+            if let Some(cache_usage) = usage.cache_usage {
+                usage_json["cache_creation_input_tokens"] =
+                    json!(cache_usage.cache_creation_input_tokens);
+                usage_json["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+                usage_json["cache_creation"] = json!({
+                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                });
+            }
+            if let Some(metering) = usage.metering {
+                usage_json["credit_usage"] = json!(metering.usage);
+                usage_json["credit_unit"] = json!(metering.unit);
+                usage_json["credit_unit_plural"] = json!(metering.unit_plural);
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -486,10 +526,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage_json
                 }),
             ));
         }
@@ -507,8 +544,6 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -519,6 +554,8 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
+    /// cache usage 统计（可选）
+    pub cache_usage: Option<CacheUsageBreakdown>,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
@@ -537,8 +574,16 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
-    /// 文本块索引（thinking 启用时动态分配）
+    /// Q 上游 reasoningContentEvent 通过独立事件流推 thinking 内容（与老的
+    /// 嵌入 `<thinking>` 标签格式互斥）；此字段标记 reasoning 块是否打开。
+    pub reasoning_block_open: bool,
+    /// reasoningContentEvent 末尾 payload 可能带 signature，需要在 content_block_stop
+    /// 之前 emit signature_delta；缓存它直到关闭 thinking 块的时机。
+    pub pending_reasoning_signature: Option<String>,
+    /// 文本块索引（按需动态分配）
     pub text_block_index: Option<i32>,
+    /// 上游 meteringEvent 透传的 credit usage，仅用于最终 usage 统计，不生成独立 SSE 事件
+    pub metering: Option<MeteringEvent>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -549,6 +594,7 @@ impl StreamContext {
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
@@ -557,6 +603,7 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
+            cache_usage,
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -566,13 +613,34 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
+            reasoning_block_open: false,
+            pending_reasoning_signature: None,
             text_block_index: None,
+            metering: None,
             strip_thinking_leading_newline: false,
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let billed_input_tokens = self
+            .cache_usage
+            .map(|cache_usage| {
+                billed_input_tokens(
+                    self.input_tokens,
+                    cache_usage.cache_creation_input_tokens,
+                    cache_usage.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(self.input_tokens);
+        let mut usage = json!({
+            "input_tokens": billed_input_tokens,
+            "output_tokens": 1,
+        });
+        if let Some(cache_usage) = self.cache_usage {
+            usage["cache_creation_input_tokens"] = json!(cache_usage.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -583,18 +651,16 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
+    /// 生成初始事件序列（仅 message_start）
     ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 注意：不再在初始化阶段创建空 text block。
+    /// 否则当模型首个输出为 tool_use（且没有任何 text_delta）时，
+    /// 会产生一个空的 text content block（text=""），客户端写回 history 后会触发上游校验拒绝。
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -604,43 +670,41 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
-
         events
     }
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
-            Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::InitialResponse { conversation_id } => {
+                // 服务端首帧含 server-authoritative conversationId。当前
+                // 我们已经用客户端派生 ID（converter.rs::convert_request），
+                // 这里只用作可观测性 — 把上游 ID 落到 trace 便于关联日志。
+                if !conversation_id.is_empty() {
+                    tracing::debug!(
+                        server_conversation_id = %conversation_id,
+                        "收到 initialResponseEvent"
+                    );
+                }
+                Vec::new()
+            }
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::AssistantResponse(resp) => {
+                // 切换到 text 流时关闭 reasoning 块（先 signature_delta 再 stop）
+                let mut events = self.close_reasoning_if_open();
+                events.extend(self.process_assistant_response(&resp.content));
+                events
+            }
+            Event::ToolUse(tool_use) => {
+                let mut events = self.close_reasoning_if_open();
+                events.extend(self.process_tool_use(tool_use));
+                events
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let context_window = super::types::get_context_window_size(&self.model) as f64;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * context_window / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -648,9 +712,20 @@ impl StreamContext {
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    "收到 contextUsageEvent: {:.4}%, 计算 input_tokens: {} (context_window: {})",
                     context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    actual_input_tokens,
+                    context_window as i32
+                );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                self.metering = Some(metering.clone());
+                tracing::debug!(
+                    usage = metering.usage,
+                    unit = %metering.unit,
+                    unit_plural = %metering.unit_plural,
+                    "收到 meteringEvent"
                 );
                 Vec::new()
             }
@@ -659,7 +734,19 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
+                // 上游业务错误 → 转 Anthropic SSE error event + 标记 stop_reason
+                // 让客户端能感知（throttling、content filter 等）。
+                self.state_manager.set_stop_reason("error");
+                vec![SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": error_code,
+                            "message": error_message,
+                        }
+                    }),
+                )]
             }
             Event::Exception {
                 exception_type,
@@ -668,12 +755,131 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                    return Vec::new();
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                Vec::new()
+                // 其他 exception → 也转 SSE error event 并标记 stop_reason=error
+                self.state_manager.set_stop_reason("error");
+                vec![SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": exception_type,
+                            "message": message,
+                        }
+                    }),
+                )]
             }
             _ => Vec::new(),
         }
+    }
+
+    /// 处理 reasoningContentEvent — Q 上游对 thinking 模型推送的独立推理流。
+    ///
+    /// 与老式嵌入 `<thinking>` 标签的 assistantResponseEvent 路径**互斥**：
+    /// 实际生产中只会走一条路径（新模型走 reasoningContentEvent，旧 assistant
+    /// 文本流走 process_content_with_thinking）。
+    ///
+    /// Anthropic SSE 协议要求：
+    ///   content_block_start (thinking) → thinking_delta* → signature_delta → content_block_stop
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 首次进入 reasoning：分配块索引、emit content_block_start
+        if !self.reasoning_block_open {
+            let index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(index);
+            self.reasoning_block_open = true;
+            events.extend(self.state_manager.handle_content_block_start(
+                index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            ));
+        }
+
+        let Some(index) = self.thinking_block_index else {
+            return events;
+        };
+
+        if !reasoning.text.is_empty() {
+            self.output_tokens += estimate_tokens(&reasoning.text);
+            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": { "type": "thinking_delta", "thinking": reasoning.text }
+                }),
+            ) {
+                events.push(delta_event);
+            }
+        }
+
+        // 暂存 signature，在关闭块时一并发出（Anthropic 规范要求 signature_delta
+        // 紧接在 content_block_stop 之前）
+        if let Some(sig) = &reasoning.signature {
+            self.pending_reasoning_signature = Some(sig.clone());
+        }
+
+        events
+    }
+
+    /// 切换到 text/tool_use 流之前关闭 reasoning 块：
+    /// emit signature_delta（若 pending）→ content_block_stop。
+    fn close_reasoning_if_open(&mut self) -> Vec<SseEvent> {
+        if !self.reasoning_block_open {
+            return Vec::new();
+        }
+        let Some(index) = self.thinking_block_index else {
+            self.reasoning_block_open = false;
+            return Vec::new();
+        };
+
+        let mut events = Vec::new();
+
+        // signature_delta：优先用上游 reasoning event 真实 signature。
+        // Anthropic 规范要求字段存在，没有就发空串：
+        //   - Round 6 实测：客户端 SDK 接受空串、Kiro 上游接受 200
+        //   - 但下一轮 history 回写时上游可能拒（"thinking-cache token 不合法"）
+        //   - 真实 reasoningContentEvent 通常带 signature，若未带 → log 警告便于追踪
+        let signature = match self.pending_reasoning_signature.take() {
+            Some(sig) if !sig.is_empty() => sig,
+            _ => {
+                tracing::warn!(
+                    "reasoning 块关闭时无 signature（上游未在 reasoningContentEvent 中提供），\
+                     使用空串占位。下一轮 history 回写该 thinking 块可能被上游拒。"
+                );
+                String::new()
+            }
+        };
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            index,
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "signature_delta", "signature": signature }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+            events.push(stop_event);
+        }
+        self.reasoning_block_open = false;
+        // 清掉 thinking_block_index，避免老路径 process_content_with_thinking 误用同一索引
+        // （Anthropic 协议允许多 thinking 块，但 index 必须不同；不清空可能让两条路径共用 index）
+        self.thinking_block_index = None;
+        events
     }
 
     /// 处理助手响应事件
@@ -743,7 +949,7 @@ impl StreamContext {
                         .thinking_buffer
                         .len()
                         .saturating_sub("<thinking>".len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
+                    let safe_len = floor_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         // 如果 thinking 尚未提取，且安全内容只是空白字符，
@@ -775,12 +981,12 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                    if let Some(thinking_index) = self.thinking_block_index
+                        && !thinking_content.is_empty()
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
                     }
 
                     // 结束 thinking 块
@@ -791,6 +997,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -813,15 +1021,15 @@ impl StreamContext {
                         .thinking_buffer
                         .len()
                         .saturating_sub("</thinking>\n\n".len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
+                    let safe_len = floor_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
-                            if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
+                        if let Some(thinking_index) = self.thinking_block_index
+                            && !safe_content.is_empty()
+                        {
+                            events.push(
+                                self.create_thinking_delta_event(thinking_index, &safe_content),
+                            );
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
@@ -851,11 +1059,11 @@ impl StreamContext {
         let mut events = Vec::new();
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
-        // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
-        if let Some(idx) = self.text_block_index {
-            if !self.state_manager.is_block_open_of_type(idx, "text") {
-                self.text_block_index = None;
-            }
+        // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致"吞字"。
+        if let Some(idx) = self.text_block_index
+            && !self.state_manager.is_block_open_of_type(idx, "text")
+        {
+            self.text_block_index = None;
         }
 
         // 获取或创建文本块索引
@@ -916,6 +1124,34 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件（thinking 块关闭前发送）。
+    ///
+    /// Anthropic Messages 规范要求 `thinking` content block 在 `content_block_stop`
+    /// 之前发一个 `signature_delta`，客户端 SDK 会把它原样写回 history。
+    ///
+    /// **Round 6 实测结论**（2026-05-13）：
+    /// - 空字符串 `""`：Anthropic SDK 接受、Kiro 上游接受（HTTP 200）、客户端 schema 校验通过
+    /// - 缺字段：上游 HTTP 502 — 所以字段**必须存在**
+    /// - 任意伪造签名（含 SHA-256(thinking) / stub 占位）：Kiro 上游不识别为合法
+    ///   thinking-cache token，`cache_read_input_tokens` 仍为 0。
+    ///
+    /// 因此空字符串是最优解：满足 schema、零 CPU 开销、与伪造方案功能等价。
+    /// 真正的 thinking-level cache 需要 Kiro 上游回传合法 signature 才能启用，
+    /// 这是上游未实现的特性，不是 proxy 能补的。
+    fn create_thinking_signature_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": ""
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -928,40 +1164,41 @@ impl StreamContext {
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
-        // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
-        if self.thinking_enabled && self.in_thinking_block {
-            if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
-                let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
+        // 这里在开始 tool_use block 前做一次"边界场景"的结束标签识别与过滤。
+        if self.thinking_enabled
+            && self.in_thinking_block
+            && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
+        {
+            let thinking_content = self.thinking_buffer[..end_pos].to_string();
+            if let Some(thinking_index) = self.thinking_block_index
+                && !thinking_content.is_empty()
+            {
+                events.push(self.create_thinking_delta_event(thinking_index, &thinking_content));
+            }
 
-                // 结束 thinking 块
-                self.in_thinking_block = false;
-                self.thinking_extracted = true;
+            // 结束 thinking 块
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+            if let Some(thinking_index) = self.thinking_block_index {
+                // 先发送空的 thinking_delta
+                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                events.push(self.create_thinking_signature_event(thinking_index));
+                // 再发送 content_block_stop
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
                 }
+            }
 
-                // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + "</thinking>".len();
-                let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
-                self.thinking_buffer.clear();
-                if !remaining.is_empty() {
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
+            // 把结束标签后的内容当作普通文本（通常为空或空白）
+            let after_pos = end_pos + "</thinking>".len();
+            let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
+            self.thinking_buffer.clear();
+            if !remaining.is_empty() {
+                events.extend(self.create_text_delta_events(&remaining));
             }
         }
 
@@ -1031,10 +1268,10 @@ impl StreamContext {
         }
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+        if tool_use.stop
+            && let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index)
+        {
+            events.push(stop_event);
         }
 
         events
@@ -1044,6 +1281,9 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // 如果只有 reasoning 内容（没有后续 text/tool_use），在流结束前关闭 reasoning 块
+        events.extend(self.close_reasoning_if_open());
+
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
             if self.in_thinking_block {
@@ -1052,17 +1292,18 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                    if let Some(thinking_index) = self.thinking_block_index
+                        && !thinking_content.is_empty()
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块：先发送空的 thinking_delta + signature_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1090,6 +1331,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1117,110 +1360,55 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 始终基于本地估算输入与 cache 统计来生成 usage，
+        // 避免因服务端压缩导致上游 token 统计偏低，使客户端误判上下文大小。
+        // credit usage 则仅透传上游 meteringEvent，不影响本地 input/cache usage 语义。
+        let final_input_tokens = self.input_tokens;
+        let billed_input_tokens = self
+            .cache_usage
+            .map(|cache_usage| {
+                billed_input_tokens(
+                    final_input_tokens,
+                    cache_usage.cache_creation_input_tokens,
+                    cache_usage.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(final_input_tokens);
+
+        #[cfg(feature = "sensitive-logs")]
+        tracing::info!(
+            estimated_input_tokens = self.input_tokens,
+            context_input_tokens = ?self.context_input_tokens,
+            final_input_tokens,
+            output_tokens = self.output_tokens,
+            "StreamContext usage: final_input_tokens={} (估算值), billed_input_tokens={}, context_input_tokens={} (上游值), output_tokens={}",
+            final_input_tokens,
+            billed_input_tokens,
+            self.context_input_tokens.map_or("N/A".to_string(), |v| v.to_string()),
+            self.output_tokens
+        );
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(FinalUsage {
+            input_tokens: billed_input_tokens,
+            output_tokens: self.output_tokens,
+            cache_usage: self.cache_usage,
+            metering: self.metering.as_ref(),
+        }));
         events
     }
 }
 
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-    ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens,
-            initial_events_generated: false,
-        }
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 生成最终事件
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
-    }
+/// 将总输入 token 转为 Anthropic usage 的 input_tokens 口径（剔除 cache 读写）
+fn billed_input_tokens(
+    input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    input_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .saturating_sub(cache_read_input_tokens)
+        .max(0)
 }
 
 /// 简单的 token 估算
@@ -1247,6 +1435,116 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zero_cache_usage() -> Option<CacheUsageBreakdown> {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+    }
+
+    fn cache_usage(
+        cache_creation_input_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_5m_input_tokens: i32,
+        cache_creation_1h_input_tokens: i32,
+    ) -> Option<CacheUsageBreakdown> {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+        })
+    }
+
+    /// Round 7 regression: "error" must be the highest-priority stop_reason,
+    /// covering end_turn / tool_use / max_tokens / model_context_window_exceeded.
+    /// 上游流中断 (handlers.rs Some(Err(e)) 分支) 与 Event::Error/Exception 都靠
+    /// 这个优先级覆盖默认 end_turn —— Round 5 patch #11-13 的回归保护。
+    #[test]
+    fn test_stop_reason_priority_error_wins_over_end_turn() {
+        let mut mgr = SseStateManager::new();
+        // 先设了 end_turn，再设 error 应该覆盖。
+        mgr.set_stop_reason("end_turn");
+        mgr.set_stop_reason("error");
+        // 模拟 final delta 抽出最终 stop_reason。
+        let final_reason = mgr.stop_reason.clone();
+        assert_eq!(final_reason.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn test_stop_reason_priority_error_wins_over_tool_use_and_max_tokens() {
+        for first_set in &["tool_use", "max_tokens", "model_context_window_exceeded"] {
+            let mut mgr = SseStateManager::new();
+            mgr.set_stop_reason(*first_set);
+            mgr.set_stop_reason("error");
+            assert_eq!(
+                mgr.stop_reason.as_deref(),
+                Some("error"),
+                "error must override {}",
+                first_set
+            );
+        }
+    }
+
+    /// Round 7 regression: Event::Error gets converted to an Anthropic SSE error
+    /// event AND set stop_reason="error" — Round 5 patch #13.
+    #[test]
+    fn test_event_error_emits_sse_error_event() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4", 0, None, false, HashMap::new());
+        let events = ctx.process_kiro_event(&Event::Error {
+            error_code: "ThrottlingException".to_string(),
+            error_message: "Rate limited".to_string(),
+        });
+        assert_eq!(
+            events.len(),
+            1,
+            "Event::Error should emit one SSE error event"
+        );
+        assert_eq!(events[0].event, "error");
+        let data = &events[0].data;
+        assert_eq!(data["type"], "error");
+        assert_eq!(data["error"]["type"], "ThrottlingException");
+        assert_eq!(data["error"]["message"], "Rate limited");
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("error"));
+    }
+
+    /// Round 7 regression: Event::Exception (non ContentLengthExceededException)
+    /// also flows through the new "error" SSE path.
+    #[test]
+    fn test_event_exception_emits_sse_error_event() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4", 0, None, false, HashMap::new());
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "InternalServerException".to_string(),
+            message: "boom".to_string(),
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["error"]["type"], "InternalServerException");
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("error"));
+    }
+
+    /// Round 7 regression: ContentLengthExceededException stays on its
+    /// "max_tokens" override (NOT mapped to "error"), preserving Round 5's
+    /// special-case for the more semantically-precise stop_reason.
+    #[test]
+    fn test_event_content_length_exceeded_keeps_max_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4", 0, None, false, HashMap::new());
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(
+            events.is_empty(),
+            "ContentLengthExceededException emits no SSE event"
+        );
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("max_tokens"));
+    }
 
     #[test]
     fn test_sse_event_format() {
@@ -1297,9 +1595,12 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, map);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1313,7 +1614,10 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
             start_event.data["content_block"]["name"],
             "mcp__very_long_original_tool_name",
@@ -1322,20 +1626,200 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_context_includes_metering_in_message_delta_usage() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            123,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
+        let initial_events = ctx.generate_initial_events();
+        let mut all_events = initial_events;
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "credit".to_string(),
+            unit_plural: "credits".to_string(),
+            usage: 0.75,
+        }));
+
+        all_events.extend(ctx.generate_final_events());
+        let message_start_usage = all_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .map(|e| e.data["message"]["usage"].clone())
+            .expect("message_start should exist");
+
+        let message_delta_usage = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+
+        assert_eq!(message_start_usage["input_tokens"], json!(123));
+        assert_eq!(message_start_usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(message_start_usage["cache_read_input_tokens"], json!(0));
+        assert_eq!(message_delta_usage["input_tokens"], json!(123));
+        assert_eq!(message_delta_usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(message_delta_usage["cache_read_input_tokens"], json!(0));
+        assert_eq!(message_delta_usage["credit_usage"], json!(0.75));
+        assert_eq!(message_delta_usage["credit_unit"], json!("credit"));
+        assert_eq!(message_delta_usage["credit_unit_plural"], json!("credits"));
+    }
+
+    #[test]
+    fn test_stream_context_includes_cache_usage_fields() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            321,
+            cache_usage(7, 8, 0, 0),
+            false,
+            HashMap::new(),
+        );
+        let all_events = ctx.generate_initial_events();
+
+        let message_start_usage = all_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .map(|e| e.data["message"]["usage"].clone())
+            .expect("message_start should exist");
+
+        assert_eq!(message_start_usage["input_tokens"], json!(306));
+        assert_eq!(message_start_usage["cache_creation_input_tokens"], json!(7));
+        assert_eq!(message_start_usage["cache_read_input_tokens"], json!(8));
+    }
+    #[test]
+    fn test_stream_context_uses_billed_input_tokens_when_cache_read_present() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            321,
+            cache_usage(7, 8, 0, 0),
+            false,
+            HashMap::new(),
+        );
+        let initial_events = ctx.generate_initial_events();
+        let message_start_usage = initial_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .map(|e| e.data["message"]["usage"].clone())
+            .expect("message_start should exist");
+
+        let final_events = ctx.generate_final_events();
+        let message_delta_usage = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+
+        assert_eq!(message_start_usage["input_tokens"], json!(306));
+        assert_eq!(message_delta_usage["input_tokens"], json!(306));
+        assert_eq!(message_delta_usage["cache_creation_input_tokens"], json!(7));
+        assert_eq!(message_delta_usage["cache_read_input_tokens"], json!(8));
+    }
+    #[test]
+    fn test_stream_context_omits_cache_usage_fields_when_disabled() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 321, None, false, HashMap::new());
+        let initial_events = ctx.generate_initial_events();
+        let message_start_usage = initial_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .map(|e| e.data["message"]["usage"].clone())
+            .expect("message_start should exist");
+
+        let final_events = ctx.generate_final_events();
+        let message_delta_usage = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+
+        assert_eq!(message_start_usage["input_tokens"], json!(321));
+        assert!(
+            message_start_usage
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(message_start_usage.get("cache_read_input_tokens").is_none());
+        assert_eq!(message_delta_usage["input_tokens"], json!(321));
+        assert!(
+            message_delta_usage
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(message_delta_usage.get("cache_read_input_tokens").is_none());
+        assert!(message_delta_usage.get("cache_creation").is_none());
+    }
+
+    #[test]
+    fn test_stream_context_extracts_cache_from_metering_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1000,
+            cache_usage(50, 800, 30, 20),
+            false,
+            HashMap::new(),
+        );
+
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "credit".to_string(),
+            unit_plural: "credits".to_string(),
+            usage: 0.5,
+        }));
+
+        let final_events = ctx.generate_final_events();
+        let message_delta_usage = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+
+        assert_eq!(message_delta_usage["cache_read_input_tokens"], json!(800));
+        assert_eq!(
+            message_delta_usage["cache_creation_input_tokens"],
+            json!(50)
+        );
+        assert_eq!(
+            message_delta_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            json!(30)
+        );
+        assert_eq!(
+            message_delta_usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            json!(20)
+        );
+        assert_eq!(message_delta_usage["input_tokens"], json!(150));
+    }
+
+    #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
 
         let initial_events = ctx.generate_initial_events();
         assert!(
             initial_events
                 .iter()
-                .any(|e| e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "text")
+                .all(|e| !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "text"))
         );
 
-        let initial_text_index = ctx
-            .text_block_index
-            .expect("initial text block index should exist");
+        // 首次输出文本时应创建 text block
+        let first_text_events = ctx.process_assistant_response("hi");
+        let initial_text_index = first_text_events
+            .iter()
+            .find_map(|e| {
+                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+                    e.data["index"].as_i64()
+                } else {
+                    None
+                }
+            })
+            .expect("text block should start on first text delta")
+            as i32;
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1381,10 +1865,53 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_use_only_does_not_emit_empty_text_block() {
+        // tool_use-only 的流式响应不应产生空 text block（text=""），否则客户端写回 history 会触发上游校验拒绝
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.generate_initial_events());
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            }),
+            "should emit tool_use content_block_start"
+        );
+        assert!(
+            all_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "text")
+            }),
+            "tool_use-only stream should not start a text block"
+        );
+    }
+
+    #[test]
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1591,7 +2118,13 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1643,7 +2176,13 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1663,7 +2202,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1692,7 +2237,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1724,7 +2275,13 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1738,7 +2295,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1748,17 +2310,20 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1790,9 +2355,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1801,7 +2364,13 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1811,7 +2380,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1820,7 +2393,13 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1829,7 +2408,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1838,7 +2421,13 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1849,7 +2438,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1858,7 +2451,13 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1878,7 +2477,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1887,7 +2490,13 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1942,7 +2551,13 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1963,17 +2578,25 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
