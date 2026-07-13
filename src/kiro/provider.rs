@@ -152,6 +152,11 @@ impl KiroProvider {
         }
     }
 
+    /// 获取多凭据 Token 管理器句柄（供 TTFT 上报等外部链路使用）
+    pub fn token_manager(&self) -> Arc<MultiTokenManager> {
+        self.token_manager.clone()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());

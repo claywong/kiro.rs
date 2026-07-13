@@ -892,7 +892,13 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 各模型的 TTFT（首字延迟，毫秒）EWMA 平滑值，key = model。
+    /// 用于 priority 模式同层按响应最快调度。不持久化，重启后重新探测。
+    ttft_ewma: HashMap<String, f64>,
 }
+
+/// TTFT EWMA 平滑系数（α=0.3，等效约最近 6 条样本）
+const TTFT_EWMA_ALPHA: f64 = 0.3;
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1135,6 +1141,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    ttft_ewma: HashMap::new(),
                 }
             })
             .collect();
@@ -1314,14 +1321,25 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：先取最高优先级层（priority 最小），
-                // 同层有多个凭据时按 success_count 均衡（least-used），
-                // 再平局按 id 保证确定性，避免固定压在同一个账号上。
+                // priority 模式（默认）：先取最高优先级层（priority 最小）。
+                // 同层多个凭据时，按该模型的 TTFT EWMA 最小（响应最快）调度；
+                // 无样本的账号视为最优（0），优先探测；
+                // 未指定模型时回退到 success_count（least-used）。
                 let min_priority = available.iter().map(|e| e.credentials.priority).min()?;
                 let entry = available
                     .iter()
                     .filter(|e| e.credentials.priority == min_priority)
-                    .min_by_key(|e| (e.success_count, e.id))?;
+                    .min_by(|a, b| {
+                        let key = |e: &&CredentialEntry| match model {
+                            Some(m) => e.ttft_ewma.get(m).copied().unwrap_or(0.0),
+                            None => e.success_count as f64,
+                        };
+                        // 平局按 id 保证确定性
+                        key(a)
+                            .partial_cmp(&key(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.id.cmp(&b.id))
+                    })?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -1909,6 +1927,21 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 上报某凭据在指定模型上的 TTFT（首字延迟，毫秒），更新 EWMA 平滑值。
+    ///
+    /// 仅流式请求有 TTFT；用于 priority 模式同层按响应最快调度。不持久化。
+    pub fn report_ttft(&self, id: u64, model: &str, ttft_ms: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let sample = ttft_ms as f64;
+            entry
+                .ttft_ewma
+                .entry(model.to_string())
+                .and_modify(|v| *v = TTFT_EWMA_ALPHA * sample + (1.0 - TTFT_EWMA_ALPHA) * *v)
+                .or_insert(sample);
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2998,6 +3031,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                ttft_ewma: HashMap::new(),
             });
         }
 
@@ -4748,6 +4782,49 @@ mod tests {
                 .map(|(id, _)| id),
             Some(2),
             "priority 模式应在同优先级层内选 success_count 最小的凭据"
+        );
+    }
+
+    #[test]
+    fn test_priority_mode_schedules_by_fastest_ttft() {
+        // priority 模式同层：按该模型的 TTFT EWMA 最小（响应最快）调度。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A(id1) 首字慢、B(id2) 首字快
+        manager.report_ttft(1, "claude-sonnet-5", 800);
+        manager.report_ttft(2, "claude-sonnet-5", 200);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(2),
+            "同层应选 TTFT 更小的 B"
+        );
+
+        // 换 B 变慢后应回选 A（EWMA α=0.3，一次大样本足以反超）
+        manager.report_ttft(2, "claude-sonnet-5", 5000);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(1),
+            "B 变慢后应回选 A"
+        );
+
+        // 无样本的模型：两者都视为 0，平局按 id 取靠前的 A
+        assert_eq!(
+            manager
+                .select_next_credential(Some("other-model"), Some("g1"))
+                .map(|(id, _)| id),
+            Some(1),
+            "无 TTFT 样本时平局按 id 取靠前"
         );
     }
 

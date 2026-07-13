@@ -133,6 +133,8 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// Token 管理器句柄，用于结束时上报 TTFT EWMA（可选）
+    token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -171,6 +173,7 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            token_manager: state.kiro_provider.as_ref().map(|p| p.token_manager()),
         }
     }
 
@@ -199,6 +202,12 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        // 上报 TTFT EWMA：用于 priority 模式同层按响应最快调度
+        if let (Some(tm), Some(ttft), true) =
+            (&self.token_manager, first_token_ms, final_credential_id != 0)
+        {
+            tm.report_ttft(final_credential_id, &self.model, ttft);
+        }
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
