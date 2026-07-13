@@ -51,6 +51,8 @@ pub(crate) struct UsageRecordHook {
     pub client_keys: Option<SharedClientKeyManager>,
     pub key_id: u64,
     pub model: String,
+    /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
+    pub effort: Option<String>,
     pub started_at: Instant,
 }
 
@@ -62,8 +64,14 @@ impl UsageRecordHook {
             client_keys: state.client_keys.clone(),
             key_id,
             model,
+            effort: None,
             started_at: Instant::now(),
         }
+    }
+
+    /// 设置本次请求最终下发的 effort（在完成请求转换、拿到归一化 effort 后调用）
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.effort = effort;
     }
 
     pub fn record(
@@ -92,6 +100,7 @@ impl UsageRecordHook {
             },
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
+            effort: self.effort.clone(),
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -129,6 +138,8 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
+    /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
+    effort: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -158,6 +169,8 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
+    effort: Option<String>,
 }
 
 impl RequestTracer {
@@ -170,6 +183,7 @@ impl RequestTracer {
             key_source: options.key_ctx.key_source,
             model: options.model,
             is_stream: options.is_stream,
+            effort: options.effort,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -228,6 +242,7 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            effort: self.effort.clone(),
             attempts,
         };
         store.insert(&rec);
@@ -617,7 +632,7 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -697,6 +712,10 @@ pub async fn post_messages(
         }
     };
 
+    // 最终下发的推理思考级别，落入用量日志与链路追踪
+    let effort = extract_effort(&conversion_result);
+    hook.set_effort(effort.clone());
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -757,6 +776,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                effort: effort.clone(),
             },
         ));
         handle_stream_request(
@@ -782,6 +802,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                effort: effort.clone(),
             },
         ));
         handle_non_stream_request(
@@ -1332,6 +1353,20 @@ fn build_non_stream_content(
     content
 }
 
+/// 从转换结果里取出最终下发的推理思考级别（effort）。
+///
+/// 取的是 converter 归一化后、真正写进 `additionalModelRequestFields.output_config`
+/// 的值，与实际发往上游的请求一致；未请求 effort 时为 None。
+fn extract_effort(
+    conversion_result: &super::converter::ConversionResult,
+) -> Option<String> {
+    conversion_result
+        .additional_model_request_fields
+        .as_ref()
+        .and_then(|f| f.output_config.as_ref())
+        .map(|oc| oc.effort.clone())
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
@@ -1408,7 +1443,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1488,6 +1523,10 @@ pub async fn post_messages_cc(
         }
     };
 
+    // 最终下发的推理思考级别，落入用量日志与链路追踪
+    let effort = extract_effort(&conversion_result);
+    hook.set_effort(effort.clone());
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -1547,6 +1586,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                effort: effort.clone(),
             },
         ));
         handle_stream_request_buffered(
@@ -1572,6 +1612,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                effort: effort.clone(),
             },
         ));
         handle_non_stream_request(
