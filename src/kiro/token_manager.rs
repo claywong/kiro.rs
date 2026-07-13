@@ -268,6 +268,11 @@ pub(crate) async fn refresh_token_with_id(
     proxy: Option<&ProxyConfig>,
     _id: u64,
 ) -> anyhow::Result<KiroCredentials> {
+    // API Key 凭据无 refreshToken，无法刷新，必须先于 refreshToken 校验拒绝
+    if credentials.is_api_key_credential() {
+        bail!("API Key 凭据不支持刷新");
+    }
+
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式

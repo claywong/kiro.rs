@@ -48,7 +48,6 @@ impl IdeEndpoint {
         )
     }
 
-    #[allow(dead_code)]
     fn is_aws_sso_oidc_credentials(credentials: &KiroCredentials) -> bool {
         let auth_method = credentials.auth_method.as_deref();
         matches!(auth_method, Some("builder-id") | Some("idc"))
@@ -75,6 +74,11 @@ impl IdeEndpoint {
     /// 都必须携带，否则 CodeWhisperer 返回 403 "User is not authorized to make this call."。
     /// 旧逻辑对所有 SSO OIDC 凭据无条件剥离 profileArn，导致企业租户账号全线 403。
     fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
+        // AWS SSO OIDC（builder-id / idc / 通过 client credentials 换取）凭据不携带 profileArn，
+        // 由服务端按 token 自行解析。external_idp 走独立的 EXTERNAL_IDP 分支，不受此约束。
+        if Self::is_aws_sso_oidc_credentials(credentials) {
+            return None;
+        }
         credentials.profile_arn.as_deref().filter(|s| !s.is_empty())
     }
 
@@ -82,23 +86,41 @@ impl IdeEndpoint {
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
+        // AWS SSO OIDC 凭据：剥离 body 中残留的 profileArn，交由服务端按 token 解析。
+        if Self::is_aws_sso_oidc_credentials(credentials) {
+            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
+            if let Some(obj) = request.as_object_mut() {
+                obj.remove("profileArn");
+            }
+            return Ok(serde_json::to_string(&request)?);
+        }
+
+        // 非 SSO OIDC 凭据且无真实 profileArn。
+        let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) else {
+            // 已显式声明 auth_method 的账号（如 social/personal 自带 profile）：body 原样透传。
+            // 未声明 auth_method 的凭据：移除 body 里残留的占位符 profileArn，避免发送无效值。
+            let has_explicit_auth_method = credentials
+                .auth_method
+                .as_deref()
+                .is_some_and(|m| !m.trim().is_empty());
+            if has_explicit_auth_method {
+                return Ok(request_body.to_string());
+            }
+            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
+            if let Some(obj) = request.as_object_mut() {
+                obj.remove("profileArn");
+            }
+            return Ok(serde_json::to_string(&request)?);
+        };
+
         let mut request: serde_json::Value = serde_json::from_str(request_body)?;
         let obj = request
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
-
-        match Self::mcp_profile_arn_header_value(credentials) {
-            Some(profile_arn) => {
-                obj.insert(
-                    "profileArn".to_string(),
-                    serde_json::Value::String(profile_arn.to_string()),
-                );
-            }
-            None => {
-                // 无真实 profileArn：移除 body 里可能残留的占位符，避免发送无效值。
-                obj.remove("profileArn");
-            }
-        }
+        obj.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(profile_arn.to_string()),
+        );
         Ok(serde_json::to_string(&request)?)
     }
 }
