@@ -514,6 +514,8 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值） */
+  effort?: string | null
   attempts: TraceAttempt[]
 }
 

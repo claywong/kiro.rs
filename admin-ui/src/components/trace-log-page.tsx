@@ -118,6 +118,45 @@ function formatTokenFull(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+/**
+ * 输出速率 OTPS（output tokens / second）。
+ * - 流式：分母取「耗时 - 首 Token 延迟」（即真正产出内容的时间）
+ * - 非流式：无首 Token 概念，分母取整段耗时
+ * 分母 <= 0 或无输出时返回 null（不展示）。
+ */
+function computeOtps(rec: TraceRecord): number | null {
+  const output = rec.outputTokens ?? 0
+  if (output <= 0) return null
+  const ttft = rec.isStream && rec.firstTokenMs != null ? rec.firstTokenMs : 0
+  const genMs = rec.durationMs - ttft
+  if (genMs <= 0) return null
+  return (output / genMs) * 1000
+}
+
+function formatOtps(v: number): string {
+  if (v >= 100) return v.toFixed(0)
+  return v.toFixed(1)
+}
+
+/** effort 级别 → Badge 颜色 */
+function effortVariant(
+  effort: string,
+): 'default' | 'secondary' | 'outline' | 'success' | 'warning' {
+  switch (effort) {
+    case 'low':
+      return 'secondary'
+    case 'medium':
+      return 'outline'
+    case 'high':
+      return 'default'
+    case 'max':
+    case 'xhigh':
+      return 'warning'
+    default:
+      return 'secondary'
+  }
+}
+
 function credLabel(id: number, email?: string | null): string {
   if (id === 0) return '—'
   return email ? email : `#${id}`
@@ -191,6 +230,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   ]
   if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
   if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
+  const otps = computeOtps(rec)
   return (
     <TooltipProvider delayDuration={150}>
       <Tooltip>
@@ -202,6 +242,11 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
             <span className="text-violet-600 dark:text-violet-400">
               ↑{formatTokens(output)}
             </span>
+            {otps != null && (
+              <span className="text-[10px] font-normal text-muted-foreground">
+                {formatOtps(otps)} t/s
+              </span>
+            )}
           </span>
         </TooltipTrigger>
         <TooltipContent className="p-0">
@@ -220,6 +265,16 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
                   {formatTokenFull(total)}
                 </span>
               </div>
+              {otps != null && (
+                <div className="flex items-center justify-between gap-6">
+                  <span className="text-muted-foreground">
+                    输出速率{rec.isStream ? '（扣除首 Token）' : ''}
+                  </span>
+                  <span className="font-mono tabular-nums">
+                    {formatOtps(otps)} tokens/s
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         </TooltipContent>
@@ -250,6 +305,11 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3 text-[13px]">
           <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
+          {rec.effort && (
+            <Badge variant={effortVariant(rec.effort)} className="ml-1.5">
+              {rec.effort}
+            </Badge>
+          )}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
           <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>

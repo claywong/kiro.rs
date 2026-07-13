@@ -49,6 +49,9 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+    /// 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -733,6 +736,7 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            effort: None,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -771,6 +775,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            effort: None,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -784,6 +789,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            effort: None,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -838,6 +844,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            effort: None,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -851,6 +858,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            effort: None,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -900,6 +908,7 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            effort: None,
         };
         agg.ingest(&rec);
         let ov = agg.overview();
