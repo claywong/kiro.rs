@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,6 +20,9 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
+use crate::kiro::session_affinity::{
+    SessionAffinityCache, SessionAffinityContext, SessionAffinityKey,
+};
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -1051,6 +1054,9 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 进程内会话到凭据的有界滑动 TTL 映射。
+    session_affinity: SessionAffinityCache,
+    session_affinity_enabled: bool,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
@@ -1238,6 +1244,9 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let session_affinity_enabled = config.session_affinity_enabled;
+        let session_affinity_ttl = StdDuration::from_secs(config.session_affinity_ttl_secs.max(1));
+        let session_affinity_max_entries = config.session_affinity_max_entries;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1249,6 +1258,11 @@ impl MultiTokenManager {
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            session_affinity: SessionAffinityCache::new(
+                session_affinity_ttl,
+                session_affinity_max_entries,
+            ),
+            session_affinity_enabled,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
@@ -1329,7 +1343,17 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &HashSet::new())
+    }
+
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1337,6 +1361,9 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
+                if excluded.contains(&e.id) {
+                    return false;
+                }
                 if e.disabled {
                     return false;
                 }
@@ -1414,9 +1441,29 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_affinity(model, group, None, &HashSet::new())
+            .await
+    }
+
+    /// Acquire a credential while preferring the credential already bound to this session.
+    ///
+    /// Disabled, deleted, or request-incompatible bindings are removed. RPM and account
+    /// cooldowns only bypass the binding for the current request, so the session returns to
+    /// its original credential after the temporary condition clears.
+    pub async fn acquire_context_with_affinity(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        affinity: Option<&SessionAffinityContext>,
+        excluded: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        let affinity_key = self
+            .session_affinity_enabled
+            .then(|| affinity.map(|ctx| SessionAffinityKey::new(ctx, group, model)))
+            .flatten();
 
         loop {
             if attempt_count >= max_attempts {
@@ -1430,16 +1477,42 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
+                let mut preserve_affinity = false;
+                let affinity_hit = affinity_key.as_ref().and_then(|key| {
+                    let bound_id = self.session_affinity.get(key)?;
+                    let entries = self.entries.lock();
+                    let now = Instant::now();
+                    let Some(entry) = entries.iter().find(|e| e.id == bound_id) else {
+                        drop(entries);
+                        self.session_affinity.remove(key);
+                        return None;
+                    };
+                    if entry.disabled || !credential_matches_request(&entry.credentials, model, group) {
+                        drop(entries);
+                        self.session_affinity.remove(key);
+                        return None;
+                    }
+                    if excluded.contains(&entry.id)
+                        || entry.throttled_until.map(|t| t > now).unwrap_or(false)
+                        || is_rpm_exceeded(entry, now)
+                    {
+                        preserve_affinity = true;
+                        return None;
+                    }
+                    Some((entry.id, entry.credentials.clone()))
+                });
+
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if affinity_key.is_some() || is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
                     let is_available = |e: &CredentialEntry| {
-                        !e.disabled
+                        !excluded.contains(&e.id)
+                            && !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !is_rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
@@ -1472,11 +1545,11 @@ impl MultiTokenManager {
                     }
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = affinity_hit.or(current_hit) {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1495,11 +1568,14 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best = self.select_next_credential_excluding(model, group, excluded);
                         }
                     }
 
                     if let Some((new_id, new_creds)) = best {
+                        if let Some(key) = affinity_key.as_ref().filter(|_| !preserve_affinity) {
+                            self.session_affinity.insert(key.clone(), new_id);
+                        }
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
@@ -1546,6 +1622,18 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    pub fn invalidate_session_affinity(
+        &self,
+        context: &SessionAffinityContext,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) {
+        if self.session_affinity_enabled {
+            let key = SessionAffinityKey::new(context, group, model);
+            self.session_affinity.remove(&key);
         }
     }
 
@@ -2465,6 +2553,9 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
+        if disabled {
+            self.session_affinity.invalidate_credential(id);
+        }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -3370,6 +3461,7 @@ impl MultiTokenManager {
         }
 
         // 持久化更改
+        self.session_affinity.invalidate_credential(id);
         self.persist_credentials()?;
 
         // 立即回写统计数据，清除已删除凭据的残留条目
@@ -4815,6 +4907,120 @@ mod tests {
             .downcast_ref::<UpstreamRateLimitError>()
             .expect("RPM 达限应返回类型化 429");
         assert!(rate_limit.retry_after().is_some());
+    }
+
+    fn affinity_manager(credentials: Vec<KiroCredentials>) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.session_affinity_enabled = true;
+        config.session_affinity_ttl_secs = 3600;
+        config.session_affinity_max_entries = 100;
+        MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_affinity_reuses_credential_despite_balancing_change() {
+        let manager = affinity_manager(vec![
+            grouped_cred("first", &["g1"]),
+            grouped_cred("second", &["g1"]),
+        ]);
+        let session = SessionAffinityContext::new(10, "session-a");
+
+        let first = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+        let repeated = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        let other_session = manager
+            .acquire_context_with_affinity(
+                Some("sonnet"),
+                Some("g1"),
+                Some(&SessionAffinityContext::new(10, "session-b")),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(repeated.id, first.id);
+        assert_ne!(other_session.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn rpm_limit_temporarily_bypasses_without_rebinding_session() {
+        let mut first = grouped_cred("first", &["g1"]);
+        first.rpm_limit = 1;
+        let manager = affinity_manager(vec![first, grouped_cred("second", &["g1"])]);
+        let session = SessionAffinityContext::new(10, "session-a");
+
+        let original = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        assert!(manager.try_record_request(original.id));
+        let bypass = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        assert_ne!(bypass.id, original.id);
+
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|entry| entry.id == original.id)
+            .unwrap()
+            .recent_requests
+            .clear();
+        let restored = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(restored.id, original.id);
+    }
+
+    #[tokio::test]
+    async fn disabling_bound_credential_rebinds_session() {
+        let manager = affinity_manager(vec![
+            grouped_cred("first", &["g1"]),
+            grouped_cred("second", &["g1"]),
+        ]);
+        let session = SessionAffinityContext::new(10, "session-a");
+        let original = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+
+        manager.set_disabled(original.id, true).unwrap();
+        let rebound = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        assert_ne!(rebound.id, original.id);
+    }
+
+    #[tokio::test]
+    async fn credential_failure_invalidation_rebinds_session() {
+        let manager = affinity_manager(vec![
+            grouped_cred("first", &["g1"]),
+            grouped_cred("second", &["g1"]),
+        ]);
+        let session = SessionAffinityContext::new(10, "session-a");
+        let original = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        manager.report_success(original.id);
+
+        manager.invalidate_session_affinity(&session, Some("sonnet"), Some("g1"));
+        let rebound = manager
+            .acquire_context_with_affinity(Some("sonnet"), Some("g1"), Some(&session), &HashSet::new())
+            .await
+            .unwrap();
+        assert_ne!(rebound.id, original.id);
     }
 
     #[test]

@@ -129,6 +129,18 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// Whether requests from the same client session prefer the same credential.
+    #[serde(default)]
+    pub session_affinity_enabled: bool,
+
+    /// Sliding expiration for session affinity entries, in seconds.
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+
+    /// Maximum number of process-local session affinity entries.
+    #[serde(default = "default_session_affinity_max_entries")]
+    pub session_affinity_max_entries: usize,
+
     /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
     ///
     /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
@@ -220,6 +232,14 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_session_affinity_ttl_secs() -> u64 {
+    60 * 60
+}
+
+fn default_session_affinity_max_entries() -> usize {
+    10_000
+}
+
 fn default_account_throttle_failover() -> bool {
     true
 }
@@ -283,6 +303,9 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            session_affinity_enabled: false,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
+            session_affinity_max_entries: default_session_affinity_max_entries(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),

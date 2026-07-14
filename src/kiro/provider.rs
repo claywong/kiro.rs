@@ -17,6 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::session_affinity::SessionAffinityContext;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -244,23 +245,47 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// `sink` 可选，用于逐跳上报链路追踪。
+    #[allow(dead_code)]
     pub async fn call_api(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, group, None).await
+    }
+
+    pub async fn call_api_with_affinity(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        affinity: Option<&SessionAffinityContext>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, false, sink, group, affinity)
+            .await
     }
 
     /// 发送流式 API 请求
+    #[allow(dead_code)]
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, group, None).await
+    }
+
+    pub async fn call_api_stream_with_affinity(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        affinity: Option<&SessionAffinityContext>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, true, sink, group, affinity)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -464,6 +489,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        affinity: Option<&SessionAffinityContext>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -471,6 +497,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
+        let mut excluded_credentials: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -479,7 +506,16 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_with_affinity(
+                    model.as_deref(),
+                    group,
+                    affinity,
+                    &excluded_credentials,
+                )
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -499,6 +535,9 @@ impl KiroProvider {
 
             if !rpm_recorded.contains(&ctx.id) {
                 if !self.token_manager.try_record_request(ctx.id) {
+                    if affinity.is_some() {
+                        excluded_credentials.insert(ctx.id);
+                    }
                     continue;
                 }
                 rpm_recorded.insert(ctx.id);
@@ -519,6 +558,16 @@ impl KiroProvider {
                     );
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
+                    if affinity.is_some() {
+                        excluded_credentials.insert(ctx.id);
+                    }
+                    if let Some(affinity) = affinity {
+                        self.token_manager.invalidate_session_affinity(
+                            affinity,
+                            model.as_deref(),
+                            group,
+                        );
+                    }
                     continue;
                 }
             };
@@ -610,6 +659,7 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                excluded_credentials.insert(ctx.id);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -665,6 +715,16 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                if affinity.is_some() {
+                    excluded_credentials.insert(ctx.id);
+                }
+                if let Some(affinity) = affinity {
+                    self.token_manager.invalidate_session_affinity(
+                        affinity,
+                        model.as_deref(),
+                        group,
+                    );
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -711,6 +771,7 @@ impl KiroProvider {
                         model.as_deref(),
                         group,
                     );
+                excluded_credentials.insert(ctx.id);
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),
                     outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,

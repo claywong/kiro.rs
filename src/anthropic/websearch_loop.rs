@@ -24,6 +24,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
+use crate::kiro::session_affinity::SessionAffinityContext;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
@@ -198,6 +199,7 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    affinity: Option<&SessionAffinityContext>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
@@ -237,7 +239,10 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider
+        .call_api_stream_with_affinity(&request_body, None, group, affinity)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -518,6 +523,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    affinity: Option<SessionAffinityContext>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
@@ -540,6 +546,7 @@ pub(super) async fn run_web_search_loop(
                 &hook,
                 fallback_input_tokens,
                 group.as_deref(),
+                affinity.as_ref(),
                 tool_compatibility_mode,
             )
             .await

@@ -11,13 +11,14 @@ use crate::admin::trace_db::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::session_affinity::SessionAffinityContext;
 use crate::token;
 use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -36,6 +37,36 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
+
+const SESSION_ID_HEADERS: [&str; 4] = [
+    "x-session-id",
+    "session-id",
+    "idempotency-key",
+    "x-client-request-id",
+];
+
+fn session_affinity_context(
+    headers: &HeaderMap,
+    payload: &MessagesRequest,
+    client_key_id: u64,
+) -> Option<SessionAffinityContext> {
+    let header_session = SESSION_ID_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 1024)
+    });
+    let session_id = header_session.or_else(|| {
+        payload
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.user_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 1024)
+    })?;
+    Some(SessionAffinityContext::new(client_key_id, session_id))
+}
 
 /// 请求结束时记录用量的钩子
 ///
@@ -611,6 +642,7 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -633,6 +665,7 @@ pub async fn post_messages(
         );
     }
     let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let affinity = session_affinity_context(&headers, &payload, key_ctx.key_id);
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -683,7 +716,7 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), affinity, state.tool_compatibility_mode)
             .await;
     }
 
@@ -791,6 +824,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            affinity,
         )
         .await
     } else {
@@ -817,6 +851,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            affinity,
         )
         .await
     }
@@ -835,9 +870,15 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    affinity: Option<SessionAffinityContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream_with_affinity(
+        request_body,
+        Some(tracer.as_ref()),
+        group.as_deref(),
+        affinity.as_ref(),
+    ).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1054,9 +1095,15 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    affinity: Option<SessionAffinityContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_with_affinity(
+        request_body,
+        Some(tracer.as_ref()),
+        group.as_deref(),
+        affinity.as_ref(),
+    ).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1434,6 +1481,7 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1444,6 +1492,7 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
     let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let affinity = session_affinity_context(&headers, &payload, key_ctx.key_id);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1494,7 +1543,7 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), affinity, state.tool_compatibility_mode)
             .await;
     }
 
@@ -1601,6 +1650,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            affinity,
         )
         .await
     } else {
@@ -1627,6 +1677,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            affinity,
         )
         .await
     }
@@ -1648,9 +1699,15 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    affinity: Option<SessionAffinityContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream_with_affinity(
+        request_body,
+        Some(tracer.as_ref()),
+        group.as_deref(),
+        affinity.as_ref(),
+    ).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -2020,5 +2077,31 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    #[test]
+    fn affinity_prefers_explicit_session_header() {
+        let payload: MessagesRequest = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4-8","max_tokens":100,"messages":[],"metadata":{"user_id":"metadata-session"}}"#,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "header-session".parse().unwrap());
+
+        let context = session_affinity_context(&headers, &payload, 42).unwrap();
+        assert_eq!(context.client_key_id, 42);
+        assert_eq!(context.session_id, "header-session");
+    }
+
+    #[test]
+    fn affinity_falls_back_to_metadata_user_id() {
+        let payload: MessagesRequest = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4-8","max_tokens":100,"messages":[],"metadata":{"user_id":"metadata-session"}}"#,
+        )
+        .unwrap();
+
+        let context = session_affinity_context(&HeaderMap::new(), &payload, 7).unwrap();
+        assert_eq!(context.client_key_id, 7);
+        assert_eq!(context.session_id, "metadata-session");
     }
 }

@@ -295,6 +295,9 @@ Admin API 鉴权同样支持：
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `sessionAffinityEnabled` | `false` | 同一客户端会话优先复用相同凭据；支持 `X-Session-ID`、`Session-Id`、`Idempotency-Key`、`X-Client-Request-Id` 和 `metadata.user_id` |
+| `sessionAffinityTtlSecs` | `3600` | 会话绑定的滑动过期时间（秒） |
+| `sessionAffinityMaxEntries` | `10000` | 单进程最多保存的会话绑定数量，超限淘汰最久未访问项 |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
