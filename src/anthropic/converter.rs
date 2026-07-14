@@ -193,6 +193,30 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// 已支持的非 Claude 模型规范名（小写）。
+///
+/// 这些模型由 Kiro 上游原样透传（modelId 即此处的规范名），不做版本改写。
+/// 匹配采用 `contains`：客户端名包含规范名即命中（自然忽略 `-thinking` 等后缀）。
+/// 顺序无关——各规范名互不为子串。
+const NON_CLAUDE_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "deepseek-3.2",
+    "minimax-m2.5",
+    "minimax-m2.1",
+    "glm-5",
+    "qwen3-coder-next",
+];
+
+/// 将非 Claude 模型名映射为透传给上游的规范名（小写）。命中返回规范名，否则 `None`。
+fn map_non_claude_model(model_lower: &str) -> Option<String> {
+    NON_CLAUDE_MODELS
+        .iter()
+        .find(|canonical| model_lower.contains(**canonical))
+        .map(|canonical| canonical.to_string())
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
@@ -236,11 +260,19 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
+    } else if let Some(canonical) = map_non_claude_model(&model_lower) {
+        // 非 Claude 模型：原样透传规范名给上游（`-thinking` 等后缀已被剥掉）
+        Some(canonical)
     } else if model_lower.starts_with("gpt-5") {
-        // GPT-5.x models served by the Kiro backend (e.g. gpt-5.6-sol / terra / luna).
-        // Kiro advertises and accepts these ids verbatim, so pass them through unchanged.
-        // Scoped to gpt-5* so legacy ids like "gpt-4" stay unsupported.
-        Some(model_lower)
+        // 兜底：Kiro 后端新增的 gpt-5.x（尚未登记进 NON_CLAUDE_MODELS）原样透传。
+        // 限定 gpt-5* 以免 "gpt-4" 这类 legacy id 被误认为受支持。
+        // 仍需剥掉 `-thinking`——上游只接受裸模型名。
+        Some(
+            model_lower
+                .strip_suffix("-thinking")
+                .unwrap_or(&model_lower)
+                .to_string(),
+        )
     } else {
         None
     }
@@ -250,7 +282,8 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 4.7 / 4.8 同 1M。
+/// 非 Claude 模型：gpt-5.6 系为 272k，其余（deepseek/minimax/glm/qwen）为 200k。
 pub fn get_context_window_size(model: &str) -> i32 {
     // 自定义模型若显式声明了上下文窗口，优先返回。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
@@ -1899,6 +1932,39 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+        // claude-sonnet-4（无 4.5/4.6/4.8/5 版本号）仍不支持
+        assert!(map_model("claude-sonnet-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_non_claude_passthrough() {
+        // 非 Claude 模型原样透传规范名（小写），忽略 -thinking 等后缀
+        for (input, expected) in [
+            ("gpt-5.6-sol", "gpt-5.6-sol"),
+            ("gpt-5.6-terra", "gpt-5.6-terra"),
+            ("gpt-5.6-luna", "gpt-5.6-luna"),
+            ("deepseek-3.2", "deepseek-3.2"),
+            ("minimax-m2.5", "minimax-m2.5"),
+            ("minimax-m2.1", "minimax-m2.1"),
+            ("glm-5", "glm-5"),
+            ("qwen3-coder-next", "qwen3-coder-next"),
+            ("GPT-5.6-Sol-thinking", "gpt-5.6-sol"),
+        ] {
+            assert_eq!(map_model(input), Some(expected.to_string()), "input={input}");
+        }
+    }
+
+    #[test]
+    fn test_context_window_non_claude() {
+        // gpt-5.6 系 → 272k，其余非 Claude → 200k
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+        assert_eq!(get_context_window_size("deepseek-3.2"), 200_000);
+        assert_eq!(get_context_window_size("minimax-m2.5"), 200_000);
+        assert_eq!(get_context_window_size("minimax-m2.1"), 200_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
+        assert_eq!(get_context_window_size("qwen3-coder-next"), 200_000);
     }
 
     #[test]
