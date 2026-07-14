@@ -27,6 +27,10 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 每分钟请求数上限（0 表示不限速）
+    pub rpm_limit: u32,
+    /// 当前 60 秒滑动窗口内已使用的请求数
+    pub rpm_current: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -156,6 +160,10 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub priority: u32,
 
+    /// 每分钟请求数上限（新凭据默认 10；0 表示不限速）
+    #[serde(default = "default_rpm_limit")]
+    pub rpm_limit: u32,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -203,6 +211,10 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+fn default_rpm_limit() -> u32 {
+    10
+}
+
 /// 更新 refreshToken 请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,6 +247,9 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 每分钟请求数上限（None 表示不修改，0 表示不限速）
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
 }
 
 /// 添加凭据成功响应
@@ -1084,4 +1099,23 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod rpm_tests {
+    use super::{AddCredentialRequest, UpdateCredentialRequest};
+
+    #[test]
+    fn add_credential_defaults_rpm_to_ten() {
+        let request: AddCredentialRequest =
+            serde_json::from_str(r#"{"refreshToken":"token"}"#).unwrap();
+        assert_eq!(request.rpm_limit, 10);
+    }
+
+    #[test]
+    fn update_credential_accepts_unlimited_rpm() {
+        let request: UpdateCredentialRequest =
+            serde_json::from_str(r#"{"rpmLimit":0}"#).unwrap();
+        assert_eq!(request.rpm_limit, Some(0));
+    }
 }
