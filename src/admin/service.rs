@@ -549,6 +549,8 @@ impl AdminService {
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
+                    rpm_limit: entry.rpm_limit,
+                    rpm_current: entry.rpm_current,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -1071,6 +1073,7 @@ impl AdminService {
             issuer_url: req.issuer_url,
             scopes: req.scopes,
             priority: req.priority,
+            rpm_limit: req.rpm_limit,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -1210,6 +1213,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.rpm_limit,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2309,6 +2313,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // rpm_limit 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2378,7 +2383,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

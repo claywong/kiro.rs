@@ -282,6 +282,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut rpm_recorded: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
@@ -298,6 +299,13 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            if !rpm_recorded.contains(&ctx.id) {
+                if !self.token_manager.try_record_request(ctx.id) {
+                    continue;
+                }
+                rpm_recorded.insert(ctx.id);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -462,6 +470,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut rpm_recorded: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -487,6 +496,13 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            if !rpm_recorded.contains(&ctx.id) {
+                if !self.token_manager.try_record_request(ctx.id) {
+                    continue;
+                }
+                rpm_recorded.insert(ctx.id);
+            }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await?;

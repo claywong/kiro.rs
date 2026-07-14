@@ -33,6 +33,7 @@ interface CredentialInput {
   authRegion?: string
   apiRegion?: string
   priority?: number
+  rpmLimit?: number
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
@@ -176,6 +177,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authMethod: 'api_key',
               kiroApiKey: apiKey,
               priority: cred.priority || 0,
+              rpmLimit: cred.rpmLimit ?? 10,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -233,6 +235,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               issuerUrl: cred.issuerUrl?.trim() || undefined,
               scopes: cred.scopes?.trim() || undefined,
               priority: cred.priority || 0,
+              rpmLimit: cred.rpmLimit ?? 10,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,

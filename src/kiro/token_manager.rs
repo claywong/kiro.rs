@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -895,6 +895,8 @@ struct CredentialEntry {
     /// 各模型的 TTFT（首字延迟）EWMA 样本，key = model。
     /// 用于 priority 模式同层按响应最快调度。不持久化，重启后重新探测。
     ttft_ewma: HashMap<String, TtftSample>,
+    /// 最近 60 秒内向上游发起请求的时间戳，仅用于进程内 RPM 滑动窗口。
+    recent_requests: VecDeque<Instant>,
 }
 
 /// 单个模型的 TTFT EWMA 样本：平滑值 + 最后更新时刻。
@@ -952,6 +954,10 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 每分钟请求数上限（0 表示不限速）
+    pub rpm_limit: u32,
+    /// 当前 60 秒滑动窗口内已使用的请求数
+    pub rpm_current: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1101,6 +1107,31 @@ fn credential_matches_request(
     group_matches(&credentials.groups, group)
 }
 
+const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
+
+fn rpm_window_count(entry: &CredentialEntry, now: Instant) -> u32 {
+    let cutoff = now.checked_sub(RPM_WINDOW);
+    entry
+        .recent_requests
+        .iter()
+        .filter(|&&timestamp| cutoff.map(|c| timestamp > c).unwrap_or(true))
+        .count() as u32
+}
+
+fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
+    let limit = entry.credentials.rpm_limit;
+    limit > 0 && rpm_window_count(entry, now) >= limit
+}
+
+fn rpm_retry_after_secs(entry: &CredentialEntry, now: Instant) -> Option<u64> {
+    if !is_rpm_exceeded(entry, now) {
+        return None;
+    }
+    let reset_at = entry.recent_requests.front()?.checked_add(RPM_WINDOW)?;
+    let remaining = reset_at.checked_duration_since(now)?;
+    Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -1159,6 +1190,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     ttft_ewma: HashMap::new(),
+                    recent_requests: VecDeque::new(),
                 }
             })
             .collect();
@@ -1312,6 +1344,9 @@ impl MultiTokenManager {
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
+                if is_rpm_exceeded(e, now) {
+                    return false;
+                }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
                 if !credential_matches_request(&e.credentials, model, group) {
                     return false;
@@ -1406,6 +1441,7 @@ impl MultiTokenManager {
                     let is_available = |e: &CredentialEntry| {
                         !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                            && !is_rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
                     };
                     // 当前活跃凭据所在的最高优先级层若存在多个可用凭据，
@@ -1470,6 +1506,21 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
+                        let now = Instant::now();
+                        let retry_after = entries
+                            .iter()
+                            .filter(|e| {
+                                !e.disabled
+                                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                    && credential_matches_request(&e.credentials, model, group)
+                            })
+                            .filter_map(|e| rpm_retry_after_secs(e, now))
+                            .min();
+                        if let Some(retry_after) = retry_after {
+                            return Err(anyhow::Error::new(UpstreamRateLimitError::new(Some(
+                                retry_after.max(1).to_string(),
+                            ))));
+                        }
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -1926,6 +1977,33 @@ impl MultiTokenManager {
         }
     }
 
+    /// 原子校验并记录一次外部请求使用该凭据。
+    /// Provider 对同一外部请求中的同凭据重试去重；故障转移到新凭据时分别记账。
+    pub(crate) fn try_record_request(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(RPM_WINDOW);
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if let Some(cutoff) = cutoff {
+                while entry
+                    .recent_requests
+                    .front()
+                    .is_some_and(|timestamp| *timestamp <= cutoff)
+                {
+                    entry.recent_requests.pop_front();
+                }
+            }
+            if entry.credentials.rpm_limit > 0
+                && entry.recent_requests.len() >= entry.credentials.rpm_limit as usize
+            {
+                return false;
+            }
+            entry.recent_requests.push_back(now);
+            return true;
+        }
+        false
+    }
+
     /// 报告指定凭据 API 调用成功
     ///
     /// 重置该凭据的失败计数
@@ -2284,6 +2362,8 @@ impl MultiTokenManager {
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
+                    rpm_limit: e.credentials.rpm_limit,
+                    rpm_current: rpm_window_count(e, now),
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3031,6 +3111,7 @@ impl MultiTokenManager {
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
+        validated_cred.rpm_limit = new_cred.rpm_limit;
         validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
             crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
@@ -3090,6 +3171,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 ttft_ewma: HashMap::new(),
+                recent_requests: VecDeque::new(),
             });
         }
 
@@ -3114,6 +3196,7 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        rpm_limit: Option<u32>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3141,6 +3224,9 @@ impl MultiTokenManager {
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(rpm_limit) = rpm_limit {
+                entry.credentials.rpm_limit = rpm_limit;
             }
         }
         self.persist_credentials()?;
@@ -4653,6 +4739,82 @@ mod tests {
         c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         c.groups = groups.iter().map(|s| s.to_string()).collect();
         c
+    }
+
+    #[test]
+    fn rpm_window_enforces_limit_and_is_atomic() {
+        let mut credential = grouped_cred("limited", &[]);
+        credential.rpm_limit = 5;
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
+                .unwrap(),
+        );
+
+        let threads: Vec<_> = (0..20)
+            .map(|_| {
+                let manager = std::sync::Arc::clone(&manager);
+                std::thread::spawn(move || manager.try_record_request(1))
+            })
+            .collect();
+        let accepted = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
+
+        assert_eq!(accepted, 5);
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].rpm_current, 5);
+        assert_eq!(snapshot.entries[0].rpm_limit, 5);
+    }
+
+    #[test]
+    fn rpm_window_discards_expired_requests() {
+        let mut credential = grouped_cred("limited", &[]);
+        credential.rpm_limit = 1;
+        let manager = MultiTokenManager::new(
+            Config::default(), vec![credential], None, None, false,
+        ).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].recent_requests
+                .push_back(Instant::now() - StdDuration::from_secs(61));
+        }
+
+        assert!(manager.try_record_request(1));
+        assert!(!manager.try_record_request(1));
+        assert_eq!(manager.snapshot().entries[0].rpm_current, 1);
+    }
+
+    #[test]
+    fn selection_skips_credentials_at_rpm_limit() {
+        let mut first = grouped_cred("first", &[]);
+        first.rpm_limit = 1;
+        let second = grouped_cred("second", &[]);
+        let manager = MultiTokenManager::new(
+            Config::default(), vec![first, second], None, None, false,
+        ).unwrap();
+
+        assert!(manager.try_record_request(1));
+        assert_eq!(manager.select_next_credential(None, None).map(|v| v.0), Some(2));
+    }
+
+    #[tokio::test]
+    async fn all_matching_credentials_at_rpm_limit_return_retry_after() {
+        let mut credential = grouped_cred("limited", &[]);
+        credential.rpm_limit = 1;
+        let manager = MultiTokenManager::new(
+            Config::default(), vec![credential], None, None, false,
+        ).unwrap();
+        assert!(manager.try_record_request(1));
+
+        let error = match manager.acquire_context(None, None).await {
+            Ok(_) => panic!("RPM 达限时不应获得调用上下文"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("RPM 达限应返回类型化 429");
+        assert!(rate_limit.retry_after().is_some());
     }
 
     #[test]

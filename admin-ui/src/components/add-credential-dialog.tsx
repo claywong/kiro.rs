@@ -46,6 +46,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [rpmLimit, setRpmLimit] = useState('10')
 
   const groupOptions = useGroupOptions()
 
@@ -69,6 +70,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setRpmLimit('10')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -120,6 +122,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        rpmLimit: Number(rpmLimit),
       },
       {
         onSuccess: (data) => {
@@ -378,6 +381,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="rpmLimit" className="text-sm font-medium">
+                每分钟请求上限（RPM）
+              </label>
+              <Input
+                id="rpmLimit"
+                type="number"
+                min={0}
+                step={1}
+                value={rpmLimit}
+                onChange={(e) => setRpmLimit(e.target.value)}
+                disabled={isPending}
+                required
+              />
+              <p className="text-xs text-muted-foreground">0 表示不限速</p>
             </div>
 
             {/* 代理配置 */}
