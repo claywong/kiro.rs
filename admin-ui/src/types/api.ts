@@ -10,6 +10,10 @@ export interface CredentialsStatusResponse {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  /** 每分钟请求数上限（0 = 不限速） */
+  rpmLimit: number
+  /** 当前 60 秒滑动窗口内已使用的请求数 */
+  rpmCurrent: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
@@ -116,6 +120,8 @@ export interface AddCredentialRequest {
   /** 企业 SSO 授予的 scopes（空格分隔，可选） */
   scopes?: string
   priority?: number
+  /** 每分钟请求数上限（默认 10；0 表示不限速） */
+  rpmLimit?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -147,6 +153,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 每分钟请求数上限（undefined 表示不修改，0 表示不限速） */
+  rpmLimit?: number
 }
 
 // 更新 refreshToken 请求

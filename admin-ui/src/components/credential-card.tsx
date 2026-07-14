@@ -654,6 +654,20 @@ export function CredentialCard({
           </div>
         </div>
 
+        <div className="w-16 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            RPM
+          </div>
+          <div
+            className="mt-0.5 text-sm font-medium tabular-nums"
+            title="当前 60 秒已用请求数 / 每分钟上限"
+          >
+            {credential.rpmLimit === 0
+              ? "不限"
+              : `${credential.rpmCurrent}/${credential.rpmLimit}`}
+          </div>
+        </div>
+
         <div className="w-20 text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             失败
@@ -916,6 +930,14 @@ export function CredentialCard({
                     <Pencil className="h-3 w-3 opacity-70" />
                   </button>
                 )}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">RPM（已用/上限）</dt>
+              <dd className="min-w-0 truncate text-right font-medium tabular-nums">
+                {credential.rpmLimit === 0
+                  ? "不限速"
+                  : `${credential.rpmCurrent} / ${credential.rpmLimit}`}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">

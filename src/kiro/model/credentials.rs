@@ -83,6 +83,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 每分钟请求数上限（60 秒滑动窗口）。0 表示不限速。
+    /// 缺省为 0，以保持已有凭据文件升级后的行为不变；通过 Admin 新增凭据时默认 10。
+    #[serde(default)]
+    pub rpm_limit: u32,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +195,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("issuer_url", &self.issuer_url)
             .field("scopes", &self.scopes)
             .field("priority", &self.priority)
+            .field("rpm_limit", &self.rpm_limit)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
             .field("api_region", &self.api_region)
@@ -584,6 +590,14 @@ mod tests {
 
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
+        assert_eq!(creds.rpm_limit, 0, "已有凭据缺少 rpmLimit 时应保持不限速");
+    }
+
+    #[test]
+    fn test_rpm_limit_roundtrip() {
+        let creds = KiroCredentials::from_json(r#"{"rpmLimit":7}"#).unwrap();
+        assert_eq!(creds.rpm_limit, 7);
+        assert!(creds.to_pretty_json().unwrap().contains("\"rpmLimit\": 7"));
     }
 
     #[test]
@@ -603,6 +617,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -797,6 +812,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -835,6 +851,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -956,6 +973,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 3,
+            rpm_limit: 0,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

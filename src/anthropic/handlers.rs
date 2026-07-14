@@ -318,12 +318,12 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
-        tracing::warn!(error = %err, "上游限流（映射为 429）");
+        tracing::warn!(error = %err, "请求限流（映射为 429）");
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse::new(
                 "rate_limit_error",
-                "Upstream rate limit exceeded. Retry later.",
+                "Rate limit exceeded. Retry later.",
             )),
         )
             .into_response();
