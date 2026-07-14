@@ -34,7 +34,7 @@ pub fn create_router_with_provider(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Router {
     create_router(
-        kiro_provider,
+        kiro_provider.map(std::sync::Arc::new),
         extract_thinking,
         tool_compatibility_mode,
         None,
@@ -48,7 +48,7 @@ pub fn create_router_with_provider(
 /// 创建 Anthropic API 路由（供 main.rs 使用）
 #[allow(clippy::too_many_arguments)]
 pub fn create_router(
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<std::sync::Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
@@ -59,7 +59,7 @@ pub fn create_router(
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
-        state = state.with_kiro_provider(provider);
+        state = state.with_shared_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);

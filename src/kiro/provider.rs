@@ -253,6 +253,68 @@ impl KiroProvider {
         self.call_api_with_retry(request_body, false, sink, group).await
     }
 
+    /// 使用指定凭据发送一次非流式请求，不切换到其他凭据。
+    pub async fn call_api_with_credential(
+        &self,
+        credential_id: u64,
+        request_body: &str,
+    ) -> anyhow::Result<KiroCallResult> {
+        let model = Self::extract_model_from_request(request_body);
+        let mut ctx = self
+            .token_manager
+            .acquire_context_for_credential(credential_id, model.as_deref())
+            .await?;
+        if !self.token_manager.try_record_request(ctx.id) {
+            anyhow::bail!("凭据 #{} 已达到 RPM 限制", ctx.id);
+        }
+        self.ensure_profile_arn(&mut ctx).await?;
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let endpoint = self.endpoint_for(&ctx.credentials)?;
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+        let url = endpoint.api_url(&rctx);
+        let body = endpoint.transform_api_body(request_body, &rctx);
+        let request = self
+            .client_for(&ctx.credentials)?
+            .post(&url)
+            .body(body)
+            .header("content-type", endpoint.content_type())
+            .header("Connection", "close");
+        let response = endpoint.decorate_api(request, &rctx).send().await?;
+
+        if response.status().is_success() {
+            self.token_manager.report_success(ctx.id);
+            return Ok(KiroCallResult { response, credential_id: ctx.id });
+        }
+
+        let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            self.token_manager.report_quota_exhausted(ctx.id);
+        } else if matches!(status.as_u16(), 401 | 403) {
+            self.token_manager.report_failure(ctx.id);
+        } else if status.as_u16() == 429 && endpoint.is_account_throttled(&body) {
+            let cooldown = Duration::from_secs(
+                self.token_manager.get_account_throttle_cooldown_secs().max(1),
+            );
+            self.token_manager.report_account_throttled_for_request(
+                ctx.id, cooldown, model.as_deref(), None,
+            );
+        }
+        if let Some(error) = rate_limit_error {
+            return Err(anyhow::Error::new(error));
+        }
+        anyhow::bail!("凭据 #{} API 请求失败: {} {}", ctx.id, status, body)
+    }
+
     /// 发送流式 API 请求
     pub async fn call_api_stream(
         &self,

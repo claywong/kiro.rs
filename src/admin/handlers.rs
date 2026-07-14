@@ -21,7 +21,7 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CredentialModelTestRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
@@ -150,6 +150,18 @@ pub async fn get_credential_models(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/test-model
+pub async fn test_credential_model(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<CredentialModelTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_credential_model(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
     }

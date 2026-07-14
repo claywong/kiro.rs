@@ -1549,6 +1549,36 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取严格绑定到指定凭据的调用上下文，不参与负载均衡或故障转移。
+    pub async fn acquire_context_for_credential(
+        &self,
+        id: u64,
+        model: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            let now = Instant::now();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            if entry.disabled {
+                anyhow::bail!("凭据 #{} 已禁用", id);
+            }
+            if entry.throttled_until.is_some_and(|until| until > now) {
+                anyhow::bail!("凭据 #{} 正在限流冷却中", id);
+            }
+            if is_rpm_exceeded(entry, now) {
+                anyhow::bail!("凭据 #{} 已达到 RPM 限制", id);
+            }
+            if !credential_matches_request(&entry.credentials, model, None) {
+                anyhow::bail!("凭据 #{} 不支持模型 {}", id, model.unwrap_or("<unknown>"));
+            }
+            entry.credentials.clone()
+        };
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 分类并记录一次 Token 刷新错误。
     ///
     /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
@@ -4796,6 +4826,32 @@ mod tests {
 
         assert!(manager.try_record_request(1));
         assert_eq!(manager.select_next_credential(None, None).map(|v| v.0), Some(2));
+    }
+
+    #[tokio::test]
+    async fn fixed_credential_context_uses_requested_id_and_rejects_disabled() {
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.auth_method = Some("api_key".to_string());
+        first.kiro_api_key = Some("key-first".to_string());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.auth_method = Some("api_key".to_string());
+        second.kiro_api_key = Some("key-second".to_string());
+        let manager = MultiTokenManager::new(
+            Config::default(), vec![first, second], None, None, false,
+        ).unwrap();
+
+        let context = manager.acquire_context_for_credential(2, None).await.unwrap();
+        assert_eq!(context.id, 2);
+        assert_eq!(context.token, "key-second");
+
+        manager.set_disabled(2, true).unwrap();
+        let error = match manager.acquire_context_for_credential(2, None).await {
+            Ok(_) => panic!("已禁用凭据不应获得调用上下文"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("已禁用"));
     }
 
     #[tokio::test]
