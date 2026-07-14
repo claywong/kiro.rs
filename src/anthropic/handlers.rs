@@ -588,6 +588,79 @@ fn available_models() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
+        // 非 Claude 模型：由 Kiro 上游原样透传，不提供 thinking 变体
+        Model {
+            id: "gpt-5.6-sol".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Sol".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Terra".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "deepseek-3.2".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "deepseek".to_string(),
+            display_name: "DeepSeek 3.2".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.5".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.1".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "glm-5".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "zhipu".to_string(),
+            display_name: "GLM-5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "qwen3-coder-next".to_string(),
+            object: "model".to_string(),
+            created: 1782950400, // Jul 1, 2026
+            owned_by: "alibaba".to_string(),
+            display_name: "Qwen3 Coder Next".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
     ]
 }
 
