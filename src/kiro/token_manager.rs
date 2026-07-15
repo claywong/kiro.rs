@@ -1096,12 +1096,18 @@ fn credential_matches_request(
     model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
-    let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
+    // 模型隔离：按该凭据真实支持的模型集合（supported_models，来自上游 ListAvailableModels）
+    // 精确过滤。语义：
+    // - 请求指定了模型：
+    //   * supported_models 非空且包含该模型 → 通过；
+    //   * supported_models 非空但不含该模型 → 跳过，交给下一个支持该模型的凭据；
+    //   * supported_models 为空（尚未拉取到）→ 跳过；清单会在查询余额时搭车回填，
+    //     且随凭据持久化，故正常运行下几乎不会命中此分支。
+    // - 请求未指定模型（如 profile 探测等非模型相关调用）→ 不按模型过滤。
+    if let Some(m) = model {
+        if !credentials.supported_models.iter().any(|s| s == m) {
+            return false;
+        }
     }
 
     group_matches(&credentials.groups, group)
@@ -2844,6 +2850,45 @@ impl MultiTokenManager {
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("邮箱回填后持久化失败（不影响本次请求）: {}", e);
                 }
+            }
+        }
+
+        // 搭车回填该凭据真实支持的模型列表（供调度按模型精确隔离）。
+        // 复用同一 token / proxy 调 ListAvailableModels；失败仅告警、保留已有清单，
+        // 不影响本次余额查询结果。仅在清单发生变化时才持久化。
+        match get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
+            .await
+        {
+            Ok(resp) => {
+                let mut models: Vec<String> = resp.models.into_iter().map(|m| m.model_id).collect();
+                models.sort();
+                models.dedup();
+                let changed = {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        if entry.credentials.supported_models != models {
+                            tracing::info!(
+                                "凭据 #{} 支持模型列表已更新: {} 个模型",
+                                id,
+                                models.len()
+                            );
+                            entry.credentials.supported_models = models;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("模型列表更新后持久化失败（不影响本次请求）: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("凭据 #{} 拉取可用模型列表失败（保留原有清单）: {}", id, e);
             }
         }
 
@@ -4768,6 +4813,13 @@ mod tests {
         c.access_token = Some(token.to_string());
         c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         c.groups = groups.iter().map(|s| s.to_string()).collect();
+        // 默认代表“支持调度测试涉及的全部模型”，使这些以调度为焦点的用例不被模型过滤影响。
+        // 需要验证模型隔离的用例应显式覆盖 supported_models。
+        c.supported_models = vec![
+            "claude-sonnet-5".to_string(),
+            "claude-opus-4.6".to_string(),
+            "other-model".to_string(),
+        ];
         c
     }
 
@@ -4912,30 +4964,81 @@ mod tests {
         assert!(manager.select_next_credential(None, None).is_some());
     }
 
-    #[tokio::test]
-    async fn test_acquire_context_priority_current_respects_model_support() {
-        let mut free_cred = grouped_cred("free", &[]);
-        free_cred.subscription_title = Some("KIRO FREE".to_string());
-
-        let mut pro_cred = grouped_cred("pro", &[]);
-        pro_cred.subscription_title = Some("KIRO PRO".to_string());
-        pro_cred.priority = 10;
+    #[test]
+    fn test_select_next_credential_filters_by_supported_models() {
+        // A 只支持 sonnet，B 只支持 opus，C 清单为空（未拉取到）。
+        let mut a = grouped_cred("a", &[]);
+        a.supported_models = vec!["claude-sonnet-4.5".to_string()];
+        let mut b = grouped_cred("b", &[]);
+        b.supported_models = vec!["claude-opus-4.6".to_string()];
+        let mut c = grouped_cred("c", &[]);
+        c.supported_models = vec![];
 
         let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+            MultiTokenManager::new(Config::default(), vec![a, b, c], None, None, false).unwrap();
 
-        // Warm current_id with the highest-priority Free account.
+        // 精确命中：请求 sonnet 只能落到 A(id=1)
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-4.5"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "请求 sonnet 应只选到支持 sonnet 的 A"
+        );
+        // 精确命中：请求 opus 只能落到 B(id=2)
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-opus-4.6"), None)
+                .map(|(id, _)| id),
+            Some(2),
+            "请求 opus 应只选到支持 opus 的 B"
+        );
+        // 没有任何凭据支持该模型（含 C 清单为空一律跳过）→ 无可用账号
+        assert!(
+            manager
+                .select_next_credential(Some("claude-haiku-4.5"), None)
+                .is_none(),
+            "无凭据支持该模型（空清单亦跳过）时应返回 None"
+        );
+        // 请求未指定模型（None）→ 不按模型过滤，可选到最靠前账号
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "未指定模型时不做模型过滤"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_priority_current_respects_model_support() {
+        // 高优先级账号只支持 sonnet，不支持 opus；低优先级账号支持 opus。
+        let mut sonnet_only = grouped_cred("sonnet-only", &[]);
+        sonnet_only.supported_models = vec!["claude-sonnet-4.5".to_string()];
+
+        let mut opus_cred = grouped_cred("opus", &[]);
+        opus_cred.supported_models = vec!["claude-opus-4.6".to_string()];
+        opus_cred.priority = 10;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![sonnet_only, opus_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 预热 current_id 为最高优先级的 sonnet-only 账号。
         let current = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
+        // 请求 opus：高优先级的 current 不支持该模型，必须跳过、落到支持 opus 的账号。
         let opus = manager
             .acquire_context(Some("claude-opus-4.6"), None)
             .await
             .unwrap();
         assert_eq!(
             opus.id, 2,
-            "priority current_id must not bypass Opus subscription filtering"
+            "priority current_id must not bypass per-credential model filtering"
         );
     }
 
