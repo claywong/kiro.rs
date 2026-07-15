@@ -747,7 +747,7 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 是否系统密钥（config.json apiKey 导入，不可删除、可轮换）
+    /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
 }

@@ -90,8 +90,6 @@ async fn main() {
         "已选定主凭证"
     );
 
-    // apiKey 每次启动都会同步为 id=0 的系统 Key；后续 /v1 认证全部走客户端 Key 系统。
-    // adminApiKey 仍是管理面板登录密钥。
     let configured_api_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
 
     // 构建代理配置
@@ -242,8 +240,6 @@ async fn main() {
         });
     }
 
-    // 每次启动将 config.apiKey 同步为 id=0 的系统 Key（不可删除、可轮换）。
-    // 配置值是权威值：修改 config.apiKey 后，原系统 Key 会立即失效。
     if let Some(initial_key) = configured_api_key.as_ref() {
         client_key_manager.sync_system_key(
             "默认密钥".to_string(),

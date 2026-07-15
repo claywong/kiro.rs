@@ -120,7 +120,6 @@ pub async fn auth_middleware(
         }
     };
 
-    // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);

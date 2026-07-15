@@ -1,7 +1,6 @@
 //! 客户端 API Key 管理
 //!
-//! 中转站对外分发的"客户端 Key"层。程序生成的 Key 以 `sk-` 开头；鉴权时不校验
-//! 前缀，只按完整 Key 精确匹配，并按 Key 维度记录调用次数与累计 Token。
+//! 管理中转站下发的客户端 Key。生成值以 `sk-` 开头；鉴权不校验前缀，只按完整值匹配。
 //!
 //! 与上游 Kiro 凭据（`KiroCredentials`，`ksk_*`）相互独立：
 //! - 上游凭据池：服务对接 Kiro 的"出口"
@@ -52,19 +51,13 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除、可轮换）。
+    /// 系统 Key（由 config.json apiKey 同步，不可删除、可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
 }
 
-/// 客户端 Key 管理器
-///
-/// 内部双索引：
-/// - `by_key: HashMap<String, u64>` —— 用于 Key 判重和索引维护
-/// - `entries: HashMap<u64, ClientKey>` —— 用于按 id 读写明细和鉴权扫描
-///
-/// 校验比对仍使用 `subtle::ConstantTimeEq` 防止时序攻击。
+/// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
@@ -146,7 +139,7 @@ impl ClientKeyManager {
         list
     }
 
-    /// 创建新 Key（生成明文随机串），返回新建条目
+    /// 生成并保存新 Key。
     pub fn create(
         &self,
         name: String,
@@ -156,8 +149,7 @@ impl ClientKeyManager {
         self.create_with_key(name, description, group, generate_client_key())
     }
 
-    /// 用指定明文创建 Key。
-    /// 若该明文已存在则跳过，返回已存在的条目。
+    /// 使用指定明文创建 Key；明文已存在时返回原条目。
     pub fn create_with_key(
         &self,
         name: String,
@@ -166,7 +158,6 @@ impl ClientKeyManager {
         plaintext: String,
     ) -> ClientKey {
         let mut inner = self.inner.write();
-        // 防止创建重复明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
             return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
         }
@@ -195,12 +186,8 @@ impl ClientKeyManager {
         entry
     }
 
-    /// 将 `config.json` 的 `apiKey` 同步为唯一的系统 Key（每次启动调用）。
-    ///
-    /// `config.apiKey` 是权威值，固定占用 `id=0`。已有 `id=0` 且配置值变化时替换
-    /// 明文、重新启用，并保留名称、描述、分组和统计；不存在时才使用传入的默认元数据
-    /// 创建。与当前或上一个系统 Key 明文冲突的非系统条目会被移除，确保同一明文只
-    /// 对应一个 id，且配置变更后旧系统 Key 立即失效。
+    /// 将 `config.apiKey` 同步为唯一的 `id=0` 系统 Key。配置值变化时保留元数据与统计、
+    /// 重新启用新值，并删除与新旧明文冲突的非系统条目，使旧值立即失效。
     pub fn sync_system_key(&self, name: String, description: Option<String>, plaintext: String) {
         let mut inner = self.inner.write();
         let previous_key = inner.entries.get(&0).map(|entry| entry.key.clone());
@@ -407,17 +394,13 @@ impl ClientKeyManager {
         affected
     }
 
-    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled/is_system。
-    /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
-    /// 命中且替换成功返回新条目（含新明文）；id 不存在返回 None。
-    /// 注意：系统 Key 轮换后调用方需把新明文同步写回 config.json apiKey，避免下次启动恢复配置中的旧值。
+    /// 生成新明文并保留 id、元数据、分组、统计及状态；旧明文立即失效。
+    /// 系统 Key 的调用方必须同步 `config.apiKey`，否则重启时配置值会覆盖轮换结果。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
         let new_key = generate_client_key();
         let mut inner = self.inner.write();
-        // 取出旧条目并从 by_key 索引摘除
         let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
         inner.by_key.remove(&old_key);
-        // 写入新明文 + 索引（is_system 等其余字段保留不变）
         let entry = inner.entries.get_mut(&id)?;
         entry.key = new_key.clone();
         let snapshot = entry.clone();
@@ -447,13 +430,9 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
-    ///
-    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// Key 的前缀和格式不参与鉴权，允许 `config.apiKey` 使用自定义值。
+    /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
         let mut inner = self.inner.write();
-        // 扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
@@ -509,7 +488,6 @@ impl Default for ClientKeyManager {
     }
 }
 
-/// serde 辅助：bool 为 false 时跳过序列化
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -538,12 +516,10 @@ pub fn mask_client_key(key: &str) -> String {
     format!("{start}...{end}")
 }
 
-/// 默认管理器路径（相对凭据目录）
 pub fn default_path_in(dir: &Path) -> PathBuf {
     dir.join("client_api_keys.json")
 }
 
-/// Arc 包装，便于注入 axum State
 pub type SharedClientKeyManager = Arc<ClientKeyManager>;
 
 #[cfg(test)]
@@ -594,24 +570,18 @@ mod tests {
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
-        // 累计一些统计
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
-        // 新 Key 与旧 Key 不同，且使用统一生成前缀
         assert_ne!(rotated.key, old_key);
         assert!(rotated.key.starts_with("sk-"));
-        // 元数据保留
         assert_eq!(rotated.id, entry.id);
         assert_eq!(rotated.name, "kb");
         assert_eq!(rotated.description.as_deref(), Some("desc"));
         assert_eq!(rotated.group.as_deref(), Some("groupA"));
-        // 统计保留
         assert_eq!(rotated.total_input_tokens, 100);
         assert_eq!(rotated.total_output_tokens, 50);
-        // 旧 Key 立即失效
         assert_eq!(mgr.verify_and_touch(&old_key), None);
-        // 新 Key 命中
         assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
     }
 
