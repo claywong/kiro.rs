@@ -155,6 +155,15 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
 
+    /// 该凭据当前真实支持的模型 ID 列表（kiro model_id 格式，如 "claude-opus-4.6"）
+    ///
+    /// 来源：上游 `ListAvailableModels`，在查询余额（`get_usage_limits_for`）时搭车回填。
+    /// 调度时按此精确过滤：非空且不含请求模型则跳过该凭据，为空（未拉取到）时同样跳过、
+    /// 交由下一个支持该模型的凭据承接。随凭据 json 持久化，重启后无需重新拉取即可精确调度。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
+
     /// 账号来源渠道（纯备注）
     ///
     /// 标记该账号的购买来源/渠道，便于运营追踪。不参与调度、导出或筛选。
@@ -455,21 +464,6 @@ impl KiroCredentials {
         }
     }
 
-    /// 检查凭据是否支持 Opus 模型
-    ///
-    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
-    pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
-    }
-
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
@@ -631,6 +625,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            supported_models: vec![],
             source_channel: None,
         };
 
@@ -826,6 +821,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            supported_models: vec![],
             source_channel: None,
         };
 
@@ -865,11 +861,43 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            supported_models: vec![],
             source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
         assert!(!json.contains("region"));
+    }
+
+    #[test]
+    fn test_supported_models_empty_not_serialized() {
+        // 空清单不落盘（skip_serializing_if = "Vec::is_empty"）
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("supportedModels"));
+    }
+
+    #[test]
+    fn test_supported_models_roundtrip() {
+        // 非空清单序列化为 camelCase 并可原样回读
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.supported_models =
+            vec!["claude-sonnet-4.5".to_string(), "claude-opus-4.6".to_string()];
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("supportedModels"));
+
+        let parsed: KiroCredentials = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.supported_models, creds.supported_models);
+    }
+
+    #[test]
+    fn test_supported_models_missing_field_defaults_empty() {
+        // 老格式缺少该字段时反序列化回退为空 Vec
+        let json = r#"{"refreshToken":"test"}"#;
+        let parsed: KiroCredentials = serde_json::from_str(json).unwrap();
+        assert!(parsed.supported_models.is_empty());
     }
 
     // ============ MachineId 字段测试 ============
@@ -987,6 +1015,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            supported_models: vec![],
             source_channel: None,
         };
 

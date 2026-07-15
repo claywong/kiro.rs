@@ -1218,6 +1218,7 @@ impl AdminService {
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
+            supported_models: vec![], // 将在首次获取使用额度时自动回填
             source_channel: req.source_channel,
         };
 
