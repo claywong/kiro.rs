@@ -27,7 +27,7 @@ use super::{
         start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
         stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
-        update_refresh_token,
+        update_refresh_token, test_credential_model,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -90,6 +90,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/credentials/{id}/test-model", post(test_credential_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))
