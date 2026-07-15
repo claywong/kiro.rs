@@ -256,7 +256,8 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
-        // 非 Claude 模型：原样透传规范名给上游
+        // 非 Claude 模型（gpt-5.6-sol/terra/luna、deepseek/minimax/glm/qwen）：
+        // 按 NON_CLAUDE_MODELS 规范名匹配后透传，剥离 -thinking 等后缀
         map_non_claude_model(&model_lower)
     }
 }
@@ -269,6 +270,8 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 非 Claude 模型：gpt-5.6 系为 272k，其余（deepseek/minimax/glm/qwen）为 200k。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
+        // GPT-5.6 family on Kiro ships a 272K context window.
+        Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
@@ -280,7 +283,6 @@ pub fn get_context_window_size(model: &str) -> i32 {
         {
             1_000_000
         }
-        Some(mapped) if mapped.starts_with("gpt-5.6") => 272_000,
         _ => 200_000,
     }
 }
@@ -1936,6 +1938,15 @@ mod tests {
         assert_eq!(get_context_window_size("minimax-m2.1"), 200_000);
         assert_eq!(get_context_window_size("glm-5"), 200_000);
         assert_eq!(get_context_window_size("qwen3-coder-next"), 200_000);
+    }
+
+    #[test]
+    fn test_map_model_gpt_5_6_family() {
+        // Kiro serves the GPT-5.6 family; ids pass through verbatim.
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
     }
 
     #[test]
