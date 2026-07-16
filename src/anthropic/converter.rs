@@ -1867,8 +1867,13 @@ mod tests {
             map_model("claude-opus-4-8"),
             Some("claude-opus-4.8".to_string())
         );
+        // thinking 后缀两种写法（点 / 横线）都应映射到同一模型
         assert_eq!(
             map_model("claude-opus-4.8-thinking"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-8-thinking"),
             Some("claude-opus-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);

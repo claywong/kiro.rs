@@ -950,6 +950,50 @@ impl std::fmt::Display for ToolJsonAccumulatorError {
 
 impl std::error::Error for ToolJsonAccumulatorError {}
 
+/// 上游在 event-stream 中下发的业务错误（`error` / `exception` 类型消息）。
+///
+/// 上游可能在流中途返回 `throttlingException`、`internalServerException`、
+/// `quotaExceededException` 等异常帧，或 `error` 类型帧。这些必须显式暴露给客户端，
+/// 否则客户端只会拿到「200 + 空/截断内容 + `stop_reason: end_turn`」的假成功。
+/// 处理方式与 [`ToolJsonAccumulatorError`] 对称：实时流已回 200 时收尾补发一个
+/// Anthropic `error` 事件；非流式 / 缓冲流则返回 502。
+///
+/// 注意：`ContentLengthExceededException` 是正常的截断信号（映射为 `max_tokens`），
+/// **不**归为此错误，由调用方在置位前用白名单排除。
+#[derive(Debug, Clone)]
+pub struct UpstreamEventError {
+    /// 上游 `error_code`（error 帧）或 `exception_type`（exception 帧）。
+    kind: String,
+    /// 上游下发的错误 / 异常消息正文。
+    message: String,
+}
+
+impl UpstreamEventError {
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Anthropic error 事件里统一的 error.type。
+    pub fn error_type(&self) -> &'static str {
+        "upstream_error"
+    }
+
+    pub fn message(&self) -> String {
+        format!("Upstream returned {}: {}", self.kind, self.message)
+    }
+}
+
+impl std::fmt::Display for UpstreamEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for UpstreamEventError {}
+
 /// 工具调用参数（JSON）累积器。
 ///
 /// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
@@ -1393,6 +1437,9 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 上游业务错误（event-stream 里的 `error` / `exception` 帧，白名单除外）。
+    /// 一旦置位，收尾时补发 `error` 事件，上层据此把本次请求记为 error 而非 success。
+    upstream_error: Option<UpstreamEventError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1411,6 +1458,12 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    /// 上游业务错误信息（event-stream 里的 error / exception 帧）。上层据此把本次
+    /// 请求记为 error、或在非流式路径返回 502。无错误时返回 `None`。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.upstream_error.as_ref().map(|err| err.message())
     }
 
     /// 创建 StreamContext
@@ -1449,6 +1502,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1548,18 +1602,35 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
+                // 上游业务错误帧：置位 upstream_error，收尾补发 Anthropic error 事件，
+                // 并把 stop_reason 改为 error，避免客户端把截断响应当成正常完成。
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                if self.upstream_error.is_none() {
+                    self.upstream_error =
+                        Some(UpstreamEventError::new(error_code.clone(), error_message.clone()));
+                }
+                self.state_manager.set_stop_reason("error");
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
+                // ContentLengthExceededException 是正常的截断信号，走白名单映射为
+                // max_tokens；其余异常（throttling / internalServer / quota 等）均视为
+                // 上游业务错误，置位 upstream_error 并改 stop_reason 为 error。
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                    if self.upstream_error.is_none() {
+                        self.upstream_error = Some(UpstreamEventError::new(
+                            exception_type.clone(),
+                            message.clone(),
+                        ));
+                    }
+                    self.state_manager.set_stop_reason("error");
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2461,16 +2532,26 @@ impl StreamContext {
             cache_read,
         ));
 
-        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
-        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
-        if let Some(err) = &self.tool_json_error {
+        // 在最终事件之后补一个 Anthropic `error` 事件，明确告知客户端本次响应因错误
+        // 未能正常完成（实时流已返回 200，无法再改状态码）。两类错误共用一个 error 事件，
+        // 工具 JSON 错误优先（更贴近具体失败点），避免重复补发两个 error。
+        let error_payload = self
+            .tool_json_error
+            .as_ref()
+            .map(|err| (err.error_type(), err.message()))
+            .or_else(|| {
+                self.upstream_error
+                    .as_ref()
+                    .map(|err| (err.error_type(), err.message()))
+            });
+        if let Some((error_type, message)) = error_payload {
             events.push(SseEvent::new(
                 "error",
                 json!({
                     "type": "error",
                     "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
+                        "type": error_type,
+                        "message": message
                     }
                 }),
             ));
@@ -2597,6 +2678,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 上游业务错误信息（转发内部 StreamContext）。缓冲流据此记 error。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message()
     }
 }
 
@@ -4686,6 +4772,104 @@ mod tests {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
+        }));
+    }
+
+    #[test]
+    fn test_upstream_exception_emits_error_event_and_error_stop_reason() {
+        // 上游流中途发 exception（非白名单）→ 收尾应补发 Anthropic error 事件，
+        // 且 message_delta 的 stop_reason 为 error，客户端据此察觉这是失败而非正常完成。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response("partial answer"));
+        all_events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ThrottlingException".to_string(),
+            message: "Rate exceeded".to_string(),
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        // 补发了 error 事件，type 为 upstream_error，message 含上游异常类型
+        let error_event = all_events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应补发 error 事件");
+        assert_eq!(error_event.data["error"]["type"], "upstream_error");
+        assert!(
+            error_event.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ThrottlingException")
+        );
+
+        // message_delta 的 stop_reason 为 error
+        assert!(all_events.iter().any(|e| {
+            e.event == "message_delta" && e.data["delta"]["stop_reason"] == "error"
+        }));
+
+        // 上层可据此把请求记为 error
+        assert!(ctx.upstream_error_message().is_some());
+    }
+
+    #[test]
+    fn test_upstream_error_event_emits_error_event() {
+        // 上游 error 类型帧同样应补发 error 事件并置 stop_reason=error。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "boom".to_string(),
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        let error_event = all_events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应补发 error 事件");
+        assert_eq!(error_event.data["error"]["type"], "upstream_error");
+        assert!(
+            error_event.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("InternalServerException")
+        );
+        assert!(ctx.upstream_error_message().is_some());
+    }
+
+    #[test]
+    fn test_content_length_exceeded_is_not_treated_as_error() {
+        // 白名单：ContentLengthExceededException 是正常截断信号 → max_tokens，
+        // 不应补发 error 事件、不应置位 upstream_error。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(!all_events.iter().any(|e| e.event == "error"));
+        assert!(ctx.upstream_error_message().is_none());
+        assert!(all_events.iter().any(|e| {
+            e.event == "message_delta" && e.data["delta"]["stop_reason"] == "max_tokens"
         }));
     }
 }
