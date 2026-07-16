@@ -36,20 +36,24 @@ impl ProxyConfig {
     }
 }
 
-/// 构建 HTTP Client
-///
-/// # Arguments
-/// * `proxy` - 可选的代理配置
-/// * `timeout_secs` - 超时时间（秒）
-///
-/// # Returns
-/// 配置好的 reqwest::Client
-pub fn build_client(
+/// 建连超时（DNS + TCP + TLS 握手）。所有 Client 统一应用：连不上的上游 / 挂掉的
+/// 代理会在此时限内快速失败，而不是卡在总超时里干等。连上后即失效。
+const CONNECT_TIMEOUT_SECS: u64 = 50;
+
+/// 流式 / API Client 的读超时（相邻两次读数据之间的最大间隔）。既是首字节（TTFB）
+/// 保护，也是流中途的空闲保护：上游连上后长时间不吐数据即报错，避免僵死连接拖满总
+/// 超时。只要上游持续吐字节就不触发，因此不会误杀正常的长响应。
+const STREAM_READ_TIMEOUT_SECS: u64 = 120;
+
+/// 构建基础 ClientBuilder（统一 TLS 后端、代理、建连超时、总超时）。
+fn base_builder(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
-) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -79,6 +83,35 @@ pub fn build_client(
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
 
+    Ok(builder)
+}
+
+/// 构建 HTTP Client
+///
+/// # Arguments
+/// * `proxy` - 可选的代理配置
+/// * `timeout_secs` - 总超时时间（秒）
+///
+/// # Returns
+/// 配置好的 reqwest::Client（含统一的建连超时）
+pub fn build_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    Ok(base_builder(proxy, timeout_secs, tls_backend)?.build()?)
+}
+
+/// 构建流式 / API 用 Client：在 [`build_client`] 基础上额外加读超时（空闲 / 首字节
+/// 保护）。供上游 API（流式 / 非流式）与 MCP 调用使用——这些场景都要读上游响应体，
+/// 需要空闲超时兜住僵死连接。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = base_builder(proxy, timeout_secs, tls_backend)?
+        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS));
     Ok(builder.build()?)
 }
 
@@ -112,6 +145,17 @@ mod tests {
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client() {
+        // 流式 Client（含读超时）应能正常构建，代理有无均可
+        let client = build_streaming_client(None, 720, TlsBackend::Rustls);
+        assert!(client.is_ok());
+
+        let config = ProxyConfig::new("socks5://127.0.0.1:1080");
+        let client = build_streaming_client(Some(&config), 720, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 }
