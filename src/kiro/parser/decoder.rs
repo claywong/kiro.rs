@@ -220,6 +220,14 @@ impl EventStreamDecoder {
         DecodeIter { decoder: self }
     }
 
+    /// 解码器是否已因连续错误过多而停机（终止态）。
+    ///
+    /// 一旦停机，后续 `decode_iter` 不再产出任何帧。上层据此判定上游数据严重损坏，
+    /// 应向客户端暴露错误而非把截断响应当成正常完成。
+    pub fn is_stopped(&self) -> bool {
+        self.state == DecoderState::Stopped
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：

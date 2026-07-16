@@ -1002,9 +1002,12 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
-                            // 解码事件
+                            // 解码事件。缓冲区溢出（>16MB）后 feed 会持续失败、后续字节
+                            // 被丢弃，继续 pump 只会让客户端收到永久截断的响应，故置位
+                            // upstream_error 并立即收尾。
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::error!("缓冲区溢出，终止流: {}", e);
+                                ctx.mark_upstream_error("BufferOverflow", e.to_string());
                             }
 
                             let mut events = Vec::new();
@@ -1020,6 +1023,34 @@ fn create_sse_stream(
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
                                 }
+                            }
+
+                            // 解码器因连续错误过多而停机：上游数据严重损坏，后续不再产出
+                            // 任何帧，置位 upstream_error 并收尾，避免把截断响应记为 success。
+                            if decoder.is_stopped() {
+                                ctx.mark_upstream_error(
+                                    "DecoderStopped",
+                                    "上游事件流连续解析错误过多，解码器已停机".to_string(),
+                                );
+                            }
+
+                            // 致命错误（缓冲区溢出 / 解码停机）：补发收尾事件（含 error 事件）
+                            // 并结束流，与 None/Err 分支同口径记 error。
+                            if let Some(message) = ctx.upstream_error_message() {
+                                events.extend(ctx.generate_final_events());
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "error",
+                                    Some(outcome::TRANSIENT),
+                                    Some(&message),
+                                    Some(sent_bytes),
+                                    stream_trace_usage(&ctx),
+                                );
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
 
                             // 转换为 SSE 字节流

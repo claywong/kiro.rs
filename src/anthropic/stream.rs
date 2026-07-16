@@ -1466,6 +1466,16 @@ impl StreamContext {
         self.upstream_error.as_ref().map(|err| err.message())
     }
 
+    /// 显式置位一个上游错误（供解码层异常复用同一条错误暴露通道）：
+    /// 缓冲区溢出（feed 失败）、解码器因连续错误过多而停机等。与 error / exception
+    /// 帧同口径——收尾补发 `error` 事件、记 error、非流式返回 502。首个错误优先保留。
+    pub fn mark_upstream_error(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        if self.upstream_error.is_none() {
+            self.upstream_error = Some(UpstreamEventError::new(kind, message));
+            self.state_manager.set_stop_reason("error");
+        }
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -2683,6 +2693,12 @@ impl BufferedStreamContext {
     /// 上游业务错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn upstream_error_message(&self) -> Option<String> {
         self.inner.upstream_error_message()
+    }
+
+    /// 显式置位上游错误（转发内部 StreamContext）。缓冲流的缓冲区溢出 / 解码停机
+    /// 据此走同一条错误暴露通道。
+    pub fn mark_upstream_error(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        self.inner.mark_upstream_error(kind, message);
     }
 }
 
