@@ -172,7 +172,12 @@ async fn decode_round(
             }
         };
         if let Err(e) = decoder.feed(&chunk) {
-            tracing::warn!("buffer overflow: {}", e);
+            // 缓冲区溢出：后续字节被丢弃，本轮内容不可信，收尾返回 502。
+            tracing::error!("buffer overflow, aborting round: {}", e);
+            if upstream_error.is_none() {
+                upstream_error = Some(format!("Upstream returned BufferOverflow: {}", e));
+            }
+            break;
         }
         for result in decoder.decode_iter() {
             let frame = match result {
@@ -244,6 +249,17 @@ async fn decode_round(
                 }
                 _ => {}
             }
+        }
+
+        // 解码器因连续错误过多而停机：上游数据严重损坏，本轮内容不可信，收尾返回 502。
+        if decoder.is_stopped() {
+            if upstream_error.is_none() {
+                upstream_error = Some(
+                    "Upstream returned DecoderStopped: 上游事件流连续解析错误过多，解码器已停机"
+                        .to_string(),
+                );
+            }
+            break;
         }
     }
 

@@ -4888,4 +4888,54 @@ mod tests {
             e.event == "message_delta" && e.data["delta"]["stop_reason"] == "max_tokens"
         }));
     }
+
+    #[test]
+    fn test_mark_upstream_error_emits_error_event() {
+        // 缓冲区溢出 / 解码停机通过 mark_upstream_error 复用同一条错误暴露通道：
+        // 收尾补发 error 事件、stop_reason=error、可据此记 error。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response("partial"));
+        ctx.mark_upstream_error("BufferOverflow", "buffer exceeded 16MB");
+        all_events.extend(ctx.generate_final_events());
+
+        let error_event = all_events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应补发 error 事件");
+        assert_eq!(error_event.data["error"]["type"], "upstream_error");
+        assert!(
+            error_event.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("BufferOverflow")
+        );
+        assert!(all_events.iter().any(|e| {
+            e.event == "message_delta" && e.data["delta"]["stop_reason"] == "error"
+        }));
+        assert!(ctx.upstream_error_message().is_some());
+    }
+
+    #[test]
+    fn test_mark_upstream_error_keeps_first() {
+        // 首个错误优先保留，后续 mark 不覆盖。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.mark_upstream_error("BufferOverflow", "first");
+        ctx.mark_upstream_error("DecoderStopped", "second");
+        let msg = ctx.upstream_error_message().unwrap();
+        assert!(msg.contains("BufferOverflow") && msg.contains("first"));
+        assert!(!msg.contains("DecoderStopped"));
+    }
 }

@@ -342,4 +342,33 @@ mod tests {
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
     }
+
+    #[test]
+    fn test_decoder_stops_after_too_many_errors() {
+        // 喂入一段全 0xFF 的垃圾字节：每次 decode 读到超大 total_length（>16MB）触发
+        // MessageTooLarge，恢复时跳 1 字节；连续 DEFAULT_MAX_ERRORS 次后解码器停机。
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&[0xFFu8; 32]).unwrap();
+
+        let mut last = None;
+        for _ in 0..DEFAULT_MAX_ERRORS {
+            last = Some(decoder.decode());
+        }
+
+        // 最后一次返回 TooManyErrors，且 is_stopped() 为 true
+        assert!(matches!(
+            last,
+            Some(Err(ParseError::TooManyErrors { .. }))
+        ));
+        assert!(decoder.is_stopped());
+    }
+
+    #[test]
+    fn test_decoder_not_stopped_normally() {
+        // 数据不足不应导致停机
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&[0u8; 10]).unwrap();
+        let _ = decoder.decode();
+        assert!(!decoder.is_stopped());
+    }
 }
