@@ -1227,9 +1227,6 @@ async fn handle_non_stream_request(
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
-    }
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
@@ -1251,6 +1248,16 @@ async fn handle_non_stream_request(
     // 上游 error / exception 帧（白名单 ContentLengthExceededException 除外）。
     // 一旦置位，收尾时直接返回 502，而非把空 / 截断内容当成 200 成功。
     let mut upstream_error: Option<super::stream::UpstreamEventError> = None;
+
+    // 喂入完整响应体。缓冲区溢出（>16MB）时后续字节被丢弃、解析基于不完整数据，
+    // 视为上游错误 → 收尾返回 502，而非把截断内容当成 200 成功。
+    if let Err(e) = decoder.feed(&body_bytes) {
+        tracing::error!("缓冲区溢出: {}", e);
+        upstream_error = Some(super::stream::UpstreamEventError::new(
+            "BufferOverflow",
+            e.to_string(),
+        ));
+    }
 
     for result in decoder.decode_iter() {
         match result {
@@ -1350,6 +1357,14 @@ async fn handle_non_stream_request(
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+
+    // 解码器因连续错误过多而停机：上游数据严重损坏，解析结果不可信，收尾返回 502。
+    if decoder.is_stopped() && upstream_error.is_none() {
+        upstream_error = Some(super::stream::UpstreamEventError::new(
+            "DecoderStopped",
+            "上游事件流连续解析错误过多，解码器已停机".to_string(),
+        ));
     }
 
     // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
@@ -1917,9 +1932,11 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
-                                // 解码事件
+                                // 解码事件。缓冲区溢出置位 upstream_error，由 None 分支收尾时
+                                // 补发 error 事件并记 error（缓冲流 EOF 前本不输出，无实时性损失）。
                                 if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
+                                    tracing::error!("缓冲区溢出: {}", e);
+                                    ctx.mark_upstream_error("BufferOverflow", e.to_string());
                                 }
 
                                 for result in decoder.decode_iter() {
@@ -1934,6 +1951,14 @@ fn create_buffered_sse_stream(
                                             tracing::warn!("解码事件失败: {}", e);
                                         }
                                     }
+                                }
+
+                                // 解码器因连续错误过多而停机：置位 upstream_error，收尾记 error。
+                                if decoder.is_stopped() {
+                                    ctx.mark_upstream_error(
+                                        "DecoderStopped",
+                                        "上游事件流连续解析错误过多，解码器已停机".to_string(),
+                                    );
                                 }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
