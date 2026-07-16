@@ -68,6 +68,10 @@ struct RoundOutcome {
     /// True if the upstream stream ended due to a read error, so the decoded
     /// content for this round is partial and must not be treated as a success.
     stream_error: bool,
+    /// Set when the upstream emitted an `error` / `exception` frame (other than the
+    /// whitelisted ContentLengthExceededException). Like `stream_error`, the round's
+    /// decoded content is untrustworthy and the caller returns 502.
+    upstream_error: Option<String>,
     /// Tool names declared to the upstream this round (original + shortened),
     /// taken from `ConversionResult::known_tool_names`. Used by the shared
     /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
@@ -154,6 +158,9 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
+    // 上游 error / exception 帧（白名单 ContentLengthExceededException 除外）：
+    // 与 stream_error 同口径，本轮内容视为不可信，收尾返回 502。
+    let mut upstream_error: Option<String> = None;
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
@@ -205,9 +212,34 @@ async fn decode_round(
                     }
                 }
                 Event::Metering(m) => credits += m.usage,
-                Event::Exception { exception_type, .. } => {
+                Event::Exception { exception_type, message } => {
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
+                    } else {
+                        tracing::warn!(
+                            "web_search loop received an exception event: {} - {}",
+                            exception_type,
+                            message
+                        );
+                        if upstream_error.is_none() {
+                            upstream_error = Some(format!(
+                                "Upstream returned {}: {}",
+                                exception_type, message
+                            ));
+                        }
+                    }
+                }
+                Event::Error { error_code, error_message } => {
+                    tracing::error!(
+                        "web_search loop received an error event: {} - {}",
+                        error_code,
+                        error_message
+                    );
+                    if upstream_error.is_none() {
+                        upstream_error = Some(format!(
+                            "Upstream returned {}: {}",
+                            error_code, error_message
+                        ));
                     }
                 }
                 _ => {}
@@ -242,6 +274,7 @@ async fn decode_round(
         credits,
         stop_reason_override,
         stream_error,
+        upstream_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
         known_tool_names: std::collections::HashSet::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
@@ -322,6 +355,16 @@ async fn run_round(
                 "upstream_error",
                 "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
             )),
+        )
+            .into_response());
+    }
+    if let Some(message) = outcome.upstream_error {
+        // The upstream emitted a business error/exception frame; the round's content is
+        // untrustworthy, so fail instead of feeding truncated text/tool_use back in.
+        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_error", message)),
         )
             .into_response());
     }
@@ -995,6 +1038,7 @@ mod tests {
             credits: 0.0,
             stop_reason_override: None,
             stream_error: false,
+            upstream_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
