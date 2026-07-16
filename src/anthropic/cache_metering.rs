@@ -24,8 +24,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
+/// 默认条目上限（防止内存无限增长）。
+/// 高并发时段每个活跃长会话会写回整条前缀链（几十段），4096 会被反复打爆导致
+/// 热前缀在下一轮到达前被 LRU 挤掉、命中变 miss，故上调到 64K（内存开销仍仅几 MB）。
+const DEFAULT_CAPACITY: usize = 65536;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
