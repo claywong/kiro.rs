@@ -70,6 +70,14 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_account_throttled(body)
     }
 
+    /// 判断响应体是否表示当前用户的请求速率已超限。
+    ///
+    /// 这类错误只影响本次调用的当前凭据：Provider 会在本次重试链路中临时排除它，
+    /// 但不会禁用、冷却或改变后续请求的全局调度状态。
+    fn is_user_request_rate_exceeded(&self, body: &str) -> bool {
+        default_is_user_request_rate_exceeded(body)
+    }
+
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
     ///
     /// 这类错误（tool_use↔tool_result 不配对、消息序列非法等）的根因是调用方的
@@ -154,6 +162,22 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity")
         && body.contains("temporary limits")
+}
+
+/// 默认的用户级请求速率限制判断逻辑。
+///
+/// 只匹配结构化 reason，避免把普通的 `Too many requests` 或服务级限流误判为
+/// 可以通过切换凭据恢复的用户级限流。
+pub fn default_is_user_request_rate_exceeded(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let top = value.get("reason").and_then(|v| v.as_str());
+    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+    [top, nested]
+        .into_iter()
+        .flatten()
+        .any(|reason| reason == "USER_REQUEST_RATE_EXCEEDED")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -270,6 +294,22 @@ mod tests {
         ));
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled("suspicious activity detected"));
+    }
+
+    #[test]
+    fn test_default_is_user_request_rate_exceeded() {
+        assert!(default_is_user_request_rate_exceeded(
+            r#"{"message":"Too many requests","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_user_request_rate_exceeded(
+            r#"{"error":{"reason":"USER_REQUEST_RATE_EXCEEDED"}}"#
+        ));
+        assert!(!default_is_user_request_rate_exceeded(
+            r#"{"message":"Too many requests","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(!default_is_user_request_rate_exceeded(
+            r#"{"message":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
     }
 
     #[test]

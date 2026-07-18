@@ -24,12 +24,11 @@ use parking_lot::Mutex;
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
-/// 总重试次数硬上限（避免无限重试）
+/// 总重试次数的防御性硬上限。
 ///
-/// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
-/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
-/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
-const MAX_TOTAL_RETRIES: usize = 4;
+/// 实际重试数至少覆盖当前分组的全部可用凭据；当可用凭据数超过该上限时，
+/// 遍历下限优先，避免永远只尝试前几个凭据。
+const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 64;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -341,7 +340,8 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let available = self.token_manager.available_count_in_group(group);
+        let max_retries = Self::compute_max_retries(total_credentials, available);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
@@ -529,10 +529,12 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let available = self.token_manager.available_count_in_group(group);
+        let max_retries = Self::compute_max_retries(total_credentials, available);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
+        let mut request_excluded_credentials: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -541,7 +543,10 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self.token_manager
+                .acquire_context_excluding(model.as_deref(), group, &request_excluded_credentials)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -745,6 +750,29 @@ impl KiroProvider {
                 continue;
             }
 
+            // 用户级请求速率限制只在本次调用中临时跳过当前凭据。
+            // 不禁用、不冷却，也不改变全局 current_id；下一次新请求仍按原调度选择。
+            if status.as_u16() == 429 && endpoint.is_user_request_rate_exceeded(&body) {
+                request_excluded_credentials.insert(ctx.id);
+                tracing::warn!(
+                    "API 请求失败（用户级限流，本次请求临时跳过凭据 #{}，尝试 {}/{}）: {}",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    outcome::TRANSIENT, Some(&body), attempt_start,
+                );
+                last_error = Some(
+                    rate_limit_error
+                        .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                        .into(),
+                );
+                continue;
+            }
+
             // 429 + suspicious activity = 账号级临时风控
             // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
             if status.as_u16() == 429
@@ -915,6 +943,15 @@ impl KiroProvider {
         }))
     }
 
+    /// 保证单次请求至少能遍历当前分组的全部可用凭据一轮。
+    fn compute_max_retries(total_credentials: usize, available: usize) -> usize {
+        let budget = total_credentials.saturating_mul(MAX_RETRIES_PER_CREDENTIAL);
+        let floor = available.max(1);
+        budget
+            .max(floor)
+            .min(ABSOLUTE_MAX_TOTAL_RETRIES.max(floor))
+    }
+
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
     #[allow(clippy::too_many_arguments)]
     fn emit_attempt(
@@ -1024,6 +1061,15 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+
+    #[test]
+    fn max_retries_covers_every_available_credential() {
+        assert_eq!(KiroProvider::compute_max_retries(1, 1), 3);
+        assert_eq!(KiroProvider::compute_max_retries(2, 2), 6);
+        assert!(KiroProvider::compute_max_retries(10, 10) >= 10);
+        assert!(KiroProvider::compute_max_retries(50, 50) >= 50);
+        assert!(KiroProvider::compute_max_retries(20, 7) >= 7);
+    }
 
     #[test]
     fn preserves_typed_rate_limit_when_later_credential_selection_fails() {
