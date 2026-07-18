@@ -174,10 +174,25 @@ pub fn default_is_user_request_rate_exceeded(body: &str) -> bool {
     };
     let top = value.get("reason").and_then(|v| v.as_str());
     let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
-    [top, nested]
+    if [top, nested]
         .into_iter()
         .flatten()
         .any(|reason| reason == "USER_REQUEST_RATE_EXCEEDED")
+    {
+        return true;
+    }
+
+    let top_reason_is_null = value.get("reason").is_some_and(serde_json::Value::is_null);
+    let nested_reason_is_null = value
+        .pointer("/error/reason")
+        .is_some_and(serde_json::Value::is_null);
+    let message = value
+        .get("message")
+        .or_else(|| value.pointer("/error/message"))
+        .and_then(|v| v.as_str());
+
+    (top_reason_is_null || nested_reason_is_null)
+        && message == Some("Too many requests, please wait before trying again.")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -304,8 +319,17 @@ mod tests {
         assert!(default_is_user_request_rate_exceeded(
             r#"{"error":{"reason":"USER_REQUEST_RATE_EXCEEDED"}}"#
         ));
+        assert!(default_is_user_request_rate_exceeded(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":null}"#
+        ));
+        assert!(default_is_user_request_rate_exceeded(
+            r#"{"error":{"message":"Too many requests, please wait before trying again.","reason":null}}"#
+        ));
         assert!(!default_is_user_request_rate_exceeded(
             r#"{"message":"Too many requests","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(!default_is_user_request_rate_exceeded(
+            r#"{"message":"unrelated error","reason":null}"#
         ));
         assert!(!default_is_user_request_rate_exceeded(
             r#"{"message":"USER_REQUEST_RATE_EXCEEDED"}"#
