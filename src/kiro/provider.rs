@@ -24,11 +24,10 @@ use parking_lot::Mutex;
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
-/// 总重试次数的防御性硬上限。
+/// 总重试次数硬上限（避免无限重试）
 ///
-/// 实际重试数至少覆盖当前分组的全部可用凭据；当可用凭据数超过该上限时，
-/// 遍历下限优先，避免永远只尝试前几个凭据。
-const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 64;
+/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。
+const MAX_TOTAL_RETRIES: usize = 4;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -340,8 +339,7 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let available = self.token_manager.available_count_in_group(group);
-        let max_retries = Self::compute_max_retries(total_credentials, available);
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
@@ -529,8 +527,7 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let available = self.token_manager.available_count_in_group(group);
-        let max_retries = Self::compute_max_retries(total_credentials, available);
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
@@ -943,15 +940,6 @@ impl KiroProvider {
         }))
     }
 
-    /// 保证单次请求至少能遍历当前分组的全部可用凭据一轮。
-    fn compute_max_retries(total_credentials: usize, available: usize) -> usize {
-        let budget = total_credentials.saturating_mul(MAX_RETRIES_PER_CREDENTIAL);
-        let floor = available.max(1);
-        budget
-            .max(floor)
-            .min(ABSOLUTE_MAX_TOTAL_RETRIES.max(floor))
-    }
-
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
     #[allow(clippy::too_many_arguments)]
     fn emit_attempt(
@@ -1061,15 +1049,6 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-
-    #[test]
-    fn max_retries_covers_every_available_credential() {
-        assert_eq!(KiroProvider::compute_max_retries(1, 1), 3);
-        assert_eq!(KiroProvider::compute_max_retries(2, 2), 6);
-        assert!(KiroProvider::compute_max_retries(10, 10) >= 10);
-        assert!(KiroProvider::compute_max_retries(50, 50) >= 50);
-        assert!(KiroProvider::compute_max_retries(20, 7) >= 7);
-    }
 
     #[test]
     fn preserves_typed_rate_limit_when_later_credential_selection_fails() {

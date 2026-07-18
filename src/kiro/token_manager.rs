@@ -1328,20 +1328,6 @@ impl MultiTokenManager {
             .count()
     }
 
-    /// 获取指定分组的当前可用凭据数。
-    pub fn available_count_in_group(&self, group: Option<&str>) -> usize {
-        let now = Instant::now();
-        self.entries
-            .lock()
-            .iter()
-            .filter(|e| {
-                !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && group_matches(&e.credentials.groups, group)
-            })
-            .count()
-    }
-
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -5133,29 +5119,6 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
-    }
-
-    #[test]
-    fn test_available_count_in_group() {
-        let mut disabled = grouped_cred("disabled", &["g1"]);
-        disabled.disabled = true;
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![
-                grouped_cred("a", &["g1"]),
-                disabled,
-                grouped_cred("b", &["g2"]),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(manager.available_count_in_group(Some("g1")), 1);
-        assert_eq!(manager.available_count_in_group(Some("g2")), 1);
-        assert_eq!(manager.available_count_in_group(None), 2);
-        assert_eq!(manager.available_count_in_group(Some("none")), 0);
     }
 
     #[test]
