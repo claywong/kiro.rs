@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1328,6 +1328,20 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 获取指定分组的当前可用凭据数。
+    pub fn available_count_in_group(&self, group: Option<&str>) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && group_matches(&e.credentials.groups, group)
+            })
+            .count()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1335,7 +1349,17 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &HashSet::new())
+    }
+
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1343,7 +1367,7 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                if e.disabled {
+                if e.disabled || excluded_ids.contains(&e.id) {
                     return false;
                 }
                 // 临时冷却中（账号级 429 风控）：跳过
@@ -1420,6 +1444,20 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+        let excluded_ids = HashSet::new();
+        self.acquire_context_excluding(model, group, &excluded_ids).await
+    }
+
+    /// 获取调用上下文，但在本次选择中临时排除指定凭据。
+    ///
+    /// 排除集合仅属于调用方当前请求；命中其他凭据时不会更新全局 `current_id`，
+    /// 因而不会改变下一次新请求的正常调度起点。
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1445,7 +1483,8 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
                     let is_available = |e: &CredentialEntry| {
-                        !e.disabled
+                        !excluded_ids.contains(&e.id)
+                            && !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !is_rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
@@ -1482,7 +1521,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1501,14 +1540,16 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best = self.select_next_credential_excluding(model, group, excluded_ids);
                         }
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        // 请求级临时排除不能改变后续请求的全局调度起点。
+                        if excluded_ids.is_empty() {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
@@ -1517,6 +1558,7 @@ impl MultiTokenManager {
                             .iter()
                             .filter(|e| {
                                 !e.disabled
+                                    && !excluded_ids.contains(&e.id)
                                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                     && credential_matches_request(&e.credentials, model, group)
                             })
@@ -4907,6 +4949,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_exclusion_uses_another_credential_without_changing_next_request() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager = MultiTokenManager::new(
+            Config::default(), vec![first, second], None, None, false,
+        ).unwrap();
+
+        let initial = manager.acquire_context(Some("other-model"), None).await.unwrap();
+        assert_eq!(initial.id, 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        let excluded_ids = HashSet::from([1]);
+        let fallback = manager
+            .acquire_context_excluding(Some("other-model"), None, &excluded_ids)
+            .await
+            .unwrap();
+        assert_eq!(fallback.id, 2);
+        assert_eq!(
+            manager.snapshot().current_id,
+            1,
+            "请求级临时切换不应改变全局 current_id"
+        );
+
+        let next_request = manager.acquire_context(Some("other-model"), None).await.unwrap();
+        assert_eq!(next_request.id, 1);
+    }
+
+    #[tokio::test]
     async fn all_matching_credentials_at_rpm_limit_return_retry_after() {
         let mut credential = grouped_cred("limited", &[]);
         credential.rpm_limit = 1;
@@ -5061,6 +5133,29 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_available_count_in_group() {
+        let mut disabled = grouped_cred("disabled", &["g1"]);
+        disabled.disabled = true;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                disabled,
+                grouped_cred("b", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count_in_group(Some("g1")), 1);
+        assert_eq!(manager.available_count_in_group(Some("g2")), 1);
+        assert_eq!(manager.available_count_in_group(None), 2);
+        assert_eq!(manager.available_count_in_group(Some("none")), 0);
     }
 
     #[test]
