@@ -22,7 +22,7 @@ import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
-import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { extractErrorMessage, maskProxyUrl, parsePurchaseCost } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
 import type { CredentialStatusItem } from '@/types/api'
 
@@ -43,6 +43,9 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [purchaseCost, setPurchaseCost] = useState(
+    credential.purchaseCost != null ? String(credential.purchaseCost) : '',
+  )
   const [rpmLimit, setRpmLimit] = useState(String(credential.rpmLimit))
   const [manualMode, setManualMode] = useState(false)
 
@@ -63,6 +66,7 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setPurchaseCost(credential.purchaseCost != null ? String(credential.purchaseCost) : '')
       setRpmLimit(String(credential.rpmLimit))
       setManualMode(false)
     }
@@ -83,6 +87,8 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          // 空 → -1（清除）；有值 → 数值。始终提交最终状态。
+          purchaseCost: parsePurchaseCost(purchaseCost) ?? -1,
           rpmLimit: Number(rpmLimit),
         },
       },
@@ -166,6 +172,26 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
+              </p>
+            </div>
+
+            {/* 购买成本 */}
+            <div className="space-y-2">
+              <label htmlFor="purchaseCost" className="text-sm font-medium">
+                购买成本
+              </label>
+              <Input
+                id="purchaseCost"
+                type="number"
+                min={0}
+                step="0.01"
+                placeholder="例: 30"
+                value={purchaseCost}
+                onChange={(e) => setPurchaseCost(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                账号购买价格，用于按使用率折算每天成本（概览页展示）。留空表示清除。
               </p>
             </div>
 

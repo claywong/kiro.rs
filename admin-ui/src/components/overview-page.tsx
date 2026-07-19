@@ -2,12 +2,13 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, Calendar, Coins, Cpu, KeyRound, Server, Wallet } from 'lucide-react'
+import { useByCredential, useByModel, useCost, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
   ClientKeyItem,
+  CostPoint,
   CredentialDistribution,
   ModelDistribution,
   StatsFilter,
@@ -17,9 +18,10 @@ import type {
   TimeSeriesPoint,
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
+import { CostChart } from '@/components/charts/cost-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
-import { cn, formatCredits, formatNumber } from '@/lib/utils'
+import { cn, formatCredits, formatCurrency, formatNumber } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -83,6 +85,7 @@ export function OverviewPage() {
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
   const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
   const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
+  const { data: cost } = useCost(filters.timeFilter)
   const seriesData = useMemo(() => series ?? [], [series])
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
@@ -97,6 +100,8 @@ export function OverviewPage() {
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
         stats={rangeStats}
+        totalCost={cost?.totalCost ?? 0}
+        currency={cost?.currency ?? '¥'}
         timeText={timeLabel(filters.timeFilter)}
       />
       <KeyFilterCard
@@ -121,6 +126,11 @@ export function OverviewPage() {
         onCustomStartDateChange={filters.setCustomStartDate}
         onGranularityChange={filters.setDraftGranularity}
         onPresetRangeChange={filters.selectPresetRange}
+      />
+      <CostTrendCard
+        points={cost?.points ?? []}
+        currency={cost?.currency ?? '¥'}
+        timeText={timeLabel(filters.timeFilter)}
       />
       <DistributionPanels
         byCred={credData}
@@ -226,11 +236,15 @@ function StatsCards({
   activeCredentials,
   activeKeys,
   stats,
+  totalCost,
+  currency,
   timeText,
 }: {
   activeCredentials: number
   activeKeys: number
   stats: RangeStats
+  totalCost: number
+  currency: string
   timeText: string
 }) {
   const cards = [
@@ -251,6 +265,12 @@ function StatsCards({
       extra: <span className="text-[11px] text-muted-foreground">上游计费量</span>,
     },
     {
+      icon: <Wallet className="h-4 w-4" />,
+      label: '成本',
+      value: formatCurrency(totalCost, currency),
+      extra: <span className="text-[11px] text-muted-foreground">按使用率折算</span>,
+    },
+    {
       icon: <KeyRound className="h-4 w-4" />,
       label: '启用的客户端 Key',
       meta: '当前可用入口',
@@ -265,7 +285,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-6">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
@@ -387,6 +407,33 @@ function TrendCard({
         <div key={chartKey} className="chart-range-fade">
           <TimeSeriesChart data={seriesData} granularity={timeFilter.granularity} />
         </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function CostTrendCard({
+  points,
+  currency,
+  timeText,
+}: {
+  points: CostPoint[]
+  currency: string
+  timeText: string
+}) {
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">每日成本趋势</h2>
+            <p className="text-[12px] text-muted-foreground">
+              按使用率折算 · 日常摊销 + 废弃补齐（账号报错/删除时剩余成本计入当天）
+            </p>
+          </div>
+          <span className="text-[11px] text-muted-foreground">{timeText}</span>
+        </div>
+        <CostChart data={points} currency={currency} />
       </CardContent>
     </Card>
   )

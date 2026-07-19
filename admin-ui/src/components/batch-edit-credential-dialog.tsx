@@ -51,6 +51,9 @@ export function BatchEditCredentialDialog({
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
 
+  const [editCost, setEditCost] = useState(false)
+  const [purchaseCost, setPurchaseCost] = useState('')
+
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
 
@@ -61,6 +64,8 @@ export function BatchEditCredentialDialog({
       setGroups([])
       setEditSource(false)
       setSourceChannel('')
+      setEditCost(false)
+      setPurchaseCost('')
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -74,8 +79,15 @@ export function BatchEditCredentialDialog({
   }
 
   const handleApply = async () => {
-    if (!editGroups && !editSource) {
+    if (!editGroups && !editSource && !editCost) {
       toast.error('请至少开启一项要修改的字段')
+      return
+    }
+    // 购买成本：空 → -1（清除）；有值 → 数值。
+    const costTrim = purchaseCost.trim()
+    const costValue = costTrim === '' ? -1 : Number(costTrim)
+    if (editCost && !Number.isFinite(costValue)) {
+      toast.error('购买成本必须是数字')
       return
     }
     setRunning(true)
@@ -87,6 +99,7 @@ export function BatchEditCredentialDialog({
       const req: Record<string, unknown> = {}
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
+      if (editCost) req.purchaseCost = costValue
       try {
         await updateCredential(c.id, req)
         ok++
@@ -164,6 +177,30 @@ export function BatchEditCredentialDialog({
                   disabled={running}
                 />
                 <p className="text-[11px] text-muted-foreground">纯备注，标记账号来源/渠道。</p>
+              </>
+            )}
+          </div>
+
+          {/* 购买成本区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改购买成本</span>
+              <Switch checked={editCost} onCheckedChange={setEditCost} disabled={running} />
+            </label>
+            {editCost && (
+              <>
+                <Input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  placeholder="应用到所有选中账号（留空 = 清除）"
+                  value={purchaseCost}
+                  onChange={(e) => setPurchaseCost(e.target.value)}
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  账号购买价格，用于按使用率折算每天成本。
+                </p>
               </>
             )}
           </div>

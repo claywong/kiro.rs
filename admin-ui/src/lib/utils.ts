@@ -153,6 +153,36 @@ export function formatCredits(value: number | null | undefined): string {
 }
 
 /**
+ * 解析「购买成本」输入框的值。
+ * - 空串 → undefined（表示不设置/不修改）
+ * - 合法非负数 → 该数值
+ * - 非法/负值 → undefined
+ */
+export function parsePurchaseCost(raw: string): number | undefined {
+  const s = raw.trim()
+  if (!s) return undefined
+  const n = Number(s)
+  if (!Number.isFinite(n) || n < 0) return undefined
+  return n
+}
+
+/**
+ * 货币金额展示：带符号，保留 2 位小数；≥ 1000 走 K/M 紧凑模式。
+ * 例：formatCurrency(30, '¥') → "¥30.00"；formatCurrency(1234.5, '¥') → "¥1.2K"
+ */
+export function formatCurrency(value: number | null | undefined, currency: string = '¥'): string {
+  if (value == null || Number.isNaN(value)) return `${currency}0`
+  if (Math.abs(value) >= 1000) {
+    const compact = new Intl.NumberFormat('en-US', {
+      notation: 'compact',
+      maximumFractionDigits: 1,
+    }).format(value)
+    return `${currency}${compact}`
+  }
+  return `${currency}${value.toFixed(2)}`
+}
+
+/**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
 /** 企业 SSO (external_idp) 的 authMethod 别名，与后端 canonicalize_auth_method_value 保持一致 */

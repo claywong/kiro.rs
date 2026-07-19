@@ -553,6 +553,30 @@ impl UsageAggregator {
         out
     }
 
+    /// 全量历史按天×凭证的 credits，`(day_ts, cred_id -> credits)`，按天升序。
+    ///
+    /// day_ts 为天桶起始（本地午夜 Unix 秒）。用于成本核算：成本摊销需要**全量**
+    /// 历史来正确累积「剩余未摊销成本」，故返回所有天桶而非仅窗口内。
+    /// 只输出 credits > 0 的凭证条目，减少体积。
+    pub fn daily_credits_by_credential(&self) -> Vec<(i64, HashMap<u64, f64>)> {
+        let inner = self.inner.read();
+        let mut out: Vec<(i64, HashMap<u64, f64>)> = inner
+            .day_buckets
+            .iter()
+            .map(|b| {
+                let m: HashMap<u64, f64> = b
+                    .by_credential
+                    .iter()
+                    .filter(|(_, s)| s.credits > 0.0)
+                    .map(|(id, s)| (*id, s.credits))
+                    .collect();
+                (b.ts, m)
+            })
+            .collect();
+        out.sort_by_key(|(ts, _)| *ts);
+        out
+    }
+
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
         let inner = self.inner.read();
@@ -913,5 +937,38 @@ mod tests {
         agg.ingest(&rec);
         let ov = agg.overview();
         assert_eq!(ov.today_errors, 1);
+    }
+
+    #[test]
+    fn daily_credits_by_credential_aggregates_per_cred() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now().to_rfc3339();
+        let mk = |cred: u64, credits: f64| UsageRecord {
+            ts: now.clone(),
+            key_id: 1,
+            credential_id: cred,
+            model: "m".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 100,
+            status: "success".to_string(),
+            effort: None,
+        };
+        agg.ingest(&mk(5, 0.3));
+        agg.ingest(&mk(5, 0.2));
+        agg.ingest(&mk(6, 0.1));
+        // credits=0 的凭证不应出现
+        agg.ingest(&mk(7, 0.0));
+
+        let daily = agg.daily_credits_by_credential();
+        // 同一天一个桶
+        assert_eq!(daily.len(), 1);
+        let (_, m) = &daily[0];
+        assert!((m.get(&5).copied().unwrap_or(0.0) - 0.5).abs() < 1e-9);
+        assert!((m.get(&6).copied().unwrap_or(0.0) - 0.1).abs() < 1e-9);
+        assert!(!m.contains_key(&7));
     }
 }

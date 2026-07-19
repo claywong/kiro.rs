@@ -24,6 +24,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
+use super::cost_ledger::SharedCostLedger;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
@@ -175,6 +176,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 成本账本（购买成本 + 额度快照 + 废弃事件），独立于凭证生命周期持久化
+    cost_ledger: SharedCostLedger,
 }
 
 /// Social 登录会话状态
@@ -482,6 +485,10 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let cost_ledger_path = token_manager
+            .cache_dir()
+            .map(|d| d.join("cost_ledger.json"));
+        let cost_ledger = Arc::new(super::cost_ledger::CostLedger::load(cost_ledger_path));
 
         let svc = Self {
             token_manager,
@@ -496,6 +503,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            cost_ledger,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -514,6 +522,16 @@ impl AdminService {
         }
 
         svc
+    }
+
+    /// 成本账本引用（供 handler 计算成本序列时读取）
+    pub fn cost_ledger(&self) -> &SharedCostLedger {
+        &self.cost_ledger
+    }
+
+    /// 货币符号（成本展示用），来自 config，默认 "¥"
+    pub fn cost_currency(&self) -> String {
+        self.token_manager.config().cost_currency.clone()
     }
 
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
@@ -703,6 +721,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    purchase_cost: entry.purchase_cost,
                     ttft_ewma_ms: entry.ttft_ewma_ms,
                     balance,
                     balance_updated_at,
@@ -877,6 +896,11 @@ impl AdminService {
         }
         self.save_balance_cache();
 
+        // 成本账本：回填额度基数（单价分母）。非 force——不覆盖录入时的快照，
+        // 仅在为空时补齐（如「直接导入」或首次快照失败的凭证）。
+        self.cost_ledger
+            .snapshot_quota_basis(id, balance.usage_limit, false);
+
         Ok(balance)
     }
 
@@ -984,10 +1008,28 @@ impl AdminService {
         (success, failure)
     }
 
+    /// 依据当前凭证快照，检测自动禁用型废弃并记入成本账本。
+    ///
+    /// 遍历所有 `disabled = true` 的凭证，对废弃原因命中
+    /// [`DISCARD_DISABLED_REASONS`](super::cost_ledger::DISCARD_DISABLED_REASONS) 的，
+    /// 标记废弃（剩余成本计入检测当天）。幂等：已废弃的不重复处理。
+    /// 在余额刷新调度和成本查询前调用做兜底。
+    pub fn sync_cost_discards(&self) {
+        let snapshot = self.token_manager.snapshot();
+        let disabled: Vec<(u64, Option<String>)> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.disabled)
+            .map(|e| (e.id, e.disabled_reason.clone()))
+            .collect();
+        self.cost_ledger.detect_auto_disabled(&disabled);
+    }
+
     /// 启动余额后台刷新调度器
     ///
     /// - 启动后立刻执行一次刷新
     /// - 之后按 `interval` 周期循环刷新
+    /// - 每轮刷新后同步成本废弃检测
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
         let svc = Arc::clone(self);
@@ -997,6 +1039,8 @@ impl AdminService {
             loop {
                 let started = std::time::Instant::now();
                 let (ok, err) = svc.refresh_all_balances().await;
+                // 刷新后同步废弃检测（自动禁用的凭证剩余成本计入当天）
+                svc.sync_cost_discards();
                 tracing::info!(
                     "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s",
                     ok,
@@ -1189,6 +1233,7 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let purchase_cost = req.purchase_cost;
         let new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
@@ -1220,6 +1265,7 @@ impl AdminService {
             groups: req.groups,
             supported_models: vec![], // 将在首次获取使用额度时自动回填
             source_channel: req.source_channel,
+            purchase_cost,
         };
 
         // 调用 token_manager 添加凭据
@@ -1229,12 +1275,26 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
+        // 同步成本账本（购买成本）
+        if purchase_cost.is_some() {
+            self.cost_ledger.set_purchase_cost(credential_id, purchase_cost);
+        }
+
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
         if fetch_balance {
-            if let Err(e) = self.get_balance(credential_id).await {
-                tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+            match self.get_balance(credential_id).await {
+                Ok(balance) => {
+                    // 录入时快照额度基数（单价分母），force 覆盖占位。
+                    if purchase_cost.is_some() {
+                        self.cost_ledger
+                            .snapshot_quota_basis(credential_id, balance.usage_limit, true);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+                }
             }
         }
 
@@ -1313,6 +1373,8 @@ impl AdminService {
                 );
                 // 回滚：直接删除（delete_credential 会清理 balance 缓存与 trace）。
                 // 不先 disable——delete 是整条移除，无 enabled 守卫，足够原子。
+                // 先移除成本账本条目：验活失败的凭证从未真正可用，不应记「废弃剩余成本」。
+                self.cost_ledger.set_purchase_cost(resp.credential_id, None);
                 let rolled_back = self.delete_credential(resp.credential_id).is_ok();
                 ImportItemResult {
                     status: ImportStatus::Failed,
@@ -1332,6 +1394,11 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        // purchase_cost 约定：None=不修改；负值=清除；非负=设置。
+        // 转成 token_manager 的 Option<Option<f64>>：None=不改，Some(None)=清除，Some(Some(x))=设置。
+        let purchase_cost_arg: Option<Option<f64>> = req
+            .purchase_cost
+            .map(|c| if c >= 0.0 { Some(c) } else { None });
         self.token_manager
             .update_credential(
                 id,
@@ -1346,8 +1413,14 @@ impl AdminService {
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.rpm_limit,
+                purchase_cost_arg,
             )
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        // 同步成本账本（仅当请求包含 purchase_cost 时）
+        if let Some(inner) = purchase_cost_arg {
+            self.cost_ledger.set_purchase_cost(id, inner);
+        }
+        Ok(())
     }
 
     /// 删除凭据
@@ -1355,6 +1428,9 @@ impl AdminService {
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
+
+        // 成本账本：删除即废弃，剩余未摊销成本一次性计入今日（若有成本记录）。
+        self.cost_ledger.mark_discarded(id, "deleted");
 
         // 清理已删除凭据的余额缓存
         {
@@ -2446,6 +2522,7 @@ impl AdminService {
                 None,            // groups 不修改
                 None,            // source_channel 不修改
                 None,            // rpm_limit 不修改
+                None,            // purchase_cost 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2515,7 +2592,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

@@ -1006,6 +1006,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 账号购买成本（纯运营元数据，用于成本核算）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_cost: Option<f64>,
     /// 各模型 TTFT EWMA 的均值（毫秒）；无样本时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ewma_ms: Option<u64>,
@@ -2494,6 +2497,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    purchase_cost: e.credentials.purchase_cost,
                     // 展示各模型 EWMA 的均值，反映最近一次测得的表现；
                     // 不做 TTL 过滤（陈旧样本仅影响调度重探，不影响历史展示）。
                     ttft_ewma_ms: if e.ttft_ewma.is_empty() {
@@ -3288,8 +3292,9 @@ impl MultiTokenManager {
 
     /// 更新凭据的可编辑字段（Admin API）
     ///
-    /// 支持更新 email、proxy_url、proxy_username、proxy_password。
-    /// 传 `None` 表示不修改该字段，传 `Some("")` 表示清除该字段。
+    /// 支持更新 email、proxy_url、proxy_username、proxy_password、groups、
+    /// source_channel、rpm_limit、purchase_cost。
+    /// 传 `None` 表示不修改该字段，传 `Some(None)` / `Some("")` 表示清除该字段。
     pub fn update_credential(
         &self,
         id: u64,
@@ -3300,6 +3305,7 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         rpm_limit: Option<u32>,
+        purchase_cost: Option<Option<f64>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3330,6 +3336,10 @@ impl MultiTokenManager {
             }
             if let Some(rpm_limit) = rpm_limit {
                 entry.credentials.rpm_limit = rpm_limit;
+            }
+            if let Some(v) = purchase_cost {
+                // Some(None) 清除；Some(Some(x)) 设置（负值归一为 None）
+                entry.credentials.purchase_cost = v.filter(|x| x.is_finite() && *x >= 0.0);
             }
         }
         self.persist_credentials()?;

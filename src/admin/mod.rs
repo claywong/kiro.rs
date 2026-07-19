@@ -28,6 +28,7 @@ pub mod client_keys;
 pub mod groups;
 pub mod usage_stats;
 pub mod trace_db;
+pub mod cost_ledger;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;
