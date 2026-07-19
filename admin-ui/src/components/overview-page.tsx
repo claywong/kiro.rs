@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server, Wallet } from 'lucide-react'
-import { useByCredential, useByModel, useCost, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, Calendar, Coins, Cpu, Server, Wallet } from 'lucide-react'
+import { useByCredential, useByModel, useCost, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
@@ -79,7 +79,6 @@ function timeLabel(filter: StatsTimeFilter): string {
 
 export function OverviewPage() {
   const filters = useOverviewFilters()
-  const { data: overview } = useOverview()
   const { data: keysData } = useClientKeys()
   const groupOptions = useGroupOptions()
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
@@ -97,8 +96,6 @@ export function OverviewPage() {
     <div>
       <PageHeader />
       <StatsCards
-        activeCredentials={overview?.activeCredentials ?? 0}
-        activeKeys={overview?.activeClientKeys ?? 0}
         stats={rangeStats}
         totalCost={cost?.totalCost ?? 0}
         currency={cost?.currency ?? '¥'}
@@ -233,15 +230,11 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
 }
 
 function StatsCards({
-  activeCredentials,
-  activeKeys,
   stats,
   totalCost,
   currency,
   timeText,
 }: {
-  activeCredentials: number
-  activeKeys: number
   stats: RangeStats
   totalCost: number
   currency: string
@@ -270,24 +263,12 @@ function StatsCards({
       value: formatCurrency(totalCost, currency),
       extra: <span className="text-[11px] text-muted-foreground">按使用率折算</span>,
     },
-    {
-      icon: <KeyRound className="h-4 w-4" />,
-      label: '启用的客户端 Key',
-      meta: '当前可用入口',
-      value: formatNumber(activeKeys),
-      className: 'col-span-2 max-[360px]:col-span-1 lg:col-span-1',
-      extra: (
-        <span className="text-[11px] text-muted-foreground">
-          上游 {formatNumber(activeCredentials)}
-        </span>
-      ),
-    },
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-6">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
       {cards.map((card) => (
-        <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
+        <StatCard key={card.label} meta={timeText} {...card} />
       ))}
     </div>
   )
