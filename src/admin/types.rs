@@ -78,6 +78,9 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 账号购买成本（纯运营元数据，用于成本核算）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_cost: Option<f64>,
     /// 各模型 TTFT EWMA 的均值（毫秒）；无样本时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ewma_ms: Option<u64>,
@@ -205,6 +208,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 账号购买成本（可选，用于成本核算）
+    #[serde(default)]
+    pub purchase_cost: Option<f64>,
 }
 
 fn default_auth_method() -> String {
@@ -250,6 +256,11 @@ pub struct UpdateCredentialRequest {
     /// 每分钟请求数上限（None 表示不修改，0 表示不限速）
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+    /// 账号购买成本（None 表示不修改；负值表示清除；非负表示设置）
+    ///
+    /// 与 `rpm_limit` 一致的约定：字段缺失 → 不修改；前端清空时发负值（如 -1）→ 清除。
+    #[serde(default)]
+    pub purchase_cost: Option<f64>,
 }
 
 /// 添加凭据成功响应
@@ -358,6 +369,38 @@ pub struct BalanceResponse {
     /// 上游 `overageCapability` 原始字符串（用于排查"未知"状态）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage_capability_raw: Option<String>,
+}
+
+// ============ 成本核算 ============
+
+/// 单日成本点（概览页每日成本趋势用）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostPoint {
+    /// 本地日期（YYYY-MM-DD）
+    pub date: String,
+    /// 当日日常摊销成本（当天各凭证消耗 credits × 单价，封顶到剩余成本）
+    pub amortized_cost: f64,
+    /// 当日废弃补齐成本（当天被删除/自动禁用凭证的剩余未摊销成本一次性计入）
+    pub discard_cost: f64,
+    /// 当日总成本 = amortized_cost + discard_cost
+    pub total_cost: f64,
+}
+
+/// 成本查询响应（区间汇总 + 每日序列）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostSeriesResponse {
+    /// 货币符号（如 "¥"）
+    pub currency: String,
+    /// 区间总成本
+    pub total_cost: f64,
+    /// 区间日常摊销合计
+    pub total_amortized: f64,
+    /// 区间废弃补齐合计
+    pub total_discard: f64,
+    /// 每日成本序列（按日期升序）
+    pub points: Vec<CostPoint>,
 }
 
 // ============ 可用模型查询 ============

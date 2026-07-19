@@ -18,7 +18,7 @@ import {
 } from '@/components/ui/select'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
-import { extractErrorMessage } from '@/lib/utils'
+import { extractErrorMessage, parsePurchaseCost } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
 
 interface AddCredentialDialogProps {
@@ -46,6 +46,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [purchaseCost, setPurchaseCost] = useState('')
   const [rpmLimit, setRpmLimit] = useState('10')
 
   const groupOptions = useGroupOptions()
@@ -70,6 +71,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setPurchaseCost('')
     setRpmLimit('10')
   }
 
@@ -122,6 +124,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        purchaseCost: parsePurchaseCost(purchaseCost),
         rpmLimit: Number(rpmLimit),
       },
       {
@@ -380,6 +383,26 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
+              </p>
+            </div>
+
+            {/* 购买成本 */}
+            <div className="space-y-2">
+              <label htmlFor="purchaseCost" className="text-sm font-medium">
+                购买成本
+              </label>
+              <Input
+                id="purchaseCost"
+                type="number"
+                min={0}
+                step="0.01"
+                placeholder="例: 30"
+                value={purchaseCost}
+                onChange={(e) => setPurchaseCost(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。账号购买价格，用于按使用率折算每天成本（概览页展示）
               </p>
             </div>
 

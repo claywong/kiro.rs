@@ -172,6 +172,10 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 成本核算展示的货币符号（默认 "¥"）。仅用于前端展示，不参与计算。
+    #[serde(default = "default_cost_currency")]
+    pub cost_currency: String,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -256,6 +260,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_cost_currency() -> String {
+    "¥".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -291,6 +299,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            cost_currency: default_cost_currency(),
             endpoints: HashMap::new(),
             config_path: None,
         }

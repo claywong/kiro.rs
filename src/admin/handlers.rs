@@ -1240,6 +1240,33 @@ pub async fn stats_by_credential(
     Json(enriched).into_response()
 }
 
+/// GET /api/admin/stats/cost?startDate&endDate&granularity 或 ?range=24h|7d|30d
+///
+/// 按使用率折算的每日成本序列 + 区间汇总。成本恒按天核算（granularity 仅用于复用
+/// 窗口解析，不影响成本粒度）。
+pub async fn stats_cost(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let window = match parse_stats_window(&params) {
+        Ok(w) => w,
+        Err(message) => return stats_bad_request(message),
+    };
+    // 兜底同步废弃检测（自动禁用的凭证剩余成本计入当天），保证查询实时性
+    state.service.sync_cost_discards();
+
+    // 全量历史按天×凭证 credits（成本摊销需全量以正确累积剩余成本）
+    let daily = state.usage_aggregator.daily_credits_by_credential();
+    let currency = state.service.cost_currency();
+    let resp = state.service.cost_ledger().compute_cost_series(
+        &daily,
+        window.start_ts,
+        window.end_ts,
+        &currency,
+    );
+    Json(resp).into_response()
+}
+
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
 /// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
