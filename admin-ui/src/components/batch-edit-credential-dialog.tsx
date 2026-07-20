@@ -118,7 +118,7 @@ export function BatchEditCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !running && onOpenChange(o)}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>批量编辑（{credentials.length} 个账号）</DialogTitle>
           <DialogDescription>
@@ -126,7 +126,7 @@ export function BatchEditCredentialDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-5 py-2">
+        <div className="space-y-5 py-2 overflow-y-auto flex-1 min-h-0 pr-1">
           {/* 分组区 */}
           <div className="space-y-3 rounded-xl border border-border/60 p-3">
             <label className="flex items-center justify-between">

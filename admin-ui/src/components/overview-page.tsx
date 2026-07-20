@@ -98,7 +98,6 @@ export function OverviewPage() {
       <StatsCards
         stats={rangeStats}
         totalCost={cost?.totalCost ?? 0}
-        currency={cost?.currency ?? '¥'}
         timeText={timeLabel(filters.timeFilter)}
       />
       <KeyFilterCard
@@ -126,7 +125,7 @@ export function OverviewPage() {
       />
       <CostTrendCard
         points={cost?.points ?? []}
-        currency={cost?.currency ?? '¥'}
+        currency="$"
         timeText={timeLabel(filters.timeFilter)}
       />
       <DistributionPanels
@@ -232,12 +231,10 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
 function StatsCards({
   stats,
   totalCost,
-  currency,
   timeText,
 }: {
   stats: RangeStats
   totalCost: number
-  currency: string
   timeText: string
 }) {
   const cards = [
@@ -255,13 +252,11 @@ function StatsCards({
       icon: <Coins className="h-4 w-4" />,
       label: 'Credit',
       value: formatCredits(stats.credits),
-      extra: <span className="text-[11px] text-muted-foreground">上游计费量</span>,
     },
     {
       icon: <Wallet className="h-4 w-4" />,
       label: '成本',
-      value: formatCurrency(totalCost, currency),
-      extra: <span className="text-[11px] text-muted-foreground">按使用率折算</span>,
+      value: formatCurrency(totalCost, '$'),
     },
   ]
 

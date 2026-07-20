@@ -117,15 +117,15 @@ export function EditCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>
             编辑凭据 #{credential.id}
           </DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
-          <div className="space-y-4 py-4">
+        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+          <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* 邮箱 */}
             <div className="space-y-2">
               <label htmlFor="email" className="text-sm font-medium">
