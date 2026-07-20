@@ -443,6 +443,12 @@ export function CredentialCard({
           来源: {credential.sourceChannel}
         </Badge>
       )}
+      {/* 购买成本 */}
+      {credential.purchaseCost != null && (
+        <Badge variant="outline" title="购买成本">
+          成本: ${credential.purchaseCost}
+        </Badge>
+      )}
     </>
   );
 
