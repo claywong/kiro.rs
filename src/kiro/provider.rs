@@ -27,7 +27,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 ///
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。
-const MAX_TOTAL_RETRIES: usize = 4;
+const MAX_TOTAL_RETRIES: usize = 6;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -541,7 +541,14 @@ impl KiroProvider {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager
-                .acquire_context_excluding(model.as_deref(), group, &request_excluded_credentials)
+                .acquire_context_excluding(
+                    model.as_deref(),
+                    group,
+                    &request_excluded_credentials,
+                    // 换号重试的后半程进入兜底模式：跨优先级层按 RPM 余量选号，
+                    // 避免在高优先级热号上反复撞 USER_REQUEST_RATE_EXCEEDED。
+                    attempt >= max_retries / 2,
+                )
                 .await
             {
                 Ok(c) => c,

@@ -1340,14 +1340,22 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     #[cfg(test)]
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, group, &HashSet::new())
+        self.select_next_credential_excluding(model, group, &HashSet::new(), false)
     }
 
+    /// 选择下一个可用凭据。
+    ///
+    /// `salvage` 为兜底模式：正常调度严格按优先级分层（高优先级层未耗尽不降级），
+    /// 但高优先级层长期承载最重流量，最易触发上游 USER_REQUEST_RATE_EXCEEDED。
+    /// 一次请求在高优先级层连续撞限时，继续按优先级换号只会在同一批热号里打转。
+    /// 兜底模式下跳过优先级分层，跨层按 RPM 剩余余量最大（负载最轻、上游被限概率
+    /// 最低）选号，把重试导向闲置的低优先级冷号。仅用于换号重试的后半程。
     fn select_next_credential_excluding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
+        salvage: bool,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -1376,6 +1384,27 @@ impl MultiTokenManager {
 
         if available.is_empty() {
             return None;
+        }
+
+        // 兜底模式：跨优先级层，按 RPM 剩余余量最大选号（rpm_limit=0 视为无限余量）。
+        // 平局按 success_count 少、priority 高、id 小，保证确定性。
+        if salvage {
+            let remaining = |e: &CredentialEntry| -> u64 {
+                let limit = e.credentials.rpm_limit;
+                if limit == 0 {
+                    u64::MAX
+                } else {
+                    u64::from(limit.saturating_sub(rpm_window_count(e, now)))
+                }
+            };
+            let entry = available.iter().max_by(|a, b| {
+                remaining(a)
+                    .cmp(&remaining(b))
+                    .then(b.success_count.cmp(&a.success_count))
+                    .then(b.credentials.priority.cmp(&a.credentials.priority))
+                    .then(b.id.cmp(&a.id))
+            })?;
+            return Some((entry.id, entry.credentials.clone()));
         }
 
         let mode = self.load_balancing_mode.lock().clone();
@@ -1434,7 +1463,7 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
         let excluded_ids = HashSet::new();
-        self.acquire_context_excluding(model, group, &excluded_ids).await
+        self.acquire_context_excluding(model, group, &excluded_ids, false).await
     }
 
     /// 获取调用上下文，但在本次选择中临时排除指定凭据。
@@ -1446,6 +1475,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
+        salvage: bool,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -1465,7 +1495,9 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if is_balanced || salvage {
+                    // 兜底模式不复用当前活跃凭据（它往往正是刚撞限的热号），
+                    // 直接交由跨层 RPM 余量选号。
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1510,7 +1542,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids, salvage);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1529,7 +1561,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential_excluding(model, group, excluded_ids);
+                            best = self.select_next_credential_excluding(model, group, excluded_ids, salvage);
                         }
                     }
 
