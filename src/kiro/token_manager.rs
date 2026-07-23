@@ -1510,25 +1510,33 @@ impl MultiTokenManager {
                             && !is_rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
                     };
-                    // 当前活跃凭据所在的最高优先级层若存在多个可用凭据，
-                    // 放开黏性交由 select_next_credential 做同层均衡；
-                    // 否则维持黏性，复用当前活跃凭据。
-                    let same_layer_available = entries
+                    // 黏性放开条件（满足任一即交由 select_next_credential 重选）：
+                    // 1. 存在【优先级严格更高】的可用凭据 —— 消除跨层倒挂：
+                    //    瞬时 429 等把 current 踹到低优先级层后，高优先级账号冷却
+                    //    恢复时必须自动爬回，不能永久卡在低层。
+                    // 2. current 所在层存在多个可用凭据 —— 同层 least-used/TTFT 均衡。
+                    // 否则维持黏性，复用当前活跃凭据（保 cache read 亲和性）。
+                    let release_stickiness = entries
                         .iter()
                         .find(|e| e.id == current_id)
                         .filter(|e| is_available(e))
                         .map(|cur| {
-                            entries
+                            let has_higher_priority_available = entries.iter().any(|e| {
+                                e.credentials.priority < cur.credentials.priority
+                                    && is_available(e)
+                            });
+                            let same_layer_available = entries
                                 .iter()
                                 .filter(|e| {
                                     e.credentials.priority == cur.credentials.priority
                                         && is_available(e)
                                 })
-                                .count()
+                                .count();
+                            has_higher_priority_available || same_layer_available > 1
                         })
-                        .unwrap_or(0);
+                        .unwrap_or(true);
 
-                    if same_layer_available > 1 {
+                    if release_stickiness {
                         None
                     } else {
                         entries
@@ -5139,6 +5147,40 @@ mod tests {
         assert_eq!(
             opus.id, 2,
             "priority current_id must not bypass per-credential model filtering"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_recovers_after_higher_priority_throttle_clears() {
+        // 跨层倒挂自愈：高优先级账号被瞬时风控踹走后，冷却恢复时 current
+        // 必须自动爬回最高优先级层，而不是永久黏在低优先级账号上。
+        let a = grouped_cred("a", &[]); // priority 0（默认）
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 5;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
+
+        // 预热：current 落到最高优先级的 A。
+        let warm = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(warm.id, 1, "预热应选最高优先级 A");
+
+        // A 触发账号级风控并冷却；此后新请求应故障转移到 B，且 current 变为 B。
+        manager.report_account_throttled_for_request(
+            1,
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+        );
+        let during = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(during.id, 2, "A 冷却期间应故障转移到低优先级 B");
+
+        // A 冷却解除后，下一次请求必须爬回 A（修复前会永久黏在 B）。
+        manager.clear_throttle(1).unwrap();
+        let recovered = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            recovered.id, 1,
+            "更高优先级 A 恢复可用后必须放开黏性、重新选回 A"
         );
     }
 
