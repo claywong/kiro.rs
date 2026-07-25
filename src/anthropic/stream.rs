@@ -207,20 +207,27 @@ fn is_inline_space(buffer: &str, pos: usize) -> bool {
 /// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号或引号包裹
 /// （如 `` `</thinking>` ``），这类「引用」会被跳过。
 ///
-/// 判定规则：第一个未被 [`THINKING_QUOTE_CHARS`] 包裹、且未被空格/制表符隔开的
-/// `</thinking>` 即为真结束标签。协议上整段响应只有一个真结束标签
-/// （状态机命中后即置 `thinking_extracted`），故不再要求标签后必须紧跟 `\n\n`——
+/// 判定规则：第一个未被 [`THINKING_QUOTE_CHARS`] 包裹、且非「两侧都被空格/制表符
+/// 隔开」的 `</thinking>` 即为真结束标签。协议上整段响应只有一个真结束标签
+/// （状态机命中后即置 `thinking_extracted`），故不要求标签后必须紧跟 `\n\n`——
 /// 模型完全可能直接输出 `</thinking>正文` 或 `</thinking>\n正文`，
-/// 旧的 `\n\n` 硬要求会让这些形态永远无法闭合。
+/// `\n\n` 硬要求会让这些形态永远无法闭合。
 ///
 /// 跳过 / 等待的情况：
 /// - 被引用字符包裹（反引号、双引号、单引号、反斜杠）
-/// - 紧邻空格或制表符：真结束标签总是紧贴思考正文（`...收尾。</thinking>`）
-///   或独占一行（`...\n</thinking>`），不会出现 `提到 </thinking> 的问题` 这种
-///   句中被空格隔开的形态；后者是模型在正文里**提及**标签，不能据此闭合。
-///   注意换行不算隔开——`\n</thinking>` 是最常见的真结束形态。
+/// - **两侧都**紧邻空格或制表符：这是句中提及的典型形态
+///   （`提到 </thinking> 的问题`），模型在正文里谈论标签，不能据此闭合。
+///   单侧空格不作为提及的证据——`</thinking> 正文` / `思考完毕 </thinking>` 都是
+///   完全正常的真结束形态，若单侧即判提及，thinking 块会永不闭合、
+///   整段正文以 thinking_delta 下发，并因「只有 thinking 块」触发收尾兜底把
+///   `stop_reason` 误置为 `max_tokens`。换行同样不算隔开——`\n</thinking>`
+///   是最常见的真结束形态。
 /// - 标签正好在缓冲区末尾：后一个字符可能是尚未到达的反引号，返回 `None` 等待更多内容
 ///   （流结束或 tool_use 边界由 [`find_real_thinking_end_tag_at_buffer_end`] 兜底）
+///
+/// 取舍：两侧空格的真结束标签（`思考完毕 </thinking> 正文`）仍会漏判。代价不对称——
+/// 漏判真标签会丢掉整段正文并误报 `max_tokens`，误判提及只是让 thinking 提前截断、
+/// 内容仍完整可见，故按「宁可误判提及」取舍。
 ///
 /// # 参数
 /// - `buffer`: 要搜索的字符串
@@ -235,7 +242,7 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
     while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        // 检查前面是否有引用字符 / 空格隔开（句中提及的特征）
+        // 检查前面是否有引用字符 / 空格
         let has_quote_before = absolute_pos > 0 && is_thinking_quote_char(buffer, absolute_pos - 1);
         let spaced_before = absolute_pos > 0 && is_inline_space(buffer, absolute_pos - 1);
 
@@ -246,12 +253,13 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
             return None;
         }
 
-        // 检查后面是否有引用字符 / 空格隔开
+        // 检查后面是否有引用字符 / 空格
         let has_quote_after = is_thinking_quote_char(buffer, after_pos);
         let spaced_after = is_inline_space(buffer, after_pos);
 
-        // 被引用包裹或被空格隔开 → 判为正文提及，跳过继续搜索
-        if has_quote_before || has_quote_after || spaced_before || spaced_after {
+        // 被引用包裹，或**两侧都**被空格隔开（句中提及的典型形态）→ 跳过继续搜索。
+        // 单侧空格不算提及：`</thinking> 正文`、`思考完毕 </thinking>` 都是真结束形态。
+        if has_quote_before || has_quote_after || (spaced_before && spaced_after) {
             search_start = absolute_pos + 1;
             continue;
         }
@@ -3362,17 +3370,18 @@ mod tests {
         // 旧实现在这两种形态下返回 None，导致 thinking 块永不闭合。
         assert_eq!(find_real_thinking_end_tag("</thinking>\n"), Some(0));
 
-        // 标签后紧跟空格：视为正文提及，不闭合
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+        // 标签后紧跟空格：单侧空格不是提及的证据，仍是真结束标签。
+        // `</thinking> 正文` 是模型的常见输出形态（英文尤甚）。
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), Some(0));
     }
 
     /// 模型在 thinking 正文里**提及**结束标签时不得误闭合。
     ///
     /// 放宽 `\n\n` 硬要求后，这类形态失去了原有的天然屏障，
-    /// 改由「空格隔开 = 句中提及」的判定兜住。
+    /// 改由「两侧都被空格隔开 = 句中提及」的判定兜住。
     #[test]
     fn test_find_real_thinking_end_tag_skips_inline_mentions() {
-        // 未加引号、被空格隔开的句中提及 → 跳过，命中后面真正的结束标签
+        // 未加引号、两侧被空格隔开的句中提及 → 跳过，命中后面真正的结束标签
         let s = "问题在于 </thinking> 没被识别\n\n真结束</thinking>\n\n";
         let pos = find_real_thinking_end_tag(s).expect("应命中真结束标签");
         assert_eq!(
@@ -3385,15 +3394,45 @@ mod tests {
             "不能命中句中提及的那个标签，got pos={pos}"
         );
 
-        // 只有一侧被空格隔开也算提及
-        assert_eq!(find_real_thinking_end_tag("提到 </thinking>的问题"), None);
-        assert_eq!(find_real_thinking_end_tag("提到</thinking> 的问题"), None);
-
         // 换行不算隔开：`\n</thinking>` 是最常见的真结束形态
         assert_eq!(
             find_real_thinking_end_tag("思考完毕\n</thinking>\n\n正文"),
             Some("思考完毕\n".len())
         );
+    }
+
+    /// 单侧空格必须视为真结束标签。
+    ///
+    /// 曾经「任一侧有空格即判提及」，导致 `</thinking> 正文` / `思考完毕 </thinking>`
+    /// 这类常见形态永不闭合：整段正文以 thinking_delta 下发，且因为全程没有 text 块，
+    /// 收尾兜底会补一个空格当正文并把 `stop_reason` 误置为 `max_tokens`。
+    #[test]
+    fn test_find_real_thinking_end_tag_single_side_space_is_real() {
+        // 标签后单个空格（英文输出尤其常见）
+        assert_eq!(
+            find_real_thinking_end_tag("Done.</thinking> Body text here."),
+            Some(5),
+            "标签后单侧空格应闭合"
+        );
+        assert_eq!(
+            find_real_thinking_end_tag("思考。</thinking> 正文内容。"),
+            Some("思考。".len()),
+            "标签后单侧空格应闭合（中文）"
+        );
+        // 标签前单个空格
+        assert_eq!(
+            find_real_thinking_end_tag("思考完毕 </thinking>正文内容。"),
+            Some("思考完毕 ".len()),
+            "标签前单侧空格应闭合"
+        );
+        // 制表符同理
+        assert_eq!(
+            find_real_thinking_end_tag("思考。</thinking>\t正文内容。"),
+            Some("思考。".len()),
+            "标签后单侧制表符应闭合"
+        );
+        // 单侧空格 + 引号仍判提及（引号优先）
+        assert_eq!(find_real_thinking_end_tag("提到 `</thinking>`的问题"), None);
     }
 
     /// 复现线上现象：thinking 正文以句号结尾、`</thinking>` 后直接跟正文（无 `\n\n`），
@@ -3471,7 +3510,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn test_find_real_thinking_end_tag_mixed() {
         // 先有被包裹的，后有真正的结束标签
