@@ -1,0 +1,365 @@
+import { useState } from 'react'
+import { toast } from 'sonner'
+import {
+  Wallet, PackageOpen, Webhook, BellRing, Send, Ticket, Upload, ShoppingCart,
+} from 'lucide-react'
+import { Card, CardContent } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
+} from '@/components/ui/dialog'
+import { useConfirm } from '@/components/ui/confirm-dialog'
+import {
+  useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
+  useSetVendorWebhookUrl, usePurchaseAdHoc,
+} from '@/hooks/use-vendor'
+import { extractErrorMessage } from '@/lib/utils'
+import type { VendorStatus } from '@/types/api'
+
+/** 四格状态卡片中的一格 */
+function StatCard({
+  icon, label, value, hint, tone = 'normal',
+}: {
+  icon: React.ReactNode
+  label: string
+  value: React.ReactNode
+  hint?: React.ReactNode
+  tone?: 'normal' | 'warn' | 'good'
+}) {
+  const toneClass =
+    tone === 'warn'
+      ? 'text-amber-600 dark:text-amber-500'
+      : tone === 'good'
+        ? 'text-emerald-600 dark:text-emerald-500'
+        : ''
+  return (
+    <Card>
+      <CardContent className="p-4">
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          {icon}
+          <span>{label}</span>
+        </div>
+        <div className={`mt-1.5 text-xl font-semibold tabular-nums ${toneClass}`}>{value}</div>
+        {hint && <div className="mt-1 text-xs text-muted-foreground">{hint}</div>}
+      </CardContent>
+    </Card>
+  )
+}
+
+/** 本机应有的 webhook 地址。路径 token 只存在后端，前端拿不到，故只做「是否已配置」提示。 */
+function describeWebhook(status?: VendorStatus): {
+  value: string
+  tone: 'normal' | 'warn' | 'good'
+  hint: string
+} {
+  if (!status?.inboundEnabled) {
+    return {
+      value: '未启用',
+      tone: 'warn',
+      hint: '配置 vendor.webhookPathToken 后启用入站接收',
+    }
+  }
+  const saved = status.profile?.webhook_url?.trim()
+  if (!saved) {
+    return { value: '卖家侧未保存', tone: 'warn', hint: '点「写入卖家」提交本机地址' }
+  }
+  return { value: '已连接', tone: 'good', hint: saved }
+}
+
+export function VendorStatusBar() {
+  const { data: status, isLoading } = useVendorStatus()
+  const redeem = useRedeemVendorCode()
+  const testWebhook = useTestVendorWebhook()
+  const setWebhookUrl = useSetVendorWebhookUrl()
+  const purchaseAdHoc = usePurchaseAdHoc()
+  const confirm = useConfirm()
+
+  const [redeemOpen, setRedeemOpen] = useState(false)
+  const [code, setCode] = useState('')
+  const [webhookOpen, setWebhookOpen] = useState(false)
+  const [webhookUrl, setWebhookInput] = useState('')
+  const [directOpen, setDirectOpen] = useState(false)
+  const [directCount, setDirectCount] = useState('1')
+
+  const profile = status?.profile
+  const webhookInfo = describeWebhook(status)
+
+  const handleRedeem = async () => {
+    const trimmed = code.trim()
+    if (!trimmed) {
+      toast.error('请填写兑换码')
+      return
+    }
+    try {
+      const r = await redeem.mutateAsync(trimmed)
+      if (r.replayed) {
+        toast.info('这张码此前已兑换过，余额未变动', {
+          description: `首次兑换于 ${r.redeemed_at ?? '未知时间'}，额度 ${r.quota ?? '-'}`,
+        })
+      } else {
+        toast.success(`充值成功，+${r.quota ?? 0}`, {
+          description: `余额 ${r.previous_quota ?? '-'} → ${r.balance ?? '-'}`,
+        })
+      }
+      setRedeemOpen(false)
+      setCode('')
+    } catch (e) {
+      toast.error(extractErrorMessage(e))
+    }
+  }
+
+  const handleTest = async () => {
+    try {
+      await testWebhook.mutateAsync()
+      toast.success('已请求卖家推送测试消息', {
+        description: '稍等几秒刷新事件列表，应能看到一条新记录',
+      })
+    } catch (e) {
+      toast.error(extractErrorMessage(e))
+    }
+  }
+
+  const handleSetWebhook = async () => {
+    const url = webhookUrl.trim()
+    if (!/^https?:\/\/.+/.test(url)) {
+      toast.error('地址需以 http:// 或 https:// 开头')
+      return
+    }
+    try {
+      await setWebhookUrl.mutateAsync(url)
+      toast.success('已写入卖家侧 webhook 地址')
+      setWebhookOpen(false)
+    } catch (e) {
+      toast.error(extractErrorMessage(e))
+    }
+  }
+
+  /**
+   * 直接提取：不依赖 webhook 事件，服务端自行生成订单号。
+   * 会真实扣费，故强制二次确认并把数量、预计扣费、余额变化列清楚。
+   */
+  const handleDirectPurchase = async () => {
+    const n = Number(directCount)
+    if (!Number.isInteger(n) || n <= 0) {
+      toast.error('提取数量需为正整数')
+      return
+    }
+    const balance = profile?.remaining ?? profile?.quota
+    const ok = await confirm({
+      title: `确认直接提取 ${n} 个 Key？`,
+      description:
+        `该操作会立刻向卖家下单并按实际出 Key 数扣费${
+          balance != null ? `，当前余额 ${balance}` : ''
+        }。订单号由服务端生成，不与任何 webhook 事件关联，提交后无法撤销。`,
+      confirmText: `确认提取 ${n} 个`,
+      destructive: true,
+    })
+    if (!ok) return
+    try {
+      const r = await purchaseAdHoc.mutateAsync(n)
+      toast.success(`提取完成：出 ${r.purchased} 个，入库 ${r.imported} 个`, {
+        description: [
+          r.duplicated ? `重复 ${r.duplicated} 个` : null,
+          r.failed ? `失败 ${r.failed} 个` : null,
+          r.remaining != null ? `剩余余额 ${r.remaining}` : null,
+        ]
+          .filter(Boolean)
+          .join('，'),
+      })
+      setDirectOpen(false)
+    } catch (e) {
+      toast.error(extractErrorMessage(e))
+    }
+  }
+
+  if (!isLoading && status && !status.configured) {
+    return (
+      <Card className="border-amber-500/40 bg-amber-500/5">
+        <CardContent className="p-4 text-sm">
+          <div className="font-medium text-amber-600 dark:text-amber-500">未配置卖家对接</div>
+          <div className="mt-1 text-muted-foreground">
+            在 config.json 补上 <code className="text-xs">vendor.baseUrl</code> 与{' '}
+            <code className="text-xs">vendor.apiKey</code> 后重启即可启用；再加{' '}
+            <code className="text-xs">vendor.webhookPathToken</code> 才会接收入站推送。
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Button variant="outline" size="sm" onClick={handleTest} disabled={testWebhook.isPending}>
+          <Send className="mr-1.5 h-3.5 w-3.5" />
+          测试推送
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setWebhookInput(profile?.webhook_url ?? '')
+            setWebhookOpen(true)
+          }}
+        >
+          <Upload className="mr-1.5 h-3.5 w-3.5" />
+          写入卖家
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => setRedeemOpen(true)}>
+          <Ticket className="mr-1.5 h-3.5 w-3.5" />
+          兑换充值
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => {
+            setDirectCount(String(status?.stockMax && status.stockMax > 0 ? 1 : 1))
+            setDirectOpen(true)
+          }}
+        >
+          <ShoppingCart className="mr-1.5 h-3.5 w-3.5" />
+          直接提取
+        </Button>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          icon={<Wallet className="h-3.5 w-3.5" />}
+          label="卖家余额"
+          value={status?.profileError ? '—' : (profile?.remaining ?? profile?.quota ?? '—')}
+          hint={
+            status?.profileError
+              ? status.profileError
+              : profile
+                ? `总额度 ${profile.quota ?? '-'} / 已用 ${profile.used_quota ?? '-'}`
+                : undefined
+          }
+          tone={status?.profileError ? 'warn' : 'normal'}
+        />
+        <StatCard
+          icon={<PackageOpen className="h-3.5 w-3.5" />}
+          label="本轮可提取"
+          value={status?.stockError ? '—' : (status?.stockMax ?? '—')}
+          hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
+          tone={status?.stockError ? 'warn' : 'normal'}
+        />
+        <StatCard
+          icon={<Webhook className="h-3.5 w-3.5" />}
+          label="入站 Webhook"
+          value={webhookInfo.value}
+          hint={<span className="break-all">{webhookInfo.hint}</span>}
+          tone={webhookInfo.tone}
+        />
+        <StatCard
+          icon={<BellRing className="h-3.5 w-3.5" />}
+          label="未处理事件"
+          value={status?.unacked ?? 0}
+          hint={status?.unacked ? '下方列表点「已知悉」消除' : '全部已处理'}
+          tone={status?.unacked ? 'warn' : 'good'}
+        />
+      </div>
+
+      {/* 兑换充值 */}
+      <Dialog open={redeemOpen} onOpenChange={setRedeemOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>兑换码充值</DialogTitle>
+            <DialogDescription>
+              形如 KM-XXXXX-XXXXX-XXXXX，大小写 / 空格 / 连字符会自动规整，可整段粘贴。
+              同一张码重复提交不会重复充值。
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="KM-A2B3C-D4E5F-G6H7J"
+            autoFocus
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRedeemOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={handleRedeem} disabled={redeem.isPending}>
+              {redeem.isPending ? '兑换中…' : '兑换'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 写入卖家 webhook 地址 */}
+      <Dialog open={webhookOpen} onOpenChange={setWebhookOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>写入卖家侧 Webhook 地址</DialogTitle>
+            <DialogDescription>
+              需填完整地址，含路径 token，例如
+              <code className="mx-1 text-xs">https://你的域名/webhook/vendor/whk_xxx</code>
+              。token 只存在服务端配置里，此处需手动补全。
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={webhookUrl}
+            onChange={(e) => setWebhookInput(e.target.value)}
+            placeholder="https://rs.example.com/webhook/vendor/whk_xxx"
+            autoFocus
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setWebhookOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={handleSetWebhook} disabled={setWebhookUrl.isPending}>
+              {setWebhookUrl.isPending ? '提交中…' : '写入'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 直接提取 */}
+      <Dialog open={directOpen} onOpenChange={setDirectOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>直接提取</DialogTitle>
+            <DialogDescription>
+              不依赖 webhook 事件，订单号由服务端生成。会真实扣费，提交前需二次确认。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-muted-foreground">提取数量</label>
+              <Input
+                type="number"
+                min={1}
+                value={directCount}
+                onChange={(e) => setDirectCount(e.target.value)}
+                className="mt-1"
+                autoFocus
+              />
+              <div className="mt-1 text-xs text-muted-foreground">
+                本轮可提取上限 {status?.stockMax ?? '未知'}
+                {profile?.remaining != null ? `，当前余额 ${profile.remaining}` : ''}
+              </div>
+            </div>
+            <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
+              入库参数：分组{' '}
+              {status?.defaultGroups?.length ? status.defaultGroups.join(' / ') : '无'}
+              ，成本 {status?.defaultPurchaseCost ?? '未设'}，RPM{' '}
+              {status?.defaultRpmLimit ?? 10}
+              （在 config.json 的 vendor 段调整）
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDirectOpen(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={handleDirectPurchase}
+              disabled={purchaseAdHoc.isPending}
+            >
+              {purchaseAdHoc.isPending ? '提取中…' : '提取'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}

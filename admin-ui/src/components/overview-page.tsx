@@ -2,10 +2,11 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, Server, Wallet } from 'lucide-react'
+import { Activity, BellRing, Calendar, Coins, Cpu, Server, Wallet } from 'lucide-react'
 import { useByCredential, useByModel, useCost, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { useVendorUnacked } from '@/hooks/use-vendor'
 import type {
   ClientKeyItem,
   CostPoint,
@@ -77,6 +78,36 @@ function timeLabel(filter: StatsTimeFilter): string {
   return `${formatDateText(filter.startDate ?? '')} - ${formatDateText(filter.endDate ?? '')} · ${suffix}`
 }
 
+/**
+ * 供应商未处理事件横幅。只在有未确认事件时出现，点击跳到供应商页。
+ * 卖家 webhook 不会自动提取 Key，漏看事件就等于漏提，所以在首页也露一条。
+ */
+function VendorAlertBanner() {
+  const unacked = useVendorUnacked()
+  if (unacked <= 0) return null
+  return (
+    <Card className="mb-4 border-amber-500/40 bg-amber-500/5">
+      <CardContent className="flex items-center justify-between gap-3 p-3">
+        <div className="flex items-center gap-2 text-sm">
+          <BellRing className="h-4 w-4 text-amber-600 dark:text-amber-500" />
+          <span>
+            供应商有 <span className="font-semibold">{unacked}</span> 条未处理事件
+          </span>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => {
+            window.location.hash = '#/vendor'
+          }}
+        >
+          去查看
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
 export function OverviewPage() {
   const filters = useOverviewFilters()
   const { data: keysData } = useClientKeys()
@@ -95,6 +126,7 @@ export function OverviewPage() {
   return (
     <div>
       <PageHeader />
+      <VendorAlertBanner />
       <StatsCards
         stats={rangeStats}
         totalCost={cost?.totalCost ?? 0}

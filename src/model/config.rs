@@ -30,6 +30,62 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 卖家（Key 供应商）对接配置。
+///
+/// 覆盖两个方向：
+/// - **入站**：卖家把 `new_keys_available` / `all_keys_dead` 事件 POST 到
+///   `/webhook/vendor/{webhook_path_token}`。对方推送端不带签名，故用不可猜测的
+///   路径段做唯一凭证，比对不上直接 404。入站只负责落库 + 告警，不触发任何扣费动作。
+/// - **出站**：kiro.rs 拿 `api_key`（`usr-` 前缀）调卖家 `/api/my/*` 接口提取 Key、
+///   查库存余额、兑换充值。全部由管理面板手动触发。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VendorConfig {
+    /// 卖家 API base URL（如 `https://vendor.example.com`，末尾斜杠会被规整掉）
+    pub base_url: String,
+
+    /// 卖家账号密钥，出站请求以 `X-API-Key` 头发送（形如 `usr-xxx`）
+    pub api_key: String,
+
+    /// 入站 webhook 路径 token。请求路径需完整匹配，否则 404。
+    /// 为空视为入站未启用（出站接口仍可用）。
+    #[serde(default)]
+    pub webhook_path_token: String,
+
+    /// 手动提取入库时默认写入的凭据分组（可选）。提取弹窗仅展示，不在弹窗内编辑。
+    #[serde(default)]
+    pub default_groups: Vec<String>,
+
+    /// 手动提取入库时默认写入的单账号成本（可选，用于成本核算）
+    #[serde(default)]
+    pub default_purchase_cost: Option<f64>,
+
+    /// 手动提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    #[serde(default = "default_vendor_rpm_limit")]
+    pub default_rpm_limit: u32,
+}
+
+fn default_vendor_rpm_limit() -> u32 {
+    10
+}
+
+impl VendorConfig {
+    /// 规整后的 base URL（去掉末尾斜杠）
+    pub fn normalized_base_url(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
+
+    /// 出站接口是否可用（base_url 与 api_key 均非空）
+    pub fn outbound_enabled(&self) -> bool {
+        !self.normalized_base_url().is_empty() && !self.api_key.trim().is_empty()
+    }
+
+    /// 入站 webhook 是否可用（出站可用且路径 token 非空）
+    pub fn inbound_enabled(&self) -> bool {
+        self.outbound_enabled() && !self.webhook_path_token.trim().is_empty()
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,6 +232,11 @@ pub struct Config {
     #[serde(default = "default_cost_currency")]
     pub cost_currency: String,
 
+    /// 卖家（Key 供应商）对接配置。未配置时 webhook 端点与出站接口均不启用。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<VendorConfig>,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -300,6 +361,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cost_currency: default_cost_currency(),
+            vendor: None,
             endpoints: HashMap::new(),
             config_path: None,
         }

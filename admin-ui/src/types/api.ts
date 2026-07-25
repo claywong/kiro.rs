@@ -636,3 +636,107 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+// ============ 卖家（Key 供应商）对接 ============
+
+/** 卖家账号余额与 webhook 配置（`GET /api/my/profile` 原样透出） */
+export interface VendorProfile {
+  name?: string
+  quota?: number
+  remaining?: number
+  used_quota?: number
+  webhook_url?: string
+}
+
+/** 顶部状态条 */
+export interface VendorStatus {
+  /** baseUrl + apiKey 均已配置，出站接口可用 */
+  configured: boolean
+  /** 额外配了路径 token，入站 webhook 可用 */
+  inboundEnabled: boolean
+  /** 未点「已知悉」的事件数 */
+  unacked: number
+  /** 提取入库时写入的默认分组 */
+  defaultGroups: string[]
+  defaultPurchaseCost?: number | null
+  defaultRpmLimit: number
+  profile?: VendorProfile
+  /** 拉余额失败时的原因（不影响其余字段） */
+  profileError?: string
+  /** 本轮最大可提取数量 */
+  stockMax?: number
+  stockError?: string
+}
+
+/** 卖家推来的一条 webhook 事件 */
+export interface VendorEvent {
+  eventId: string
+  /** new_keys_available / all_keys_dead / unknown */
+  eventType: string
+  /** 提取用订单号，必须原样作为 client_order_id */
+  purchaseOrderId?: string
+  message?: string
+  newKeys?: number
+  dead?: number
+  receivedAt: string
+  /** 同一事件被推送的次数，> 1 说明对方在重投 */
+  deliveryCount: number
+  acked: boolean
+  /** 首次提交提取时绑定的数量；非空即不可更改 */
+  boundCount?: number
+  /** done / failed；未提取过则为空 */
+  purchaseStatus?: string
+  purchased?: number
+  imported?: number
+  duplicated?: number
+  failed?: number
+  lastError?: string
+  processedAt?: string
+}
+
+export interface VendorEventsResponse {
+  events: VendorEvent[]
+  unacked: number
+}
+
+/** 卖家侧提取订单（对账用） */
+export interface VendorOrder {
+  client_order_id?: string
+  requested?: number
+  purchased?: number
+  created_at?: string
+}
+
+export interface VendorOrdersResponse {
+  orders: VendorOrder[]
+}
+
+/** 提取 + 入库结果 */
+export interface VendorPurchaseResult {
+  /** 本次绑定并提交的数量 */
+  count: number
+  /** 卖家实际出 Key 数 */
+  purchased: number
+  /** 成功入库数 */
+  imported: number
+  /** 本地已存在而跳过 */
+  duplicated: number
+  failed: number
+  /** 提取后卖家侧剩余余额 */
+  remaining?: number
+  error?: string
+  /** 直接提取时服务端生成的订单号 */
+  clientOrderId?: string
+}
+
+/** 兑换码充值结果 */
+export interface VendorRedeemResult {
+  code?: string
+  quota?: number
+  previous_quota?: number
+  balance?: number
+  created_by_name?: string
+  redeemed_at?: string
+  /** true 表示此前已兑换过，本次未改动余额 */
+  replayed: boolean
+}

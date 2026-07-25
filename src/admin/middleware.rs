@@ -38,9 +38,11 @@ pub struct AdminState {
 }
 
 impl AdminState {
+    /// `service` 收 `Arc`：同一个 [`AdminService`] 实例会被卖家对接模块共享
+    /// （提取 Key 后复用其 `import_one_credential` 入库），不能各持一份。
     pub fn new(
         admin_api_key: impl Into<String>,
-        service: AdminService,
+        service: Arc<AdminService>,
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
@@ -48,7 +50,7 @@ impl AdminState {
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
-            service: Arc::new(service),
+            service,
             client_keys,
             usage_aggregator,
             trace_store,

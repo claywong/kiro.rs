@@ -33,7 +33,11 @@ pub mod cost_ledger;
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;
 pub use middleware::AdminState;
+/// 供卖家对接路由复用同一套 adminApiKey 认证
+pub use middleware::admin_auth_middleware;
 pub use router::create_admin_router;
 pub use service::AdminService;
+/// 供卖家对接模块复用凭据入库（去重 / 验活 / 回滚）的结果分类
+pub(crate) use service::ImportStatus;
 pub use usage_stats::{UsageAggregator, UsageRecorder};
 pub use trace_db::{SharedTraceStore, TraceStore};
