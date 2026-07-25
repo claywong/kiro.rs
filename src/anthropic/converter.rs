@@ -255,6 +255,12 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("opus.5")
+        {
+            // 精确匹配 5 代，避免命中 legacy opus 写法
+            Some("claude-opus-5".to_string())
         } else {
             None
         }
@@ -302,6 +308,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -1890,6 +1897,20 @@ mod tests {
             Some("claude-sonnet-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5-20260101-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        // 不应误伤 legacy 4.x
+        assert_eq!(
+            map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
     }
 
     #[test]
