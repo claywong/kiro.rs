@@ -7,6 +7,7 @@ mod image_resize;
 mod kiro;
 mod model;
 pub mod token;
+mod vendor;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,6 +168,9 @@ async fn main() {
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
     model::custom_models::init(config.custom_models.clone());
 
+    // count_tokens 初始化会 move 掉 proxy_config，卖家出站客户端仍需复用同一份代理配置
+    let proxy_config_for_vendor = proxy_config.clone();
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
@@ -258,6 +262,37 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
+    let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
+        std::sync::Arc::new(
+            admin::TraceStore::open_in_memory().expect("内存 trace store 初始化失败"),
+        )
+    });
+
+    // AdminService 在此统一构建（而非仅在 Admin API 分支内）：卖家 webhook 提取 Key 后
+    // 要复用它的 import_one_credential 入库，而入站 webhook 不该依赖 adminApiKey 是否配置。
+    // 后台调度器仍只在 Admin API 启用时才启动，不会多跑任务。
+    let admin_service = std::sync::Arc::new(
+        admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+            .with_kiro_provider(kiro_provider.clone())
+            .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone())),
+    );
+
+    // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。
+    let vendor_store: vendor::SharedVendorStore = std::sync::Arc::new(
+        vendor::VendorStore::open(cache_dir.join("vendor_events.db")).unwrap_or_else(|e| {
+            tracing::warn!("打开 vendor_events.db 失败，卖家事件仅存于内存: {}", e);
+            vendor::VendorStore::open_in_memory().expect("内存卖家事件库初始化失败")
+        }),
+    );
+    let vendor_state = vendor::VendorState::new(std::sync::Arc::new(vendor::VendorService::new(
+        config.vendor.clone(),
+        proxy_config_for_vendor.clone(),
+        config.tls_backend,
+        vendor_store.clone(),
+        admin_service.clone(),
+    )));
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -276,26 +311,12 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
-            let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
-                std::sync::Arc::new(
-                    admin::TraceStore::open_in_memory()
-                        .expect("内存 trace store 初始化失败"),
-                )
-            });
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
-                    .with_kiro_provider(kiro_provider.clone())
-                    .with_log_governance(
-                        Some(admin_trace_store.clone()),
-                        Some(usage_recorder.clone()),
-                    );
             let admin_state = admin::AdminState::new(
                 admin_key,
-                admin_service,
+                admin_service.clone(),
                 client_key_manager.clone(),
                 usage_aggregator.clone(),
-                admin_trace_store,
+                admin_trace_store.clone(),
                 group_manager.clone(),
             );
 
@@ -313,7 +334,17 @@ async fn main() {
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();
 
-            let admin_app = admin::create_admin_router(admin_state);
+            // 卖家管理接口与 Admin API 共用 adminApiKey 认证。
+            // 注意：认证中间件必须在此显式套在 vendor 路由上 —— create_admin_router 内部
+            // 的中间件只作用于它自己的子路由，对 nest 进来的分支无效。
+            let vendor_admin_app = vendor::create_vendor_admin_router(vendor_state.clone()).layer(
+                axum::middleware::from_fn_with_state(
+                    admin_state.clone(),
+                    admin::admin_auth_middleware,
+                ),
+            );
+            let admin_app =
+                admin::create_admin_router(admin_state).nest("/vendor", vendor_admin_app);
 
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
@@ -327,6 +358,10 @@ async fn main() {
     } else {
         anthropic_app
     };
+
+    // 入站卖家 webhook：独立于 adminApiKey 是否配置。认证靠路径 token，
+    // 未配置 vendor 时路由仍在但一律 404。
+    let app = app.nest("/webhook", vendor::create_vendor_webhook_router(vendor_state));
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
@@ -343,6 +378,18 @@ async fn main() {
     tracing::info!("  GET  /api/admin/credentials/:index/balance");
     tracing::info!("Admin UI:");
     tracing::info!("  GET  /admin");
+    match config.vendor.as_ref() {
+        Some(v) if v.inbound_enabled() => {
+            tracing::info!("卖家对接已启用（入站 + 出站）:");
+            // 不打 token 明文：它等同于入站凭证
+            tracing::info!("  POST /webhook/vendor/<webhookPathToken>");
+            tracing::info!("  GET  /api/admin/vendor/status");
+        }
+        Some(v) if v.outbound_enabled() => {
+            tracing::info!("卖家对接已启用（仅出站，未配置 webhookPathToken）");
+        }
+        _ => {}
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

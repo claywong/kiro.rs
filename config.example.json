@@ -10,5 +10,13 @@
   "updateAutoApplyTime": "03:00",
   "traceEnabled": true,
   "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "usageLogRetentionDays": 31,
+  "vendor": {
+    "baseUrl": "https://your-vendor.example.com",
+    "apiKey": "usr-xxxxxxxxxxxxxxxx",
+    "webhookPathToken": "whk_替换为自己生成的随机串",
+    "defaultGroups": [],
+    "defaultPurchaseCost": null,
+    "defaultRpmLimit": 10
+  }
 }
