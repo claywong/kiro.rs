@@ -5000,7 +5000,7 @@ mod tests {
 
         let excluded_ids = HashSet::from([1]);
         let fallback = manager
-            .acquire_context_excluding(Some("other-model"), None, &excluded_ids)
+            .acquire_context_excluding(Some("other-model"), None, &excluded_ids, false)
             .await
             .unwrap();
         assert_eq!(fallback.id, 2);
