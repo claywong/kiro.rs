@@ -321,8 +321,10 @@ pub fn get_context_window_size(model: &str) -> i32 {
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
+/// 一并视为支持。GPT-5.6 系（sol / terra / luna）同样放开。
+/// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
+/// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
+/// （`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
     // 自定义模型可按 backend_id 声明支持 reasoning。
@@ -338,6 +340,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("sonnet-5")
         || m.contains("opus-5")
         || m.contains("claude-5")
+        || m.contains("gpt-5.6")
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -2115,6 +2118,42 @@ mod tests {
             "high",
             "effort should be passed through for the supported model"
         );
+    }
+
+    /// GPT-5.6 系放开 `output_config`：显式 effort 应原样下发。
+    #[test]
+    fn test_output_config_emits_for_gpt_5_6() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let req = minimal_request_with_effort(model, "xhigh");
+            let result = convert_request(&req).unwrap();
+            let fields = result
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("{model} 显式 effort 应下发 output_config"));
+            assert_eq!(
+                fields.output_config.unwrap().effort,
+                "xhigh",
+                "{model} 应原样下发 xhigh"
+            );
+        }
+    }
+
+    /// 其余非 Claude 模型仍不下发，避免上游 400。
+    #[test]
+    fn test_output_config_still_skipped_for_other_non_claude_models() {
+        for model in [
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+        ] {
+            let req = minimal_request_with_effort(model, "xhigh");
+            let result = convert_request(&req).unwrap();
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "{model} 未确认接受 output_config，不应下发"
+            );
+        }
     }
 
     #[test]
