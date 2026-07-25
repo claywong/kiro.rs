@@ -298,7 +298,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
+/// 一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
@@ -347,7 +347,7 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 }
 
 /// 选定最终下发的 effort：优先显式 `output_config.effort`；否则据 `budget_tokens`
-/// 推导；再统一过 [`normalize_effort_for_model`]（按模型把 xhigh 安全降级等）。
+/// 推导；再统一过 [`normalize_effort_for_model`]（大小写与空格归一、非法值兜底）。
 fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> String {
     let raw = req
         .output_config
@@ -415,50 +415,17 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
         }
     };
 
-    // `xhigh` is a newer effort tier. Known older effort-capable models reject
-    // it with `Invalid additionalModelRequestFields`, so map to the nearest
-    // lower tier instead of failing the request. Unknown/future models keep
-    // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
-        EffortTier::High
-    } else {
-        requested
-    };
-    if normalized != requested || normalized.as_str() != trimmed {
+    // 上游各档位（含 xhigh）均已受支持，识别到的档位一律原样下发，不再按模型降级。
+    if requested.as_str() != trimmed {
         tracing::debug!(
             model_id = %model_id,
             effort = %trimmed,
-            normalized_effort = normalized.as_str(),
+            normalized_effort = requested.as_str(),
             "normalized output_config.effort for model"
         );
     }
 
-    Some(normalized.as_str().to_string())
-}
-
-fn model_supports_xhigh_effort(model_id: &str) -> bool {
-    let model = model_id.to_ascii_lowercase();
-
-    // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
-    if model.contains("opus-4.7")
-        || model.contains("opus-4.8")
-        || model.contains("fable-5")
-        || model.contains("mythos-5")
-        || model.contains("claude-5")
-    {
-        return true;
-    }
-
-    // Known Kiro/Claude model ids that predate xhigh. Keep this as a compact
-    // deny-list, not a full capability matrix.
-    !matches!(
-        model.as_str(),
-        "claude-opus-4.6"
-            | "claude-sonnet-4.6"
-            | "claude-opus-4.5"
-            | "claude-sonnet-4.5"
-            | "claude-haiku-4.5"
-    )
+    Some(requested.as_str().to_string())
 }
 
 fn build_additional_model_request_fields(
@@ -2124,7 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_downgrades_xhigh_for_opus_4_6() {
+    fn test_output_config_preserves_xhigh_for_opus_4_6() {
         let req =
             minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "xhigh");
         let result = convert_request(&req).unwrap();
@@ -2134,55 +2101,53 @@ mod tests {
             .expect("opus 4.6 adaptive thinking should keep output_config");
         assert_eq!(
             fields.output_config.unwrap().effort,
-            "high",
-            "opus 4.6 upstream only accepts low/medium/high/max, so xhigh should downgrade"
+            "xhigh",
+            "上游已支持 xhigh，不再按模型降级"
         );
     }
 
+    /// xhigh 对所有模型一律原样下发，不再有降级名单。
     #[test]
-    fn test_output_config_downgrades_xhigh_for_known_older_models() {
+    fn test_output_config_preserves_xhigh_for_all_models() {
         for model in [
             "claude-opus-4.6",
             "claude-sonnet-4.6",
             "claude-opus-4.5",
             "claude-sonnet-4.5",
             "claude-haiku-4.5",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-opus-5",
+            "claude-5",
+            "claude-sonnet-5.1",
+            "claude-unknown-9",
         ] {
             assert_eq!(
                 normalize_effort_for_model(model, "xhigh").as_deref(),
-                Some("high"),
-                "{model} should not emit xhigh"
+                Some("xhigh"),
+                "{model} 应原样下发 xhigh"
             );
         }
     }
 
+    /// 大小写与空格仍需归一，非法档位仍兜底为 high。
     #[test]
-    fn test_output_config_preserves_xhigh_for_models_without_known_restriction() {
+    fn test_normalize_effort_still_canonicalizes_and_falls_back() {
         assert_eq!(
-            normalize_effort_for_model("claude-opus-4.7", "xhigh").as_deref(),
-            Some("xhigh"),
-            "opus 4.7 supports xhigh"
+            normalize_effort_for_model("claude-opus-5", "  XHigh  ").as_deref(),
+            Some("xhigh")
         );
         assert_eq!(
-            normalize_effort_for_model("claude-opus-4.8", "xhigh").as_deref(),
+            normalize_effort_for_model("claude-opus-5", "x-high").as_deref(),
             Some("xhigh"),
-            "opus 4.8 supports xhigh"
+            "x-high / x_high 视作 xhigh 的别名"
         );
         assert_eq!(
-            normalize_effort_for_model("claude-5", "xhigh").as_deref(),
-            Some("xhigh"),
-            "claude 5 supports xhigh"
+            normalize_effort_for_model("claude-opus-5", "extreme").as_deref(),
+            Some("high"),
+            "未识别档位兜底为 high"
         );
-        assert_eq!(
-            normalize_effort_for_model("claude-sonnet-5.1", "xhigh").as_deref(),
-            Some("xhigh"),
-            "future models should not require explicit allow-listing for recognized effort values"
-        );
-        assert_eq!(
-            normalize_effort_for_model("claude-unknown-9", "xhigh").as_deref(),
-            Some("xhigh"),
-            "unknown future models should keep recognized effort values"
-        );
+        assert_eq!(normalize_effort_for_model("claude-opus-5", "   ").as_deref(), None);
     }
 
     #[test]
@@ -2316,7 +2281,7 @@ mod tests {
         let fields = result
             .additional_model_request_fields
             .expect("fable-5 显式 effort 应下发");
-        // fable-5 支持 xhigh（model_supports_xhigh_effort），不降级。
+        // xhigh 原样下发，不降级。
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
