@@ -1081,6 +1081,10 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 上游中途断流：置位 upstream_error，让收尾事件里补发一个
+                            // Anthropic `error` 事件。否则客户端只会收到一个语法完整、
+                            // 内容被截断的流，无法区分「模型说完了」和「上游断了」。
+                            ctx.mark_upstream_error("StreamInterrupted", e.to_string());
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -1982,6 +1986,9 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 上游中途断流：置位 upstream_error，收尾补发 `error` 事件，
+                                // 与实时流路径同口径（缓冲流同样已回 200，改不了状态码）。
+                                ctx.mark_upstream_error("StreamInterrupted", e.to_string());
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
