@@ -666,6 +666,30 @@ export interface VendorStatus {
   /** 本轮最大可提取数量 */
   stockMax?: number
   stockError?: string
+  /** 卖家 /api/status：存活 / 失效 / 存货 Key 数 */
+  system?: VendorSystemStatus
+  systemError?: string
+  /** 名下最早一条 Key 的创建时间，用于推算账号有效期起点 */
+  keysCreatedAt?: VendorKeysCreatedAt
+  keysCreatedAtError?: string
+}
+
+/** 卖家 `/api/status` 返回的 Key 数量分布 */
+export interface VendorSystemStatus {
+  keys_active?: number | null
+  keys_dead?: number | null
+  /** 卖家侧尚未售出的存货 Key */
+  keys_stock?: number | null
+  /** 卖家侧是否正在生成新 Key */
+  generating?: boolean | null
+}
+
+/** 卖家 `/api/my/keys/created-at` 返回 */
+export interface VendorKeysCreatedAt {
+  /** 最早创建时间；从未有过 Key 时为 null */
+  created_at?: string | null
+  /** 历史记录总数（含已失效） */
+  key_count?: number
 }
 
 /** 卖家推来的一条 webhook 事件 */

@@ -39,6 +39,36 @@ pub struct StockResponse {
     pub max: u32,
 }
 
+/// `GET /api/status` 响应 —— 卖家账号维度的 Key 数量与库存
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VendorSystemStatus {
+    /// 卖家侧当前存活 Key 数
+    #[serde(default)]
+    pub keys_active: Option<u32>,
+    /// 卖家侧已失效 Key 数
+    #[serde(default)]
+    pub keys_dead: Option<u32>,
+    /// 卖家侧尚未售出的存货 Key 数
+    #[serde(default)]
+    pub keys_stock: Option<u32>,
+    /// 卖家侧是否正在生成新 Key
+    #[serde(default)]
+    pub generating: Option<bool>,
+}
+
+/// `GET /api/my/keys/created-at` 响应 —— 名下最早一条 Key 的创建时间
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct KeysCreatedAtResponse {
+    /// 最早创建时间；从未有过 Key 或旧库无记录时为 null
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// 历史记录总数（含已失效）
+    #[serde(default)]
+    pub key_count: u32,
+}
+
 /// `GET /api/my/profile` 响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +253,17 @@ impl VendorClient {
         self.get("/api/my/profile").await
     }
 
+    /// `GET /api/status` —— 卖家系统状态：存活 / 失效 / 存货 Key 数
+    pub async fn system_status(&self) -> Result<VendorSystemStatus, VendorApiError> {
+        self.get("/api/status").await
+    }
+
+    /// `GET /api/my/keys/created-at` —— 名下最早一条 Key 的创建时间，
+    /// 用于推算账号有效期起点。不接收请求体，也不返回 Key 内容。
+    pub async fn keys_created_at(&self) -> Result<KeysCreatedAtResponse, VendorApiError> {
+        self.get("/api/my/keys/created-at").await
+    }
+
     /// `GET /api/my/purchase-orders` —— 最近 50 条提取订单，用于跟本地事件对账
     pub async fn purchase_orders(&self) -> Result<Vec<PurchaseOrder>, VendorApiError> {
         self.get("/api/my/purchase-orders").await
@@ -322,6 +363,36 @@ mod tests {
     fn truncate_不切坏多字节字符() {
         assert_eq!(truncate("中文测试", 2), "中文…");
         assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    #[test]
+    fn 解析系统状态_容忍缺字段() {
+        let full: VendorSystemStatus = serde_json::from_str(
+            r#"{"keys_active":10,"keys_dead":2,"keys_stock":4,"generating":false,"extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(full.keys_active, Some(10));
+        assert_eq!(full.keys_dead, Some(2));
+        assert_eq!(full.keys_stock, Some(4));
+        assert_eq!(full.generating, Some(false));
+
+        // 卖家少给字段时不能整体解析失败，否则状态卡片全空
+        let partial: VendorSystemStatus = serde_json::from_str(r#"{"keys_stock":0}"#).unwrap();
+        assert_eq!(partial.keys_stock, Some(0));
+        assert_eq!(partial.keys_active, None);
+    }
+
+    #[test]
+    fn 解析key创建时间_含无key情形() {
+        let 有 : KeysCreatedAtResponse =
+            serde_json::from_str(r#"{"created_at":"2026-07-20 04:48:10","key_count":5}"#).unwrap();
+        assert_eq!(有.created_at.as_deref(), Some("2026-07-20 04:48:10"));
+        assert_eq!(有.key_count, 5);
+
+        let 无: KeysCreatedAtResponse =
+            serde_json::from_str(r#"{"created_at":null,"key_count":0}"#).unwrap();
+        assert!(无.created_at.is_none());
+        assert_eq!(无.key_count, 0);
     }
 
     #[test]

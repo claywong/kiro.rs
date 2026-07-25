@@ -137,9 +137,10 @@ pub async fn list_events(
     }
 }
 
-/// `GET /api/admin/vendor/status` —— 顶部状态条：配置状态 + 余额 + 库存 + 未确认数
+/// `GET /api/admin/vendor/status` —— 顶部状态条：配置状态 + 余额 + 库存 + 存货 +
+/// 账号起始时间 + 未确认数
 ///
-/// 余额 / 库存要打卖家接口，任一失败不影响其余字段（各自返回 error 字段）。
+/// 四个出站请求并发发出；任一失败不影响其余字段（各自返回对应 error 字段）。
 pub async fn get_status(State(state): State<VendorState>) -> Response {
     let cfg = state.service.config();
     let configured = cfg.map(|c| c.outbound_enabled()).unwrap_or(false);
@@ -159,13 +160,28 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         return Json(body).into_response();
     }
 
-    match state.service.profile().await {
+    let (profile, stock, system, created) = tokio::join!(
+        state.service.profile(),
+        state.service.stock(),
+        state.service.system_status(),
+        state.service.keys_created_at(),
+    );
+
+    match profile {
         Ok(p) => body["profile"] = serde_json::to_value(&p).unwrap_or_default(),
         Err(e) => body["profileError"] = serde_json::json!(e.to_string()),
     }
-    match state.service.stock().await {
+    match stock {
         Ok(max) => body["stockMax"] = serde_json::json!(max),
         Err(e) => body["stockError"] = serde_json::json!(e.to_string()),
+    }
+    match system {
+        Ok(s) => body["system"] = serde_json::to_value(&s).unwrap_or_default(),
+        Err(e) => body["systemError"] = serde_json::json!(e.to_string()),
+    }
+    match created {
+        Ok(c) => body["keysCreatedAt"] = serde_json::to_value(&c).unwrap_or_default(),
+        Err(e) => body["keysCreatedAtError"] = serde_json::json!(e.to_string()),
     }
 
     Json(body).into_response()

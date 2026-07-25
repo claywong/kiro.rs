@@ -21,6 +21,44 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+/** 取出 axios 错误里的 HTTP 状态码 */
+function errorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const resp = (error as Record<string, unknown>).response as
+    | Record<string, unknown>
+    | undefined
+  return typeof resp?.status === 'number' ? resp.status : undefined
+}
+
+/** 是否被限流。后端原样透出卖家状态码，故 429 可直接判定。 */
+export function isRateLimited(error: unknown): boolean {
+  return errorStatus(error) === 429
+}
+
+/**
+ * 卖家接口错误提示。后端把卖家的 `{"error":"..."}` 原样透出，并保留其状态码，
+ * 通用的 extractErrorMessage 读不到这个形状，只会给出「Request failed with
+ * status code 429」这类无信息量的文案，故单独解析。
+ */
+export function vendorErrorMessage(error: unknown, fallback = '操作失败'): string {
+  if (!error || typeof error !== 'object') return fallback
+  const resp = (error as Record<string, unknown>).response as
+    | Record<string, unknown>
+    | undefined
+  const data = resp?.data as Record<string, unknown> | undefined
+  const status = errorStatus(error)
+  const detail = typeof data?.error === 'string' ? data.error.trim() : ''
+
+  // 429 一律按限流解释：卖家对测试推送等接口有频率限制
+  if (status === 429) {
+    return detail ? `请求过于频繁：${detail}` : '请求过于频繁，请稍后再试'
+  }
+  if (detail) return detail
+  if (status) return `${fallback}（HTTP ${status}）`
+  const msg = (error as Record<string, unknown>).message
+  return typeof msg === 'string' && msg ? msg : fallback
+}
+
 /** 顶部状态条：配置状态 + 余额 + 本轮可提取量 + 未确认事件数 */
 export async function getVendorStatus(): Promise<VendorStatus> {
   const { data } = await api.get<VendorStatus>('/status')

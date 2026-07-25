@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   Wallet, PackageOpen, Webhook, BellRing, Send, Ticket, Upload, ShoppingCart,
+  Boxes, CalendarClock,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -14,7 +15,7 @@ import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
   useSetVendorWebhookUrl, usePurchaseAdHoc,
 } from '@/hooks/use-vendor'
-import { extractErrorMessage } from '@/lib/utils'
+import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 import type { VendorStatus } from '@/types/api'
 
 /** 四格状态卡片中的一格 */
@@ -45,6 +46,40 @@ function StatCard({
       </CardContent>
     </Card>
   )
+}
+
+/**
+ * 账号起点展示。卖家返回 `YYYY-MM-DD HH:mm:ss`（无时区标记），Safari 对该形式
+ * 直接 new Date 会得到 Invalid Date，故先补 'T' 再解析；解析不出来就原样显示。
+ */
+function describeAccountStart(status?: VendorStatus): {
+  value: string
+  hint: string
+  tone: 'normal' | 'warn'
+} {
+  if (status?.keysCreatedAtError) {
+    return { value: '—', hint: status.keysCreatedAtError, tone: 'warn' }
+  }
+  const info = status?.keysCreatedAt
+  const raw = info?.created_at?.trim()
+  const countHint = `历史 Key 记录 ${info?.key_count ?? 0} 条`
+  if (!raw) {
+    return {
+      value: '—',
+      hint: info ? `账号名下暂无 Key 记录，${countHint}` : '暂无数据',
+      tone: 'normal',
+    }
+  }
+  const d = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T'))
+  if (Number.isNaN(d.getTime())) {
+    return { value: raw, hint: countHint, tone: 'normal' }
+  }
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000)
+  return {
+    value: d.toLocaleDateString('zh-CN'),
+    hint: `${d.toLocaleString('zh-CN', { hour12: false })}，已 ${days} 天 · ${countHint}`,
+    tone: 'normal',
+  }
 }
 
 /** 本机应有的 webhook 地址。路径 token 只存在后端，前端拿不到，故只做「是否已配置」提示。 */
@@ -84,6 +119,8 @@ export function VendorStatusBar() {
 
   const profile = status?.profile
   const webhookInfo = describeWebhook(status)
+  const system = status?.system
+  const accountStart = describeAccountStart(status)
 
   const handleRedeem = async () => {
     const trimmed = code.trim()
@@ -105,7 +142,7 @@ export function VendorStatusBar() {
       setRedeemOpen(false)
       setCode('')
     } catch (e) {
-      toast.error(extractErrorMessage(e))
+      toast.error(vendorErrorMessage(e))
     }
   }
 
@@ -116,7 +153,11 @@ export function VendorStatusBar() {
         description: '稍等几秒刷新事件列表，应能看到一条新记录',
       })
     } catch (e) {
-      toast.error(extractErrorMessage(e))
+      // 卖家对测试推送有频率限制，429 时给出可操作的提示而不是原始报错
+      const rateLimited = isRateLimited(e)
+      toast.error(vendorErrorMessage(e, '测试推送失败'), {
+        description: rateLimited ? '卖家侧对测试推送限流，稍后再试即可' : undefined,
+      })
     }
   }
 
@@ -131,7 +172,7 @@ export function VendorStatusBar() {
       toast.success('已写入卖家侧 webhook 地址')
       setWebhookOpen(false)
     } catch (e) {
-      toast.error(extractErrorMessage(e))
+      toast.error(vendorErrorMessage(e))
     }
   }
 
@@ -169,7 +210,7 @@ export function VendorStatusBar() {
       })
       setDirectOpen(false)
     } catch (e) {
-      toast.error(extractErrorMessage(e))
+      toast.error(vendorErrorMessage(e))
     }
   }
 
@@ -222,7 +263,7 @@ export function VendorStatusBar() {
         </Button>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <StatCard
           icon={<Wallet className="h-3.5 w-3.5" />}
           label="卖家余额"
@@ -242,6 +283,34 @@ export function VendorStatusBar() {
           value={status?.stockError ? '—' : (status?.stockMax ?? '—')}
           hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
           tone={status?.stockError ? 'warn' : 'normal'}
+        />
+        <StatCard
+          icon={<Boxes className="h-3.5 w-3.5" />}
+          label="卖家存货 Key"
+          value={status?.systemError ? '—' : (system?.keys_stock ?? '—')}
+          hint={
+            status?.systemError
+              ? status.systemError
+              : system
+                ? `存活 ${system.keys_active ?? '-'} / 失效 ${system.keys_dead ?? '-'}${
+                    system.generating ? ' · 正在生成' : ''
+                  }`
+                : undefined
+          }
+          tone={
+            status?.systemError
+              ? 'warn'
+              : system?.keys_stock === 0
+                ? 'warn'
+                : 'normal'
+          }
+        />
+        <StatCard
+          icon={<CalendarClock className="h-3.5 w-3.5" />}
+          label="账号起始时间"
+          value={accountStart.value}
+          hint={accountStart.hint}
+          tone={accountStart.tone}
         />
         <StatCard
           icon={<Webhook className="h-3.5 w-3.5" />}

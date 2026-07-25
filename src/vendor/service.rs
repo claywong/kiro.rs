@@ -342,6 +342,28 @@ impl VendorService {
         client.profile().await.map_err(VendorServiceError::Upstream)
     }
 
+    /// 卖家系统状态：存活 / 失效 / 存货 Key 数
+    pub async fn system_status(
+        &self,
+    ) -> Result<super::client::VendorSystemStatus, VendorServiceError> {
+        let client = self.client()?;
+        client
+            .system_status()
+            .await
+            .map_err(VendorServiceError::Upstream)
+    }
+
+    /// 名下最早一条 Key 的创建时间（账号有效期起点）
+    pub async fn keys_created_at(
+        &self,
+    ) -> Result<super::client::KeysCreatedAtResponse, VendorServiceError> {
+        let client = self.client()?;
+        client
+            .keys_created_at()
+            .await
+            .map_err(VendorServiceError::Upstream)
+    }
+
     /// 最近 50 条提取订单，用于跟本地事件对账、发现漏提
     pub async fn purchase_orders(
         &self,
