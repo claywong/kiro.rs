@@ -52,9 +52,30 @@ pub struct VendorSystemStatus {
     /// 卖家侧尚未售出的存货 Key 数
     #[serde(default)]
     pub keys_stock: Option<u32>,
+    /// 卖家侧 Key 累计总数（含已失效）
+    #[serde(default)]
+    pub keys_total: Option<u32>,
     /// 卖家侧是否正在生成新 Key
     #[serde(default)]
     pub generating: Option<bool>,
+    /// 卖家侧已运行秒数
+    #[serde(default)]
+    pub uptime_seconds: Option<f64>,
+    /// 卖家侧启动时刻，形如 `2026-07-25 20:59:33`（无时区标记）
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// 卖家侧是否开启自动检测
+    #[serde(default)]
+    pub auto_check: Option<bool>,
+    /// 卖家侧是否开启自动生成
+    #[serde(default)]
+    pub auto_generate: Option<bool>,
+    /// 自动检测间隔。卖家用字符串给（如 "20"），故不解析成数字
+    #[serde(default)]
+    pub check_interval: Option<String>,
+    /// 其余未建模字段原样透传，卖家新增字段时不必改一轮后端
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `GET /api/my/keys/created-at` 响应 —— 名下最早一条 Key 的创建时间
@@ -365,21 +386,42 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 
+    /// 用卖家 `/api/status` 的真实返回做样本
     #[test]
-    fn 解析系统状态_容忍缺字段() {
-        let full: VendorSystemStatus = serde_json::from_str(
-            r#"{"keys_active":10,"keys_dead":2,"keys_stock":4,"generating":false,"extra":1}"#,
-        )
-        .unwrap();
-        assert_eq!(full.keys_active, Some(10));
-        assert_eq!(full.keys_dead, Some(2));
-        assert_eq!(full.keys_stock, Some(4));
-        assert_eq!(full.generating, Some(false));
+    fn 解析系统状态_真实样本() {
+        let raw = r#"{"auto_check":true,"auto_generate":true,"check_interval":"20",
+            "generating":false,"keys_active":200,"keys_dead":5857,"keys_stock":57,
+            "keys_total":6076,"started_at":"2026-07-25 20:59:33","uptime_seconds":7179}"#;
+        let s: VendorSystemStatus = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.keys_active, Some(200));
+        assert_eq!(s.keys_dead, Some(5857));
+        assert_eq!(s.keys_stock, Some(57));
+        assert_eq!(s.keys_total, Some(6076));
+        assert_eq!(s.generating, Some(false));
+        assert_eq!(s.uptime_seconds, Some(7179.0));
+        assert_eq!(s.started_at.as_deref(), Some("2026-07-25 20:59:33"));
+        assert_eq!(s.auto_check, Some(true));
+        assert_eq!(s.auto_generate, Some(true));
+        // 间隔是字符串，不能当数字解析
+        assert_eq!(s.check_interval.as_deref(), Some("20"));
+        assert!(s.extra.is_empty(), "已建模字段不应落进 extra");
+    }
 
+    #[test]
+    fn 解析系统状态_容忍缺字段与未知字段() {
         // 卖家少给字段时不能整体解析失败，否则状态卡片全空
         let partial: VendorSystemStatus = serde_json::from_str(r#"{"keys_stock":0}"#).unwrap();
         assert_eq!(partial.keys_stock, Some(0));
         assert_eq!(partial.keys_active, None);
+        assert_eq!(partial.uptime_seconds, None);
+
+        // 卖家新增字段走 extra 透传，不报错
+        let unknown: VendorSystemStatus =
+            serde_json::from_str(r#"{"keys_stock":1,"brand_new_field":"x"}"#).unwrap();
+        assert_eq!(
+            unknown.extra.get("brand_new_field").and_then(|v| v.as_str()),
+            Some("x")
+        );
     }
 
     #[test]

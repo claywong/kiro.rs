@@ -20,12 +20,14 @@ import type { VendorStatus } from '@/types/api'
 
 /** 四格状态卡片中的一格 */
 function StatCard({
-  icon, label, value, hint, tone = 'normal',
+  icon, label, value, hint, sub, tone = 'normal',
 }: {
   icon: React.ReactNode
   label: string
   value: React.ReactNode
   hint?: React.ReactNode
+  /** hint 下方的补充行，用于放运行时长这类次要信息 */
+  sub?: React.ReactNode
   tone?: 'normal' | 'warn' | 'good'
 }) {
   const toneClass =
@@ -43,9 +45,57 @@ function StatCard({
         </div>
         <div className={`mt-1.5 text-xl font-semibold tabular-nums ${toneClass}`}>{value}</div>
         {hint && <div className="mt-1 text-xs text-muted-foreground">{hint}</div>}
+        {sub && <div className="mt-0.5 text-xs text-muted-foreground/80">{sub}</div>}
       </CardContent>
     </Card>
   )
+}
+
+/**
+ * 解析卖家返回的时间串。形如 `YYYY-MM-DD HH:mm:ss`（无时区标记），Safari 对该
+ * 形式直接 new Date 会得到 Invalid Date，故先补 'T' 再解析。解析失败返回 null。
+ */
+function parseVendorTime(raw?: string | null): Date | null {
+  const s = raw?.trim()
+  if (!s) return null
+  const d = new Date(s.includes('T') ? s : s.replace(' ', 'T'))
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/** 秒数转「1小时57分钟」。不足 1 分钟显示秒；有天数时省略分钟避免噪声。 */
+function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds))
+  if (s < 60) return `${s}秒`
+  const days = Math.floor(s / 86400)
+  const hours = Math.floor((s % 86400) / 3600)
+  const minutes = Math.floor((s % 3600) / 60)
+  const parts: string[] = []
+  if (days) parts.push(`${days}天`)
+  if (hours) parts.push(`${hours}小时`)
+  if (minutes && !days) parts.push(`${minutes}分钟`)
+  return parts.join('') || '0分钟'
+}
+
+/**
+ * 卖家运行时长。优先用 uptime_seconds —— 它是卖家自己算的时长，不受两侧时钟
+ * 偏差和时区影响；缺失时才退回按 started_at 与本地时间相减。
+ *
+ * started_at 无时区标记，原样展示卖家给的字符串，不做本地化转换，免得在时区
+ * 不同的机器上显示成另一个时刻。
+ */
+function describeUptime(system?: VendorStatus['system']): string | null {
+  if (!system) return null
+  const startedRaw = system.started_at?.trim()
+  const seconds =
+    typeof system.uptime_seconds === 'number' && system.uptime_seconds >= 0
+      ? system.uptime_seconds
+      : (() => {
+          const d = parseVendorTime(startedRaw)
+          return d ? (Date.now() - d.getTime()) / 1000 : null
+        })()
+  if (seconds == null) return startedRaw ? `启动于 ${startedRaw}` : null
+  const ran = `已运行 ${formatDuration(seconds)}`
+  return startedRaw ? `${ran} — 启动于 ${startedRaw}` : ran
 }
 
 /**
@@ -70,8 +120,8 @@ function describeAccountStart(status?: VendorStatus): {
       tone: 'normal',
     }
   }
-  const d = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T'))
-  if (Number.isNaN(d.getTime())) {
+  const d = parseVendorTime(raw)
+  if (!d) {
     return { value: raw, hint: countHint, tone: 'normal' }
   }
   const days = Math.floor((Date.now() - d.getTime()) / 86400000)
@@ -293,10 +343,11 @@ export function VendorStatusBar() {
               ? status.systemError
               : system
                 ? `存活 ${system.keys_active ?? '-'} / 失效 ${system.keys_dead ?? '-'}${
-                    system.generating ? ' · 正在生成' : ''
-                  }`
+                    system.keys_total != null ? ` / 累计 ${system.keys_total}` : ''
+                  }${system.generating ? ' · 正在生成' : ''}`
                 : undefined
           }
+          sub={status?.systemError ? undefined : describeUptime(system)}
           tone={
             status?.systemError
               ? 'warn'

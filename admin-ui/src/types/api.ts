@@ -680,8 +680,20 @@ export interface VendorSystemStatus {
   keys_dead?: number | null
   /** 卖家侧尚未售出的存货 Key */
   keys_stock?: number | null
+  /** 卖家侧 Key 累计总数（含已失效） */
+  keys_total?: number | null
   /** 卖家侧是否正在生成新 Key */
   generating?: boolean | null
+  /** 卖家侧已运行秒数 */
+  uptime_seconds?: number | null
+  /** 卖家侧启动时刻，形如 `2026-07-25 20:59:33`（无时区标记） */
+  started_at?: string | null
+  auto_check?: boolean | null
+  auto_generate?: boolean | null
+  /** 自动检测间隔，卖家用字符串给（如 "20"） */
+  check_interval?: string | null
+  /** 卖家未建模字段，后端 flatten 透传 */
+  [key: string]: unknown
 }
 
 /** 卖家 `/api/my/keys/created-at` 返回 */
