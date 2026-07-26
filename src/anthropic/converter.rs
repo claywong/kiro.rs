@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -317,35 +319,53 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
+/// 模型接受 effort 时所用的 `additionalModelRequestFields` 键名。
+///
+/// 上游对不同模型族用了**不同的包装键**，且互不认识对方的：错配一定 400。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningFieldStyle {
+    /// Claude 系：`{"output_config":{"effort":"..."}}`
+    OutputConfig,
+    /// GPT-5.6 系：`{"reasoning":{"effort":"..."}}`
+    Reasoning,
+}
+
+/// 判定模型接受哪种 effort 包装键，不接受则 `None`。
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
 /// 一并视为支持。
 ///
-/// GPT-5.6 系（sol / terra / luna）曾于 2026-07-25 放开，线上实测上游返回 400
-/// （`property 'output_config' is not defined in the schema and the schema does not
-/// allow additional properties`），2026-07-26 已回滚——上游对这三个模型的 schema
-/// 不接受任何 `additionalModelRequestFields`，不要再加回来。
+/// GPT-5.6 系（sol / terra / luna）走 `reasoning` 键。历史：2026-07-25 曾按
+/// `output_config` 放开，实测 400（`property 'output_config' is not defined in the
+/// schema and the schema does not allow additional properties`），07-26 回滚并一度
+/// 判定「不接受任何 `additionalModelRequestFields`」——该结论有误。2026-07-26 抓包
+/// 确认上游实际接受 `{"reasoning":{"effort":"xhigh"}}`，即字段是支持的、只是键名不同。
+/// **不要**给这三个模型下发 `output_config`。
 ///
 /// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
 /// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
 /// （`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
-fn model_supports_native_reasoning(model_id: &str) -> bool {
+fn model_reasoning_field_style(model_id: &str) -> Option<ReasoningFieldStyle> {
     // 自定义模型可按 backend_id 声明支持 reasoning。
     if crate::model::custom_models::backend_supports_reasoning(model_id) {
-        return true;
+        return Some(ReasoningFieldStyle::OutputConfig);
     }
     let m = model_id.to_ascii_lowercase();
-    matches!(
+    // 与 map_model 的放行范围对齐：只认 gpt-5*，legacy gpt-4 之类不进这条分支。
+    if m.starts_with("gpt-5") {
+        return Some(ReasoningFieldStyle::Reasoning);
+    }
+    let claude = matches!(
         m.as_str(),
         "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
     ) || m.contains("fable-5")
         || m.contains("mythos-5")
         || m.contains("sonnet-5")
         || m.contains("opus-5")
-        || m.contains("claude-5")
+        || m.contains("claude-5");
+    claude.then_some(ReasoningFieldStyle::OutputConfig)
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -476,8 +496,8 @@ fn build_additional_model_request_fields(
         return None;
     }
 
-    // 仅对确认接受 output_config 的模型下发，避免上游 400。
-    if !model_supports_native_reasoning(model_id) {
+    // 仅对确认接受 effort 字段的模型下发，避免上游 400。
+    let Some(style) = model_reasoning_field_style(model_id) else {
         if let Some(oc) = &req.output_config
             && !oc.effort.trim().is_empty()
         {
@@ -487,16 +507,24 @@ fn build_additional_model_request_fields(
             );
         }
         return None;
-    }
+    };
 
     // 需要客户端确实请求了 reasoning（thinking 启用或显式 effort；opus 4.6 需 adaptive）。
     if !native_reasoning_requested(req, model_id) {
         return None;
     }
 
+    // effort 档位两族共用，只有包装键不同。
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
+    Some(match style {
+        ReasoningFieldStyle::OutputConfig => AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        },
+        ReasoningFieldStyle::Reasoning => AdditionalModelRequestFields {
+            reasoning: Some(KiroReasoningConfig { effort }),
+            output_config: None,
+        },
     })
 }
 
@@ -2125,21 +2153,78 @@ mod tests {
         );
     }
 
-    /// GPT-5.6 系不下发 `output_config`：即便客户端显式给了 effort 也要丢掉。
+    /// GPT-5.6 系走 `reasoning` 键，且**绝不能**带 `output_config`。
     ///
-    /// 2026-07-25 曾放开，线上 400（`property 'output_config' is not defined in the
-    /// schema`），2026-07-26 回滚。此用例防止再次误放开。
+    /// 2026-07-25 曾按 `output_config` 放开 → 线上 400（`property 'output_config' is
+    /// not defined in the schema`）→ 07-26 回滚。抓包确认真实键名是 `reasoning`，
+    /// 此用例同时钉住「必须有 reasoning」和「必须没有 output_config」两侧。
     #[test]
-    fn test_output_config_skipped_for_gpt_5_6() {
+    fn test_gpt_5_6_uses_reasoning_field_not_output_config() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let req = minimal_request_with_effort(model, "xhigh");
             let result = convert_request(&req).unwrap();
+            let fields = result
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("{model} 应下发 reasoning.effort"));
+            assert_eq!(
+                fields.reasoning.expect("应有 reasoning 字段").effort,
+                "xhigh",
+                "{model} 的 effort 应原样透传"
+            );
             assert!(
-                result.additional_model_request_fields.is_none(),
-                "{model} 不得下发 additionalModelRequestFields：上游 schema 不接受该字段，\
-                 会返回 400 REQUEST_BODY_INVALID"
+                fields.output_config.is_none(),
+                "{model} 不得带 output_config：上游 schema 不认该键，会返回 400"
             );
         }
+    }
+
+    /// GPT-5.6 的 effort 档位与 Claude 完全一致，不做单独裁剪。
+    #[test]
+    fn test_gpt_5_6_effort_tiers_match_claude() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let req = minimal_request_with_effort("gpt-5.6-sol", effort);
+            let result = convert_request(&req).unwrap();
+            let fields = result
+                .additional_model_request_fields
+                .expect("应下发 reasoning");
+            assert_eq!(
+                fields.reasoning.unwrap().effort, effort,
+                "档位 {effort} 应原样下发"
+            );
+        }
+    }
+
+    /// 线上 400 的那条路径：GPT-5.6 的 JSON 里不能出现 output_config 字面量。
+    #[test]
+    fn test_gpt_5_6_wire_format_has_no_output_config_key() {
+        let req = minimal_request_with_effort("gpt-5.6-terra", "xhigh");
+        let fields = convert_request(&req)
+            .unwrap()
+            .additional_model_request_fields
+            .expect("应下发 reasoning");
+        let json = serde_json::to_string(&fields).unwrap();
+        assert_eq!(json, r#"{"reasoning":{"effort":"xhigh"}}"#);
+        assert!(
+            !json.contains("output_config"),
+            "序列化结果不得含 output_config：{json}"
+        );
+    }
+
+    /// thinking:disabled 对 GPT-5.6 同样生效，不下发任何字段。
+    #[test]
+    fn test_gpt_5_6_respects_disabled_thinking() {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_effort("gpt-5.6-luna", "xhigh");
+        req.thinking = Some(Thinking {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: 0,
+        });
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "显式关闭 thinking 时不应下发 reasoning"
+        );
     }
 
     /// 其余非 Claude 模型仍不下发，避免上游 400。
@@ -2267,7 +2352,8 @@ mod tests {
     }
 
     #[test]
-    fn model_supports_native_reasoning_allows_confirmed_and_5_family() {
+    fn model_reasoning_field_style_maps_each_family_to_its_key() {
+        // Claude 系 → output_config
         for m in [
             "claude-opus-4.6",
             "claude-opus-4.7",
@@ -2276,17 +2362,33 @@ mod tests {
             "claude-fable-5",
             "claude-sonnet-5",
         ] {
-            assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
+            assert_eq!(
+                model_reasoning_field_style(m),
+                Some(ReasoningFieldStyle::OutputConfig),
+                "{m} 应走 output_config"
+            );
         }
+        // GPT-5.6 系 → reasoning
+        for m in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                model_reasoning_field_style(m),
+                Some(ReasoningFieldStyle::Reasoning),
+                "{m} 应走 reasoning"
+            );
+        }
+        // 未确认的模型 → 不下发
         for m in [
             "claude-sonnet-4.8",
             "claude-sonnet-4.5",
             "claude-opus-4.5",
             "claude-haiku-4.5",
+            "gpt-4",
+            "deepseek-3.2",
         ] {
-            assert!(
-                !model_supports_native_reasoning(m),
-                "{m} 未确认支持，不应下发 output_config"
+            assert_eq!(
+                model_reasoning_field_style(m),
+                None,
+                "{m} 未确认支持，不应下发任何 effort 字段"
             );
         }
     }

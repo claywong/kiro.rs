@@ -58,8 +58,21 @@ pub struct KiroRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
     /// Output configuration (including reasoning effort)
+    ///
+    /// Used by the Claude family (Opus 4.6/4.7/4.8, Sonnet 4.6, Claude 5 line).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    /// Reasoning configuration, the GPT-5.6 family's equivalent of `output_config`
+    ///
+    /// The GPT-5.6 line (sol / terra / luna) rejects `output_config` outright
+    /// (`property 'output_config' is not defined in the schema`) but does accept
+    /// the effort tier under a `reasoning` key. Real wire sample:
+    /// ```json
+    /// "additionalModelRequestFields": { "reasoning": { "effort": "xhigh" } }
+    /// ```
+    /// The two keys are mutually exclusive: pick per model, never send both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
 }
 
 /// The effort control field recognized by the AWS Q backend
@@ -73,6 +86,15 @@ pub struct AdditionalModelRequestFields {
 /// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroOutputConfig {
+    pub effort: String,
+}
+
+/// The GPT-5.6 family's effort control field
+///
+/// Same tier vocabulary as [`KiroOutputConfig`] (`low / medium / high / xhigh / max`),
+/// only the wrapping key differs. See [`AdditionalModelRequestFields::reasoning`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
     pub effort: String,
 }
 #[cfg(test)]
@@ -119,6 +141,7 @@ mod tests {
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),
+            reasoning: None,
         };
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");
@@ -126,5 +149,26 @@ mod tests {
             v.get("outputConfig").is_none(),
             "inner key must stay snake_case output_config, got {v}"
         );
+        assert!(
+            v.get("reasoning").is_none(),
+            "unset reasoning must be omitted entirely, got {v}"
+        );
+    }
+
+    /// The GPT-5.6 family's wire shape: `reasoning` only, no `output_config` leaking in.
+    ///
+    /// Sending `output_config` to these models returns 400
+    /// (`property 'output_config' is not defined in the schema`), so the absence
+    /// assertion is the one that actually guards production traffic.
+    #[test]
+    fn test_additional_model_request_fields_reasoning_wire_format() {
+        let fields = AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig {
+                effort: "xhigh".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&fields).unwrap();
+        assert_eq!(json, r#"{"reasoning":{"effort":"xhigh"}}"#);
     }
 }

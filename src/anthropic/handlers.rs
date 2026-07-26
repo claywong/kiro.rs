@@ -9,7 +9,7 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
 use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroRequest};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
@@ -818,7 +818,7 @@ pub async fn post_messages(
     };
 
     // 最终下发的推理思考级别，落入用量日志与链路追踪
-    let effort = extract_effort(&conversion_result);
+    let effort = extract_effort(conversion_result.additional_model_request_fields.as_ref());
     hook.set_effort(effort.clone());
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
@@ -1587,16 +1587,18 @@ fn build_non_stream_content(
 
 /// 从转换结果里取出最终下发的推理思考级别（effort）。
 ///
-/// 取的是 converter 归一化后、真正写进 `additionalModelRequestFields.output_config`
-/// 的值，与实际发往上游的请求一致；未请求 effort 时为 None。
-fn extract_effort(
-    conversion_result: &super::converter::ConversionResult,
-) -> Option<String> {
-    conversion_result
-        .additional_model_request_fields
+/// 取的是 converter 归一化后、真正写进 `additionalModelRequestFields` 的值，与实际
+/// 发往上游的请求一致；未请求 effort 时为 None。
+///
+/// 两个键都要读：Claude 系落在 `output_config`，GPT-5.6 系落在 `reasoning`。二者
+/// 互斥，只会命中一个；漏读会让 gpt 请求的 effort 在用量统计和 trace 里记成空。
+fn extract_effort(fields: Option<&AdditionalModelRequestFields>) -> Option<String> {
+    let fields = fields?;
+    fields
+        .output_config
         .as_ref()
-        .and_then(|f| f.output_config.as_ref())
         .map(|oc| oc.effort.clone())
+        .or_else(|| fields.reasoning.as_ref().map(|r| r.effort.clone()))
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -1761,7 +1763,7 @@ pub async fn post_messages_cc(
     };
 
     // 最终下发的推理思考级别，落入用量日志与链路追踪
-    let effort = extract_effort(&conversion_result);
+    let effort = extract_effort(conversion_result.additional_model_request_fields.as_ref());
     hook.set_effort(effort.clone());
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
@@ -2087,6 +2089,33 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// effort 记账要覆盖两族包装键，否则 GPT-5.6 的 effort 在统计/trace 里丢成 None。
+    #[test]
+    fn extract_effort_reads_both_output_config_and_reasoning() {
+        use crate::kiro::model::requests::kiro::{KiroOutputConfig, KiroReasoningConfig};
+
+        // Claude 系：output_config
+        let claude = AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: "high".to_string(),
+            }),
+            reasoning: None,
+        };
+        assert_eq!(extract_effort(Some(&claude)).as_deref(), Some("high"));
+
+        // GPT-5.6 系：reasoning
+        let gpt = AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig {
+                effort: "xhigh".to_string(),
+            }),
+        };
+        assert_eq!(extract_effort(Some(&gpt)).as_deref(), Some("xhigh"));
+
+        // 未请求 effort
+        assert_eq!(extract_effort(None), None);
+    }
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {
