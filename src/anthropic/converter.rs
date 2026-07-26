@@ -321,7 +321,13 @@ pub fn get_context_window_size(model: &str) -> i32 {
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 一并视为支持。GPT-5.6 系（sol / terra / luna）同样放开。
+/// 一并视为支持。
+///
+/// GPT-5.6 系（sol / terra / luna）曾于 2026-07-25 放开，线上实测上游返回 400
+/// （`property 'output_config' is not defined in the schema and the schema does not
+/// allow additional properties`），2026-07-26 已回滚——上游对这三个模型的 schema
+/// 不接受任何 `additionalModelRequestFields`，不要再加回来。
+///
 /// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
 /// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
 /// （`additionalModelRequestFields is not supported`）。
@@ -340,7 +346,6 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("sonnet-5")
         || m.contains("opus-5")
         || m.contains("claude-5")
-        || m.contains("gpt-5.6")
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -2120,19 +2125,19 @@ mod tests {
         );
     }
 
-    /// GPT-5.6 系放开 `output_config`：显式 effort 应原样下发。
+    /// GPT-5.6 系不下发 `output_config`：即便客户端显式给了 effort 也要丢掉。
+    ///
+    /// 2026-07-25 曾放开，线上 400（`property 'output_config' is not defined in the
+    /// schema`），2026-07-26 回滚。此用例防止再次误放开。
     #[test]
-    fn test_output_config_emits_for_gpt_5_6() {
+    fn test_output_config_skipped_for_gpt_5_6() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let req = minimal_request_with_effort(model, "xhigh");
             let result = convert_request(&req).unwrap();
-            let fields = result
-                .additional_model_request_fields
-                .unwrap_or_else(|| panic!("{model} 显式 effort 应下发 output_config"));
-            assert_eq!(
-                fields.output_config.unwrap().effort,
-                "xhigh",
-                "{model} 应原样下发 xhigh"
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "{model} 不得下发 additionalModelRequestFields：上游 schema 不接受该字段，\
+                 会返回 400 REQUEST_BODY_INVALID"
             );
         }
     }
