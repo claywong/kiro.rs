@@ -330,6 +330,20 @@ enum ReasoningFieldStyle {
     Reasoning,
 }
 
+/// 按后端族判定 effort 的包装键名。
+///
+/// 只回答「该用哪个键」，不回答「是否放行」——后者由
+/// [`model_reasoning_field_style`] 的内置白名单与自定义模型声明共同决定。
+/// 上游若再出第三种包装键，只改这一处，内置与自定义两条路径同时跟上。
+fn reasoning_field_key(model_id: &str) -> ReasoningFieldStyle {
+    // 与 map_model 的放行范围对齐：只认 gpt-5*，legacy gpt-4 之类不进这条分支。
+    if model_id.to_ascii_lowercase().starts_with("gpt-5") {
+        ReasoningFieldStyle::Reasoning
+    } else {
+        ReasoningFieldStyle::OutputConfig
+    }
+}
+
 /// 判定模型接受哪种 effort 包装键，不接受则 `None`。
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
@@ -343,29 +357,34 @@ enum ReasoningFieldStyle {
 /// 确认上游实际接受 `{"reasoning":{"effort":"xhigh"}}`，即字段是支持的、只是键名不同。
 /// **不要**给这三个模型下发 `output_config`。
 ///
+/// 自定义模型（`config.json` 的 `customModels`，`supportsReasoning: true`）按
+/// backend_id 额外放行，但**键名一律由 [`reasoning_field_key`] 按后端族决定**：
+/// `supportsReasoning` 只表达「该后端接受 effort 字段」，不表达用哪个键——用户没有
+/// 判断键名的依据。此处早期实现把该声明直接当成 `output_config`（当时判定尚是
+/// bool 两态，「支持」与「output_config」同义），导致自定义模型指向 gpt-5.x 时下发
+/// `output_config` 撞上述 400，而直连同一后端却正常。
+///
 /// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
 /// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
 /// （`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
 fn model_reasoning_field_style(model_id: &str) -> Option<ReasoningFieldStyle> {
-    // 自定义模型可按 backend_id 声明支持 reasoning。
-    if crate::model::custom_models::backend_supports_reasoning(model_id) {
-        return Some(ReasoningFieldStyle::OutputConfig);
-    }
     let m = model_id.to_ascii_lowercase();
-    // 与 map_model 的放行范围对齐：只认 gpt-5*，legacy gpt-4 之类不进这条分支。
-    if m.starts_with("gpt-5") {
-        return Some(ReasoningFieldStyle::Reasoning);
-    }
-    let claude = matches!(
-        m.as_str(),
-        "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
-    ) || m.contains("fable-5")
+    let builtin = m.starts_with("gpt-5")
+        || matches!(
+            m.as_str(),
+            "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
+        )
+        || m.contains("fable-5")
         || m.contains("mythos-5")
         || m.contains("sonnet-5")
         || m.contains("opus-5")
         || m.contains("claude-5");
-    claude.then_some(ReasoningFieldStyle::OutputConfig)
+
+    if builtin || crate::model::custom_models::backend_supports_reasoning(model_id) {
+        return Some(reasoning_field_key(model_id));
+    }
+    None
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -2208,6 +2227,103 @@ mod tests {
             !json.contains("output_config"),
             "序列化结果不得含 output_config：{json}"
         );
+    }
+
+    /// 装载自定义模型注册表（幂等）。
+    ///
+    /// `custom_models::init` 走进程级 `OnceLock`，测试又是并发的：谁先调谁生效，
+    /// 后续调用静默忽略。故所有依赖自定义模型的用例都从这里装载**同一份**列表，
+    /// 与执行顺序无关。backend_id 一律用虚构值，避开真实模型——否则会污染
+    /// `test_output_config_still_skipped_for_other_non_claude_models` 等
+    /// 断言「该后端不放行」的用例。
+    fn setup_custom_models() {
+        use crate::model::config::CustomModel;
+
+        fn entry(id: &str, backend: &str) -> CustomModel {
+            CustomModel {
+                id: id.to_string(),
+                backend_id: backend.to_string(),
+                display_name: None,
+                context_window: None,
+                max_tokens: None,
+                supports_reasoning: Some(true),
+                owned_by: None,
+            }
+        }
+
+        crate::model::custom_models::init(vec![
+            // 指向 gpt-5.x 族：键名必须是 reasoning。
+            entry("custom-gpt-alias", "gpt-5.9-probe"),
+            // 指向非 gpt 族：保持 output_config（PR #46 原行为）。
+            entry("custom-other-alias", "vendor-model-probe"),
+        ]);
+    }
+
+    /// 自定义模型指向 gpt-5.x 时必须走 `reasoning` 键，不能是 `output_config`。
+    ///
+    /// 回归 0.7.2 合并引入的语义冲突：`supportsReasoning` 早期被直接翻译成
+    /// `output_config`（当时判定是 bool 两态），三态化后这行没跟上，导致自定义模型
+    /// 指向 gpt-5.x 时下发上游明确拒绝的 `output_config`（`property 'output_config'
+    /// is not defined in the schema`），而直连同一后端却正常。
+    #[test]
+    fn test_custom_model_on_gpt_family_uses_reasoning_key() {
+        setup_custom_models();
+
+        let req = minimal_request_with_effort("custom-gpt-alias", "xhigh");
+        let fields = convert_request(&req)
+            .unwrap()
+            .additional_model_request_fields
+            .expect("声明 supportsReasoning 的自定义模型应下发 effort 字段");
+
+        assert_eq!(
+            fields.reasoning.as_ref().map(|r| r.effort.as_str()),
+            Some("xhigh"),
+            "映射到 gpt-5.x 的自定义模型应走 reasoning 键"
+        );
+        let json = serde_json::to_string(&fields).unwrap();
+        assert_eq!(json, r#"{"reasoning":{"effort":"xhigh"}}"#);
+        assert!(
+            !json.contains("output_config"),
+            "序列化结果不得含 output_config，上游会 400：{json}"
+        );
+    }
+
+    /// 自定义模型指向非 gpt 族时仍走 `output_config`，保持 PR #46 的原行为。
+    #[test]
+    fn test_custom_model_on_non_gpt_backend_keeps_output_config() {
+        setup_custom_models();
+
+        let req = minimal_request_with_effort("custom-other-alias", "high");
+        let fields = convert_request(&req)
+            .unwrap()
+            .additional_model_request_fields
+            .expect("声明 supportsReasoning 的自定义模型应下发 effort 字段");
+
+        assert_eq!(
+            fields.output_config.as_ref().map(|oc| oc.effort.as_str()),
+            Some("high"),
+            "非 gpt 族的自定义模型应保持 output_config 键"
+        );
+        assert!(fields.reasoning.is_none(), "不应同时下发 reasoning");
+    }
+
+    /// 键名判定与「是否放行」解耦：`reasoning_field_key` 只看后端族。
+    #[test]
+    fn test_reasoning_field_key_depends_only_on_backend_family() {
+        for m in ["gpt-5.6-sol", "gpt-5.9-probe", "GPT-5.6-Terra"] {
+            assert_eq!(
+                reasoning_field_key(m),
+                ReasoningFieldStyle::Reasoning,
+                "{m} 属 gpt-5 族，应走 reasoning"
+            );
+        }
+        for m in ["claude-opus-4.8", "vendor-model-probe", "gpt-4-legacy"] {
+            assert_eq!(
+                reasoning_field_key(m),
+                ReasoningFieldStyle::OutputConfig,
+                "{m} 非 gpt-5 族，应走 output_config"
+            );
+        }
     }
 
     /// thinking:disabled 对 GPT-5.6 同样生效，不下发任何字段。
