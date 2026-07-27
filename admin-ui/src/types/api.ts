@@ -660,6 +660,10 @@ export interface VendorStatus {
   defaultGroups: string[]
   defaultPurchaseCost?: number | null
   defaultRpmLimit: number
+  /** 提取模式：true = 自动，false = 手动。运行时值，切换后立即生效 */
+  autoPurchase: boolean
+  /** 自动模式单次提取上限；实际数量 = min(newKeys, stockMax, 本值) */
+  autoPurchaseMaxCount: number
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
@@ -672,6 +676,15 @@ export interface VendorStatus {
   /** 名下最早一条 Key 的创建时间，用于推算账号有效期起点 */
   keysCreatedAt?: VendorKeysCreatedAt
   keysCreatedAtError?: string
+}
+
+/** 切换提取模式的结果 */
+export interface VendorModeChange {
+  autoPurchase: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
 }
 
 /** 卖家 `/api/status` 返回的 Key 数量分布 */
@@ -720,7 +733,7 @@ export interface VendorEvent {
   acked: boolean
   /** 首次提交提取时绑定的数量；非空即不可更改 */
   boundCount?: number
-  /** done / failed；未提取过则为空 */
+  /** done / failed / skipped；未提取过则为空 */
   purchaseStatus?: string
   purchased?: number
   imported?: number
@@ -728,6 +741,15 @@ export interface VendorEvent {
   failed?: number
   lastError?: string
   processedAt?: string
+  /** manual / auto；未提取过则为空 */
+  purchaseTrigger?: string
+  /** 失效确认结论，仅 all_keys_dead 事件有值 */
+  validationStatus?: 'pending' | 'confirmed_dead' | 'still_alive' | 'inconclusive'
+  /** 确认结论的依据说明 */
+  validationDetail?: string
+  validatedAt?: string
+  /** 该确认是否已被某次自动提取用掉 */
+  validationUsed: boolean
 }
 
 export interface VendorEventsResponse {
