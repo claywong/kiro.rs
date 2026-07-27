@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   VendorStatus,
   VendorEventsResponse,
+  VendorModeChange,
   VendorOrdersResponse,
   VendorPurchaseResult,
   VendorRedeemResult,
@@ -98,6 +99,15 @@ export async function purchaseForEvent(
 /** 不依赖事件的直接提取（服务端生成订单号）。会真实扣费，调用前需二次确认。 */
 export async function purchaseAdHoc(count: number): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>('/purchase', { count })
+  return data
+}
+
+/**
+ * 切换提取模式。运行时立即生效，并尽力写回 config.json；
+ * 返回的 `persisted=false` 表示只在当前进程生效，重启会回退。
+ */
+export async function setVendorMode(autoPurchase: boolean): Promise<VendorModeChange> {
+  const { data } = await api.put<VendorModeChange>('/mode', { autoPurchase })
   return data
 }
 

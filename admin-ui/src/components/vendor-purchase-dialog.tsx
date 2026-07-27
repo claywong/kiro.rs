@@ -16,7 +16,7 @@ import type { VendorEvent, VendorStatus } from '@/types/api'
  * 核心约束：卖家侧对「同订单号 + 同 count」幂等重放，改 count 会返回 409。
  * 而订单号由卖家给定、重投不变，所以首次提交的数量一旦绑定就永久锁死。
  * 因此：
- * - 未绑定过 → 数量可改，默认填 newKeys，并醒目提示「提交后永久绑定」
+ * - 未绑定过 → 数量可改，默认取 newKeys 与当前可提取上限的较小值，并醒目提示「提交后永久绑定」
  * - 已绑定过 → 数量框置灰锁死，只能按绑定值重试
  */
 export function VendorPurchaseDialog({
@@ -38,9 +38,10 @@ export function VendorPurchaseDialog({
 
   useEffect(() => {
     if (!event) return
-    // 已绑定则强制显示绑定值，否则默认填 webhook 声明的 newKeys
-    setCount(String(boundCount ?? event.newKeys ?? 1))
-  }, [event, boundCount])
+    // 已绑定则强制显示绑定值；首次提取取事件声明数量与当前上限的较小值
+    const availableCount = Math.min(event.newKeys ?? 1, status?.stockMax ?? Infinity)
+    setCount(String(boundCount ?? availableCount))
+  }, [event, boundCount, status?.stockMax])
 
   const handleSubmit = async () => {
     if (!event) return

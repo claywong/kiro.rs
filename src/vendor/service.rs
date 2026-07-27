@@ -1,21 +1,28 @@
-//! 卖家对接服务层：事件解析、手动提取入库、告警计数
+//! 卖家对接服务层：事件解析、提取入库、失效确认、告警计数
 //!
-//! 设计约束：入站 webhook **只落库不花钱**。所有扣费动作（`/api/my/purchase`）
-//! 一律由管理面板显式触发，且提取数量一旦绑定就不可更改（卖家侧同订单号改
-//! count 会 409）。
+//! 设计约束：提取数量一旦绑定就不可更改（卖家侧同订单号改 count 会 409），
+//! 这是整个模块所有取舍的出发点。
+//!
+//! - 手动模式（默认）：入站 webhook **只落库不花钱**，扣费一律由面板显式触发。
+//! - 自动模式：仅当上一轮 `all_keys_dead` 已确认「名下卖家 Key 全部失效」时，
+//!   才在收到 `new_keys_available` 后自动提取，且只提最小数量。判定规则见
+//!   [`super::auto`]。
 //!
 //! @author wangzhong
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::admin::AdminService;
 use crate::admin::types::AddCredentialRequest;
 use crate::http_client::ProxyConfig;
 use crate::model::config::{TlsBackend, VendorConfig};
 
+use super::auto;
 use super::client::{VendorApiError, VendorClient};
 use super::store::{
-    IncomingEvent, PurchaseOutcome, PurchaseStatus, SharedVendorStore, VendorEventKind,
+    IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, SharedVendorStore,
+    ValidationStatus, VendorEventKind,
 };
 
 /// 提取入库的汇总结果（返回给前端）
@@ -38,6 +45,19 @@ pub struct PurchaseImportResult {
     /// 首条失败原因（便于前端直接展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 切换提取模式的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeChange {
+    /// 切换后的模式（运行时已生效）
+    pub auto_purchase: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// 服务层错误
@@ -80,6 +100,9 @@ pub struct VendorService {
     tls_backend: TlsBackend,
     store: SharedVendorStore,
     admin: Arc<AdminService>,
+    /// 提取模式的运行时值。`config.auto_purchase` 只是启动快照，面板切换后
+    /// 以本字段为准 —— 读它而不是读 config。
+    auto_purchase: AtomicBool,
 }
 
 impl VendorService {
@@ -90,12 +113,14 @@ impl VendorService {
         store: SharedVendorStore,
         admin: Arc<AdminService>,
     ) -> Self {
+        let auto_purchase = config.as_ref().is_some_and(|c| c.auto_purchase);
         Self {
             config,
             proxy,
             tls_backend,
             store,
             admin,
+            auto_purchase: AtomicBool::new(auto_purchase),
         }
     }
 
@@ -103,8 +128,65 @@ impl VendorService {
         &self.store
     }
 
+    /// 启动时的配置快照。`auto_purchase` 字段可能已被面板改过，
+    /// 判断提取模式请用 [`Self::auto_purchase`]。
     pub fn config(&self) -> Option<&VendorConfig> {
         self.config.as_ref()
+    }
+
+    /// 当前是否为自动提取模式
+    pub fn auto_purchase(&self) -> bool {
+        self.auto_purchase.load(Ordering::Relaxed)
+    }
+
+    /// 切换提取模式：先改运行时值，再尽力写回 config.json。
+    ///
+    /// 持久化失败不算切换失败 —— 运行时已生效，只是重启后会回退到文件里的值，
+    /// 这一点通过返回的 `persisted` 告知调用方，由面板提示用户。
+    pub fn set_auto_purchase(&self, enabled: bool) -> ModeChange {
+        self.auto_purchase.store(enabled, Ordering::Relaxed);
+        match self.persist_auto_purchase(enabled) {
+            Ok(()) => ModeChange {
+                auto_purchase: enabled,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化提取模式失败（运行时已生效）: {}", e);
+                ModeChange {
+                    auto_purchase: enabled,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// 写回 config.json 的 `vendor.autoPurchase`。
+    ///
+    /// 重新从磁盘加载再改单个字段，避免把进程内的旧快照整体覆盖上去 ——
+    /// 与 `AdminService::persist_log_governance_config` 同一套做法。
+    fn persist_auto_purchase(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，提取模式仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        let vendor = config
+            .vendor
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("config.json 缺少 vendor 段，无法持久化提取模式"))?;
+        vendor.auto_purchase = enabled;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 校验入站路径 token。未配置或 token 为空一律拒绝。
@@ -165,6 +247,17 @@ impl VendorService {
         event_id: &str,
         count: u32,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
+        self.purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Manual)
+            .await
+    }
+
+    /// 同 [`Self::purchase_for_event`]，但记录触发方式（自动模式用）
+    pub async fn purchase_for_event_with_trigger(
+        &self,
+        event_id: &str,
+        count: u32,
+        trigger: PurchaseTrigger,
+    ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
 
         let record = self
@@ -189,7 +282,7 @@ impl VendorService {
             Err(bound) => return Err(VendorServiceError::CountLocked { bound }),
         };
 
-        self.purchase_and_import(&client, event_id, &order_id, effective)
+        self.purchase_and_import(&client, event_id, &order_id, effective, trigger)
             .await
     }
 
@@ -227,6 +320,7 @@ impl VendorService {
         event_id: &str,
         order_id: &str,
         count: u32,
+        trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let resp = match client.purchase(count, order_id).await {
             Ok(r) => r,
@@ -236,9 +330,9 @@ impl VendorService {
                     last_error: Some(e.to_string()),
                     ..Default::default()
                 };
-                let _ = self
-                    .store
-                    .finish_purchase(event_id, PurchaseStatus::Failed, &outcome);
+                let _ =
+                    self.store
+                        .finish_purchase(event_id, PurchaseStatus::Failed, trigger, &outcome);
                 return Err(VendorServiceError::Upstream(e));
             }
         };
@@ -255,7 +349,10 @@ impl VendorService {
         } else {
             PurchaseStatus::Done
         };
-        if let Err(e) = self.store.finish_purchase(event_id, status, &outcome) {
+        if let Err(e) = self
+            .store
+            .finish_purchase(event_id, status, trigger, &outcome)
+        {
             tracing::warn!("写回提取结果失败 event_id={}: {}", event_id, e);
         }
 
@@ -324,6 +421,173 @@ impl VendorService {
             }
         }
         outcome
+    }
+
+    // ============ 自动模式 ============
+
+    /// 自动模式单次提取上限
+    fn auto_max_count(&self) -> u32 {
+        self.config
+            .as_ref()
+            .map(|c| c.auto_purchase_max_count)
+            .unwrap_or(1)
+    }
+
+    /// 从凭据池取出卖家 Key 的状态切片
+    fn vendor_key_states(&self) -> Vec<auto::VendorKeyState> {
+        self.admin
+            .token_manager()
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|e| auto::VendorKeyState {
+                source_channel: e.source_channel,
+                disabled: e.disabled,
+                disabled_reason: e.disabled_reason,
+                failure_count: e.failure_count,
+            })
+            .collect()
+    }
+
+    /// 盘点并写入一次确认结论，返回该结论
+    fn run_validation_once(&self, event_id: &str, window_expired: bool) -> ValidationStatus {
+        let c = auto::census(&self.vendor_key_states());
+        let (status, detail) = auto::conclude(c, window_expired);
+        if let Err(e) = self.store.set_validation(event_id, status, &detail) {
+            tracing::warn!("写入失效确认结论失败 event_id={}: {}", event_id, e);
+        }
+        tracing::info!(
+            event_id = %event_id,
+            status = status.as_str(),
+            detail = %detail,
+            "卖家 Key 失效确认"
+        );
+        status
+    }
+
+    /// 启动失效确认的观察窗口。
+    ///
+    /// 卖家推来 `all_keys_dead` 时本地通常还没探到失效（本地状态靠真实请求
+    /// 失败累积），故先立刻盘点一次，未得出"已全部失效"就按 30 秒一轮继续
+    /// 观察，最多 3 分钟。一旦确认失效即提前收敛。
+    pub fn spawn_dead_validation(self: &Arc<Self>, event_id: String) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            if svc.run_validation_once(&event_id, false) == ValidationStatus::ConfirmedDead {
+                return;
+            }
+            let deadline = tokio::time::Instant::now() + auto::VALIDATION_WINDOW;
+            loop {
+                tokio::time::sleep(auto::VALIDATION_POLL_INTERVAL).await;
+                let expired = tokio::time::Instant::now() >= deadline;
+                let status = svc.run_validation_once(&event_id, expired);
+                if expired || status == ValidationStatus::ConfirmedDead {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// 自动提取。仅在自动模式 + 上一轮失效已确认时真正下单。
+    ///
+    /// 检查顺序按「代价从小到大、可逆到不可逆」排列：先读本地确认结论（零成本），
+    /// 再查卖家可提取上限（一次出站），最后才 `bind_count` —— 绑定是唯一不可逆的
+    /// 一步，之前任何一环给出否定结论都只记跳过，订单号仍留给手动提取。
+    pub fn spawn_auto_purchase(self: &Arc<Self>, event_id: String, new_keys: Option<u32>) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys).await {
+                tracing::info!(event_id = %event_id, reason = %reason, "自动提取已跳过");
+                if let Err(e) = svc.store.record_skip(&event_id, &reason) {
+                    tracing::warn!("记录跳过原因失败 event_id={}: {}", event_id, e);
+                }
+            }
+        });
+    }
+
+    /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
+    async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
+        // 1. 失效确认：必须有一条已确认失效、且尚未被消费的 all_keys_dead
+        let dead = self
+            .store
+            .latest_dead_event()
+            .map_err(|e| format!("读取失效确认记录失败: {e}"))?
+            .ok_or_else(|| "尚未收到「全部失效」事件，无法确认旧 Key 已失效".to_string())?;
+
+        let status = dead
+            .validation_status
+            .as_deref()
+            .and_then(ValidationStatus::from_str);
+        match status {
+            Some(ValidationStatus::ConfirmedDead) => {}
+            Some(ValidationStatus::Pending) => {
+                return Err("旧 Key 失效确认仍在观察中，本轮不自动提取".to_string());
+            }
+            Some(ValidationStatus::StillAlive) => {
+                return Err(dead
+                    .validation_detail
+                    .unwrap_or_else(|| "本地仍有健康的卖家 Key".to_string()));
+            }
+            Some(ValidationStatus::Inconclusive) | None => {
+                return Err(dead
+                    .validation_detail
+                    .unwrap_or_else(|| "旧 Key 是否失效无法确认".to_string()));
+            }
+        }
+        if dead.validation_used {
+            return Err("上一次失效确认已用于此前的自动提取，需新的失效事件".to_string());
+        }
+
+        // 2. 数量：三者取最小，为 0 则无可提
+        let stock = self
+            .stock()
+            .await
+            .map_err(|e| format!("查询可提取上限失败: {e}"))?;
+        let count = auto::decide_count(new_keys, stock, self.auto_max_count());
+        if count == 0 {
+            return Err(format!(
+                "可提取数量为 0（事件声明 {}，卖家上限 {}，配置上限 {}）",
+                new_keys.map(|v| v.to_string()).unwrap_or("-".into()),
+                stock,
+                self.auto_max_count()
+            ));
+        }
+
+        // 3. 消费确认额度。抢占式，确保一次确认只授权一轮提取
+        let consumed = self
+            .store
+            .consume_validation(&dead.event_id)
+            .map_err(|e| format!("消费失效确认失败: {e}"))?;
+        if !consumed {
+            return Err("失效确认已被其他自动提取取用".to_string());
+        }
+
+        // 4. 下单。此处开始不可逆
+        tracing::info!(
+            event_id = %event_id,
+            count,
+            dead_event = %dead.event_id,
+            "自动提取开始"
+        );
+        match self
+            .purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Auto)
+            .await
+        {
+            Ok(r) => {
+                tracing::info!(
+                    event_id = %event_id,
+                    purchased = r.purchased,
+                    imported = r.imported,
+                    "自动提取完成"
+                );
+                Ok(())
+            }
+            // 失败已由 purchase_and_import 写回事件行，这里不再覆盖为 skipped
+            Err(e) => {
+                tracing::warn!(event_id = %event_id, "自动提取失败: {}", e);
+                Ok(())
+            }
+        }
     }
 
     // ============ 出站只读 / 运营接口 ============

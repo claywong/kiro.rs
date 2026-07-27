@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   RefreshCw, PackagePlus, SkullIcon, ChevronDown, ChevronRight, Check, CheckCheck, Repeat,
+  Zap, Hand,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -42,15 +43,76 @@ function EventTypeBadge({ type }: { type: string }) {
   return <Badge variant="secondary">{type}</Badge>
 }
 
+/** 自动 / 手动触发标记。未提取过的事件不显示 */
+function TriggerTag({ trigger }: { trigger?: string }) {
+  if (!trigger) return null
+  const auto = trigger === 'auto'
+  return (
+    <span
+      className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+      title={auto ? '由自动模式触发' : '手动触发'}
+    >
+      {auto ? <Zap className="h-2.5 w-2.5" /> : <Hand className="h-2.5 w-2.5" />}
+      {auto ? '自动' : '手动'}
+    </span>
+  )
+}
+
+/**
+ * 失效确认结论（仅 all_keys_dead 事件）。
+ *
+ * 这一列决定了下一轮新 Key 能不能自动提取：只有「已确认失效」才授权自动扣费，
+ * 且该授权用掉一次后失效，故一并标出是否已被使用。
+ */
+function ValidationCell({ event }: { event: VendorEvent }) {
+  const s = event.validationStatus
+  if (!s) return <span className="text-xs text-muted-foreground">—</span>
+
+  const map = {
+    pending: { text: '确认中', cls: 'text-amber-600 dark:text-amber-500' },
+    confirmed_dead: { text: '已确认失效', cls: 'text-emerald-600 dark:text-emerald-500' },
+    still_alive: { text: '仍有健康 Key', cls: 'text-muted-foreground' },
+    inconclusive: { text: '无法确认', cls: 'text-muted-foreground' },
+  } as const
+  const { text, cls } = map[s]
+
+  return (
+    <div className="text-xs">
+      <span className={`font-medium ${cls}`}>{text}</span>
+      {s === 'confirmed_dead' && (
+        <span className="ml-1.5 text-[10px] text-muted-foreground">
+          {event.validationUsed ? '已用于自动提取' : '可授权一次自动提取'}
+        </span>
+      )}
+      {event.validationDetail && (
+        <div className="mt-0.5 text-muted-foreground">{event.validationDetail}</div>
+      )}
+    </div>
+  )
+}
+
 /** 提取结果列 */
 function PurchaseStatusCell({ event }: { event: VendorEvent }) {
   if (!event.purchaseStatus) {
     return <span className="text-xs text-muted-foreground">未提取</span>
   }
+  if (event.purchaseStatus === 'skipped') {
+    return (
+      <div className="text-xs">
+        <span className="font-medium text-muted-foreground">自动跳过</span>
+        <TriggerTag trigger={event.purchaseTrigger} />
+        {event.lastError && (
+          <div className="mt-0.5 break-all text-muted-foreground">{event.lastError}</div>
+        )}
+        <div className="mt-0.5 text-muted-foreground/80">数量未绑定，仍可手动提取</div>
+      </div>
+    )
+  }
   if (event.purchaseStatus === 'failed') {
     return (
       <div className="text-xs">
         <span className="font-medium text-destructive">提取失败</span>
+        <TriggerTag trigger={event.purchaseTrigger} />
         {event.lastError && (
           <div className="mt-0.5 break-all text-muted-foreground">{event.lastError}</div>
         )}
@@ -65,6 +127,7 @@ function PurchaseStatusCell({ event }: { event: VendorEvent }) {
       <span className="font-medium text-emerald-600 dark:text-emerald-500">
         {parts.join(' / ')}
       </span>
+      <TriggerTag trigger={event.purchaseTrigger} />
       <div className="mt-0.5 text-muted-foreground">{formatTime(event.processedAt)}</div>
     </div>
   )
@@ -239,6 +302,7 @@ export function VendorPage() {
                       <th className="px-4 py-2 text-left font-medium">类型</th>
                       <th className="px-4 py-2 text-left font-medium">消息</th>
                       <th className="px-4 py-2 text-right font-medium">数量</th>
+                      <th className="px-4 py-2 text-left font-medium">失效确认</th>
                       <th className="px-4 py-2 text-left font-medium">提取结果</th>
                       <th className="px-4 py-2 text-right font-medium">操作</th>
                     </tr>
@@ -275,6 +339,9 @@ export function VendorPage() {
                         </td>
                         <td className="px-4 py-2.5 text-right tabular-nums">
                           {e.newKeys ?? e.dead ?? '—'}
+                        </td>
+                        <td className="max-w-[16rem] px-4 py-2.5">
+                          <ValidationCell event={e} />
                         </td>
                         <td className="px-4 py-2.5">
                           <PurchaseStatusCell event={e} />
