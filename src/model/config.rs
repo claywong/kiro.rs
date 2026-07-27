@@ -100,6 +100,25 @@ pub struct VendorConfig {
     /// 手动提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
+
+    /// 提取模式：true = 自动，false = 手动（默认）。
+    ///
+    /// 默认手动 —— 提取会真实扣费，且提取数量一旦提交就与订单号永久绑定
+    /// （卖家侧改数量返回 409），把这个决策交给程序需要用户显式开启。
+    /// 运行时可在管理面板切换，切换会写回本文件。
+    #[serde(default)]
+    pub auto_purchase: bool,
+
+    /// 自动模式下单次提取的数量上限（默认 1）。
+    ///
+    /// 实际提取数量 = `min(事件声明的 newKeys, 卖家当前可提取上限, 本值)`。
+    /// 取最小值是因为自动模式没有人工复核，而数量一旦绑定就无法改小。
+    #[serde(default = "default_vendor_auto_max_count")]
+    pub auto_purchase_max_count: u32,
+}
+
+fn default_vendor_auto_max_count() -> u32 {
+    1
 }
 
 fn default_vendor_rpm_limit() -> u32 {

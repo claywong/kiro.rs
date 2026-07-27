@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   Wallet, PackageOpen, Webhook, BellRing, Send, Ticket, Upload, ShoppingCart,
-  Boxes, CalendarClock,
+  Boxes, CalendarClock, Zap, Hand,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -11,9 +11,10 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { Switch } from '@/components/ui/switch'
 import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
-  useSetVendorWebhookUrl, usePurchaseAdHoc,
+  useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 import type { VendorStatus } from '@/types/api'
@@ -158,6 +159,7 @@ export function VendorStatusBar() {
   const testWebhook = useTestVendorWebhook()
   const setWebhookUrl = useSetVendorWebhookUrl()
   const purchaseAdHoc = usePurchaseAdHoc()
+  const setMode = useSetVendorMode()
   const confirm = useConfirm()
 
   const [redeemOpen, setRedeemOpen] = useState(false)
@@ -227,6 +229,40 @@ export function VendorStatusBar() {
   }
 
   /**
+   * 切换提取模式。开自动要二次确认 —— 之后收到 `new_keys_available` 就会
+   * 直接扣费提取，且提取数量与订单号永久绑定，没有人工复核的机会。
+   * 关自动不确认：从花钱变不花钱，没有风险。
+   */
+  const handleToggleMode = async (next: boolean) => {
+    if (next) {
+      const ok = await confirm({
+        title: '开启自动提取？',
+        description:
+          '开启后，收到「全部失效」事件时会核对本地凭据，确认名下卖家 Key 已全部失效；' +
+          `之后收到「新 Key 就绪」才自动下单，每次最多 ${
+            status?.autoPurchaseMaxCount ?? 1
+          } 个（还会受事件声明数量与卖家上限限制）。` +
+          '数量一旦提交就与该订单号永久绑定，无法改数量重试。',
+        confirmText: '开启自动提取',
+        destructive: true,
+      })
+      if (!ok) return
+    }
+    try {
+      const r = await setMode.mutateAsync(next)
+      if (!r.persisted) {
+        toast.warning(next ? '已切到自动提取（仅本次运行）' : '已切回手动提取（仅本次运行）', {
+          description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
+        })
+        return
+      }
+      toast.success(next ? '已切到自动提取' : '已切回手动提取')
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换提取模式失败'))
+    }
+  }
+
+  /**
    * 直接提取：不依赖 webhook 事件，服务端自行生成订单号。
    * 会真实扣费，故强制二次确认并把数量、预计扣费、余额变化列清楚。
    */
@@ -281,7 +317,40 @@ export function VendorStatusBar() {
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div
+          className={`flex items-center gap-2.5 rounded-md border px-3 py-1.5 ${
+            status?.autoPurchase
+              ? 'border-amber-500/40 bg-amber-500/5'
+              : 'border-border bg-muted/30'
+          }`}
+        >
+          {status?.autoPurchase ? (
+            <Zap className="h-3.5 w-3.5 text-amber-600 dark:text-amber-500" />
+          ) : (
+            <Hand className="h-3.5 w-3.5 text-muted-foreground" />
+          )}
+          <div className="text-xs">
+            <span className="font-medium">
+              {status?.autoPurchase ? '自动提取' : '手动提取'}
+            </span>
+            <span className="ml-1.5 text-muted-foreground">
+              {status?.autoPurchase
+                ? `确认旧 Key 全部失效后，新 Key 就绪时最多自动提 ${
+                    status.autoPurchaseMaxCount ?? 1
+                  } 个`
+                : '所有提取需在下方事件列表手动触发'}
+            </span>
+          </div>
+          <Switch
+            checked={status?.autoPurchase ?? false}
+            onCheckedChange={handleToggleMode}
+            disabled={setMode.isPending || !status}
+            aria-label="切换自动 / 手动提取模式"
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
         <Button variant="outline" size="sm" onClick={handleTest} disabled={testWebhook.isPending}>
           <Send className="mr-1.5 h-3.5 w-3.5" />
           测试推送
@@ -311,6 +380,7 @@ export function VendorStatusBar() {
           <ShoppingCart className="mr-1.5 h-3.5 w-3.5" />
           直接提取
         </Button>
+        </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

@@ -359,6 +359,8 @@ mod tests {
             default_groups: vec![],
             default_purchase_cost: None,
             default_rpm_limit: 10,
+            auto_purchase: false,
+            auto_purchase_max_count: 1,
         }
     }
 

@@ -2,7 +2,8 @@
 //!
 //! 分两组：
 //! - 入站 webhook（`/webhook/vendor/{token}`）：无 API Key，靠不可猜测的路径 token 校验。
-//!   只落库 + 告警，不做任何扣费动作。
+//!   落库 + 告警后立即返回；后续动作（失效确认、自动提取）一律异步派发，
+//!   手动模式下不做任何扣费动作。
 //! - 管理接口（`/api/admin/vendor/*`）：走 adminApiKey 认证，手动触发提取 / 兑换 / 测试。
 //!
 //! @author wangzhong
@@ -17,7 +18,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::service::{VendorService, VendorServiceError};
-use super::store::{DEFAULT_QUERY_LIMIT, RecordOutcome};
+use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEventKind};
 
 /// 入站 webhook 与管理接口共享的状态
 #[derive(Clone)]
@@ -92,6 +93,9 @@ pub async fn receive_webhook(
                 dead = ?event.dead,
                 "收到卖家 webhook 事件"
             );
+            // 只对首次收到的事件做后续动作，且全部异步 —— 提取加逐条验活可能耗时
+            // 数十秒，同步执行会让卖家侧超时重投。
+            dispatch_event(&state, &event);
         }
         Ok(RecordOutcome::Duplicate) => {
             tracing::info!(
@@ -106,6 +110,37 @@ pub async fn receive_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+/// 按事件类型派发后台动作。
+///
+/// - `all_keys_dead`：启动失效确认观察窗口。与提取模式无关 —— 手动模式下这个
+///   结论也是有用的诊断信息，且用户可能随时切到自动。
+/// - `new_keys_available`：仅自动模式下尝试提取，且需通过失效确认。
+fn dispatch_event(state: &VendorState, event: &IncomingEvent) {
+    match event.kind {
+        VendorEventKind::AllKeysDead => {
+            state
+                .service
+                .spawn_dead_validation(event.event_id.clone());
+        }
+        VendorEventKind::NewKeysAvailable => {
+            if !state.service.auto_purchase() {
+                return;
+            }
+            if event.purchase_order_id.is_none() {
+                tracing::info!(
+                    event_id = %event.event_id,
+                    "自动模式已开启，但事件缺少订单号，跳过自动提取"
+                );
+                return;
+            }
+            state
+                .service
+                .spawn_auto_purchase(event.event_id.clone(), event.new_keys);
+        }
+        VendorEventKind::Unknown => {}
+    }
 }
 
 // ============ 管理接口 ============
@@ -154,6 +189,9 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         "defaultGroups": cfg.map(|c| c.default_groups.clone()).unwrap_or_default(),
         "defaultPurchaseCost": cfg.and_then(|c| c.default_purchase_cost),
         "defaultRpmLimit": cfg.map(|c| c.default_rpm_limit).unwrap_or(10),
+        // 运行时值，可能已被面板改过，与 config.json 的启动快照不一定一致
+        "autoPurchase": state.service.auto_purchase(),
+        "autoPurchaseMaxCount": cfg.map(|c| c.auto_purchase_max_count).unwrap_or(1),
     });
 
     if !configured {
@@ -259,6 +297,37 @@ pub async fn purchase_ad_hoc(
         }
         Err(e) => err_response(e),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModeRequest {
+    /// true = 自动提取，false = 手动提取
+    pub auto_purchase: bool,
+}
+
+/// `PUT /api/admin/vendor/mode` —— 切换提取模式
+///
+/// 未配置卖家对接时拒绝：开了也没有出站能力，只会给出一个误导性的「自动」状态。
+pub async fn set_mode(
+    State(state): State<VendorState>,
+    Json(req): Json<SetModeRequest>,
+) -> Response {
+    if !state
+        .service
+        .config()
+        .map(|c| c.outbound_enabled())
+        .unwrap_or(false)
+    {
+        return err_response(VendorServiceError::NotConfigured);
+    }
+    let result = state.service.set_auto_purchase(req.auto_purchase);
+    tracing::info!(
+        auto_purchase = result.auto_purchase,
+        persisted = result.persisted,
+        "提取模式已切换"
+    );
+    Json(result).into_response()
 }
 
 #[derive(Debug, Deserialize)]

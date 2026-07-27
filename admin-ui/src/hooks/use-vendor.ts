@@ -7,6 +7,7 @@ import {
   purchaseAdHoc,
   ackVendorEvents,
   redeemVendorCode,
+  setVendorMode,
   testVendorWebhook,
   setVendorWebhookUrl,
 } from '@/api/vendor'
@@ -87,6 +88,15 @@ export function useAckVendorEvents() {
       qc.invalidateQueries({ queryKey: ['vendor-events'] })
       qc.invalidateQueries({ queryKey: ['vendor-status'] })
     },
+  })
+}
+
+/** 切换提取模式。成功后刷 status 拿回服务端确认的值，不做乐观更新 */
+export function useSetVendorMode() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (autoPurchase: boolean) => setVendorMode(autoPurchase),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-status'] }),
   })
 }
 
