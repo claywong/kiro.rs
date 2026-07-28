@@ -1550,20 +1550,68 @@ impl MultiTokenManager {
             get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
                 .await?;
 
-        let generations = self.model_cache_generations.lock();
-        if generation == generations.get(&id).copied().unwrap_or(0) {
-            let mut cache = self.model_cache.lock();
-            if epoch == self.model_cache_epoch.load(Ordering::Relaxed) {
-                cache.insert(
-                    id,
-                    ModelCacheEntry {
-                        response: response.clone(),
-                        refreshed_at: Instant::now(),
-                    },
-                );
-            }
-        }
+        self.store_model_cache_entry(id, &response, generation, epoch);
         Ok(response)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 模型缓存回填（本地扩展）
+    //
+    // `cached_model_support` 的三态完全由 `model_cache` 决定，缓存缺条目即 `Unknown`。
+    // 上游只在「启动预热 / GET /v1/models / Admin 手动查」这三条外部事件里填充缓存，
+    // 业务请求路径不填，导致预热失败或运行中新增的凭据会永久停在 `Unknown`，
+    // 三态退化成无效维度。这里补上自愈路径：凡是已经从上游拿到过模型列表的地方，
+    // 都把结果回填进缓存。方法独立成块，避免与上游改动挤在同一批函数里。
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 把一次成功的模型列表写入 `model_cache`，并复核代数 / epoch 守卫。
+    ///
+    /// `generation` 与 `epoch` 必须在发起上游请求【之前】采样：凭据改动或全局代理
+    /// 变更会递增它们，据此丢弃在途旧请求的回填，避免用过期数据覆盖新缓存。
+    fn store_model_cache_entry(
+        &self,
+        id: u64,
+        response: &ListAvailableModelsResponse,
+        generation: u64,
+        epoch: u64,
+    ) {
+        let generations = self.model_cache_generations.lock();
+        if generation != generations.get(&id).copied().unwrap_or(0) {
+            return;
+        }
+        let mut cache = self.model_cache.lock();
+        if epoch != self.model_cache_epoch.load(Ordering::Relaxed) {
+            return;
+        }
+        cache.insert(
+            id,
+            ModelCacheEntry {
+                response: response.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
+    }
+
+    /// 当前的缓存守卫快照（代数 + epoch），供发起上游请求前采样。
+    fn model_cache_guards(&self, id: u64) -> (u64, u64) {
+        (
+            self.model_cache_generation(id),
+            self.model_cache_epoch.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 后台强制刷新单个凭据的模型缓存，不阻塞调用方。
+    ///
+    /// 用于凭据新增 / 修改后立刻让该凭据走出 `Unknown`（改代理会 invalidate 缓存，
+    /// 不刷新就得等下一轮余额刷新才恢复）。失败只告警——缓存缺条目退回 `Unknown`
+    /// 即上游的「放行」语义，不影响可用性。
+    pub fn spawn_local_model_cache_refresh(self: &Arc<Self>, id: u64) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = manager.refresh_model_cache_for(id, true).await {
+                tracing::warn!("凭据 #{} 模型缓存刷新失败（暂按未知支持处理）: {}", id, error);
+            }
+        });
     }
 
     async fn cached_or_refresh_models_for(
@@ -3280,10 +3328,21 @@ impl MultiTokenManager {
         // 搭车回填该凭据真实支持的模型列表（供调度按模型精确隔离）。
         // 复用同一 token / proxy 调 ListAvailableModels；失败仅告警、保留已有清单，
         // 不影响本次余额查询结果。仅在清单发生变化时才持久化。
+        //
+        // 同一份响应还会回填 `model_cache`：调度的三态（`cached_model_support`）只认
+        // 那份缓存，而余额刷新是唯一周期性触达全部凭据的路径。不回填就等于每 300s
+        // 白拿一次模型列表再丢掉，凭据只能靠外部事件走出 `Unknown`。
+        let (model_cache_generation, model_cache_epoch) = self.model_cache_guards(id);
         match get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
             .await
         {
             Ok(resp) => {
+                self.store_model_cache_entry(
+                    id,
+                    &resp,
+                    model_cache_generation,
+                    model_cache_epoch,
+                );
                 let mut models: Vec<String> = resp.models.into_iter().map(|m| m.model_id).collect();
                 models.sort();
                 models.dedup();
@@ -6106,5 +6165,65 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 模型缓存回填（本地扩展测试，单独成块）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 回填后三态从 Unknown 收敛为 Confirmed / Unsupported。
+    #[test]
+    fn test_local_store_model_cache_entry_materializes_support_states() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Unknown,
+            "缓存无条目时应为 Unknown"
+        );
+
+        let (generation, epoch) = manager.model_cache_guards(1);
+        manager.store_model_cache_entry(1, &model_response(&["glm-5"]), generation, epoch);
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Confirmed
+        );
+        assert_eq!(
+            manager.cached_model_support(1, Some("opus-4")),
+            CachedModelSupport::Unsupported
+        );
+    }
+
+    /// 采样守卫后凭据发生改动（代数递增）：回填被丢弃，状态留在 Unknown。
+    #[test]
+    fn test_local_store_model_cache_entry_rejects_stale_generation() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let (generation, epoch) = manager.model_cache_guards(1);
+        manager.invalidate_model_cache(1);
+        manager.store_model_cache_entry(1, &model_response(&["glm-5"]), generation, epoch);
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Unknown,
+            "在途旧请求不得回填已失效的缓存"
+        );
+    }
+
+    /// 采样守卫后全局代理变更（epoch 递增）：回填同样被丢弃。
+    #[test]
+    fn test_local_store_model_cache_entry_rejects_stale_epoch() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let (generation, epoch) = manager.model_cache_guards(1);
+        manager.set_global_proxy(None);
+        manager.store_model_cache_entry(1, &model_response(&["glm-5"]), generation, epoch);
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Unknown,
+            "全局代理变更后在途旧请求不得回填"
+        );
     }
 }

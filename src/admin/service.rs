@@ -1474,6 +1474,11 @@ impl AdminService {
                     tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
                 }
             }
+        } else {
+            // "直接导入"跳过了余额查询，也就跳过了搭车的模型缓存回填。新凭据会停在
+            // Unknown 直到下一轮余额刷新，故后台单独补一次。
+            self.token_manager
+                .spawn_local_model_cache_refresh(credential_id);
         }
 
         Ok(AddCredentialResponse {
@@ -1597,6 +1602,9 @@ impl AdminService {
         if let Some(inner) = purchase_cost_arg {
             self.cost_ledger.set_purchase_cost(id, inner);
         }
+        // 改代理会让 token_manager 失效该凭据的模型缓存，不重建就退回 Unknown，
+        // 得等下一轮余额刷新才恢复三态。这里后台补一次，不阻塞本次响应。
+        self.token_manager.spawn_local_model_cache_refresh(id);
         Ok(())
     }
 

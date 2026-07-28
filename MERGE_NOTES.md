@@ -13,6 +13,28 @@
 
 `supported_models` 字段本身保留，但**已退化为纯元数据**（Admin 展示用），调度层不再读它。
 
+### 配套的本地补丁：模型缓存回填（必须保住）
+
+让位给上游的三态语义有个前提——`model_cache` 得有数据。上游只在三条**外部事件**里填充它
+（启动预热、`GET /v1/models`、Admin 手动查），业务请求路径不填。于是预热失败或运行中新增的
+凭据会永久停在 `Unknown`，`discovery_rank` 对所有候选返回同一档，三态退化成无效维度。
+
+本地补了自愈路径，凡已从上游拿到过模型列表的地方都回填缓存：
+
+- `get_usage_limits_for` 的搭车块（余额刷新每 300s 全量触达所有凭据，是唯一的周期性路径；
+  它本来就调了 `ListAvailableModels`，只写 `supported_models` 然后把响应丢掉）。
+- `AdminService::update_credential` 之后（改代理会 invalidate 缓存，不重建就退回 `Unknown`）。
+- `add_credential_inner` 的「直接导入」分支（`fetch_balance = false` 跳过了余额查询，
+  也就跳过了搭车回填；验活路径经 `get_balance` 已覆盖）。
+
+实现放在 `store_model_cache_entry` / `model_cache_guards` / `spawn_local_model_cache_refresh`
+三个方法里，单独成块，`refresh_model_cache_for` 尾部改为调用前者。守卫（代数 + epoch）必须在
+发起上游请求**之前**采样，否则在途旧请求会覆盖新缓存。上游若自己补了回填，取上游、删本地块。
+
+未修的已知缺口：`start_balance_refresher` 只在配置了 `adminApiKey` 时启动（`main.rs`），
+没配 Admin Key 的部署拿不到周期性自愈。另：`cached_model_support` 不看 TTL，stale 的
+`Unsupported` 会持续硬过滤该凭据——这属于上游语义，改动前需显式决策。
+
 ## 二、本地独有、上游没有的特性（冲突时必须保住）
 
 - **卖家 / Key 供应商对接**：`src/vendor/` 整个模块。webhook 接入、自动/手动提取模式、事件库降级内存。
