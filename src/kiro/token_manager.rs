@@ -1170,6 +1170,110 @@ fn rpm_retry_after_secs(entry: &CredentialEntry, now: Instant) -> Option<u64> {
     Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 选号排序策略（本地扩展）
+//
+// 这些函数从 `select_next_credential_excluding` 的函数体内抽出，目的是把本地改动
+// 的足迹压在上游函数体之外——上游重写选号函数时，冲突只落在几行调用上，而不是
+// 几十行内联逻辑。新增排序维度请在此处加键，不要回到上游函数体里内联。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 候选凭据：可用凭据 + 该请求模型在其缓存中的支持状态。
+type Candidate<'a> = (&'a CredentialEntry, CachedModelSupport);
+
+/// 模型发现档：已确认支持该模型的凭据排在待发现的之前。
+///
+/// 上游语义——`Confirmed` 优先，`Unknown` 仍可尝试（避免上游模型列表临时不可用时
+/// 退化成本地硬白名单），`Unsupported` 在调用方过滤阶段已被剔除。
+fn discovery_rank(support: CachedModelSupport) -> usize {
+    usize::from(support != CachedModelSupport::Confirmed)
+}
+
+/// 该凭据当前 RPM 滑动窗口的剩余余量（`rpm_limit == 0` 视为无限）。
+fn rpm_headroom(entry: &CredentialEntry, now: Instant) -> u64 {
+    let limit = entry.credentials.rpm_limit;
+    if limit == 0 {
+        u64::MAX
+    } else {
+        u64::from(limit.saturating_sub(rpm_window_count(entry, now)))
+    }
+}
+
+/// 兜底模式选号：跨优先级层，按 RPM 剩余余量最大者优先。
+///
+/// 正常调度严格按优先级分层（高优先级层未耗尽不降级），但高优先级层承载最重流量，
+/// 最易触发上游 USER_REQUEST_RATE_EXCEEDED。一次请求在高优先级层连续撞限时，
+/// 继续按优先级换号只会在同一批热号里打转，故此处跳过分层，把重试导向负载最轻
+/// （上游被限概率最低）的冷号。平局按 success_count 少、priority 高、id 小，保证确定性。
+fn pick_by_rpm_headroom(available: &[Candidate<'_>], now: Instant) -> Option<(u64, KiroCredentials)> {
+    let (entry, _) = available.iter().max_by(|(a, _), (b, _)| {
+        rpm_headroom(a, now)
+            .cmp(&rpm_headroom(b, now))
+            .then(b.success_count.cmp(&a.success_count))
+            .then(b.credentials.priority.cmp(&a.credentials.priority))
+            .then(b.id.cmp(&a.id))
+    })?;
+    Some((entry.id, entry.credentials.clone()))
+}
+
+/// balanced 模式选号：发现档优先，其后按成功次数最少（least-used）、优先级高者优先。
+fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)> {
+    let (entry, _) = available.iter().min_by_key(|(e, support)| {
+        (
+            discovery_rank(*support),
+            e.success_count,
+            e.credentials.priority,
+        )
+    })?;
+    Some((entry.id, entry.credentials.clone()))
+}
+
+/// priority 模式选号：三级排序 —— 发现档 → 优先级层 → 同层 TTFT 最快。
+///
+/// 前两级取最优层后，同层内按该模型的 TTFT EWMA 最小（响应最快）调度。
+/// 无样本或样本已过期（超过 `ttft_ttl`，即风控冷却时长）的账号视为最优（0），
+/// 优先被选中跑一笔校准，以此打破赢家通吃、让长期落选凭据的陈旧估计自愈。
+/// 未指定模型时回退到 success_count（least-used）。平局按 id 保证确定性。
+fn pick_by_discovery_priority_ttft(
+    available: &[Candidate<'_>],
+    model: Option<&str>,
+    now: Instant,
+    ttft_ttl: StdDuration,
+) -> Option<(u64, KiroCredentials)> {
+    let min_rank = available
+        .iter()
+        .map(|(_, support)| discovery_rank(*support))
+        .min()?;
+    let min_priority = available
+        .iter()
+        .filter(|(_, support)| discovery_rank(*support) == min_rank)
+        .map(|(e, _)| e.credentials.priority)
+        .min()?;
+
+    let ttft_key = |e: &CredentialEntry| match model {
+        Some(m) => e
+            .ttft_ewma
+            .get(m)
+            .filter(|s| now.duration_since(s.updated_at) < ttft_ttl)
+            .map(|s| s.ewma)
+            .unwrap_or(0.0),
+        None => e.success_count as f64,
+    };
+
+    let (entry, _) = available
+        .iter()
+        .filter(|(e, support)| {
+            discovery_rank(*support) == min_rank && e.credentials.priority == min_priority
+        })
+        .min_by(|(a, _), (b, _)| {
+            ttft_key(a)
+                .partial_cmp(&ttft_key(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.id.cmp(&b.id))
+        })?;
+    Some((entry.id, entry.credentials.clone()))
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -1637,83 +1741,21 @@ impl MultiTokenManager {
             return None;
         }
 
-        // 兜底模式：跨优先级层，按 RPM 剩余余量最大选号（rpm_limit=0 视为无限余量）。
-        // 平局按 success_count 少、priority 高、id 小，保证确定性。
+        // 兜底模式：跳过优先级分层，跨层按 RPM 剩余余量最大选号。
         if salvage {
-            let remaining = |e: &CredentialEntry| -> u64 {
-                let limit = e.credentials.rpm_limit;
-                if limit == 0 {
-                    u64::MAX
-                } else {
-                    u64::from(limit.saturating_sub(rpm_window_count(e, now)))
-                }
-            };
-            let (entry, _) = available.iter().max_by(|(a, _), (b, _)| {
-                remaining(a)
-                    .cmp(&remaining(b))
-                    .then(b.success_count.cmp(&a.success_count))
-                    .then(b.credentials.priority.cmp(&a.credentials.priority))
-                    .then(b.id.cmp(&a.id))
-            })?;
-            return Some((entry.id, entry.credentials.clone()));
+            return pick_by_rpm_headroom(&available, now);
         }
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
-            "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.success_count, e.credentials.priority)
-                })?;
-
-                Some((entry.id, entry.credentials.clone()))
-            }
+            "balanced" => pick_least_used(&available),
             _ => {
-                // priority 模式（默认）：已确认支持该模型的账号优先于待发现的账号；
-                // 同一发现档内先取最高优先级层（priority 最小）。
-                // 同层多个凭据时，按该模型的 TTFT EWMA 最小（响应最快）调度；
-                // 无样本或样本已过期（超过风控冷却时长）的账号视为最优（0），优先重探；
-                // 未指定模型时回退到 success_count（least-used）。
+                // priority 模式（默认）：发现档 → 优先级层 → 同层 TTFT 最快。
+                // TTFT 样本新鲜期取账号级风控冷却时长（运行时可改）。
                 let ttft_ttl = StdDuration::from_secs(self.get_account_throttle_cooldown_secs());
-                let discovery_rank = |support: &CachedModelSupport| {
-                    usize::from(*support != CachedModelSupport::Confirmed)
-                };
-                let min_rank = available
-                    .iter()
-                    .map(|(_, support)| discovery_rank(support))
-                    .min()?;
-                let min_priority = available
-                    .iter()
-                    .filter(|(_, support)| discovery_rank(support) == min_rank)
-                    .map(|(e, _)| e.credentials.priority)
-                    .min()?;
-                let (entry, _) = available
-                    .iter()
-                    .filter(|(e, support)| {
-                        discovery_rank(support) == min_rank
-                            && e.credentials.priority == min_priority
-                    })
-                    .min_by(|(a, _), (b, _)| {
-                        let key = |e: &&CredentialEntry| match model {
-                            Some(m) => e
-                                .ttft_ewma
-                                .get(m)
-                                .filter(|s| now.duration_since(s.updated_at) < ttft_ttl)
-                                .map(|s| s.ewma)
-                                .unwrap_or(0.0),
-                            None => e.success_count as f64,
-                        };
-                        // 平局按 id 保证确定性
-                        key(a)
-                            .partial_cmp(&key(b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then(a.id.cmp(&b.id))
-                    })?;
-                Some((entry.id, entry.credentials.clone()))
+                pick_by_discovery_priority_ttft(&available, model, now, ttft_ttl)
             }
         }
     }
