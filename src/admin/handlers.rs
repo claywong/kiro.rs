@@ -31,9 +31,6 @@ use super::{
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
-// 本地新增类型单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
-use super::types::CredentialModelTestRequest;
-
 // Path 元组提取：(credential_id, session_id)
 type CredSessionPath = (u64, String);
 
@@ -152,18 +149,6 @@ pub async fn get_credential_models(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => e.into_http_response(),
-    }
-}
-
-/// POST /api/admin/credentials/:id/test-model
-pub async fn test_credential_model(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-    Json(payload): Json<CredentialModelTestRequest>,
-) -> impl IntoResponse {
-    match state.service.test_credential_model(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
     }

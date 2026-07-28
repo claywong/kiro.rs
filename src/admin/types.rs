@@ -426,24 +426,6 @@ pub enum ModelSelectionMode {
     Balanced,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialModelTestRequest {
-    pub model: String,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialModelTestResponse {
-    pub success: bool,
-    pub credential_id: u64,
-    pub model: String,
-    pub reply: String,
-    pub latency_ms: u64,
-    pub credits: f64,
-}
-
 /// 单个可用模型
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -10,8 +10,17 @@
 | 模型闸门 | 凭据 `supported_models` 白名单硬过滤，空清单也跳过 | 上游语义：调度层只按订阅等级（Opus 需非 Free），具体支持与否交由 `model_cache` 三态（Confirmed 优先 / Unsupported 跳过 / Unknown 放行） | 上游列表临时不可用时不该退化成本地硬白名单；新模型新账号不必等清单回填 |
 | 模型映射 | `NON_CLAUDE_MODELS` 白名单 + 逐版本 if-else | 上游的开放透传 + 通用 Claude 规范化 | 白名单注定被上游取代，维护成本高 |
 | `GET /v1/models` | 280 行静态 Model 清单 | 上游动态目录（按分组查上游、合并去重、按 ID 排序） | 静态清单每次新模型都要改，且与上游必然冲突 |
+| 凭据级模型测试 | `POST /api/admin/credentials/{id}/test-model` + 独立弹窗 + `call_api_with_credential` / `acquire_context_for_credential` | 上游 `POST /api/admin/models/test`，入口在上游「查看可用模型」弹窗的逐行测试按钮 | 上游弹窗已含模型列表 + 逐行测试，本地那套是它的功能子集，只多一个自定义消息框，不值得为此维护一条平行链路 |
 
 `supported_models` 字段本身保留，但**已退化为纯元数据**（Admin 展示用），调度层不再读它。
+
+让位凭据级模型测试后，接受两处能力损失（若日后确实碍事，从 `4c0511e` 捞回，别重写）：
+
+- 上游 `test_model` 用 `provider.call_api()` 由账号池挑号，即便从某张凭据卡片进入「查看可用模型」，
+  点测试也可能打到别的凭据（响应里的 `credentialId` 会显示真实命中号，不算误导，但对不上标题）。
+- 上游 `test_model` 手搓 `ConversationState` 且 `additional_model_request_fields: None`，
+  **绕过了 `convert_request_with_mode`**，因此测不出 effort 键名下错（gpt-5.x 族走 `reasoning`，
+  其他走 `output_config`）这类构造问题。本地已删的版本走的是真实转换链。
 
 ### 配套的本地补丁：模型缓存回填（必须保住）
 
@@ -43,8 +52,6 @@
 - **自定义模型注册表**：`src/model/custom_models.rs`。承担上游透传管不了的四件事：别名映射
   （客户端名 ≠ 后端名）、上下文窗口覆盖、reasoning 键名判定（gpt-5.x 族走 `reasoning`，其他走
   `output_config`，下错上游 400）、`/v1/models` 元数据优先。
-- **凭据级模型测试**：`POST /api/admin/credentials/{id}/test-model`。与上游的 `/models/test`
-  职责不同——后者由账号池挑凭据，前者指定凭据+自定义 message，排查单账号问题用。两者并存，非冗余。
 - **调度增强**：换号重试排除集（`excluded_ids`）、salvage 兜底跨层按 RPM 余量选号、
   TTFT EWMA 同层调度、黏性放开条件（跨层倒挂自愈）。
 - **成本核算**：`cost_ledger`、凭据购买成本、货币符号配置。

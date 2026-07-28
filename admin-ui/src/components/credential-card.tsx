@@ -15,7 +15,6 @@ import {
   ScrollText,
   Boxes,
   Wallet,
-  FlaskConical,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -60,7 +59,6 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
-import { CredentialModelTestDialog } from "@/components/credential-model-test-dialog";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -226,7 +224,6 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
-  const [showModelTestDialog, setShowModelTestDialog] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -502,14 +499,6 @@ export function CredentialCard({
         >
           <Boxes />
           查看可用模型
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => setShowModelTestDialog(true)}
-          disabled={credential.disabled}
-          title={credential.disabled ? "已禁用凭据无法测试" : undefined}
-        >
-          <FlaskConical />
-          模型测试
         </DropdownMenuItem>
         {throttleRemaining > 0 && (
           <DropdownMenuItem
@@ -1282,11 +1271,6 @@ export function CredentialCard({
         open={showModelsDialog}
         onOpenChange={setShowModelsDialog}
         credentialId={credential.id}
-      />
-      <CredentialModelTestDialog
-        open={showModelTestDialog}
-        onOpenChange={setShowModelTestDialog}
-        credentialId={showModelTestDialog ? credential.id : null}
       />
     </>
   );

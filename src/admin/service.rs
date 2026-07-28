@@ -9,8 +9,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::anthropic::converter::convert_request_with_mode;
-use crate::anthropic::types::{Message, MessagesRequest};
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -45,8 +43,6 @@ use super::types::{
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
-// 本地新增类型单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
-use super::types::{CredentialModelTestRequest, CredentialModelTestResponse};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -600,124 +596,6 @@ impl AdminService {
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
-    }
-
-    pub async fn test_credential_model(
-        &self,
-        id: u64,
-        request: CredentialModelTestRequest,
-    ) -> Result<CredentialModelTestResponse, AdminServiceError> {
-        let model = request.model.trim().to_string();
-        if model.is_empty() {
-            return Err(AdminServiceError::InvalidCredential("模型不能为空".to_string()));
-        }
-        let message = request.message.as_deref().map(str::trim)
-            .filter(|value| !value.is_empty()).unwrap_or("Reply with OK only.");
-        if message.chars().count() > 2000 {
-            return Err(AdminServiceError::InvalidCredential(
-                "测试消息不能超过 2000 个字符".to_string(),
-            ));
-        }
-
-        let anthropic_request = MessagesRequest {
-            model: model.clone(),
-            max_tokens: 64,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: serde_json::Value::String(message.to_string()),
-            }],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
-        let conversion = convert_request_with_mode(
-            &anthropic_request,
-            self.token_manager.config().tool_compatibility_mode,
-        ).map_err(|e| AdminServiceError::InvalidCredential(format!("构建测试请求失败: {}", e)))?;
-        let request_body = serde_json::to_string(&KiroRequest {
-            conversation_state: conversion.conversation_state,
-            profile_arn: None,
-            additional_model_request_fields: conversion.additional_model_request_fields,
-        }).map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
-        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
-            AdminServiceError::InternalError("Kiro Provider 未配置".to_string())
-        })?;
-
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            provider.call_api_with_credential(id, &request_body),
-        ).await
-            .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
-        .map_err(|e| {
-            let message = e.to_string();
-            if message.contains("RPM 限制") || message.contains("限流冷却") {
-                AdminServiceError::RateLimited { retry_after: None }
-            } else {
-                self.classify_balance_error(e, id)
-            }
-        })?;
-        debug_assert_eq!(result.credential_id, id);
-        let body = result.response.bytes().await
-            .map_err(|e| AdminServiceError::UpstreamError(format!("读取测试响应失败: {}", e)))?;
-        let (reply, credits) = Self::parse_model_test_response(&body)?;
-
-        Ok(CredentialModelTestResponse {
-            success: true,
-            credential_id: id,
-            model,
-            reply,
-            latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            credits,
-        })
-    }
-
-    fn parse_model_test_response(body: &[u8]) -> Result<(String, f64), AdminServiceError> {
-        let mut decoder = EventStreamDecoder::new();
-        decoder.feed(body)
-            .map_err(|e| AdminServiceError::UpstreamError(format!("解析测试响应失败: {}", e)))?;
-        let mut reply = String::new();
-        let mut previous = String::new();
-        let mut credits = 0.0;
-        for frame in decoder.decode_iter() {
-            let frame = frame.map_err(|e| {
-                AdminServiceError::UpstreamError(format!("解析测试响应失败: {}", e))
-            })?;
-            match Event::from_frame(frame) {
-                Ok(Event::AssistantResponse(event)) => {
-                    Self::append_cumulative_delta(&mut reply, &mut previous, &event.content);
-                }
-                Ok(Event::Metering(event)) => credits = event.usage,
-                Ok(Event::Error { error_code, error_message }) => {
-                    return Err(AdminServiceError::UpstreamError(format!(
-                        "{}: {}", error_code, error_message
-                    )));
-                }
-                Ok(Event::Exception { exception_type, message }) => {
-                    return Err(AdminServiceError::UpstreamError(format!(
-                        "{}: {}", exception_type, message
-                    )));
-                }
-                _ => {}
-            }
-        }
-        Ok((reply, credits))
-    }
-
-    fn append_cumulative_delta(output: &mut String, previous: &mut String, content: &str) {
-        if content.is_empty() { return; }
-        if previous.is_empty() {
-            output.push_str(content);
-        } else if let Some(delta) = content.strip_prefix(previous.as_str()) {
-            output.push_str(delta);
-        } else if !previous.starts_with(content) {
-            output.push_str(content);
-        }
-        *previous = content.to_string();
     }
 
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
@@ -3599,16 +3477,6 @@ mod tests {
             }
             other => panic!("预期 RateLimited，实际为 {other:?}"),
         }
-    }
-
-    #[test]
-    fn cumulative_model_test_chunks_are_not_duplicated() {
-        let mut output = String::new();
-        let mut previous = String::new();
-        AdminService::append_cumulative_delta(&mut output, &mut previous, "O");
-        AdminService::append_cumulative_delta(&mut output, &mut previous, "OK");
-        AdminService::append_cumulative_delta(&mut output, &mut previous, "OK");
-        assert_eq!(output, "OK");
     }
 
     #[test]
