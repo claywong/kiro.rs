@@ -617,17 +617,6 @@ impl VendorService {
             .map_err(VendorServiceError::Upstream)
     }
 
-    /// 名下最早一条 Key 的创建时间（账号有效期起点）
-    pub async fn keys_created_at(
-        &self,
-    ) -> Result<super::client::KeysCreatedAtResponse, VendorServiceError> {
-        let client = self.client()?;
-        client
-            .keys_created_at()
-            .await
-            .map_err(VendorServiceError::Upstream)
-    }
-
     /// 最近 50 条提取订单，用于跟本地事件对账、发现漏提
     pub async fn purchase_orders(
         &self,
@@ -637,6 +626,12 @@ impl VendorService {
             .purchase_orders()
             .await
             .map_err(VendorServiceError::Upstream)
+    }
+
+    /// 卖家近期开号批次与平均间隔
+    pub async fn gen_logs(&self) -> Result<super::client::GenLogsResponse, VendorServiceError> {
+        let client = self.client()?;
+        client.gen_logs().await.map_err(VendorServiceError::Upstream)
     }
 
     pub async fn redeem(

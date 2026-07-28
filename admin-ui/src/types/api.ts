@@ -673,9 +673,9 @@ export interface VendorStatus {
   /** 卖家 /api/status：存活 / 失效 / 存货 Key 数 */
   system?: VendorSystemStatus
   systemError?: string
-  /** 名下最早一条 Key 的创建时间，用于推算账号有效期起点 */
-  keysCreatedAt?: VendorKeysCreatedAt
-  keysCreatedAtError?: string
+  /** 卖家近期开号批次与平均间隔，用于估算下一批新 Key 何时到 */
+  genLogs?: VendorGenLogs
+  genLogsError?: string
 }
 
 /** 切换提取模式的结果 */
@@ -709,12 +709,21 @@ export interface VendorSystemStatus {
   [key: string]: unknown
 }
 
-/** 卖家 `/api/my/keys/created-at` 返回 */
-export interface VendorKeysCreatedAt {
-  /** 最早创建时间；从未有过 Key 时为 null */
+/** 卖家 `/api/my/gen-logs` 的一条开号批次 */
+export interface VendorGenLogEntry {
+  /** 开号时刻，形如 `2026-07-28 23:27:36`（无时区标记） */
   created_at?: string | null
-  /** 历史记录总数（含已失效） */
-  key_count?: number
+  /** 该批开出的 Key 数 */
+  count?: number | null
+  /** 卖家侧状态，如 "done" */
+  status?: string | null
+}
+
+/** 卖家 `/api/my/gen-logs` 返回 —— 近期开号批次与平均间隔 */
+export interface VendorGenLogs {
+  /** 相邻两批的平均间隔（分钟），不足两批时可能缺失 */
+  avg_interval_min?: number | null
+  items?: VendorGenLogEntry[]
 }
 
 /** 卖家推来的一条 webhook 事件 */

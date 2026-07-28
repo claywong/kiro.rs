@@ -78,16 +78,30 @@ pub struct VendorSystemStatus {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// `GET /api/my/keys/created-at` 响应 —— 名下最早一条 Key 的创建时间
+/// `GET /api/my/gen-logs` 单条开号记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct KeysCreatedAtResponse {
-    /// 最早创建时间；从未有过 Key 或旧库无记录时为 null
+pub struct GenLogEntry {
+    /// 开号时刻，形如 `2026-07-28 23:27:36`（无时区标记）
     #[serde(default)]
     pub created_at: Option<String>,
-    /// 历史记录总数（含已失效）
+    /// 该批开出的 Key 数
     #[serde(default)]
-    pub key_count: u32,
+    pub count: Option<u32>,
+    /// 卖家侧状态，如 "done"
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// `GET /api/my/gen-logs` 响应 —— 卖家近期开号批次，用于判断出号节奏
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GenLogsResponse {
+    /// 相邻两批的平均间隔（分钟）。卖家算好给的，不足两批时可能缺失
+    #[serde(default)]
+    pub avg_interval_min: Option<f64>,
+    #[serde(default)]
+    pub items: Vec<GenLogEntry>,
 }
 
 /// `GET /api/my/profile` 响应
@@ -279,15 +293,15 @@ impl VendorClient {
         self.get("/api/status").await
     }
 
-    /// `GET /api/my/keys/created-at` —— 名下最早一条 Key 的创建时间，
-    /// 用于推算账号有效期起点。不接收请求体，也不返回 Key 内容。
-    pub async fn keys_created_at(&self) -> Result<KeysCreatedAtResponse, VendorApiError> {
-        self.get("/api/my/keys/created-at").await
-    }
-
     /// `GET /api/my/purchase-orders` —— 最近 50 条提取订单，用于跟本地事件对账
     pub async fn purchase_orders(&self) -> Result<Vec<PurchaseOrder>, VendorApiError> {
         self.get("/api/my/purchase-orders").await
+    }
+
+    /// `GET /api/my/gen-logs` —— 卖家近期开号批次与平均间隔，
+    /// 用于估算下一批新 Key 大概什么时候到
+    pub async fn gen_logs(&self) -> Result<GenLogsResponse, VendorApiError> {
+        self.get("/api/my/gen-logs").await
     }
 
     /// `POST /api/my/redeem` —— 兑换码充值。
@@ -426,17 +440,32 @@ mod tests {
         );
     }
 
+    /// 用卖家 `/api/my/gen-logs` 的真实返回做样本
     #[test]
-    fn 解析key创建时间_含无key情形() {
-        let 有 : KeysCreatedAtResponse =
-            serde_json::from_str(r#"{"created_at":"2026-07-20 04:48:10","key_count":5}"#).unwrap();
-        assert_eq!(有.created_at.as_deref(), Some("2026-07-20 04:48:10"));
-        assert_eq!(有.key_count, 5);
+    fn 解析开号记录_真实样本() {
+        let raw = r#"{"avg_interval_min":52.25,"items":[
+            {"created_at":"2026-07-28 23:27:36","count":200,"status":"done"},
+            {"created_at":"2026-07-28 22:50:45","count":200,"status":"done"}]}"#;
+        let g: GenLogsResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(g.avg_interval_min, Some(52.25));
+        assert_eq!(g.items.len(), 2);
+        assert_eq!(g.items[0].count, Some(200));
+        assert_eq!(g.items[0].status.as_deref(), Some("done"));
+        assert_eq!(g.items[0].created_at.as_deref(), Some("2026-07-28 23:27:36"));
+    }
 
-        let 无: KeysCreatedAtResponse =
-            serde_json::from_str(r#"{"created_at":null,"key_count":0}"#).unwrap();
-        assert!(无.created_at.is_none());
-        assert_eq!(无.key_count, 0);
+    #[test]
+    fn 解析开号记录_容忍空与缺字段() {
+        // 从未开号时 items 为空，avg 缺失，不能整体解析失败
+        let empty: GenLogsResponse = serde_json::from_str(r#"{"items":[]}"#).unwrap();
+        assert!(empty.items.is_empty());
+        assert!(empty.avg_interval_min.is_none());
+
+        // 单条缺字段也要能读出其余部分
+        let partial: GenLogsResponse =
+            serde_json::from_str(r#"{"items":[{"count":10}]}"#).unwrap();
+        assert_eq!(partial.items[0].count, Some(10));
+        assert!(partial.items[0].created_at.is_none());
     }
 
     #[test]

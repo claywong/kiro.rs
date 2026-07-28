@@ -173,7 +173,7 @@ pub async fn list_events(
 }
 
 /// `GET /api/admin/vendor/status` —— 顶部状态条：配置状态 + 余额 + 库存 + 存货 +
-/// 账号起始时间 + 未确认数
+/// 开号记录 + 未确认数
 ///
 /// 四个出站请求并发发出；任一失败不影响其余字段（各自返回对应 error 字段）。
 pub async fn get_status(State(state): State<VendorState>) -> Response {
@@ -198,11 +198,11 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         return Json(body).into_response();
     }
 
-    let (profile, stock, system, created) = tokio::join!(
+    let (profile, stock, system, gen_logs) = tokio::join!(
         state.service.profile(),
         state.service.stock(),
         state.service.system_status(),
-        state.service.keys_created_at(),
+        state.service.gen_logs(),
     );
 
     match profile {
@@ -217,9 +217,9 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         Ok(s) => body["system"] = serde_json::to_value(&s).unwrap_or_default(),
         Err(e) => body["systemError"] = serde_json::json!(e.to_string()),
     }
-    match created {
-        Ok(c) => body["keysCreatedAt"] = serde_json::to_value(&c).unwrap_or_default(),
-        Err(e) => body["keysCreatedAtError"] = serde_json::json!(e.to_string()),
+    match gen_logs {
+        Ok(g) => body["genLogs"] = serde_json::to_value(&g).unwrap_or_default(),
+        Err(e) => body["genLogsError"] = serde_json::json!(e.to_string()),
     }
 
     Json(body).into_response()

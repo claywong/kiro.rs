@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Wallet, PackageOpen, Webhook, BellRing, Send, Ticket, Upload, ShoppingCart,
-  Boxes, CalendarClock, Zap, Hand,
+  Wallet, PackageOpen, Send, Ticket, Upload, ShoppingCart,
+  Boxes, Zap, Hand, History,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -99,58 +99,91 @@ function describeUptime(system?: VendorStatus['system']): string | null {
   return startedRaw ? `${ran} — 启动于 ${startedRaw}` : ran
 }
 
-/**
- * 账号起点展示。卖家返回 `YYYY-MM-DD HH:mm:ss`（无时区标记），Safari 对该形式
- * 直接 new Date 会得到 Invalid Date，故先补 'T' 再解析；解析不出来就原样显示。
- */
-function describeAccountStart(status?: VendorStatus): {
-  value: string
-  hint: string
-  tone: 'normal' | 'warn'
-} {
-  if (status?.keysCreatedAtError) {
-    return { value: '—', hint: status.keysCreatedAtError, tone: 'warn' }
-  }
-  const info = status?.keysCreatedAt
-  const raw = info?.created_at?.trim()
-  const countHint = `历史 Key 记录 ${info?.key_count ?? 0} 条`
-  if (!raw) {
-    return {
-      value: '—',
-      hint: info ? `账号名下暂无 Key 记录，${countHint}` : '暂无数据',
-      tone: 'normal',
-    }
-  }
+/** 距今多久。用于开号记录里标出「刚开的」还是「很久没开了」。 */
+function describeAgo(raw?: string | null): string | null {
   const d = parseVendorTime(raw)
-  if (!d) {
-    return { value: raw, hint: countHint, tone: 'normal' }
-  }
-  const days = Math.floor((Date.now() - d.getTime()) / 86400000)
-  return {
-    value: d.toLocaleDateString('zh-CN'),
-    hint: `${d.toLocaleString('zh-CN', { hour12: false })}，已 ${days} 天 · ${countHint}`,
-    tone: 'normal',
-  }
+  if (!d) return null
+  return `${formatDuration((Date.now() - d.getTime()) / 1000)}前`
 }
 
-/** 本机应有的 webhook 地址。路径 token 只存在后端，前端拿不到，故只做「是否已配置」提示。 */
-function describeWebhook(status?: VendorStatus): {
-  value: string
-  tone: 'normal' | 'warn' | 'good'
-  hint: string
-} {
-  if (!status?.inboundEnabled) {
-    return {
-      value: '未启用',
-      tone: 'warn',
-      hint: '配置 vendor.webhookPathToken 后启用入站接收',
-    }
-  }
-  const saved = status.profile?.webhook_url?.trim()
-  if (!saved) {
-    return { value: '卖家侧未保存', tone: 'warn', hint: '点「写入卖家」提交本机地址' }
-  }
-  return { value: '已连接', tone: 'good', hint: saved }
+/**
+ * 开号记录弹层。卖家近期开号批次 + 平均间隔，用来判断下一批新 Key 大概什么时候到。
+ * 数据随 status 一起拉回来，弹层只负责展示，不额外打接口。
+ */
+function GenLogsDialog({
+  status,
+  open,
+  onOpenChange,
+}: {
+  status?: VendorStatus
+  open: boolean
+  onOpenChange: (v: boolean) => void
+}) {
+  const logs = status?.genLogs
+  const items = logs?.items ?? []
+  const avg = logs?.avg_interval_min
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>卖家开号记录</DialogTitle>
+          <DialogDescription>
+            卖家侧最近几批开号情况
+            {avg != null ? `，平均间隔 ${formatDuration(avg * 60)}` : ''}
+            。时间为卖家本地时刻，原样展示。
+          </DialogDescription>
+        </DialogHeader>
+
+        {status?.genLogsError ? (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-600 dark:text-amber-500">
+            {status.genLogsError}
+          </div>
+        ) : items.length === 0 ? (
+          <div className="p-4 text-center text-sm text-muted-foreground">暂无开号记录</div>
+        ) : (
+          <div className="max-h-[60vh] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="text-xs text-muted-foreground">
+                <tr className="border-b">
+                  <th className="py-2 pr-3 text-left font-medium">开号时间</th>
+                  <th className="px-3 py-2 text-right font-medium">数量</th>
+                  <th className="py-2 pl-3 text-left font-medium">状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((it, i) => {
+                  const ago = describeAgo(it.created_at)
+                  return (
+                    <tr key={`${it.created_at ?? i}`} className="border-b last:border-0">
+                      <td className="py-2 pr-3 text-xs">
+                        <div className="tabular-nums">{it.created_at ?? '—'}</div>
+                        {ago && <div className="text-muted-foreground">{ago}</div>}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">{it.count ?? '—'}</td>
+                      <td className="py-2 pl-3 text-xs">
+                        {it.status === 'done' ? (
+                          <span className="text-emerald-600 dark:text-emerald-500">已完成</span>
+                        ) : (
+                          <span className="text-muted-foreground">{it.status ?? '—'}</span>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 export function VendorStatusBar() {
@@ -168,11 +201,10 @@ export function VendorStatusBar() {
   const [webhookUrl, setWebhookInput] = useState('')
   const [directOpen, setDirectOpen] = useState(false)
   const [directCount, setDirectCount] = useState('1')
+  const [genLogsOpen, setGenLogsOpen] = useState(false)
 
   const profile = status?.profile
-  const webhookInfo = describeWebhook(status)
   const system = status?.system
-  const accountStart = describeAccountStart(status)
 
   const handleRedeem = async () => {
     const trimmed = code.trim()
@@ -370,6 +402,15 @@ export function VendorStatusBar() {
           <Ticket className="mr-1.5 h-3.5 w-3.5" />
           兑换充值
         </Button>
+        <Button variant="outline" size="sm" onClick={() => setGenLogsOpen(true)}>
+          <History className="mr-1.5 h-3.5 w-3.5" />
+          开号记录
+          {status?.genLogs?.avg_interval_min != null && (
+            <span className="ml-1.5 text-xs text-muted-foreground">
+              均 {formatDuration(status.genLogs.avg_interval_min * 60)}
+            </span>
+          )}
+        </Button>
         <Button
           size="sm"
           onClick={() => {
@@ -426,28 +467,9 @@ export function VendorStatusBar() {
                 : 'normal'
           }
         />
-        <StatCard
-          icon={<CalendarClock className="h-3.5 w-3.5" />}
-          label="账号起始时间"
-          value={accountStart.value}
-          hint={accountStart.hint}
-          tone={accountStart.tone}
-        />
-        <StatCard
-          icon={<Webhook className="h-3.5 w-3.5" />}
-          label="入站 Webhook"
-          value={webhookInfo.value}
-          hint={<span className="break-all">{webhookInfo.hint}</span>}
-          tone={webhookInfo.tone}
-        />
-        <StatCard
-          icon={<BellRing className="h-3.5 w-3.5" />}
-          label="未处理事件"
-          value={status?.unacked ?? 0}
-          hint={status?.unacked ? '下方列表点「已知悉」消除' : '全部已处理'}
-          tone={status?.unacked ? 'warn' : 'good'}
-        />
       </div>
+
+      <GenLogsDialog status={status} open={genLogsOpen} onOpenChange={setGenLogsOpen} />
 
       {/* 兑换充值 */}
       <Dialog open={redeemOpen} onOpenChange={setRedeemOpen}>
