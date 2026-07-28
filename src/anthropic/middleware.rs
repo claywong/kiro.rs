@@ -71,13 +71,7 @@ impl AppState {
         }
     }
 
-    /// 设置 KiroProvider
-    #[allow(dead_code)]
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
-        self
-    }
-
+    /// 注入可与 Admin 控制面共享的 KiroProvider。
     pub fn with_shared_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self

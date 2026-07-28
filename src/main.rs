@@ -158,6 +158,7 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    token_manager.start_model_cache_warmer();
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -187,7 +188,11 @@ async fn main() {
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
-            tracing::warn!("加载客户端 Key 失败 ({}): {}", client_keys_path.display(), e);
+            tracing::warn!(
+                "加载客户端 Key 失败 ({}): {}",
+                client_keys_path.display(),
+                e
+            );
             admin::ClientKeyManager::new()
         }),
     );
@@ -202,12 +207,11 @@ async fn main() {
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
     let groups_path = admin::groups::default_path_in(&cache_dir);
-    let group_manager = std::sync::Arc::new(
-        admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
+    let group_manager =
+        std::sync::Arc::new(admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
             tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
             admin::GroupManager::new()
-        }),
-    );
+        }));
     {
         let mut all_used: Vec<String> = token_manager.list_credential_groups();
         all_used.extend(client_key_manager.used_group_names());
@@ -293,7 +297,7 @@ async fn main() {
         admin_service.clone(),
     )));
 
-    let anthropic_app = anthropic::create_router(
+    let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
@@ -450,7 +454,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         if let Err(e) = std::fs::write(cred_p, "[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {
-            tracing::info!("已生成空凭证文件: {}（可通过 Admin UI 添加凭据）", cred_p.display());
+            tracing::info!(
+                "已生成空凭证文件: {}（可通过 Admin UI 添加凭据）",
+                cred_p.display()
+            );
         }
     }
 }

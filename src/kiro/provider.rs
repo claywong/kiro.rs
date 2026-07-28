@@ -115,6 +115,11 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 返回共享凭据管理器，供模型发现等只读控制面逻辑复用。
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -148,11 +153,6 @@ impl KiroProvider {
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
-    }
-
-    /// 获取多凭据 Token 管理器句柄（供 TTFT 上报等外部链路使用）
-    pub fn token_manager(&self) -> Arc<MultiTokenManager> {
-        self.token_manager.clone()
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
