@@ -22,6 +22,19 @@ function formatTime(ts?: string): string {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 
+/** 事件展示窗口：只看最近 24 小时，更早的记录对排障已无参考价值 */
+const EVENT_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 事件时间戳转毫秒。解析不出来返回 null —— 调用方一律按「不做时间判断」处理，
+ * 免得因为一条脏时间把事件藏掉或错误开放提取按钮。
+ */
+function eventTime(ts?: string): number | null {
+  if (!ts) return null
+  const t = new Date(ts).getTime()
+  return Number.isNaN(t) ? null : t
+}
+
 /** 事件类型标签 */
 function EventTypeBadge({ type }: { type: string }) {
   if (type === 'new_keys_available') {
@@ -233,8 +246,36 @@ export function VendorPage() {
   const [purchaseTarget, setPurchaseTarget] = useState<VendorEvent | null>(null)
   const [purchaseOpen, setPurchaseOpen] = useState(false)
 
-  const events = data?.events ?? []
+  const allEvents = data?.events ?? []
   const unacked = data?.unacked ?? 0
+
+  // 只展示最近 24 小时。时间解析失败的行保留展示，宁可多显示也不要静默丢事件。
+  const cutoff = Date.now() - EVENT_WINDOW_MS
+  const events = allEvents.filter((e) => {
+    const t = eventTime(e.receivedAt)
+    return t == null || t >= cutoff
+  })
+  const hiddenCount = allEvents.length - events.length
+
+  /**
+   * 最近一条「全部失效」的时间。它之前的 `new_keys_available` 对应的 Key 已经
+   * 随这轮全灭作废，再提取就是白扣费，故不给按钮。
+   */
+  const latestDeadAt = allEvents.reduce<number | null>((acc, e) => {
+    if (e.eventType !== 'all_keys_dead') return acc
+    const t = eventTime(e.receivedAt)
+    if (t == null) return acc
+    return acc == null || t > acc ? t : acc
+  }, null)
+
+  /** 该事件是否仍值得提取：非「全部失效」之前的新 Key 事件 */
+  const isPurchasable = (e: VendorEvent): boolean => {
+    if (e.eventType !== 'new_keys_available' || !e.purchaseOrderId) return false
+    if (latestDeadAt == null) return true
+    const t = eventTime(e.receivedAt)
+    // 时间不可解析时保守放开，避免因脏数据锁死唯一的提取入口
+    return t == null || t > latestDeadAt
+  }
 
   const handleAck = async (eventId?: string) => {
     try {
@@ -259,6 +300,10 @@ export function VendorPage() {
           <div className="flex items-center justify-between px-4 py-3">
             <div className="flex items-center gap-2 text-sm font-medium">
               卖家事件
+              <span className="text-xs font-normal text-muted-foreground">
+                最近 24 小时
+                {hiddenCount > 0 ? ` · 已折叠 ${hiddenCount} 条更早记录` : ''}
+              </span>
               {unacked > 0 && (
                 <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-500">
                   {unacked} 条未处理
@@ -288,10 +333,16 @@ export function VendorPage() {
               <div className="p-4 text-sm text-muted-foreground">加载中…</div>
             ) : events.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                还没收到任何事件。
-                {status?.inboundEnabled
-                  ? '可点上方「测试推送」验证链路。'
-                  : '入站 webhook 未启用，请先配置 vendor.webhookPathToken。'}
+                {hiddenCount > 0 ? (
+                  `最近 24 小时没有新事件（更早的 ${hiddenCount} 条不再展示）。`
+                ) : (
+                  <>
+                    还没收到任何事件。
+                    {status?.inboundEnabled
+                      ? '可点上方「测试推送」验证链路。'
+                      : '入站 webhook 未启用，请先配置 vendor.webhookPathToken。'}
+                  </>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -348,7 +399,7 @@ export function VendorPage() {
                         </td>
                         <td className="whitespace-nowrap px-4 py-2.5 text-right">
                           <div className="flex items-center justify-end gap-1.5">
-                            {e.eventType === 'new_keys_available' && e.purchaseOrderId && (
+                            {isPurchasable(e) ? (
                               <Button
                                 size="sm"
                                 variant={e.purchaseStatus === 'done' ? 'outline' : 'default'}
@@ -360,6 +411,16 @@ export function VendorPage() {
                                     ? '再次提取'
                                     : '提取入库'}
                               </Button>
+                            ) : (
+                              e.eventType === 'new_keys_available' &&
+                              e.purchaseOrderId && (
+                                <span
+                                  className="text-xs text-muted-foreground"
+                                  title="此后已收到「全部失效」，这批 Key 已作废，提取只会白扣费"
+                                >
+                                  已作废
+                                </span>
+                              )
                             )}
                             {!e.acked && (
                               <Button
