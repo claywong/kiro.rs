@@ -271,9 +271,14 @@ export function VendorStatusBar() {
         title: '开启自动提取？',
         description:
           '开启后，收到「全部失效」事件时会核对本地凭据，确认名下卖家 Key 已全部失效；' +
-          `之后收到「新 Key 就绪」才自动下单，每次最多 ${
+          `之后收到「新 Key 就绪」才自动下单，当前时段每次最多 ${
             status?.autoPurchaseMaxCount ?? 1
           } 个（还会受事件声明数量与卖家上限限制）。` +
+          (status?.autoPurchaseWindow
+            ? `上限随时段变化，当前命中 ${status.autoPurchaseWindow}，其余时段 ${
+                status.autoPurchaseBaseMaxCount ?? 1
+              } 个。`
+            : '') +
           '数量一旦提交就与该订单号永久绑定，无法改数量重试。',
         confirmText: '开启自动提取',
         destructive: true,
@@ -370,7 +375,14 @@ export function VendorStatusBar() {
               {status?.autoPurchase
                 ? `确认旧 Key 全部失效后，新 Key 就绪时最多自动提 ${
                     status.autoPurchaseMaxCount ?? 1
-                  } 个`
+                  } 个${
+                    // 命中时段时标出来源，否则面板上的数看不出为何与配置不同
+                    status.autoPurchaseWindow
+                      ? `（当前时段 ${status.autoPurchaseWindow}，其余时段 ${
+                          status.autoPurchaseBaseMaxCount ?? 1
+                        } 个）`
+                      : ''
+                  }`
                 : '所有提取需在下方事件列表手动触发'}
             </span>
           </div>

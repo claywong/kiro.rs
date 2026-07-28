@@ -20,6 +20,8 @@ use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::auto;
 use super::client::{VendorApiError, VendorClient};
+// 本地新增模块单独成行，避免上游改动这批 use 时反复冲突。
+use super::schedule;
 use super::store::{
     IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, SharedVendorStore,
     ValidationStatus, VendorEventKind,
@@ -425,12 +427,25 @@ impl VendorService {
 
     // ============ 自动模式 ============
 
-    /// 自动模式单次提取上限
-    fn auto_max_count(&self) -> u32 {
-        self.config
-            .as_ref()
-            .map(|c| c.auto_purchase_max_count)
-            .unwrap_or(1)
+    /// 自动模式单次提取上限。配了时段表且当前时刻命中时以该段为准。
+    ///
+    /// 时刻取本地时区（与 usageStats / costLedger 一致），容器内需正确设置 `TZ`，
+    /// 否则「下午」会按 UTC 判定、偏 8 小时。
+    pub fn auto_max_count(&self) -> u32 {
+        let Some(cfg) = self.config.as_ref() else {
+            return 1;
+        };
+        schedule::max_count_at(
+            &cfg.auto_purchase_schedule,
+            cfg.auto_purchase_max_count,
+            chrono::Local::now().time(),
+        )
+    }
+
+    /// 当前命中的时段描述（如 `14:00–23:00`），供面板说明「为什么是这个数」
+    pub fn auto_active_window(&self) -> Option<String> {
+        let cfg = self.config.as_ref()?;
+        schedule::active_window_label(&cfg.auto_purchase_schedule, chrono::Local::now().time())
     }
 
     /// 从凭据池取出卖家 Key 的状态切片
@@ -543,13 +558,15 @@ impl VendorService {
             .stock()
             .await
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
-        let count = auto::decide_count(new_keys, stock, self.auto_max_count());
+        // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
+        let configured_max = self.auto_max_count();
+        let count = auto::decide_count(new_keys, stock, configured_max);
         if count == 0 {
             return Err(format!(
                 "可提取数量为 0（事件声明 {}，卖家上限 {}，配置上限 {}）",
                 new_keys.map(|v| v.to_string()).unwrap_or("-".into()),
                 stock,
-                self.auto_max_count()
+                configured_max
             ));
         }
 

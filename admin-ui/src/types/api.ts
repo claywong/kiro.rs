@@ -662,8 +662,15 @@ export interface VendorStatus {
   defaultRpmLimit: number
   /** 提取模式：true = 自动，false = 手动。运行时值，切换后立即生效 */
   autoPurchase: boolean
-  /** 自动模式单次提取上限；实际数量 = min(newKeys, stockMax, 本值) */
+  /**
+   * 当前时刻实际生效的单次提取上限（已应用时段表）。
+   * 实际数量 = min(newKeys, stockMax, 本值)
+   */
   autoPurchaseMaxCount: number
+  /** 未命中任何时段时的兜底上限，即 config 里的 autoPurchaseMaxCount */
+  autoPurchaseBaseMaxCount?: number
+  /** 当前命中的时段描述，如 `14:00–23:00`；未配时段表或未命中为 null */
+  autoPurchaseWindow?: string | null
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string

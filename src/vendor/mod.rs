@@ -11,6 +11,7 @@ pub mod auto;
 pub mod client;
 pub mod handlers;
 pub mod router;
+pub mod schedule;
 pub mod service;
 pub mod store;
 

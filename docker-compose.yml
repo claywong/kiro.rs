@@ -6,6 +6,10 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
+    environment:
+      # 自动提取时段表、日用量统计、成本账本都按本地时区判定，
+      # 容器默认 UTC 会让「下午」偏 8 小时，须显式指定。
+      - TZ=Asia/Shanghai
     volumes:
       - ./data/:/app/config/
     restart: unless-stopped

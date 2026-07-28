@@ -375,6 +375,7 @@ mod tests {
             default_rpm_limit: 10,
             auto_purchase: false,
             auto_purchase_max_count: 1,
+            auto_purchase_schedule: vec![],
         }
     }
 

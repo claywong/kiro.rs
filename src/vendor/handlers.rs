@@ -191,7 +191,12 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         "defaultRpmLimit": cfg.map(|c| c.default_rpm_limit).unwrap_or(10),
         // 运行时值，可能已被面板改过，与 config.json 的启动快照不一定一致
         "autoPurchase": state.service.auto_purchase(),
-        "autoPurchaseMaxCount": cfg.map(|c| c.auto_purchase_max_count).unwrap_or(1),
+        // 当前时刻实际生效的上限（已应用时段表），面板展示与判定必须用它，
+        // 否则配了时段表后显示的数与真实行为不一致
+        "autoPurchaseMaxCount": state.service.auto_max_count(),
+        // 未命中任何时段时的兜底值，用于在面板上区分「按时段」还是「按默认」
+        "autoPurchaseBaseMaxCount": cfg.map(|c| c.auto_purchase_max_count).unwrap_or(1),
+        "autoPurchaseWindow": state.service.auto_active_window(),
     });
 
     if !configured {

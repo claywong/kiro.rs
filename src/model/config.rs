@@ -113,8 +113,18 @@ pub struct VendorConfig {
     ///
     /// 实际提取数量 = `min(事件声明的 newKeys, 卖家当前可提取上限, 本值)`。
     /// 取最小值是因为自动模式没有人工复核，而数量一旦绑定就无法改小。
+    ///
+    /// 配了 `autoPurchaseSchedule` 且当前时刻命中某段时，以该段的 `maxCount`
+    /// 为准，本值退化为未命中时段时的兜底。
     #[serde(default = "default_vendor_auto_max_count")]
     pub auto_purchase_max_count: u32,
+
+    /// 按时段调整自动提取上限（可选）。空表示全天都用 `autoPurchaseMaxCount`。
+    ///
+    /// 用于「下午与晚上压力大、需多持有一张 Key」这类规律性需求。时刻按**本地
+    /// 时区**判定（同 usageStats / costLedger，容器内需正确设置 `TZ`）。
+    #[serde(default)]
+    pub auto_purchase_schedule: Vec<crate::vendor::schedule::AutoPurchaseWindow>,
 }
 
 fn default_vendor_auto_max_count() -> u32 {

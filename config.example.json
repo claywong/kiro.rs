@@ -20,6 +20,9 @@
     "defaultPurchaseCost": null,
     "defaultRpmLimit": 10,
     "autoPurchase": false,
-    "autoPurchaseMaxCount": 1
+    "autoPurchaseMaxCount": 1,
+    "autoPurchaseSchedule": [
+      { "from": "14:00", "to": "23:59", "maxCount": 2 }
+    ]
   }
 }
