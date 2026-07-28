@@ -14,13 +14,14 @@
 
 `supported_models` 字段本身保留，但**已退化为纯元数据**（Admin 展示用），调度层不再读它。
 
-让位凭据级模型测试后，接受两处能力损失（若日后确实碍事，从 `4c0511e` 捞回，别重写）：
+让位凭据级模型测试后，唯一的能力损失是：上游 `test_model` 用 `provider.call_api()` 由账号池挑号，
+即便从某张凭据卡片进入「查看可用模型」，点测试也可能打到别的凭据（响应里的 `credentialId` 会显示
+真实命中号，不算误导，但对不上弹窗标题）。若日后确实碍事，从 `4c0511e` 捞回，别重写。
 
-- 上游 `test_model` 用 `provider.call_api()` 由账号池挑号，即便从某张凭据卡片进入「查看可用模型」，
-  点测试也可能打到别的凭据（响应里的 `credentialId` 会显示真实命中号，不算误导，但对不上标题）。
-- 上游 `test_model` 手搓 `ConversationState` 且 `additional_model_request_fields: None`，
-  **绕过了 `convert_request_with_mode`**，因此测不出 effort 键名下错（gpt-5.x 族走 `reasoning`，
-  其他走 `output_config`）这类构造问题。本地已删的版本走的是真实转换链。
+上游 `test_model` 手搓 `ConversationState` 且 `additional_model_request_fields: None`，绕过了
+`convert_request_with_mode`——但这不算损失：effort 键名判定（gpt-5.x 族走 `reasoning`，其他走
+`output_config`，下错上游 400）由 `converter.rs` 的单测断言到序列化 JSON 那一层，回归靠
+`cargo test` 挡，不依赖手点。
 
 ### 配套的本地补丁：模型缓存回填（必须保住）
 
