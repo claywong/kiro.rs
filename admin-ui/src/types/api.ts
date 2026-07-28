@@ -812,3 +812,11 @@ export interface VendorRedeemResult {
   /** true 表示此前已兑换过，本次未改动余额 */
   replayed: boolean
 }
+
+// ============ 近 1 分钟额度消耗（本地扩展）============
+
+/** 各凭据近 windowSecs 秒内消耗的 credits；spend 的 key 为 credentialId 字符串 */
+export interface RecentSpendResponse {
+  windowSecs: number
+  spend: Record<string, number>
+}

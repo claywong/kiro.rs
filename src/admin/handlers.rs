@@ -346,7 +346,11 @@ pub async fn delete_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.delete_credential(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
+        Ok(_) => {
+            // 本地新增：顺手丢掉该凭证的近 1 分钟消耗窗口，避免读数挂在已删除的 id 上
+            super::recent_spend::tracker().forget(id);
+            Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -39,6 +39,8 @@ import type {
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
 } from '@/types/api'
+// 本地新增类型单独成行，不并入上游的 import 块，避免上游改动时反复冲突。
+import type { RecentSpendResponse } from '@/types/api'
 
 // 创建 axios 实例
 const api = axios.create({
@@ -645,5 +647,11 @@ export async function pollIdcRelogin(
   const { data } = await api.post<PollIdcLoginResponse>(
     `/credentials/${credentialId}/relogin/idc/poll/${sessionId}`
   )
+  return data
+}
+
+// 各凭据近 1 分钟消耗的额度（credits）
+export async function getRecentSpend(): Promise<RecentSpendResponse> {
+  const { data } = await api.get<RecentSpendResponse>('/credentials/recent-spend')
   return data
 }

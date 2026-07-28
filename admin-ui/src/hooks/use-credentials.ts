@@ -23,6 +23,8 @@ import {
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
+// 本地新增接口单独成行，避免上游改动同一 import 块时反复冲突。
+import { getRecentSpend } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
 // 查询凭据列表
@@ -31,6 +33,22 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+/**
+ * 查询各凭据近 1 分钟消耗的额度（credits）
+ *
+ * 这是个瞬时观测量，后端窗口只有 60 秒，刷新间隔取 15 秒，保证窗口内至少采到几次；
+ * 不做 placeholderData，读数宁可短暂空缺也不要显示过期值。
+ */
+export function useRecentSpend() {
+  return useQuery({
+    queryKey: ['credentials', 'recent-spend'],
+    queryFn: getRecentSpend,
+    refetchInterval: 15_000,
+    staleTime: 5_000,
+    refetchOnWindowFocus: false,
   })
 }
 

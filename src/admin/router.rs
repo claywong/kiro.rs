@@ -32,6 +32,7 @@ use super::{
 };
 // 本地新增 handler 单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
 use super::handlers::{stats_cost, test_credential_model};
+use super::recent_spend::credential_recent_spend;
 
 /// 请求体最大大小限制 (50MB)
 ///
@@ -89,6 +90,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/test-model", post(test_credential_model))
+        // 本地新增：各凭证近 60 秒 credits 消耗（凭证列表 RPM 旁的读数）
+        .route("/credentials/recent-spend", get(credential_recent_spend))
         .route("/models", get(get_current_models))
         .route("/models/test", post(test_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))

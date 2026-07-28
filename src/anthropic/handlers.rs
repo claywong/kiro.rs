@@ -111,6 +111,8 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
+        // 本地新增：喂给近 1 分钟消耗窗口（凭证列表展示用，与 trace 开关无关）
+        crate::admin::recent_spend::tracker().record(credential_id, rec.credits);
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {
                 m.record_usage(

@@ -95,6 +95,8 @@ import {
   useResetAllSuccessCount,
   useSetPriority,
 } from "@/hooks/use-credentials";
+// 本地新增 hook 单独成行，避免上游改动同一 import 块时反复冲突。
+import { useRecentSpend } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
@@ -243,6 +245,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
+  // 本地扩展：各凭据近 1 分钟额度消耗
+  const { data: recentSpendData } = useRecentSpend();
   const groupOptions = useGroupOptions();
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
@@ -1789,6 +1793,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      recentSpend={
+                        recentSpendData?.spend?.[String(credential.id)]
+                      }
                     />
                   ))}
                 </div>

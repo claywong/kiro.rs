@@ -71,6 +71,8 @@ interface CredentialCardProps {
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
+  /** 该凭据近 1 分钟消耗的额度（credits）；undefined 表示尚未取到数据 */
+  recentSpend?: number;
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
 }
@@ -94,6 +96,20 @@ function formatNumber(n: number): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+/**
+ * 近 1 分钟消耗的额度格式化
+ *
+ * 单次请求的 credits 常在 0.0x 量级，两位小数会把大部分读数压成 0.00，故小额保留三位；
+ * 上到十位以上再降到一位，避免列宽被撑开。窗口内没有消耗时显示占位符而非 0，
+ * 与「未取到数据」在视觉上一致（都表示此刻不烧额度）。
+ */
+function formatRecentSpend(credits: number | undefined): string {
+  if (credits == null || !Number.isFinite(credits) || credits <= 0) return "—";
+  if (credits < 10) return credits.toFixed(3);
+  if (credits < 100) return credits.toFixed(2);
+  return credits.toFixed(1);
 }
 
 function formatResetDate(ts: number | null): string {
@@ -197,6 +213,7 @@ export function CredentialCard({
   loadingBalance,
   onRefreshBalance,
   failureStats,
+  recentSpend,
   view = "card",
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
@@ -685,6 +702,19 @@ export function CredentialCard({
           </div>
         </div>
 
+        {/* 本地扩展：近 1 分钟额度消耗，与 RPM 同为 60 秒窗口，便于横向对照 */}
+        <div className="w-16 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            1分钟耗
+          </div>
+          <div
+            className="mt-0.5 text-sm font-medium tabular-nums"
+            title="最近 60 秒内该凭据消耗的额度（上游 credits 计量）"
+          >
+            {formatRecentSpend(recentSpend)}
+          </div>
+        </div>
+
         <div className="w-20 text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             失败
@@ -955,6 +985,16 @@ export function CredentialCard({
                 {credential.rpmLimit === 0
                   ? "不限速"
                   : `${credential.rpmCurrent} / ${credential.rpmLimit}`}
+              </dd>
+            </div>
+            {/* 本地扩展：近 1 分钟额度消耗 */}
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">近 1 分钟消耗</dt>
+              <dd
+                className="min-w-0 truncate text-right font-medium tabular-nums"
+                title="最近 60 秒内该凭据消耗的额度（上游 credits 计量）"
+              >
+                {formatRecentSpend(recentSpend)}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">
