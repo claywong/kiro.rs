@@ -38,7 +38,6 @@ use super::types::{
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    CredentialModelTestRequest, CredentialModelTestResponse,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
@@ -46,11 +45,12 @@ use super::types::{
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
+// 本地新增类型单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
+use super::types::{CredentialModelTestRequest, CredentialModelTestResponse};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
-/// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
 /// 看到红点提醒，又能避免短时间内重复请求被限流。

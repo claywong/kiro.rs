@@ -22,7 +22,7 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, CredentialModelTestRequest, GlobalProxyResponse, ModelTestRequest,
+        CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -31,6 +31,8 @@ use super::{
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
+// 本地新增类型单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
+use super::types::CredentialModelTestRequest;
 
 // Path 元组提取：(credential_id, session_id)
 type CredSessionPath = (u64, String);

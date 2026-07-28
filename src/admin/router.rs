@@ -24,12 +24,14 @@ use super::{
         set_credential_disabled, set_credential_overage, set_credential_priority, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_model, stats_cost, stats_overview, stats_timeseries,
-        test_credential_model, test_model, trace_failure_stats, update_admin_key, update_client_key,
-        update_credential, update_group, update_refresh_token,
+        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, test_model,
+        trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
+        update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
+// 本地新增 handler 单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
+use super::handlers::{stats_cost, test_credential_model};
 
 /// 请求体最大大小限制 (50MB)
 ///
