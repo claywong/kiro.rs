@@ -48,7 +48,6 @@ interface CredentialInput {
   scopes?: string
   // 运营元数据
   sourceChannel?: string
-  purchaseCost?: number
 }
 
 interface VerificationResult {
@@ -190,10 +189,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               sourceChannel: cred.sourceChannel?.trim() || undefined,
-              purchaseCost:
-                typeof cred.purchaseCost === 'number' && cred.purchaseCost >= 0
-                  ? cred.purchaseCost
-                  : undefined,
             },
           })
         } else {
@@ -251,10 +246,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               sourceChannel: cred.sourceChannel?.trim() || undefined,
-              purchaseCost:
-                typeof cred.purchaseCost === 'number' && cred.purchaseCost >= 0
-                  ? cred.purchaseCost
-                  : undefined,
             },
           })
         }

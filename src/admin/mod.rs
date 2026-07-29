@@ -28,7 +28,6 @@ pub mod client_keys;
 pub mod groups;
 pub mod usage_stats;
 pub mod trace_db;
-pub mod cost_ledger;
 // 本地新增模块单独成行，避免上游增删模块时反复冲突。
 pub mod recent_spend;
 

@@ -17,7 +17,6 @@
     "apiKey": "usr-xxxxxxxxxxxxxxxx",
     "webhookPathToken": "whk_替换为自己生成的随机串",
     "defaultGroups": [],
-    "defaultPurchaseCost": null,
     "defaultRpmLimit": 10,
     "autoPurchase": false,
     "autoPurchaseMaxCount": 1,

@@ -93,10 +93,6 @@ pub struct VendorConfig {
     #[serde(default)]
     pub default_groups: Vec<String>,
 
-    /// 手动提取入库时默认写入的单账号成本（可选，用于成本核算）
-    #[serde(default)]
-    pub default_purchase_cost: Option<f64>,
-
     /// 手动提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
@@ -122,7 +118,7 @@ pub struct VendorConfig {
     /// 按时段调整自动提取上限（可选）。空表示全天都用 `autoPurchaseMaxCount`。
     ///
     /// 用于「下午与晚上压力大、需多持有一张 Key」这类规律性需求。时刻按**本地
-    /// 时区**判定（同 usageStats / costLedger，容器内需正确设置 `TZ`）。
+    /// 时区**判定（同 usageStats，容器内需正确设置 `TZ`）。
     #[serde(default)]
     pub auto_purchase_schedule: Vec<crate::vendor::schedule::AutoPurchaseWindow>,
 }
@@ -331,10 +327,6 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 成本核算展示的货币符号（默认 "¥"）。仅用于前端展示，不参与计算。
-    #[serde(default = "default_cost_currency")]
-    pub cost_currency: String,
-
     /// 卖家（Key 供应商）对接配置。未配置时 webhook 端点与出站接口均不启用。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -452,10 +444,6 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
-fn default_cost_currency() -> String {
-    "¥".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -496,7 +484,6 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
-            cost_currency: default_cost_currency(),
             vendor: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),

@@ -32,7 +32,6 @@ use super::{
     middleware::{AdminState, admin_auth_middleware},
 };
 // 本地新增 handler 单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
-use super::handlers::stats_cost;
 use super::recent_spend::credential_recent_spend;
 
 /// 请求体最大大小限制 (50MB)
@@ -183,7 +182,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
-        .route("/stats/cost", get(stats_cost))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(

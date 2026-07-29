@@ -374,7 +374,6 @@ impl VendorService {
     async fn import_keys(&self, keys: Vec<String>, order_id: &str) -> PurchaseOutcome {
         let cfg = self.config.as_ref();
         let groups = cfg.map(|c| c.default_groups.clone()).unwrap_or_default();
-        let purchase_cost = cfg.and_then(|c| c.default_purchase_cost);
         let rpm_limit = cfg.map(|c| c.default_rpm_limit).unwrap_or(10);
 
         let mut outcome = PurchaseOutcome::default();
@@ -406,7 +405,6 @@ impl VendorService {
                 endpoint: None,
                 groups: groups.clone(),
                 source_channel: Some(format!("vendor:{order_id}")),
-                purchase_cost,
             };
 
             let result = self.admin.import_one_credential(req, true).await;
@@ -429,7 +427,7 @@ impl VendorService {
 
     /// 自动模式单次提取上限。配了时段表且当前时刻命中时以该段为准。
     ///
-    /// 时刻取本地时区（与 usageStats / costLedger 一致），容器内需正确设置 `TZ`，
+    /// 时刻取本地时区（与 usageStats 一致），容器内需正确设置 `TZ`，
     /// 否则「下午」会按 UTC 判定、偏 8 小时。
     pub fn auto_max_count(&self) -> u32 {
         let Some(cfg) = self.config.as_ref() else {

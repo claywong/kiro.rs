@@ -1,7 +1,6 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
-  CostSeriesResponse,
   CredentialDistribution,
   ModelDistribution,
   OverviewStats,
@@ -52,14 +51,6 @@ export async function getByModel(time: StatsTimeFilter, filter?: StatsFilter): P
 export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilter): Promise<CredentialDistribution[]> {
   const { data } = await api.get<CredentialDistribution[]>('/stats/by-credential', {
     params: statsParams(time, filter),
-  })
-  return data
-}
-
-export async function getCost(time: StatsTimeFilter): Promise<CostSeriesResponse> {
-  // 成本恒按天核算，keyId/group 不参与；仅传时间窗
-  const { data } = await api.get<CostSeriesResponse>('/stats/cost', {
-    params: { ...time },
   })
   return data
 }

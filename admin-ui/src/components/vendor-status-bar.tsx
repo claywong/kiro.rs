@@ -566,8 +566,7 @@ export function VendorStatusBar() {
             <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
               入库参数：分组{' '}
               {status?.defaultGroups?.length ? status.defaultGroups.join(' / ') : '无'}
-              ，成本 {status?.defaultPurchaseCost ?? '未设'}，RPM{' '}
-              {status?.defaultRpmLimit ?? 10}
+              ，RPM {status?.defaultRpmLimit ?? 10}
               （在 config.json 的 vendor 段调整）
             </div>
           </div>

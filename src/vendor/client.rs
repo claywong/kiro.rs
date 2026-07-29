@@ -371,7 +371,6 @@ mod tests {
             api_key: key.to_string(),
             webhook_path_token: token.to_string(),
             default_groups: vec![],
-            default_purchase_cost: None,
             default_rpm_limit: 10,
             auto_purchase: false,
             auto_purchase_max_count: 1,

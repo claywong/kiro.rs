@@ -187,7 +187,6 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         "inboundEnabled": inbound,
         "unacked": unacked,
         "defaultGroups": cfg.map(|c| c.default_groups.clone()).unwrap_or_default(),
-        "defaultPurchaseCost": cfg.and_then(|c| c.default_purchase_cost),
         "defaultRpmLimit": cfg.map(|c| c.default_rpm_limit).unwrap_or(10),
         // 运行时值，可能已被面板改过，与 config.json 的启动快照不一定一致
         "autoPurchase": state.service.auto_purchase(),

@@ -42,8 +42,6 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
-  /** 账号购买成本（纯运营元数据，用于成本核算） */
-  purchaseCost?: number
   /** 各模型 TTFT EWMA 的均值（毫秒），无样本时缺省 */
   ttftEwmaMs?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
@@ -149,8 +147,6 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
-  /** 账号购买成本（可选，用于成本核算） */
-  purchaseCost?: number
 }
 
 // 添加凭据响应
@@ -173,8 +169,6 @@ export interface UpdateCredentialRequest {
   sourceChannel?: string
   /** 每分钟请求数上限（undefined 表示不修改，0 表示不限速） */
   rpmLimit?: number
-  /** 账号购买成本（undefined 表示不修改；负值如 -1 表示清除；非负表示设置） */
-  purchaseCost?: number
 }
 
 // 更新 refreshToken 请求
@@ -490,34 +484,6 @@ export interface CredentialDistribution {
   errors: number
 }
 
-// ============ 成本核算 ============
-
-/** 单日成本点 */
-export interface CostPoint {
-  /** 本地日期 YYYY-MM-DD */
-  date: string
-  /** 当日日常摊销成本 */
-  amortizedCost: number
-  /** 当日废弃补齐成本 */
-  discardCost: number
-  /** 当日总成本 */
-  totalCost: number
-}
-
-/** 成本查询响应（区间汇总 + 每日序列） */
-export interface CostSeriesResponse {
-  /** 货币符号（如 "¥"） */
-  currency: string
-  /** 区间总成本 */
-  totalCost: number
-  /** 区间日常摊销合计 */
-  totalAmortized: number
-  /** 区间废弃补齐合计 */
-  totalDiscard: number
-  /** 每日成本序列（升序） */
-  points: CostPoint[]
-}
-
 // ============ 请求链路追踪 ============
 
 /** 单次上游尝试 */
@@ -658,7 +624,6 @@ export interface VendorStatus {
   unacked: number
   /** 提取入库时写入的默认分组 */
   defaultGroups: string[]
-  defaultPurchaseCost?: number | null
   defaultRpmLimit: number
   /** 提取模式：true = 自动，false = 手动。运行时值，切换后立即生效 */
   autoPurchase: boolean

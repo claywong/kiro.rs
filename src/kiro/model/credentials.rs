@@ -190,14 +190,6 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
-
-    /// 账号购买成本（纯运营元数据）
-    ///
-    /// 记录该账号的购买价格，用于成本核算：按使用率折算每天成本。
-    /// 不参与调度、导出或筛选。单价 = purchase_cost / 额度快照（见 CostLedger）。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purchase_cost: Option<f64>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -259,7 +251,6 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
-            .field("purchase_cost", &self.purchase_cost)
             .finish()
     }
 }
@@ -688,7 +679,6 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
-            purchase_cost: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -915,7 +905,6 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
-            purchase_cost: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -961,7 +950,6 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
-            purchase_cost: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1121,7 +1109,6 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
-            purchase_cost: None,
         };
 
         let json = original.to_pretty_json().unwrap();
