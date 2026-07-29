@@ -68,6 +68,32 @@
   `update_current` 是上游给 Admin 只读查询用的，`excluded_ids`/`salvage` 是本地换号重试用的。
   写回 `current_id` 的条件是 `update_current && excluded_ids.is_empty()`。
 
+### 2026-07-29 合并上游 v0.7.4（403 自愈节流 + IDC relogin 凭据替换）
+
+上游 `b7077b5`。7 处冲突，其中 5 处是「双方各自新增」（结构体字段、独立函数），全保留；
+本地新增部分按第四节约定另起一块并加注释，不与上游字段交错。两处需要判断：
+
+- **可用性判断抽取**：上游把 `select_next_credential_excluding` 的过滤条件抽成
+  `entry_available_for_request`（disabled / throttled / 模型分组匹配 / `Unsupported` 过滤），
+  取上游。但本地的 `excluded_ids` 与 RPM 滑动窗口**故意留在调用点**，不并入该 helper——
+  helper 还被 `has_available_for_request`（判断「是否还有号可用」）复用，那里不该受
+  单次换号重试的排除集与瞬时 RPM 影响，并进去会让「全灭」判定误报。
+  本地原来在 `filter_map` 尾部用 `.then_some` 过滤 `Unsupported`，与上游放进 helper 语义等价，
+  已删本地那行。
+- **自愈重选的调用**：上游把内联的「全灭即全量重置」重写为受控 `try_self_heal`
+  （冷却间隔 + 连续轮数上限 + 按模型隔离轮次 + 持久化 `last_self_heal_at`），取上游，
+  本地内联版本整块作废。但上游自愈成功后重选走的是 `select_next_credential`
+  ——那是 `#[cfg(test)]` 版本且不带排除集，本地改为 `select_next_credential_excluding(model,
+  group, excluded_ids, salvage)`，否则自愈后会把刚失败的号重新选回来。上游若后续给
+  `try_self_heal` 之后的重选加参数，以本地这行为准。
+
+`reset_health` 是上游新增，只清失败/禁用/冷却 + `clear_self_heal_streak`，**不清**本地的
+`ttft_ewma` / `recent_requests`：前者是性能估计（清了要重新探测），后者是 RPM 窗口
+（清了等于绕过限速）。保持上游原样即可，不要顺手加。
+
+验证：`cargo build` 通过，`cargo test` 693 passed，`npx tsc --noEmit` 无输出。
+上游 `test_default_is_account_suspended` 等新测试原样保留、未改断言。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。
