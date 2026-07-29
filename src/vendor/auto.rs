@@ -46,7 +46,8 @@ pub enum KeyHealth {
     Alive,
     /// 确认失效（因失败被自动禁用）
     Dead,
-    /// 说不清：被人工禁用。它不反映 Key 本身状态，不能拿来当失效证据
+    /// 说不清：被人工禁用或禁用未记原因。它不反映 Key 本身状态，不能单独当作
+    /// 失效证据；但它同样不可用，故不阻塞「已无可用 Key」的结论（见 [`conclude`]）
     Ambiguous,
 }
 
@@ -105,6 +106,11 @@ pub fn census(entries: &[VendorKeyState]) -> VendorKeyCensus {
 /// `window_expired` 为 false 时（观察窗口内），只有"确认全部失效"是终态，
 /// 其余一律 [`ValidationStatus::Pending`] 继续观察 —— 卖家刚说失效时本地通常
 /// 还没探到，此刻的"仍然健康"不是结论。
+///
+/// 待定（人工禁用 / 禁用未记原因）不阻塞结论：这类 Key 同样处于不可用状态，
+/// 拿不到它"是否真失效"的证据不代表它能用。因此判据只看有无存活的 Key —— 一旦
+/// `alive == 0` 即刻确认，不必等窗口走完：观察窗口的意义是等本地失败计数追上现实，
+/// 而"已无可用 Key"这个结论不依赖失效证据，再等也不会更成立。
 pub fn conclude(c: VendorKeyCensus, window_expired: bool) -> (ValidationStatus, String) {
     // 池里没有卖家 Key：没有任何存活的东西，补货的前提天然成立
     if c.total == 0 {
@@ -114,13 +120,19 @@ pub fn conclude(c: VendorKeyCensus, window_expired: bool) -> (ValidationStatus, 
         );
     }
 
-    if c.alive == 0 && c.ambiguous == 0 {
-        return (
-            ValidationStatus::ConfirmedDead,
-            format!("{} 张卖家 Key 均已失效", c.dead),
-        );
+    if c.alive == 0 {
+        let detail = if c.ambiguous == 0 {
+            format!("{} 张卖家 Key 均已失效", c.dead)
+        } else {
+            format!(
+                "已无可用卖家 Key：失效 {} / 人工禁用或无禁用原因 {}（共 {}）",
+                c.dead, c.ambiguous, c.total
+            )
+        };
+        return (ValidationStatus::ConfirmedDead, detail);
     }
 
+    // 仍有存活的 Key：窗口内继续观察，等本地状态追上卖家的说法
     if !window_expired {
         return (
             ValidationStatus::Pending,
@@ -131,21 +143,11 @@ pub fn conclude(c: VendorKeyCensus, window_expired: bool) -> (ValidationStatus, 
         );
     }
 
-    if c.alive > 0 {
-        return (
-            ValidationStatus::StillAlive,
-            format!(
-                "观察窗口结束仍有 {} 张卖家 Key 健康（共 {}），未触发自动提取",
-                c.alive, c.total
-            ),
-        );
-    }
-
     (
-        ValidationStatus::Inconclusive,
+        ValidationStatus::StillAlive,
         format!(
-            "{} 张卖家 Key 被人工禁用或无禁用原因，无法确认是否真失效（共 {}）",
-            c.ambiguous, c.total
+            "观察窗口结束仍有 {} 张卖家 Key 健康（共 {}），未触发自动提取",
+            c.alive, c.total
         ),
     )
 }
@@ -195,9 +197,37 @@ mod tests {
         let c = census(&entries);
         assert_eq!(c.ambiguous, 1);
         assert_eq!(c.dead, 0);
-        // 窗口结束也只能给出无结论，不授权自动提取
-        let (status, _) = conclude(c, true);
-        assert_eq!(status, ValidationStatus::Inconclusive);
+        // 待定 Key 同样不可用，不阻塞确认，且无需等窗口走完
+        let (status, detail) = conclude(c, false);
+        assert_eq!(status, ValidationStatus::ConfirmedDead);
+        assert!(detail.contains("已无可用卖家 Key"));
+        assert_eq!(conclude(c, true).0, ValidationStatus::ConfirmedDead);
+    }
+
+    #[test]
+    fn 禁用但无原因窗口结束后也确认() {
+        let entries = vec![
+            entry(Some("vendor:a"), true, None, 0),
+            entry(Some("vendor:b"), true, Some("Manual"), 0),
+            entry(Some("vendor:c"), true, Some("TooManyFailures"), 3),
+        ];
+        let c = census(&entries);
+        assert_eq!(c.ambiguous, 2);
+        assert_eq!(c.dead, 1);
+        assert_eq!(c.alive, 0);
+        // 首次盘点即确认，不必等 3 分钟窗口
+        assert_eq!(conclude(c, false).0, ValidationStatus::ConfirmedDead);
+        assert_eq!(conclude(c, true).0, ValidationStatus::ConfirmedDead);
+    }
+
+    #[test]
+    fn 有存活时待定不影响仍然健康的结论() {
+        let entries = vec![
+            entry(Some("vendor:a"), true, Some("Manual"), 0),
+            entry(Some("vendor:b"), false, None, 0),
+        ];
+        let c = census(&entries);
+        assert_eq!(conclude(c, true).0, ValidationStatus::StillAlive);
     }
 
     #[test]

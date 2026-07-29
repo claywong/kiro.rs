@@ -135,7 +135,10 @@ pub enum ValidationStatus {
     ConfirmedDead,
     /// 仍有健康的卖家 Key，无需补货
     StillAlive,
-    /// 窗口结束仍无结论（含仅被人工禁用的情况）
+    /// 窗口结束仍无结论。
+    ///
+    /// `auto::conclude` 已不再产出该状态（人工禁用 / 无禁用原因的 Key 同样不可用，
+    /// 不再阻塞确认），保留仅为兼容历史事件行里已写入的 `inconclusive`。
     Inconclusive,
 }
 

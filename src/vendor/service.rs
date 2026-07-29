@@ -484,7 +484,10 @@ impl VendorService {
     ///
     /// 卖家推来 `all_keys_dead` 时本地通常还没探到失效（本地状态靠真实请求
     /// 失败累积），故先立刻盘点一次，未得出"已全部失效"就按 30 秒一轮继续
-    /// 观察，最多 3 分钟。一旦确认失效即提前收敛。
+    /// 观察，最多 3 分钟。
+    ///
+    /// 只要本地已无可用 Key（`alive == 0`），首轮盘点即 `ConfirmedDead` 并直接返回，
+    /// 不进轮询 —— 观察窗口只用于"仍有存活 Key"的情况，等其失败计数追上卖家的说法。
     pub fn spawn_dead_validation(self: &Arc<Self>, event_id: String) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
