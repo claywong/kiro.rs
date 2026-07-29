@@ -33,6 +33,16 @@ const MAX_TOTAL_RETRIES: usize = 6;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
+/// 流式请求总超时（reqwest `.timeout()`：从发起请求到读完整个响应体的总时长，收到
+/// 数据不会重置）。
+///
+/// 曾设为 720s，但链路数据显示长 thinking / 多轮 tool use 的正常响应会稳定超过 12
+/// 分钟：最慢的成功请求耗时 716994ms，而被中断的请求精确聚集在 720002~720011ms，
+/// 且这些请求首字节都正常到达——即活着的流被总超时砍掉。放宽到 30 分钟仅作极端情况
+/// 的最后防线，僵死连接仍由 `STREAM_READ_TIMEOUT_SECS`（相邻两次读之间的空闲超时）
+/// 兜住。
+const STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
+
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
@@ -140,7 +150,7 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_streaming_client(proxy.as_ref(), 720, tls_backend)
+        let initial_client = build_streaming_client(proxy.as_ref(), STREAM_TOTAL_TIMEOUT_SECS, tls_backend)
             .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
@@ -162,7 +172,7 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_streaming_client(effective.as_ref(), STREAM_TOTAL_TIMEOUT_SECS, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
