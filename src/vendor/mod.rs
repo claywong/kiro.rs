@@ -14,8 +14,15 @@ pub mod router;
 pub mod schedule;
 pub mod service;
 pub mod store;
+// 多卖家支持：协议抽象 + 各家 flavor 实现 + 注册表。
+// 单独成模块而非塞进既有文件，便于接入第三家时只加文件。
+pub mod flavor_kiroapp;
+pub mod flavor_legacy;
+pub mod protocol;
+pub mod registry;
 
 pub use handlers::VendorState;
 pub use router::{create_vendor_admin_router, create_vendor_webhook_router};
-pub use service::VendorService;
 pub use store::{SharedVendorStore, VendorStore};
+// 本地新增导出单独成行。
+pub use registry::VendorRegistry;

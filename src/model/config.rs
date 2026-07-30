@@ -73,15 +73,34 @@ pub struct CustomModel {
 /// - **入站**：卖家把 `new_keys_available` / `all_keys_dead` 事件 POST 到
 ///   `/webhook/vendor/{webhook_path_token}`。对方推送端不带签名，故用不可猜测的
 ///   路径段做唯一凭证，比对不上直接 404。入站只负责落库 + 告警，不触发任何扣费动作。
-/// - **出站**：kiro.rs 拿 `api_key`（`usr-` 前缀）调卖家 `/api/my/*` 接口提取 Key、
-///   查库存余额、兑换充值。全部由管理面板手动触发。
+/// - **出站**：kiro.rs 拿 `api_key` 调卖家提取接口提取 Key、查库存余额、兑换充值。
+///   路径前缀与鉴权头形态由 `flavor` 决定，详见 [`crate::vendor::protocol::VendorFlavor`]。
+///
+/// 可配置多家：用 `vendors` 数组，每家一个本配置对象。旧的单例 `vendor` 字段
+/// 仍然可用（等价于只有一家），见 [`Config::resolved_vendors`]。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VendorConfig {
+    /// 供应商标识。事件按它归属，面板按它切换标签页，**配好后不要再改** ——
+    /// 改了会让历史事件与新配置对不上。缺省为 `default`，与单供应商时期的
+    /// 存量事件保持一致。
+    #[serde(default = "default_vendor_id")]
+    pub id: String,
+
+    /// 面板上展示的名字。缺省用 `id`。
+    #[serde(default)]
+    pub name: String,
+
+    /// 协议风味：`legacy`（`/api/my/*` + `X-API-Key`）或
+    /// `kiroapp`（`/api/me/*` + `Authorization: Bearer`）。缺省 `legacy`。
+    #[serde(default)]
+    pub flavor: crate::vendor::protocol::VendorFlavor,
+
     /// 卖家 API base URL（如 `https://vendor.example.com`，末尾斜杠会被规整掉）
     pub base_url: String,
 
-    /// 卖家账号密钥，出站请求以 `X-API-Key` 头发送（形如 `usr-xxx`）
+    /// 卖家账号密钥。发送形态由 `flavor` 决定：`legacy` 用 `X-API-Key: usr-xxx`，
+    /// `kiroapp` 用 `Authorization: Bearer km_xxx`。
     pub api_key: String,
 
     /// 入站 webhook 路径 token。请求路径需完整匹配，否则 404。
@@ -148,10 +167,37 @@ fn default_vendor_rpm_limit() -> u32 {
     10
 }
 
+/// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
+pub const DEFAULT_VENDOR_ID: &str = "default";
+
+fn default_vendor_id() -> String {
+    DEFAULT_VENDOR_ID.to_string()
+}
+
 impl VendorConfig {
     /// 规整后的 base URL（去掉末尾斜杠）
     pub fn normalized_base_url(&self) -> &str {
         self.base_url.trim_end_matches('/')
+    }
+
+    /// 规整后的供应商 id。为空时回退到默认 id。
+    pub fn vendor_id(&self) -> &str {
+        let trimmed = self.id.trim();
+        if trimmed.is_empty() {
+            DEFAULT_VENDOR_ID
+        } else {
+            trimmed
+        }
+    }
+
+    /// 面板展示名。未配置时回退到 id。
+    pub fn display_name(&self) -> &str {
+        let trimmed = self.name.trim();
+        if trimmed.is_empty() {
+            self.vendor_id()
+        } else {
+            trimmed
+        }
     }
 
     /// 出站接口是否可用（base_url 与 api_key 均非空）
@@ -344,10 +390,17 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 卖家（Key 供应商）对接配置。未配置时 webhook 端点与出站接口均不启用。
+    /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
+    /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
+    /// 合并规则见 [`Config::resolved_vendors`]。未配置时 webhook 端点与出站接口均不启用。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<VendorConfig>,
+
+    /// 多卖家对接配置。每家一个对象，靠 `id` 区分、`flavor` 决定协议形态。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vendors: Vec<VendorConfig>,
 
     /// 端点特定的配置
     ///
@@ -502,6 +555,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             vendor: None,
+            vendors: Vec::new(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             config_path: None,
@@ -510,6 +564,38 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 合并 `vendor`（单例，兼容）与 `vendors`（多家）为最终生效列表。
+    ///
+    /// 规则：
+    /// 1. 单例 `vendor` 排在前面 —— 它是存量配置，其事件已按 `default` id 落库。
+    /// 2. 按 `id` 去重，保留先出现的。两家共用一个 id 会让事件互相污染、
+    ///    webhook 也无法区分来源，故重复项直接丢弃并告警，而不是静默合并。
+    /// 3. 出站配置不完整（base_url / api_key 为空）的项一并丢弃 —— 留着只会
+    ///    在面板上多一个永远报错的标签页。
+    pub fn resolved_vendors(&self) -> Vec<VendorConfig> {
+        let mut out: Vec<VendorConfig> = Vec::new();
+        let candidates = self.vendor.iter().chain(self.vendors.iter());
+
+        for cfg in candidates {
+            if !cfg.outbound_enabled() {
+                tracing::warn!(
+                    vendor_id = cfg.vendor_id(),
+                    "卖家配置不完整（baseUrl / apiKey 为空），已跳过"
+                );
+                continue;
+            }
+            if out.iter().any(|c| c.vendor_id() == cfg.vendor_id()) {
+                tracing::warn!(
+                    vendor_id = cfg.vendor_id(),
+                    "卖家 id 重复，已跳过后出现的那一项（事件归属需唯一）"
+                );
+                continue;
+            }
+            out.push(cfg.clone());
+        }
+        out
+    }
+
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"

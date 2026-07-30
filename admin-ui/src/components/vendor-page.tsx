@@ -7,10 +7,11 @@ import {
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VendorStatusBar } from '@/components/vendor-status-bar'
 import { VendorPurchaseDialog } from '@/components/vendor-purchase-dialog'
 import {
-  useVendorStatus, useVendorEvents, useVendorOrders, useAckVendorEvents,
+  useVendorList, useVendorStatus, useVendorEvents, useVendorOrders, useAckVendorEvents,
 } from '@/hooks/use-vendor'
 import { extractErrorMessage } from '@/lib/utils'
 import type { VendorEvent } from '@/types/api'
@@ -147,9 +148,9 @@ function PurchaseStatusCell({ event }: { event: VendorEvent }) {
 }
 
 /** 订单历史折叠面板：展开时才拉数据 */
-function OrdersPanel() {
+function OrdersPanel({ vendorId }: { vendorId?: string }) {
   const [open, setOpen] = useState(false)
-  const { data, isLoading, refetch, isFetching } = useVendorOrders(open)
+  const { data, isLoading, refetch, isFetching } = useVendorOrders(vendorId)
   const orders = data?.orders ?? []
 
   return (
@@ -234,14 +235,23 @@ function OrdersPanel() {
  * 供应商页：卖家 webhook 事件驾驶舱。
  *
  * 设计要点：
+ * - 多供应商支持：顶部标签页切换，各家独立状态与事件
  * - 入站 webhook 只落库不花钱，所有提取动作在此页显式触发
  * - 提取数量与订单号永久绑定（卖家侧改数量会 409），弹窗内锁定处理
  * - 未确认事件整行高亮 + 顶部计数，点「已知悉」消除
  */
 export function VendorPage() {
-  const { data: status } = useVendorStatus()
-  const { data, isLoading, isFetching, refetch } = useVendorEvents()
-  const ack = useAckVendorEvents()
+  const { data: vendorList } = useVendorList()
+  const vendors = vendorList?.vendors ?? []
+  const defaultVendorId = vendorList?.defaultVendorId
+
+  // 当前选中的供应商 id，缺省用配置里的第一家
+  const [currentVendorId, setCurrentVendorId] = useState<string | undefined>(undefined)
+  const activeVendorId = currentVendorId ?? defaultVendorId
+
+  const { data: status } = useVendorStatus(activeVendorId)
+  const { data, isLoading, isFetching, refetch } = useVendorEvents(200, activeVendorId)
+  const ack = useAckVendorEvents(activeVendorId)
 
   const [purchaseTarget, setPurchaseTarget] = useState<VendorEvent | null>(null)
   const [purchaseOpen, setPurchaseOpen] = useState(false)
@@ -293,7 +303,25 @@ export function VendorPage() {
 
   return (
     <div className="space-y-4">
-      <VendorStatusBar />
+      {/* 多供应商标签页：配置了多家时显示切换器 */}
+      {vendors.length > 1 && (
+        <Tabs value={activeVendorId} onValueChange={setCurrentVendorId}>
+          <TabsList>
+            {vendors.map((v) => (
+              <TabsTrigger key={v.vendorId} value={v.vendorId} className="relative">
+                {v.name}
+                {v.unacked > 0 && (
+                  <span className="ml-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-medium text-destructive-foreground">
+                    {v.unacked}
+                  </span>
+                )}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+      )}
+
+      <VendorStatusBar vendorId={activeVendorId} />
 
       <Card>
         <CardContent className="p-0">
@@ -445,13 +473,14 @@ export function VendorPage() {
         </CardContent>
       </Card>
 
-      <OrdersPanel />
+      <OrdersPanel vendorId={activeVendorId} />
 
       <VendorPurchaseDialog
         event={purchaseTarget}
         status={status}
         open={purchaseOpen}
         onOpenChange={setPurchaseOpen}
+        vendorId={activeVendorId}
       />
     </div>
   )

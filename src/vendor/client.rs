@@ -1,159 +1,28 @@
 //! 卖家（Key 供应商）出站 API 客户端
 //!
-//! 覆盖 `/api/my/*` 系列接口：提取 Key、查库存 / 余额 / 订单、兑换充值、
-//! 维护 webhook URL。所有请求带 `X-API-Key: usr-xxx`。
+//! 按 [`VendorFlavor`] 分发到各家的路径与鉴权形态，对上统一返回
+//! [`super::protocol`] 里的中立结构 —— service 层不需要知道对接的是哪一家。
+//!
+//! 各家 DTO 与字段映射见 [`super::flavor_legacy`] / [`super::flavor_kiroapp`]。
+//! 不支持的能力直接返回 [`VendorApiError::unsupported`]，不发请求。
 //!
 //! @author wangzhong
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::http_client::{self, ProxyConfig};
 use crate::model::config::{TlsBackend, VendorConfig};
 
+use super::flavor_kiroapp as kiroapp;
+use super::flavor_legacy as legacy;
+use super::protocol::{
+    EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
+    StockInfo, VendorApiError, VendorCapabilities, VendorFlavor, VendorKeyInfo, truncate,
+};
+
 /// 出站请求超时（秒）。提取 Key 需要卖家侧现场生成，给足时间。
 const REQUEST_TIMEOUT_SECS: u64 = 120;
-
-/// 单个 Key 条目。卖家在 `/api/my/purchase` 响应里只保证 `key` 字段，
-/// 其余元数据（status / created_at）此处不需要，不做解析。
-#[derive(Debug, Clone, Deserialize)]
-pub struct VendorKey {
-    pub key: String,
-}
-
-/// `POST /api/my/purchase` 响应
-#[derive(Debug, Clone, Deserialize)]
-pub struct PurchaseResponse {
-    #[serde(default)]
-    pub purchased: u32,
-    #[serde(default)]
-    pub remaining: Option<f64>,
-    #[serde(default)]
-    pub keys: Vec<VendorKey>,
-}
-
-/// `GET /api/my/stock` 响应
-#[derive(Debug, Clone, Deserialize)]
-pub struct StockResponse {
-    #[serde(default)]
-    pub max: u32,
-}
-
-/// `GET /api/status` 响应 —— 卖家账号维度的 Key 数量与库存
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct VendorSystemStatus {
-    /// 卖家侧当前存活 Key 数
-    #[serde(default)]
-    pub keys_active: Option<u32>,
-    /// 卖家侧已失效 Key 数
-    #[serde(default)]
-    pub keys_dead: Option<u32>,
-    /// 卖家侧尚未售出的存货 Key 数
-    #[serde(default)]
-    pub keys_stock: Option<u32>,
-    /// 卖家侧 Key 累计总数（含已失效）
-    #[serde(default)]
-    pub keys_total: Option<u32>,
-    /// 卖家侧是否正在生成新 Key
-    #[serde(default)]
-    pub generating: Option<bool>,
-    /// 卖家侧已运行秒数
-    #[serde(default)]
-    pub uptime_seconds: Option<f64>,
-    /// 卖家侧启动时刻，形如 `2026-07-25 20:59:33`（无时区标记）
-    #[serde(default)]
-    pub started_at: Option<String>,
-    /// 卖家侧是否开启自动检测
-    #[serde(default)]
-    pub auto_check: Option<bool>,
-    /// 卖家侧是否开启自动生成
-    #[serde(default)]
-    pub auto_generate: Option<bool>,
-    /// 自动检测间隔。卖家用字符串给（如 "20"），故不解析成数字
-    #[serde(default)]
-    pub check_interval: Option<String>,
-    /// 其余未建模字段原样透传，卖家新增字段时不必改一轮后端
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-/// `GET /api/my/gen-logs` 单条开号记录
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct GenLogEntry {
-    /// 开号时刻，形如 `2026-07-28 23:27:36`（无时区标记）
-    #[serde(default)]
-    pub created_at: Option<String>,
-    /// 该批开出的 Key 数
-    #[serde(default)]
-    pub count: Option<u32>,
-    /// 卖家侧状态，如 "done"
-    #[serde(default)]
-    pub status: Option<String>,
-}
-
-/// `GET /api/my/gen-logs` 响应 —— 卖家近期开号批次，用于判断出号节奏
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct GenLogsResponse {
-    /// 相邻两批的平均间隔（分钟）。卖家算好给的，不足两批时可能缺失
-    #[serde(default)]
-    pub avg_interval_min: Option<f64>,
-    #[serde(default)]
-    pub items: Vec<GenLogEntry>,
-}
-
-/// `GET /api/my/profile` 响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct ProfileResponse {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub quota: Option<f64>,
-    #[serde(default)]
-    pub remaining: Option<f64>,
-    #[serde(default)]
-    pub used_quota: Option<f64>,
-    #[serde(default)]
-    pub webhook_url: Option<String>,
-}
-
-/// `POST /api/my/redeem` 响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct RedeemResponse {
-    #[serde(default)]
-    pub code: Option<String>,
-    #[serde(default)]
-    pub quota: Option<f64>,
-    #[serde(default)]
-    pub previous_quota: Option<f64>,
-    #[serde(default)]
-    pub balance: Option<f64>,
-    #[serde(default)]
-    pub created_by_name: Option<String>,
-    #[serde(default)]
-    pub redeemed_at: Option<String>,
-    /// true 表示这张码此前已兑换过，本次未改动余额
-    #[serde(default)]
-    pub replayed: bool,
-}
-
-/// `GET /api/my/purchase-orders` 单条订单
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct PurchaseOrder {
-    #[serde(default)]
-    pub client_order_id: Option<String>,
-    #[serde(default)]
-    pub requested: Option<u32>,
-    #[serde(default)]
-    pub purchased: Option<u32>,
-    #[serde(default)]
-    pub created_at: Option<String>,
-}
 
 /// 卖家返回的错误体：`{"error":"错误说明"}`
 #[derive(Debug, Deserialize)]
@@ -162,29 +31,12 @@ struct VendorError {
     error: Option<String>,
 }
 
-/// 出站调用失败，携带 HTTP 状态码便于上层按 403/404/409 分别处理
-#[derive(Debug)]
-pub struct VendorApiError {
-    pub status: Option<u16>,
-    pub message: String,
-}
-
-impl std::fmt::Display for VendorApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.status {
-            Some(code) => write!(f, "卖家接口返回 {}: {}", code, self.message),
-            None => write!(f, "卖家接口调用失败: {}", self.message),
-        }
-    }
-}
-
-impl std::error::Error for VendorApiError {}
-
 /// 卖家 API 客户端。复用全局代理与 TLS 后端配置。
 pub struct VendorClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    flavor: VendorFlavor,
 }
 
 impl VendorClient {
@@ -203,11 +55,24 @@ impl VendorClient {
             http,
             base_url: vendor.normalized_base_url().to_string(),
             api_key: vendor.api_key.trim().to_string(),
+            flavor: vendor.flavor,
         })
+    }
+
+    pub fn capabilities(&self) -> VendorCapabilities {
+        self.flavor.capabilities()
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// 按 flavor 附加鉴权头。两家形态不同，集中在此一处。
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.flavor {
+            VendorFlavor::Legacy => req.header("X-API-Key", &self.api_key),
+            VendorFlavor::Kiroapp => req.bearer_auth(&self.api_key),
+        }
     }
 
     /// 统一处理响应：非 2xx 时解析 `{"error":...}` 并带上状态码。
@@ -239,9 +104,7 @@ impl VendorClient {
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, VendorApiError> {
         let resp = self
-            .http
-            .get(self.url(path))
-            .header("X-API-Key", &self.api_key)
+            .auth(self.http.get(self.url(path)))
             .send()
             .await
             .map_err(|e| VendorApiError {
@@ -251,83 +114,174 @@ impl VendorClient {
         Self::parse(resp).await
     }
 
-    /// `POST /api/my/purchase` —— 提取 Key。
+    /// 带查询参数的 GET（分页接口用）
+    async fn get_with<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T, VendorApiError> {
+        let resp = self
+            .auth(self.http.get(self.url(path)).query(query))
+            .send()
+            .await
+            .map_err(|e| VendorApiError {
+                status: None,
+                message: e.to_string(),
+            })?;
+        Self::parse(resp).await
+    }
+
+    async fn post_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T, VendorApiError> {
+        let resp = self
+            .auth(self.http.post(self.url(path)).json(body))
+            .send()
+            .await
+            .map_err(|e| VendorApiError {
+                status: None,
+                message: e.to_string(),
+            })?;
+        Self::parse(resp).await
+    }
+
+    // ============ 提取（消费侧）============
+
+    /// 下单提取 Key。
     ///
     /// `client_order_id` 必须是 32 位十六进制串，并且**同一订单号必须始终配同一个
-    /// `count`**：卖家侧对「相同订单号 + 相同 count」幂等重放，改 count 会返回 409。
-    /// 因此调用方需持久化首次决定的 count，重试时原样复用。
+    /// `count`**：两家卖家都对「相同订单号 + 相同 count」幂等重放，改 count 会返回
+    /// 409。因此调用方需持久化首次决定的 count，重试时原样复用。
+    ///
+    /// `batch_order_id` 仅 `batch_scoped_purchase` 能力可用时有意义（kiroapp 的
+    /// 开号批次 id），传入后只拉取该批次产出的 Key。
     pub async fn purchase(
         &self,
         count: u32,
         client_order_id: &str,
-    ) -> Result<PurchaseResponse, VendorApiError> {
-        let resp = self
-            .http
-            .post(self.url("/api/my/purchase"))
-            .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({
-                "count": count,
-                "client_order_id": client_order_id,
-            }))
-            .send()
-            .await
-            .map_err(|e| VendorApiError {
-                status: None,
-                message: e.to_string(),
-            })?;
-        Self::parse(resp).await
+        batch_order_id: Option<&str>,
+    ) -> Result<PurchaseResult, VendorApiError> {
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+        });
+        match self.flavor {
+            VendorFlavor::Legacy => {
+                let r: legacy::PurchaseResponse =
+                    self.post_json(legacy::PATH_PURCHASE, &body).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::Kiroapp => {
+                // 只有该 flavor 支持按批次定向拉取
+                if let Some(batch) = batch_order_id.filter(|s| !s.trim().is_empty()) {
+                    body["order_id"] = serde_json::json!(batch.trim());
+                }
+                let r: kiroapp::PurchaseResponse =
+                    self.post_json(kiroapp::PATH_PURCHASE, &body).await?;
+                Ok(r.into())
+            }
+        }
     }
 
-    /// `GET /api/my/stock` —— 本轮最大可提取数量
-    pub async fn stock(&self) -> Result<StockResponse, VendorApiError> {
-        self.get("/api/my/stock").await
+    /// 库存与报价
+    pub async fn stock(&self) -> Result<StockInfo, VendorApiError> {
+        match self.flavor {
+            VendorFlavor::Legacy => {
+                let r: legacy::StockResponse = self.get(legacy::PATH_STOCK).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::Kiroapp => {
+                let r: kiroapp::StockResponse = self.get(kiroapp::PATH_STOCK).await?;
+                Ok(r.into())
+            }
+        }
     }
 
-    /// `GET /api/my/profile` —— 余额与 webhook 配置
-    pub async fn profile(&self) -> Result<ProfileResponse, VendorApiError> {
-        self.get("/api/my/profile").await
+    /// 账户档案（余额 / 限购 / webhook 配置）
+    pub async fn profile(&self) -> Result<ProfileInfo, VendorApiError> {
+        match self.flavor {
+            VendorFlavor::Legacy => {
+                let r: legacy::ProfileResponse = self.get(legacy::PATH_PROFILE).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::Kiroapp => {
+                let r: kiroapp::ProfileResponse = self.get(kiroapp::PATH_PROFILE).await?;
+                Ok(r.into())
+            }
+        }
     }
 
-    /// `GET /api/status` —— 卖家系统状态：存活 / 失效 / 存货 Key 数
-    pub async fn system_status(&self) -> Result<VendorSystemStatus, VendorApiError> {
-        self.get("/api/status").await
+    /// 历史提取订单，用于跟本地事件对账
+    pub async fn purchase_orders(
+        &self,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Paged<OrderInfo>, VendorApiError> {
+        match self.flavor {
+            VendorFlavor::Legacy => {
+                // 该卖家返回裸数组、无分页，固定最近 50 条
+                let orders: Vec<legacy::PurchaseOrder> = self.get(legacy::PATH_ORDERS).await?;
+                Ok(legacy::orders_to_paged(orders))
+            }
+            VendorFlavor::Kiroapp => {
+                let env: kiroapp::Envelope<kiroapp::KiroappOrder> = self
+                    .get_with(kiroapp::PATH_ORDERS, &paging(page, page_size))
+                    .await?;
+                Ok(env.map_into())
+            }
+        }
     }
 
-    /// `GET /api/my/purchase-orders` —— 最近 50 条提取订单，用于跟本地事件对账
-    pub async fn purchase_orders(&self) -> Result<Vec<PurchaseOrder>, VendorApiError> {
-        self.get("/api/my/purchase-orders").await
+    /// 兑换码充值。两家均对「同账号 + 同码」幂等，超时重试原样重发即可。
+    pub async fn redeem(&self, code: &str) -> Result<RedeemResult, VendorApiError> {
+        let body = serde_json::json!({ "code": code });
+        match self.flavor {
+            VendorFlavor::Legacy => {
+                let r: legacy::RedeemResponse = self.post_json(legacy::PATH_REDEEM, &body).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::Kiroapp => {
+                let r: kiroapp::RedeemResponse =
+                    self.post_json(kiroapp::PATH_REDEEM, &body).await?;
+                Ok(r.into())
+            }
+        }
     }
 
-    /// `GET /api/my/gen-logs` —— 卖家近期开号批次与平均间隔，
-    /// 用于估算下一批新 Key 大概什么时候到
-    pub async fn gen_logs(&self) -> Result<GenLogsResponse, VendorApiError> {
-        self.get("/api/my/gen-logs").await
+    // ============ 各家独有能力 ============
+
+    /// 卖家系统状态：存活 / 失效 / 存货 Key 数。仅 `system_status` 能力。
+    pub async fn system_status(&self) -> Result<legacy::VendorSystemStatus, VendorApiError> {
+        if !self.capabilities().system_status {
+            return Err(VendorApiError::unsupported("系统状态查询"));
+        }
+        self.get(legacy::PATH_STATUS).await
     }
 
-    /// `POST /api/my/redeem` —— 兑换码充值。
-    /// 卖家侧对「同账号 + 同码」幂等，超时重试原样重发即可。
-    pub async fn redeem(&self, code: &str) -> Result<RedeemResponse, VendorApiError> {
-        let resp = self
-            .http
-            .post(self.url("/api/my/redeem"))
-            .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({ "code": code }))
-            .send()
-            .await
-            .map_err(|e| VendorApiError {
-                status: None,
-                message: e.to_string(),
-            })?;
-        Self::parse(resp).await
+    /// 卖家近期开号批次与平均间隔，用于估算下一批新 Key 大概什么时候到。
+    /// 仅 `gen_logs` 能力。
+    pub async fn gen_logs(&self) -> Result<legacy::GenLogsResponse, VendorApiError> {
+        if !self.capabilities().gen_logs {
+            return Err(VendorApiError::unsupported("开号记录查询"));
+        }
+        self.get(legacy::PATH_GEN_LOGS).await
     }
 
-    /// `PUT /api/my/webhook` —— 更新卖家侧保存的 webhook URL
+    /// 更新卖家侧保存的 webhook URL。仅 `webhook_manage` 能力。
     pub async fn set_webhook_url(&self, webhook_url: &str) -> Result<(), VendorApiError> {
+        if !self.capabilities().webhook_manage {
+            return Err(VendorApiError::unsupported(
+                "通过 API 配置 webhook 地址（请在卖家网页的设置里填）",
+            ));
+        }
         let resp = self
-            .http
-            .put(self.url("/api/my/webhook"))
-            .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({ "webhook_url": webhook_url }))
+            .auth(
+                self.http
+                    .put(self.url(legacy::PATH_WEBHOOK))
+                    .json(&serde_json::json!({ "webhook_url": webhook_url })),
+            )
             .send()
             .await
             .map_err(|e| VendorApiError {
@@ -337,28 +291,79 @@ impl VendorClient {
         Self::parse::<serde_json::Value>(resp).await.map(|_| ())
     }
 
-    /// `POST /api/my/webhook/test` —— 让卖家往已保存的 URL 推一条测试消息
+    /// 让卖家往已保存的 URL 推一条测试消息。仅 `webhook_manage` 能力。
     pub async fn test_webhook(&self) -> Result<serde_json::Value, VendorApiError> {
-        let resp = self
-            .http
-            .post(self.url("/api/my/webhook/test"))
-            .header("X-API-Key", &self.api_key)
-            .send()
+        if !self.capabilities().webhook_manage {
+            return Err(VendorApiError::unsupported("由 API 触发 webhook 测试推送"));
+        }
+        self.post_json(legacy::PATH_WEBHOOK_TEST, &serde_json::json!({}))
             .await
-            .map_err(|e| VendorApiError {
-                status: None,
-                message: e.to_string(),
-            })?;
-        Self::parse(resp).await
+    }
+
+    /// 积分流水。仅 `ledger` 能力。
+    pub async fn ledger(
+        &self,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        entry_type: Option<&str>,
+    ) -> Result<Paged<LedgerEntry>, VendorApiError> {
+        if !self.capabilities().ledger {
+            return Err(VendorApiError::unsupported("积分流水查询"));
+        }
+        let mut query = paging(page, page_size);
+        if let Some(t) = entry_type.filter(|s| !s.trim().is_empty()) {
+            query.push(("type", t.trim().to_string()));
+        }
+        let env: kiroapp::Envelope<kiroapp::KiroappLedgerEntry> =
+            self.get_with(kiroapp::PATH_LEDGER, &query).await?;
+        Ok(env.map_into())
+    }
+
+    /// 名下密钥列表。`history` 为 true 时含已失效的。仅 `my_keys` 能力。
+    ///
+    /// 卖家的库存接口不给任何时间字段，本接口的 `created_at`（开号时刻）是
+    /// 判断 Key 新鲜度的唯一来源。
+    pub async fn my_keys(
+        &self,
+        history: bool,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Paged<VendorKeyInfo>, VendorApiError> {
+        if !self.capabilities().my_keys {
+            return Err(VendorApiError::unsupported("名下密钥列表查询"));
+        }
+        let mut query = paging(page, page_size);
+        if history {
+            query.push(("history", "1".to_string()));
+        }
+        let env: kiroapp::Envelope<kiroapp::KiroappMyKey> =
+            self.get_with(kiroapp::PATH_KEYS, &query).await?;
+        Ok(env.map_into())
+    }
+
+    /// 最早密钥时间与总数，估算账龄用。仅 `earliest_key` 能力。
+    pub async fn earliest_key(&self) -> Result<EarliestKeyInfo, VendorApiError> {
+        if !self.capabilities().earliest_key {
+            return Err(VendorApiError::unsupported("最早密钥时间查询"));
+        }
+        let r: kiroapp::CreatedAtResponse = self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
+        Ok(r.into())
     }
 }
 
-/// 按字符边界截断，避免把多字节 UTF-8 切坏
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+/// 构造分页查询参数。`page_size` 超过卖家上限时收敛，避免白拿一个 400。
+fn paging(page: Option<u32>, page_size: Option<u32>) -> Vec<(&'static str, String)> {
+    let mut q = Vec::new();
+    if let Some(p) = page {
+        q.push(("page", p.max(1).to_string()));
     }
-    s.chars().take(max).collect::<String>() + "…"
+    if let Some(size) = page_size {
+        q.push((
+            "page_size",
+            size.clamp(1, kiroapp::MAX_PAGE_SIZE).to_string(),
+        ));
+    }
+    q
 }
 
 #[cfg(test)]
@@ -367,6 +372,9 @@ mod tests {
 
     fn cfg(base: &str, key: &str, token: &str) -> VendorConfig {
         VendorConfig {
+            id: "default".to_string(),
+            name: String::new(),
+            flavor: VendorFlavor::Legacy,
             base_url: base.to_string(),
             api_key: key.to_string(),
             webhook_path_token: token.to_string(),
@@ -399,80 +407,56 @@ mod tests {
     }
 
     #[test]
-    fn truncate_不切坏多字节字符() {
-        assert_eq!(truncate("中文测试", 2), "中文…");
-        assert_eq!(truncate("abc", 10), "abc");
-    }
-
-    /// 用卖家 `/api/status` 的真实返回做样本
-    #[test]
-    fn 解析系统状态_真实样本() {
-        let raw = r#"{"auto_check":true,"auto_generate":true,"check_interval":"20",
-            "generating":false,"keys_active":200,"keys_dead":5857,"keys_stock":57,
-            "keys_total":6076,"started_at":"2026-07-25 20:59:33","uptime_seconds":7179}"#;
-        let s: VendorSystemStatus = serde_json::from_str(raw).unwrap();
-        assert_eq!(s.keys_active, Some(200));
-        assert_eq!(s.keys_dead, Some(5857));
-        assert_eq!(s.keys_stock, Some(57));
-        assert_eq!(s.keys_total, Some(6076));
-        assert_eq!(s.generating, Some(false));
-        assert_eq!(s.uptime_seconds, Some(7179.0));
-        assert_eq!(s.started_at.as_deref(), Some("2026-07-25 20:59:33"));
-        assert_eq!(s.auto_check, Some(true));
-        assert_eq!(s.auto_generate, Some(true));
-        // 间隔是字符串，不能当数字解析
-        assert_eq!(s.check_interval.as_deref(), Some("20"));
-        assert!(s.extra.is_empty(), "已建模字段不应落进 extra");
-    }
-
-    #[test]
-    fn 解析系统状态_容忍缺字段与未知字段() {
-        // 卖家少给字段时不能整体解析失败，否则状态卡片全空
-        let partial: VendorSystemStatus = serde_json::from_str(r#"{"keys_stock":0}"#).unwrap();
-        assert_eq!(partial.keys_stock, Some(0));
-        assert_eq!(partial.keys_active, None);
-        assert_eq!(partial.uptime_seconds, None);
-
-        // 卖家新增字段走 extra 透传，不报错
-        let unknown: VendorSystemStatus =
-            serde_json::from_str(r#"{"keys_stock":1,"brand_new_field":"x"}"#).unwrap();
-        assert_eq!(
-            unknown.extra.get("brand_new_field").and_then(|v| v.as_str()),
-            Some("x")
-        );
-    }
-
-    /// 用卖家 `/api/my/gen-logs` 的真实返回做样本
-    #[test]
-    fn 解析开号记录_真实样本() {
-        let raw = r#"{"avg_interval_min":52.25,"items":[
-            {"created_at":"2026-07-28 23:27:36","count":200,"status":"done"},
-            {"created_at":"2026-07-28 22:50:45","count":200,"status":"done"}]}"#;
-        let g: GenLogsResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(g.avg_interval_min, Some(52.25));
-        assert_eq!(g.items.len(), 2);
-        assert_eq!(g.items[0].count, Some(200));
-        assert_eq!(g.items[0].status.as_deref(), Some("done"));
-        assert_eq!(g.items[0].created_at.as_deref(), Some("2026-07-28 23:27:36"));
-    }
-
-    #[test]
-    fn 解析开号记录_容忍空与缺字段() {
-        // 从未开号时 items 为空，avg 缺失，不能整体解析失败
-        let empty: GenLogsResponse = serde_json::from_str(r#"{"items":[]}"#).unwrap();
-        assert!(empty.items.is_empty());
-        assert!(empty.avg_interval_min.is_none());
-
-        // 单条缺字段也要能读出其余部分
-        let partial: GenLogsResponse =
-            serde_json::from_str(r#"{"items":[{"count":10}]}"#).unwrap();
-        assert_eq!(partial.items[0].count, Some(10));
-        assert!(partial.items[0].created_at.is_none());
-    }
-
-    #[test]
     fn 客户端拒绝不完整配置() {
         let c = cfg("", "", "");
         assert!(VendorClient::new(&c, None, TlsBackend::Rustls).is_err());
+    }
+
+    #[test]
+    fn 客户端记住风味与能力() {
+        let mut c = cfg("https://v", "km_x", "t");
+        c.flavor = VendorFlavor::Kiroapp;
+        let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
+        assert!(client.capabilities().ledger);
+        assert!(!client.capabilities().gen_logs);
+    }
+
+    #[tokio::test]
+    async fn 不支持的能力不发请求直接报错() {
+        // base_url 指向黑洞地址：若真发了请求会超时而非立刻返回，
+        // 能立刻拿到 unsupported 就证明短路生效
+        let mut c = cfg("http://127.0.0.1:1", "km_x", "t");
+        c.flavor = VendorFlavor::Kiroapp;
+        let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
+
+        let e = client.gen_logs().await.unwrap_err();
+        assert!(e.status.is_none());
+        assert!(e.message.contains("开号记录"), "实际: {}", e.message);
+
+        let e = client.system_status().await.unwrap_err();
+        assert!(e.message.contains("系统状态"));
+
+        let e = client.set_webhook_url("https://x").await.unwrap_err();
+        assert!(e.message.contains("webhook"), "实际: {}", e.message);
+
+        // 反向：legacy 不支持 kiroapp 的独有能力
+        let legacy_client = VendorClient::new(&cfg("http://127.0.0.1:1", "usr-x", "t"), None, TlsBackend::Rustls)
+            .unwrap();
+        assert!(legacy_client.ledger(None, None, None).await.is_err());
+        assert!(legacy_client.my_keys(false, None, None).await.is_err());
+        assert!(legacy_client.earliest_key().await.is_err());
+    }
+
+    #[test]
+    fn 分页参数收敛到卖家上限() {
+        let q = paging(Some(0), Some(9999));
+        assert_eq!(q[0], ("page", "1".to_string()), "页码最小为 1");
+        assert_eq!(
+            q[1],
+            ("page_size", kiroapp::MAX_PAGE_SIZE.to_string()),
+            "每页条数收敛到上限，避免白拿 400"
+        );
+
+        assert!(paging(None, None).is_empty(), "都不传则不加参数");
     }
 }

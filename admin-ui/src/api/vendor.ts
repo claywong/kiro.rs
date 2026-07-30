@@ -7,6 +7,7 @@ import type {
   VendorOrdersResponse,
   VendorPurchaseResult,
   VendorRedeemResult,
+  VendorListResponse,
 } from '@/types/api'
 
 const api = axios.create({
@@ -60,79 +61,137 @@ export function vendorErrorMessage(error: unknown, fallback = '操作失败'): s
   return typeof msg === 'string' && msg ? msg : fallback
 }
 
-/** 顶部状态条：配置状态 + 余额 + 本轮可提取量 + 未确认事件数 */
-export async function getVendorStatus(): Promise<VendorStatus> {
-  const { data } = await api.get<VendorStatus>('/status')
+/** 卖家清单与能力集（不发任何出站请求，保证标签页在卖家不可用时也能渲染） */
+export async function listVendors(): Promise<VendorListResponse> {
+  const { data } = await api.get<VendorListResponse>('/vendors')
+  return data
+}
+
+/** 状态条（单个卖家的余额 / 库存 / 配置状态）。vendorId 缺省时用配置里的第一家。 */
+export async function getVendorStatus(vendorId?: string): Promise<VendorStatus> {
+  const { data } = await api.get<VendorStatus>('/status', {
+    params: vendorId ? { vendorId } : {},
+  })
   return data
 }
 
 /** 事件列表（倒序）+ 未确认数 */
-export async function listVendorEvents(limit = 200): Promise<VendorEventsResponse> {
-  const { data } = await api.get<VendorEventsResponse>('/events', { params: { limit } })
+export async function listVendorEvents(
+  limit = 200,
+  vendorId?: string
+): Promise<VendorEventsResponse> {
+  const { data } = await api.get<VendorEventsResponse>('/events', {
+    params: { limit, ...(vendorId && { vendorId }) },
+  })
   return data
 }
 
-/** 卖家侧最近 50 条提取订单，用于对账 */
-export async function listVendorOrders(): Promise<VendorOrdersResponse> {
-  const { data } = await api.get<VendorOrdersResponse>('/orders')
+/** 卖家侧最近提取订单，用于对账 */
+export async function listVendorOrders(vendorId?: string): Promise<VendorOrdersResponse> {
+  const { data } = await api.get<VendorOrdersResponse>('/orders', {
+    params: vendorId ? { vendorId } : {},
+  })
   return data
 }
 
 /**
  * 按事件提取并入库。
  *
- * 数量一旦提交就与该订单号永久绑定：卖家侧对「同订单号 + 同 count」幂等重放，
- * 换数量会返回 409。若事件已绑定过其它数量，后端直接返回 409 且带 boundCount，
- * 不会白撞一次卖家接口。
+ * `count` 为本次希望提取的数量；若该事件此前已绑定过其它数量，返回 409 并带
+ * `boundCount`，调用方提示用户按该值重试。
  */
 export async function purchaseForEvent(
   eventId: string,
   count: number,
+  vendorId?: string
 ): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>(
-    `/events/${encodeURIComponent(eventId)}/purchase`,
-    { count },
+    `/events/${eventId}/purchase`,
+    { count, vendorId },
+    { params: vendorId ? { vendorId } : {} }
   )
   return data
 }
 
-/** 不依赖事件的直接提取（服务端生成订单号）。会真实扣费，调用前需二次确认。 */
-export async function purchaseAdHoc(count: number): Promise<VendorPurchaseResult> {
-  const { data } = await api.post<VendorPurchaseResult>('/purchase', { count })
+/** 不依赖事件的主动提取（自行生成或指定订单号） */
+export async function purchaseAdHoc(
+  count: number,
+  clientOrderId?: string,
+  vendorId?: string
+): Promise<VendorPurchaseResult> {
+  const { data } = await api.post<VendorPurchaseResult>(
+    '/purchase',
+    { count, clientOrderId, vendorId },
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }
 
 /**
- * 切换提取模式。运行时立即生效，并尽力写回 config.json；
- * 返回的 `persisted=false` 表示只在当前进程生效，重启会回退。
+ * 标记事件已知悉（消红点）。
+ *
+ * - 指定 eventId：该卖家的单条标记
+ * - eventId 为空：该卖家全部标记
+ * - vendorId 也为空：所有卖家全部标记
  */
-export async function setVendorMode(autoPurchase: boolean): Promise<VendorModeChange> {
-  const { data } = await api.put<VendorModeChange>('/mode', { autoPurchase })
-  return data
-}
-
-/** 标记事件已知悉（消红点）。不传 eventId 表示全部标记。 */
-export async function ackVendorEvents(eventId?: string): Promise<{ acked: number }> {
+export async function ackVendorEvents(
+  eventId?: string,
+  vendorId?: string
+): Promise<{ acked: number }> {
   const { data } = await api.post<{ acked: number }>('/events/ack', {
-    event_id: eventId,
+    eventId,
+    vendorId,
   })
   return data
 }
 
 /** 兑换码充值。`replayed=true` 表示这张码此前已兑换，本次未改动余额。 */
-export async function redeemVendorCode(code: string): Promise<VendorRedeemResult> {
-  const { data } = await api.post<VendorRedeemResult>('/redeem', { code })
+export async function redeemVendorCode(
+  code: string,
+  vendorId?: string
+): Promise<VendorRedeemResult> {
+  const { data } = await api.post<VendorRedeemResult>(
+    '/redeem',
+    { code, vendorId },
+    { params: vendorId ? { vendorId } : {} }
+  )
+  return data
+}
+
+/** 切换提取模式 */
+export async function setVendorMode(
+  autoPurchase: boolean,
+  vendorId?: string
+): Promise<VendorModeChange> {
+  const { data } = await api.put<VendorModeChange>(
+    '/mode',
+    { autoPurchase, vendorId },
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }
 
 /** 让卖家往已保存的 URL 推一条测试消息 */
-export async function testVendorWebhook(): Promise<Record<string, unknown>> {
-  const { data } = await api.post<Record<string, unknown>>('/webhook/test')
+export async function testVendorWebhook(
+  vendorId?: string
+): Promise<Record<string, unknown>> {
+  const { data } = await api.post<Record<string, unknown>>(
+    '/webhook/test',
+    {},
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }
 
 /** 把本机 webhook 地址写到卖家侧 */
-export async function setVendorWebhookUrl(webhookUrl: string): Promise<{ ok: boolean }> {
-  const { data } = await api.put<{ ok: boolean }>('/webhook', { webhookUrl })
+export async function setVendorWebhookUrl(
+  webhookUrl: string,
+  vendorId?: string
+): Promise<{ ok: boolean }> {
+  const { data } = await api.put<{ ok: boolean }>(
+    '/webhook',
+    { webhookUrl, vendorId },
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }

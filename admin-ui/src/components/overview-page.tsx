@@ -6,7 +6,7 @@ import { Activity, BellRing, Calendar, Coins, Cpu, Server } from 'lucide-react'
 import { useByCredential, useByModel, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
-import { useVendorUnacked } from '@/hooks/use-vendor'
+import { useVendorUnackedCount } from '@/hooks/use-vendor'
 import type {
   ClientKeyItem,
   CredentialDistribution,
@@ -81,8 +81,8 @@ function timeLabel(filter: StatsTimeFilter): string {
  * 卖家 webhook 不会自动提取 Key，漏看事件就等于漏提，所以在首页也露一条。
  */
 function VendorAlertBanner() {
-  const unacked = useVendorUnacked()
-  if (unacked <= 0) return null
+  const { data: unacked } = useVendorUnackedCount()
+  if (!unacked || unacked <= 0) return null
   return (
     <Card className="mb-4 border-amber-500/40 bg-amber-500/5">
       <CardContent className="flex items-center justify-between gap-3 p-3">

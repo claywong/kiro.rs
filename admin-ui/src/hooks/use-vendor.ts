@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  listVendors,
   getVendorStatus,
   listVendorEvents,
   listVendorOrders,
@@ -12,21 +13,30 @@ import {
   setVendorWebhookUrl,
 } from '@/api/vendor'
 
-/** 状态条：余额 / 库存要打卖家接口，30s 刷新一次，别太频繁 */
-export function useVendorStatus() {
+/** 卖家清单。首次进页面拉取，后续不再刷新（卖家列表运行期不变）。 */
+export function useVendorList() {
   return useQuery({
-    queryKey: ['vendor-status'],
-    queryFn: getVendorStatus,
+    queryKey: ['vendor-list'],
+    queryFn: listVendors,
+    staleTime: Infinity,
+  })
+}
+
+/** 状态条：余额 / 库存要打卖家接口，30s 刷新一次，别太频繁 */
+export function useVendorStatus(vendorId?: string) {
+  return useQuery({
+    queryKey: ['vendor-status', vendorId],
+    queryFn: () => getVendorStatus(vendorId),
     refetchInterval: 30000,
     staleTime: 10000,
   })
 }
 
 /** 事件列表：webhook 随时可能推过来，15s 刷新 */
-export function useVendorEvents(limit = 200) {
+export function useVendorEvents(limit = 200, vendorId?: string) {
   return useQuery({
-    queryKey: ['vendor-events', limit],
-    queryFn: () => listVendorEvents(limit),
+    queryKey: ['vendor-events', limit, vendorId],
+    queryFn: () => listVendorEvents(limit, vendorId),
     refetchInterval: 15000,
     staleTime: 5000,
   })
@@ -35,87 +45,87 @@ export function useVendorEvents(limit = 200) {
 /**
  * 未确认事件数。给 tab 红点和概览页横幅用。
  *
- * 复用 vendor-events 的查询键会拖上整个列表，这里单独走 status（响应更小），
- * 且 status 本身已含 unacked。
+ * 复用 events 接口而不单独读库，避免两边数据不一致导致红点与列表对不上。
+ * 传 limit=1 就能拿到 unacked 计数且不拉完整列表。
  */
-export function useVendorUnacked(): number {
-  const { data } = useVendorStatus()
-  return data?.unacked ?? 0
-}
-
-/** 订单历史：折叠面板展开时才拉 */
-export function useVendorOrders(enabled: boolean) {
+export function useVendorUnackedCount(vendorId?: string) {
   return useQuery({
-    queryKey: ['vendor-orders'],
-    queryFn: listVendorOrders,
-    enabled,
-    staleTime: 30000,
+    queryKey: ['vendor-events', 1, vendorId],
+    queryFn: () => listVendorEvents(1, vendorId),
+    select: (data) => data.unacked,
+    refetchInterval: 30000,
+    staleTime: 10000,
   })
 }
 
-/** 提取后凭据池变了，凭据列表与状态条一并失效 */
-function invalidateAfterPurchase(qc: ReturnType<typeof useQueryClient>) {
-  qc.invalidateQueries({ queryKey: ['vendor-events'] })
-  qc.invalidateQueries({ queryKey: ['vendor-status'] })
-  qc.invalidateQueries({ queryKey: ['vendor-orders'] })
-  qc.invalidateQueries({ queryKey: ['credentials'] })
+/** 卖家侧订单列表（对账用） */
+export function useVendorOrders(vendorId?: string) {
+  return useQuery({
+    queryKey: ['vendor-orders', vendorId],
+    queryFn: () => listVendorOrders(vendorId),
+    staleTime: 60000,
+  })
 }
 
-export function usePurchaseForEvent() {
+/** 按事件提取。成功后刷 events（追加处理状态）和 status（余额 / 库存变化）。 */
+export function usePurchaseForEvent(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: ({ eventId, count }: { eventId: string; count: number }) =>
-      purchaseForEvent(eventId, count),
-    onSuccess: () => invalidateAfterPurchase(qc),
-    // 失败也要刷：后端已把失败原因和绑定数量写回事件行
-    onError: () => invalidateAfterPurchase(qc),
+      purchaseForEvent(eventId, count, vendorId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vendor-events', undefined, vendorId] })
+      qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
+    },
   })
 }
 
-export function usePurchaseAdHoc() {
+/** 直接提取（不依赖事件）。成功后只刷 status。 */
+export function usePurchaseAdHoc(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (count: number) => purchaseAdHoc(count),
-    onSuccess: () => invalidateAfterPurchase(qc),
+    mutationFn: ({ count, clientOrderId }: { count: number; clientOrderId?: string }) =>
+      purchaseAdHoc(count, clientOrderId, vendorId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }
 
-export function useAckVendorEvents() {
+/** 确认事件已知悉。成功后刷 events 拿回新的 unacked。 */
+export function useAckVendorEvents(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (eventId?: string) => ackVendorEvents(eventId),
+    mutationFn: (eventId?: string) => ackVendorEvents(eventId, vendorId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vendor-events'] })
-      qc.invalidateQueries({ queryKey: ['vendor-status'] })
     },
   })
 }
 
 /** 切换提取模式。成功后刷 status 拿回服务端确认的值，不做乐观更新 */
-export function useSetVendorMode() {
+export function useSetVendorMode(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (autoPurchase: boolean) => setVendorMode(autoPurchase),
-    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-status'] }),
+    mutationFn: (autoPurchase: boolean) => setVendorMode(autoPurchase, vendorId),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }
 
-export function useRedeemVendorCode() {
+export function useRedeemVendorCode(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (code: string) => redeemVendorCode(code),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status'] }),
+    mutationFn: (code: string) => redeemVendorCode(code, vendorId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }
 
-export function useTestVendorWebhook() {
-  return useMutation({ mutationFn: testVendorWebhook })
+export function useTestVendorWebhook(vendorId?: string) {
+  return useMutation({ mutationFn: () => testVendorWebhook(vendorId) })
 }
 
-export function useSetVendorWebhookUrl() {
+export function useSetVendorWebhookUrl(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (url: string) => setVendorWebhookUrl(url),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status'] }),
+    mutationFn: (url: string) => setVendorWebhookUrl(url, vendorId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }

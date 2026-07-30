@@ -13,15 +13,22 @@
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
   "vendor": {
-    "baseUrl": "https://your-vendor.example.com",
-    "apiKey": "usr-xxxxxxxxxxxxxxxx",
-    "webhookPathToken": "whk_替换为自己生成的随机串",
-    "defaultGroups": [],
-    "defaultRpmLimit": 10,
-    "autoPurchase": false,
-    "autoPurchaseMaxCount": 1,
-    "autoPurchaseSchedule": [
-      { "from": "14:00", "to": "23:59", "maxCount": 2 }
+    "vendors": [
+      {
+        "id": "primary",
+        "name": "主供应商",
+        "flavor": "kiroapp",
+        "baseUrl": "https://api.kiroapp.io",
+        "apiKey": "usr-xxxxxxxxxxxxxxxx",
+        "inboundToken": "whk_替换为自己生成的随机串_1",
+        "defaultGroups": [],
+        "defaultRpmLimit": 10,
+        "autoPurchase": false,
+        "autoPurchaseMaxCount": 1,
+        "autoPurchaseWindows": [
+          { "start": "14:00", "end": "23:59", "maxCount": 2 }
+        ]
+      }
     ]
   }
 }

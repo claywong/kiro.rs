@@ -188,13 +188,13 @@ function GenLogsDialog({
   )
 }
 
-export function VendorStatusBar() {
-  const { data: status, isLoading } = useVendorStatus()
-  const redeem = useRedeemVendorCode()
-  const testWebhook = useTestVendorWebhook()
-  const setWebhookUrl = useSetVendorWebhookUrl()
-  const purchaseAdHoc = usePurchaseAdHoc()
-  const setMode = useSetVendorMode()
+export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
+  const { data: status, isLoading } = useVendorStatus(vendorId)
+  const redeem = useRedeemVendorCode(vendorId)
+  const testWebhook = useTestVendorWebhook(vendorId)
+  const setWebhookUrl = useSetVendorWebhookUrl(vendorId)
+  const purchaseAdHoc = usePurchaseAdHoc(vendorId)
+  const setMode = useSetVendorMode(vendorId)
   const confirm = useConfirm()
 
   const [redeemOpen, setRedeemOpen] = useState(false)
@@ -311,7 +311,7 @@ export function VendorStatusBar() {
       toast.error('提取数量需为正整数')
       return
     }
-    const balance = profile?.remaining ?? profile?.quota
+    const balance = profile?.balance ?? profile?.quota
     const ok = await confirm({
       title: `确认直接提取 ${n} 个 Key？`,
       description:
@@ -323,7 +323,7 @@ export function VendorStatusBar() {
     })
     if (!ok) return
     try {
-      const r = await purchaseAdHoc.mutateAsync(n)
+      const r = await purchaseAdHoc.mutateAsync({ count: n })
       toast.success(`提取完成：出 ${r.purchased} 个，入库 ${r.imported} 个`, {
         description: [
           r.duplicated ? `重复 ${r.duplicated} 个` : null,
@@ -405,7 +405,7 @@ export function VendorStatusBar() {
           variant="outline"
           size="sm"
           onClick={() => {
-            setWebhookInput(profile?.webhook_url ?? '')
+            setWebhookInput(profile?.webhookUrl ?? '')
             setWebhookOpen(true)
           }}
         >
@@ -428,7 +428,7 @@ export function VendorStatusBar() {
         <Button
           size="sm"
           onClick={() => {
-            setDirectCount(String(status?.stockMax && status.stockMax > 0 ? 1 : 1))
+            setDirectCount(String(status?.stock?.available && status.stock.available > 0 ? 1 : 1))
             setDirectOpen(true)
           }}
         >
@@ -442,12 +442,12 @@ export function VendorStatusBar() {
         <StatCard
           icon={<Wallet className="h-3.5 w-3.5" />}
           label="卖家余额"
-          value={status?.profileError ? '—' : (profile?.remaining ?? profile?.quota ?? '—')}
+          value={status?.profileError ? '—' : (profile?.balance ?? profile?.quota ?? '—')}
           hint={
             status?.profileError
               ? status.profileError
               : profile
-                ? `总额度 ${profile.quota ?? '-'} / 已用 ${profile.used_quota ?? '-'}`
+                ? `总额度 ${profile.quota ?? '-'} / 已用 ${profile.usedQuota ?? '-'}`
                 : undefined
           }
           tone={status?.profileError ? 'warn' : 'normal'}
@@ -455,7 +455,7 @@ export function VendorStatusBar() {
         <StatCard
           icon={<PackageOpen className="h-3.5 w-3.5" />}
           label="本轮可提取"
-          value={status?.stockError ? '—' : (status?.stockMax ?? '—')}
+          value={status?.stockError ? '—' : (status?.stock?.available ?? status?.stockMax ?? '—')}
           hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
           tone={status?.stockError ? 'warn' : 'normal'}
         />
@@ -561,8 +561,8 @@ export function VendorStatusBar() {
                 autoFocus
               />
               <div className="mt-1 text-xs text-muted-foreground">
-                本轮可提取上限 {status?.stockMax ?? '未知'}
-                {profile?.remaining != null ? `，当前余额 ${profile.remaining}` : ''}
+                本轮可提取上限 {status?.stock?.available ?? status?.stockMax ?? '未知'}
+                {profile?.balance != null ? `，当前余额 ${profile.balance}` : ''}
               </div>
             </div>
             <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">

@@ -1,4 +1,8 @@
-//! 卖家对接服务层：事件解析、提取入库、失效确认、告警计数
+//! 单个卖家的对接服务：事件解析、提取入库、失效确认、告警计数
+//!
+//! 一个实例对应一家卖家（一份 [`VendorConfig`]）。多家的注册与分发见
+//! [`super::registry`]。所有存储访问都带本实例的 `vendor_id`，两家的事件、
+//! 绑定数量、失效确认互不干扰。
 //!
 //! 设计约束：提取数量一旦绑定就不可更改（卖家侧同订单号改 count 会 409），
 //! 这是整个模块所有取舍的出发点。
@@ -19,13 +23,37 @@ use crate::http_client::ProxyConfig;
 use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::auto;
-use super::client::{VendorApiError, VendorClient};
+use super::client::VendorClient;
 // 本地新增模块单独成行，避免上游改动这批 use 时反复冲突。
 use super::schedule;
+use super::protocol::{
+    EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
+    StockInfo, VendorApiError, VendorCapabilities, VendorFlavor, VendorKeyInfo,
+};
 use super::store::{
     IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, SharedVendorStore,
     ValidationStatus, VendorEventKind,
 };
+
+/// 单张提取到的 Key 的附带信息（返回给前端）。
+///
+/// **不含密钥明文** —— Key 本身已入凭据池，面板不需要再看一遍。这里只给
+/// 排查与对账要用的元数据：AWS 账号、签发方、以及阶梯定价下这一张的实际单价。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchasedKeyBrief {
+    /// 卖家侧账号名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    /// 这一张实际扣了多少（同一单里各张可能不同）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    /// 该账号是否附带了密码。密码本身不外传，只告知存在性 ——
+    /// 需要时从日志或卖家面板取。
+    pub has_password: bool,
+}
 
 /// 提取入库的汇总结果（返回给前端）
 #[derive(Debug, Clone, serde::Serialize)]
@@ -33,6 +61,10 @@ use super::store::{
 pub struct PurchaseImportResult {
     /// 本次实际绑定并提交的数量
     pub count: u32,
+    /// 卖家回显的请求数。余额不足时卖家会按买得起的数量成交，
+    /// 此时 `purchased < requested`，面板需据此提示「部分成交」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<u32>,
     /// 卖家实际出 Key 数
     pub purchased: u32,
     /// 成功入库数
@@ -44,6 +76,22 @@ pub struct PurchaseImportResult {
     /// 提取后卖家侧剩余余额
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining: Option<f64>,
+    /// 本单实际扣费总额。阶梯定价的卖家下这是唯一权威数字，
+    /// 前端不要用「数量 × 单价」自行估算。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_debit: Option<f64>,
+    /// 本单实际均价
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<f64>,
+    /// 卖家侧订单 / 批次 id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    /// true 表示本次是幂等重放，卖家未重复扣款
+    pub replayed: bool,
+    /// 逐张 Key 的元数据（不含明文）。阶梯定价下各张单价不同，
+    /// 面板靠它解释 `totalDebit` 是怎么来的。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<PurchasedKeyBrief>,
     /// 首条失败原因（便于前端直接展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -65,7 +113,7 @@ pub struct ModeChange {
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
-    /// 未配置卖家对接
+    /// 未配置卖家对接，或指定的 vendorId 不存在
     NotConfigured,
     /// 事件不存在
     EventNotFound,
@@ -95,9 +143,9 @@ impl std::fmt::Display for VendorServiceError {
     }
 }
 
-/// 卖家对接服务
+/// 单个卖家的对接服务
 pub struct VendorService {
-    config: Option<VendorConfig>,
+    config: VendorConfig,
     proxy: Option<ProxyConfig>,
     tls_backend: TlsBackend,
     store: SharedVendorStore,
@@ -109,13 +157,13 @@ pub struct VendorService {
 
 impl VendorService {
     pub fn new(
-        config: Option<VendorConfig>,
+        config: VendorConfig,
         proxy: Option<ProxyConfig>,
         tls_backend: TlsBackend,
         store: SharedVendorStore,
         admin: Arc<AdminService>,
     ) -> Self {
-        let auto_purchase = config.as_ref().is_some_and(|c| c.auto_purchase);
+        let auto_purchase = config.auto_purchase;
         Self {
             config,
             proxy,
@@ -130,10 +178,28 @@ impl VendorService {
         &self.store
     }
 
+    /// 本实例对应的供应商 id
+    pub fn vendor_id(&self) -> &str {
+        self.config.vendor_id()
+    }
+
+    /// 面板展示名
+    pub fn display_name(&self) -> &str {
+        self.config.display_name()
+    }
+
+    pub fn flavor(&self) -> VendorFlavor {
+        self.config.flavor
+    }
+
+    pub fn capabilities(&self) -> VendorCapabilities {
+        self.config.flavor.capabilities()
+    }
+
     /// 启动时的配置快照。`auto_purchase` 字段可能已被面板改过，
     /// 判断提取模式请用 [`Self::auto_purchase`]。
-    pub fn config(&self) -> Option<&VendorConfig> {
-        self.config.as_ref()
+    pub fn config(&self) -> &VendorConfig {
+        &self.config
     }
 
     /// 当前是否为自动提取模式
@@ -164,10 +230,13 @@ impl VendorService {
         }
     }
 
-    /// 写回 config.json 的 `vendor.autoPurchase`。
+    /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
     ///
     /// 重新从磁盘加载再改单个字段，避免把进程内的旧快照整体覆盖上去 ——
     /// 与 `AdminService::persist_log_governance_config` 同一套做法。
+    ///
+    /// 单例 `vendor` 与列表 `vendors` 都要找一遍：同一个 id 只会命中一处
+    /// （`resolved_vendors` 已按 id 去重）。
     fn persist_auto_purchase(&self, enabled: bool) -> anyhow::Result<()> {
         use anyhow::Context;
         let config_path = self
@@ -180,37 +249,56 @@ impl VendorService {
 
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        let vendor = config
-            .vendor
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("config.json 缺少 vendor 段，无法持久化提取模式"))?;
-        vendor.auto_purchase = enabled;
+
+        let target = self.vendor_id();
+        let mut hit = false;
+        if let Some(v) = config.vendor.as_mut()
+            && v.vendor_id() == target
+        {
+            v.auto_purchase = enabled;
+            hit = true;
+        }
+        if !hit {
+            for v in config.vendors.iter_mut() {
+                if v.vendor_id() == target {
+                    v.auto_purchase = enabled;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化提取模式");
+        }
+
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
         Ok(())
     }
 
-    /// 校验入站路径 token。未配置或 token 为空一律拒绝。
+    /// 校验入站路径 token。入站未启用或 token 为空一律拒绝。
     pub fn verify_path_token(&self, token: &str) -> bool {
-        let Some(cfg) = &self.config else {
-            return false;
-        };
-        if !cfg.inbound_enabled() {
+        if !self.config.inbound_enabled() {
             return false;
         }
-        crate::common::auth::constant_time_eq(token, cfg.webhook_path_token.trim())
+        crate::common::auth::constant_time_eq(token, self.config.webhook_path_token.trim())
     }
 
     /// 构建出站客户端
     fn client(&self) -> Result<VendorClient, VendorServiceError> {
-        let cfg = self.config.as_ref().ok_or(VendorServiceError::NotConfigured)?;
-        VendorClient::new(cfg, self.proxy.as_ref(), self.tls_backend)
+        VendorClient::new(&self.config, self.proxy.as_ref(), self.tls_backend)
             .map_err(|_| VendorServiceError::NotConfigured)
     }
 
     /// 解析入站 payload。字段缺失时尽量保留原文，避免丢事件。
-    pub fn parse_event(raw: &[u8]) -> Option<IncomingEvent> {
+    ///
+    /// 幂等键的来源按 flavor 区分：
+    /// - `Legacy`：`purchase_order_id`，由卖家给出
+    /// - `Kiroapp`：`client_order_id`（卖家按「批次 + 收件人」确定性派生，
+    ///   推送重试 / 重启后都是同一个值），另有 `order_id` 是开号批次 id，
+    ///   下单时带上可只拉该批次的 Key
+    pub fn parse_event(vendor_id: &str, flavor: VendorFlavor, raw: &[u8]) -> Option<IncomingEvent> {
         let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
         let obj = value.as_object()?;
         let event_type = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
@@ -222,18 +310,29 @@ impl VendorService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| fallback_event_id(raw));
 
-        Some(IncomingEvent {
-            event_id,
-            kind: VendorEventKind::from_str(event_type),
-            purchase_order_id: obj
-                .get("purchase_order_id")
+        let str_field = |key: &str| {
+            obj.get(key)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string()),
-            message: obj
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(|s| s.to_string())
+        };
+
+        let (purchase_order_id, batch_order_id) = match flavor {
+            VendorFlavor::Legacy => (str_field("purchase_order_id"), None),
+            // 该卖家的幂等键就叫 client_order_id，且已替我们生成好
+            VendorFlavor::Kiroapp => (
+                str_field("client_order_id").or_else(|| str_field("purchase_order_id")),
+                str_field("order_id"),
+            ),
+        };
+
+        Some(IncomingEvent {
+            vendor_id: vendor_id.to_string(),
+            event_id,
+            kind: VendorEventKind::from_str(event_type),
+            purchase_order_id,
+            batch_order_id,
+            message: str_field("message"),
             new_keys: obj.get("new_keys").and_then(|v| v.as_u64()).map(|v| v as u32),
             dead: obj.get("dead").and_then(|v| v.as_u64()).map(|v| v as u32),
             raw_payload: String::from_utf8_lossy(raw).to_string(),
@@ -261,10 +360,11 @@ impl VendorService {
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
+        let vid = self.vendor_id();
 
         let record = self
             .store
-            .get_event(event_id)
+            .get_event(vid, event_id)
             .map_err(|e| VendorServiceError::Storage(e.to_string()))?
             .ok_or(VendorServiceError::EventNotFound)?;
 
@@ -272,11 +372,13 @@ impl VendorService {
             .purchase_order_id
             .clone()
             .ok_or(VendorServiceError::NotPurchasable)?;
+        // 有批次 id 的卖家可定向拉取，避免买到别的批次
+        let batch = record.batch_order_id.clone();
 
         // 抢占绑定：并发点击只有一个能拿到本次 count，其余得到已绑定值
         let effective = match self
             .store
-            .bind_count(event_id, count)
+            .bind_count(vid, event_id, count)
             .map_err(|e| VendorServiceError::Storage(e.to_string()))?
         {
             Ok(v) => v,
@@ -284,8 +386,15 @@ impl VendorService {
             Err(bound) => return Err(VendorServiceError::CountLocked { bound }),
         };
 
-        self.purchase_and_import(&client, event_id, &order_id, effective, trigger)
-            .await
+        self.purchase_and_import(
+            &client,
+            event_id,
+            &order_id,
+            batch.as_deref(),
+            effective,
+            trigger,
+        )
+        .await
     }
 
     /// 不依赖 webhook 事件的主动提取（自行生成订单号）。
@@ -297,22 +406,11 @@ impl VendorService {
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
         let resp = client
-            .purchase(count, client_order_id)
+            .purchase(count, client_order_id, None)
             .await
             .map_err(VendorServiceError::Upstream)?;
-        let remaining = resp.remaining;
-        let keys: Vec<String> = resp.keys.into_iter().map(|k| k.key).collect();
-        let purchased = resp.purchased.max(keys.len() as u32);
-        let outcome = self.import_keys(keys, client_order_id).await;
-        Ok(PurchaseImportResult {
-            count,
-            purchased,
-            imported: outcome.imported,
-            duplicated: outcome.duplicated,
-            failed: outcome.failed,
-            remaining,
-            error: outcome.last_error,
-        })
+        let outcome = self.import_purchased(&resp, client_order_id).await;
+        Ok(build_result(count, &resp, outcome))
     }
 
     /// 提取 + 入库 + 结果写回事件行
@@ -321,10 +419,12 @@ impl VendorService {
         client: &VendorClient,
         event_id: &str,
         order_id: &str,
+        batch_order_id: Option<&str>,
         count: u32,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
-        let resp = match client.purchase(count, order_id).await {
+        let vid = self.vendor_id();
+        let resp = match client.purchase(count, order_id, batch_order_id).await {
             Ok(r) => r,
             Err(e) => {
                 // 记失败但保留 bound_count，便于按同一数量重试
@@ -332,19 +432,19 @@ impl VendorService {
                     last_error: Some(e.to_string()),
                     ..Default::default()
                 };
-                let _ =
-                    self.store
-                        .finish_purchase(event_id, PurchaseStatus::Failed, trigger, &outcome);
+                let _ = self.store.finish_purchase(
+                    vid,
+                    event_id,
+                    PurchaseStatus::Failed,
+                    trigger,
+                    &outcome,
+                );
                 return Err(VendorServiceError::Upstream(e));
             }
         };
 
-        let remaining = resp.remaining;
-        let keys: Vec<String> = resp.keys.into_iter().map(|k| k.key).collect();
-        let purchased = resp.purchased.max(keys.len() as u32);
-
-        let mut outcome = self.import_keys(keys, order_id).await;
-        outcome.purchased = purchased;
+        let mut outcome = self.import_purchased(&resp, order_id).await;
+        outcome.purchased = resp.purchased;
 
         let status = if outcome.failed > 0 && outcome.imported == 0 {
             PurchaseStatus::Failed
@@ -353,42 +453,35 @@ impl VendorService {
         };
         if let Err(e) = self
             .store
-            .finish_purchase(event_id, status, trigger, &outcome)
+            .finish_purchase(vid, event_id, status, trigger, &outcome)
         {
             tracing::warn!("写回提取结果失败 event_id={}: {}", event_id, e);
         }
 
-        Ok(PurchaseImportResult {
-            count,
-            purchased,
-            imported: outcome.imported,
-            duplicated: outcome.duplicated,
-            failed: outcome.failed,
-            remaining,
-            error: outcome.last_error,
-        })
+        Ok(build_result(count, &resp, outcome))
     }
 
-    /// 把提取到的 `ksk_` Key 逐条入库。复用 admin 的 `import_one_credential`：
+    /// 把提取到的 Key 逐条入库。复用 admin 的 `import_one_credential`：
     /// 去重、验活、失败回滚的逻辑与批量导入完全一致。
-    async fn import_keys(&self, keys: Vec<String>, order_id: &str) -> PurchaseOutcome {
-        let cfg = self.config.as_ref();
-        let groups = cfg.map(|c| c.default_groups.clone()).unwrap_or_default();
-        let rpm_limit = cfg.map(|c| c.default_rpm_limit).unwrap_or(10);
+    async fn import_purchased(&self, resp: &PurchaseResult, order_id: &str) -> PurchaseOutcome {
+        let cfg = &self.config;
+        let groups = cfg.default_groups.clone();
+        let rpm_limit = cfg.default_rpm_limit;
         // 缺省/空串表示不写该 region 字段，沿用全局 config
-        let non_empty_region = |value: String| {
+        let non_empty_region = |value: &str| {
             let trimmed = value.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         };
-        let api_region =
-            non_empty_region(cfg.map(|c| c.default_api_region.clone()).unwrap_or_default());
-        let auth_region = non_empty_region(
-            cfg.map(|c| c.default_auth_region.clone())
-                .unwrap_or_default(),
-        );
+        let api_region = non_empty_region(&cfg.default_api_region);
+        let auth_region = non_empty_region(&cfg.default_auth_region);
+        // 来源渠道带上供应商 id，便于按家盘点与对账
+        let source_channel = format!("{}{}:{}", auto::VENDOR_CHANNEL_PREFIX, self.vendor_id(), order_id);
 
         let mut outcome = PurchaseOutcome::default();
-        for key in keys {
+        for item in &resp.keys {
+            if item.key.trim().is_empty() {
+                continue;
+            }
             let req = AddCredentialRequest {
                 refresh_token: None,
                 access_token: None,
@@ -400,7 +493,8 @@ impl VendorService {
                 client_secret: None,
                 start_url: None,
                 token_endpoint: None,
-                issuer_url: None,
+                // 卖家给了 issuer_url 就带上，便于日后按签发方排查
+                issuer_url: item.issuer_url.clone(),
                 scopes: None,
                 priority: 0,
                 rpm_limit,
@@ -412,10 +506,10 @@ impl VendorService {
                 proxy_url: None,
                 proxy_username: None,
                 proxy_password: None,
-                kiro_api_key: Some(key),
+                kiro_api_key: Some(item.key.clone()),
                 endpoint: None,
                 groups: groups.clone(),
-                source_channel: Some(format!("vendor:{order_id}")),
+                source_channel: Some(source_channel.clone()),
             };
 
             let result = self.admin.import_one_credential(req, true).await;
@@ -441,23 +535,26 @@ impl VendorService {
     /// 时刻取本地时区（与 usageStats 一致），容器内需正确设置 `TZ`，
     /// 否则「下午」会按 UTC 判定、偏 8 小时。
     pub fn auto_max_count(&self) -> u32 {
-        let Some(cfg) = self.config.as_ref() else {
-            return 1;
-        };
         schedule::max_count_at(
-            &cfg.auto_purchase_schedule,
-            cfg.auto_purchase_max_count,
+            &self.config.auto_purchase_schedule,
+            self.config.auto_purchase_max_count,
             chrono::Local::now().time(),
         )
     }
 
     /// 当前命中的时段描述（如 `14:00–23:00`），供面板说明「为什么是这个数」
     pub fn auto_active_window(&self) -> Option<String> {
-        let cfg = self.config.as_ref()?;
-        schedule::active_window_label(&cfg.auto_purchase_schedule, chrono::Local::now().time())
+        schedule::active_window_label(
+            &self.config.auto_purchase_schedule,
+            chrono::Local::now().time(),
+        )
     }
 
-    /// 从凭据池取出卖家 Key 的状态切片
+    /// 从凭据池取出**本供应商**的 Key 状态切片。
+    ///
+    /// 按 vendor_id 过滤是多供应商下的关键：A 家推来「全部失效」时，若把 B 家
+    /// 仍然健康的 Key 也算进来，就会永远得不出「已无可用 Key」的结论，
+    /// A 家的自动补货被 B 家挡死。
     fn vendor_key_states(&self) -> Vec<auto::VendorKeyState> {
         self.admin
             .token_manager()
@@ -475,12 +572,14 @@ impl VendorService {
 
     /// 盘点并写入一次确认结论，返回该结论
     fn run_validation_once(&self, event_id: &str, window_expired: bool) -> ValidationStatus {
-        let c = auto::census(&self.vendor_key_states());
+        let vid = self.vendor_id();
+        let c = auto::census(&self.vendor_key_states(), vid);
         let (status, detail) = auto::conclude(c, window_expired);
-        if let Err(e) = self.store.set_validation(event_id, status, &detail) {
+        if let Err(e) = self.store.set_validation(vid, event_id, status, &detail) {
             tracing::warn!("写入失效确认结论失败 event_id={}: {}", event_id, e);
         }
         tracing::info!(
+            vendor_id = %vid,
             event_id = %event_id,
             status = status.as_str(),
             detail = %detail,
@@ -524,8 +623,13 @@ impl VendorService {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys).await {
-                tracing::info!(event_id = %event_id, reason = %reason, "自动提取已跳过");
-                if let Err(e) = svc.store.record_skip(&event_id, &reason) {
+                tracing::info!(
+                    vendor_id = %svc.vendor_id(),
+                    event_id = %event_id,
+                    reason = %reason,
+                    "自动提取已跳过"
+                );
+                if let Err(e) = svc.store.record_skip(svc.vendor_id(), &event_id, &reason) {
                     tracing::warn!("记录跳过原因失败 event_id={}: {}", event_id, e);
                 }
             }
@@ -534,10 +638,12 @@ impl VendorService {
 
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
-        // 1. 失效确认：必须有一条已确认失效、且尚未被消费的 all_keys_dead
+        let vid = self.vendor_id();
+
+        // 1. 失效确认：必须有一条**本供应商的**、已确认失效且尚未被消费的 all_keys_dead
         let dead = self
             .store
-            .latest_dead_event()
+            .latest_dead_event(vid)
             .map_err(|e| format!("读取失效确认记录失败: {e}"))?
             .ok_or_else(|| "尚未收到「全部失效」事件，无法确认旧 Key 已失效".to_string())?;
 
@@ -572,12 +678,12 @@ impl VendorService {
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
         // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
         let configured_max = self.auto_max_count();
-        let count = auto::decide_count(new_keys, stock, configured_max);
+        let count = auto::decide_count(new_keys, stock.available, configured_max);
         if count == 0 {
             return Err(format!(
                 "可提取数量为 0（事件声明 {}，卖家上限 {}，配置上限 {}）",
                 new_keys.map(|v| v.to_string()).unwrap_or("-".into()),
-                stock,
+                stock.available,
                 configured_max
             ));
         }
@@ -585,7 +691,7 @@ impl VendorService {
         // 3. 消费确认额度。抢占式，确保一次确认只授权一轮提取
         let consumed = self
             .store
-            .consume_validation(&dead.event_id)
+            .consume_validation(vid, &dead.event_id)
             .map_err(|e| format!("消费失效确认失败: {e}"))?;
         if !consumed {
             return Err("失效确认已被其他自动提取取用".to_string());
@@ -593,6 +699,7 @@ impl VendorService {
 
         // 4. 下单。此处开始不可逆
         tracing::info!(
+            vendor_id = %vid,
             event_id = %event_id,
             count,
             dead_event = %dead.event_id,
@@ -604,9 +711,11 @@ impl VendorService {
         {
             Ok(r) => {
                 tracing::info!(
+                    vendor_id = %vid,
                     event_id = %event_id,
                     purchased = r.purchased,
                     imported = r.imported,
+                    total_debit = ?r.total_debit,
                     "自动提取完成"
                 );
                 Ok(())
@@ -621,73 +730,140 @@ impl VendorService {
 
     // ============ 出站只读 / 运营接口 ============
 
-    pub async fn stock(&self) -> Result<u32, VendorServiceError> {
-        let client = self.client()?;
-        client
+    /// 库存与报价
+    pub async fn stock(&self) -> Result<StockInfo, VendorServiceError> {
+        self.client()?
             .stock()
             .await
-            .map(|s| s.max)
             .map_err(VendorServiceError::Upstream)
     }
 
-    pub async fn profile(&self) -> Result<super::client::ProfileResponse, VendorServiceError> {
-        let client = self.client()?;
-        client.profile().await.map_err(VendorServiceError::Upstream)
+    pub async fn profile(&self) -> Result<ProfileInfo, VendorServiceError> {
+        self.client()?
+            .profile()
+            .await
+            .map_err(VendorServiceError::Upstream)
     }
 
-    /// 卖家系统状态：存活 / 失效 / 存货 Key 数
+    /// 卖家系统状态：存活 / 失效 / 存货 Key 数（仅部分卖家支持）
     pub async fn system_status(
         &self,
-    ) -> Result<super::client::VendorSystemStatus, VendorServiceError> {
-        let client = self.client()?;
-        client
+    ) -> Result<super::flavor_legacy::VendorSystemStatus, VendorServiceError> {
+        self.client()?
             .system_status()
             .await
             .map_err(VendorServiceError::Upstream)
     }
 
-    /// 最近 50 条提取订单，用于跟本地事件对账、发现漏提
+    /// 历史提取订单，用于跟本地事件对账、发现漏提
     pub async fn purchase_orders(
         &self,
-    ) -> Result<Vec<super::client::PurchaseOrder>, VendorServiceError> {
-        let client = self.client()?;
-        client
-            .purchase_orders()
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Paged<OrderInfo>, VendorServiceError> {
+        self.client()?
+            .purchase_orders(page, page_size)
             .await
             .map_err(VendorServiceError::Upstream)
     }
 
-    /// 卖家近期开号批次与平均间隔
-    pub async fn gen_logs(&self) -> Result<super::client::GenLogsResponse, VendorServiceError> {
-        let client = self.client()?;
-        client.gen_logs().await.map_err(VendorServiceError::Upstream)
+    /// 卖家近期开号批次与平均间隔（仅部分卖家支持）
+    pub async fn gen_logs(
+        &self,
+    ) -> Result<super::flavor_legacy::GenLogsResponse, VendorServiceError> {
+        self.client()?
+            .gen_logs()
+            .await
+            .map_err(VendorServiceError::Upstream)
     }
 
-    pub async fn redeem(
+    /// 积分流水（仅部分卖家支持）
+    pub async fn ledger(
         &self,
-        code: &str,
-    ) -> Result<super::client::RedeemResponse, VendorServiceError> {
-        let client = self.client()?;
-        client
+        page: Option<u32>,
+        page_size: Option<u32>,
+        entry_type: Option<&str>,
+    ) -> Result<Paged<LedgerEntry>, VendorServiceError> {
+        self.client()?
+            .ledger(page, page_size, entry_type)
+            .await
+            .map_err(VendorServiceError::Upstream)
+    }
+
+    /// 名下密钥列表（仅部分卖家支持）。库存接口不给时间，
+    /// 这里的 `created_at`（开号时刻）是判断 Key 新鲜度的唯一来源。
+    pub async fn my_keys(
+        &self,
+        history: bool,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Paged<VendorKeyInfo>, VendorServiceError> {
+        self.client()?
+            .my_keys(history, page, page_size)
+            .await
+            .map_err(VendorServiceError::Upstream)
+    }
+
+    /// 最早密钥时间与总数，估算账龄用（仅部分卖家支持）
+    pub async fn earliest_key(&self) -> Result<EarliestKeyInfo, VendorServiceError> {
+        self.client()?
+            .earliest_key()
+            .await
+            .map_err(VendorServiceError::Upstream)
+    }
+
+    pub async fn redeem(&self, code: &str) -> Result<RedeemResult, VendorServiceError> {
+        self.client()?
             .redeem(code)
             .await
             .map_err(VendorServiceError::Upstream)
     }
 
     pub async fn test_webhook(&self) -> Result<serde_json::Value, VendorServiceError> {
-        let client = self.client()?;
-        client
+        self.client()?
             .test_webhook()
             .await
             .map_err(VendorServiceError::Upstream)
     }
 
     pub async fn set_webhook_url(&self, url: &str) -> Result<(), VendorServiceError> {
-        let client = self.client()?;
-        client
+        self.client()?
             .set_webhook_url(url)
             .await
             .map_err(VendorServiceError::Upstream)
+    }
+}
+
+/// 汇总下单响应与入库结果为面板可读的结构
+fn build_result(
+    count: u32,
+    resp: &PurchaseResult,
+    outcome: PurchaseOutcome,
+) -> PurchaseImportResult {
+    PurchaseImportResult {
+        count,
+        requested: resp.requested,
+        purchased: resp.purchased,
+        imported: outcome.imported,
+        duplicated: outcome.duplicated,
+        failed: outcome.failed,
+        remaining: resp.remaining,
+        total_debit: resp.total_debit,
+        unit_price: resp.unit_price,
+        order_id: resp.order_id.clone(),
+        replayed: resp.replayed,
+        keys: resp
+            .keys
+            .iter()
+            .map(|k| PurchasedKeyBrief {
+                account: k.account.clone(),
+                issuer_url: k.issuer_url.clone(),
+                price: k.price,
+                // 只透出存在性，密码不出后端
+                has_password: k.password.as_deref().is_some_and(|p| !p.trim().is_empty()),
+            })
+            .collect(),
+        error: outcome.last_error,
     }
 }
 
@@ -703,10 +879,18 @@ fn fallback_event_id(raw: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn parse_legacy(raw: &[u8]) -> Option<IncomingEvent> {
+        VendorService::parse_event("default", VendorFlavor::Legacy, raw)
+    }
+
+    fn parse_kiroapp(raw: &[u8]) -> Option<IncomingEvent> {
+        VendorService::parse_event("kiroapp", VendorFlavor::Kiroapp, raw)
+    }
+
     #[test]
     fn 解析新key就绪事件() {
         let raw = r#"{"event":"new_keys_available","event_id":"abc123","purchase_order_id":"0123456789abcdef0123456789abcdef","message":"新一轮 10 个 Key 已就绪","new_keys":10}"#;
-        let e = VendorService::parse_event(raw.as_bytes()).unwrap();
+        let e = parse_legacy(raw.as_bytes()).unwrap();
         assert_eq!(e.event_id, "abc123");
         assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
         assert_eq!(
@@ -715,12 +899,15 @@ mod tests {
         );
         assert_eq!(e.new_keys, Some(10));
         assert_eq!(e.dead, None);
+        assert_eq!(e.vendor_id, "default");
+        // 该 flavor 没有批次概念
+        assert!(e.batch_order_id.is_none());
     }
 
     #[test]
     fn 解析全部失效事件() {
         let raw = r#"{"event":"all_keys_dead","event_id":"def456","message":"本轮全部 5 个 Key 已失效","dead":5}"#;
-        let e = VendorService::parse_event(raw.as_bytes()).unwrap();
+        let e = parse_legacy(raw.as_bytes()).unwrap();
         assert_eq!(e.kind, VendorEventKind::AllKeysDead);
         assert_eq!(e.dead, Some(5));
         assert!(e.purchase_order_id.is_none());
@@ -729,23 +916,152 @@ mod tests {
     #[test]
     fn 缺失event_id时用原文哈希兜底且稳定() {
         let raw = br#"{"event":"all_keys_dead","dead":3}"#;
-        let a = VendorService::parse_event(raw).unwrap();
-        let b = VendorService::parse_event(raw).unwrap();
+        let a = parse_legacy(raw).unwrap();
+        let b = parse_legacy(raw).unwrap();
         assert_eq!(a.event_id, b.event_id);
         assert_eq!(a.event_id.len(), 32);
     }
 
     #[test]
     fn 非法json返回none() {
-        assert!(VendorService::parse_event(b"not json").is_none());
+        assert!(parse_legacy(b"not json").is_none());
         // 顶层非对象也拒绝
-        assert!(VendorService::parse_event(b"[1,2,3]").is_none());
+        assert!(parse_legacy(b"[1,2,3]").is_none());
     }
 
     #[test]
     fn 未知事件类型归为unknown() {
         let raw = br#"{"event":"brand_new","event_id":"x1"}"#;
-        let e = VendorService::parse_event(raw).unwrap();
+        let e = parse_legacy(raw).unwrap();
         assert_eq!(e.kind, VendorEventKind::Unknown);
+    }
+
+    // ============ kiroapp 的推送形态 ============
+
+    /// 文档给的 webhook 样本：幂等键叫 client_order_id，另有 order_id 是批次 id
+    #[test]
+    fn 解析kiroapp推送_真实样本() {
+        let raw = r#"{"event":"new_keys_available","event_id":"uniq-1",
+            "order_id":"batch-77","client_order_id":"d5c4fd9460b70fb8e944bd7faa519896",
+            "mother_id":"m-1","visibility":"public",
+            "message":"母号新开号完成，20 个 Key 就绪","new_keys":20}"#;
+        let e = parse_kiroapp(raw.as_bytes()).unwrap();
+        assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
+        // 幂等键取 client_order_id —— 卖家已按「批次 + 收件人」派生好，不能自己生成
+        assert_eq!(
+            e.purchase_order_id.as_deref(),
+            Some("d5c4fd9460b70fb8e944bd7faa519896")
+        );
+        // 批次 id 单独留存，下单时带上只拉这一批
+        assert_eq!(e.batch_order_id.as_deref(), Some("batch-77"));
+        assert_eq!(e.new_keys, Some(20));
+        assert_eq!(e.vendor_id, "kiroapp");
+    }
+
+    #[test]
+    fn kiroapp_识别滥用回收与测试事件() {
+        let e = parse_kiroapp(br#"{"event":"key_revoked_abuse","event_id":"r1"}"#).unwrap();
+        assert_eq!(e.kind, VendorEventKind::KeyRevokedAbuse);
+
+        let t = parse_kiroapp(br#"{"event":"test","event_id":"t1"}"#).unwrap();
+        assert_eq!(t.kind, VendorEventKind::Test);
+    }
+
+    #[test]
+    fn kiroapp_缺client_order_id时回退旧字段名() {
+        // 防御性：卖家若改回通用字段名，仍能拿到幂等键而不是丢掉提取能力
+        let raw = br#"{"event":"new_keys_available","event_id":"x",
+            "purchase_order_id":"aabb","new_keys":1}"#;
+        let e = parse_kiroapp(raw).unwrap();
+        assert_eq!(e.purchase_order_id.as_deref(), Some("aabb"));
+    }
+
+    #[test]
+    fn 空字符串字段视为缺失() {
+        let raw = br#"{"event":"new_keys_available","event_id":"x",
+            "client_order_id":"  ","order_id":""}"#;
+        let e = parse_kiroapp(raw).unwrap();
+        assert!(e.purchase_order_id.is_none(), "空白订单号不能当成有效幂等键");
+        assert!(e.batch_order_id.is_none());
+    }
+
+    #[test]
+    fn 汇总结果保留阶梯定价明细且不外传密码() {
+        use super::super::protocol::PurchasedKey;
+        let resp = PurchaseResult {
+            purchased: 2,
+            requested: Some(5),
+            remaining: Some(115.0),
+            unit_price: Some(35.0),
+            total_debit: Some(70.0),
+            order_id: Some("batch-1".to_string()),
+            replayed: false,
+            keys: vec![
+                PurchasedKey {
+                    key: "sk-a".to_string(),
+                    account: Some("user-a".to_string()),
+                    password: Some("secret".to_string()),
+                    issuer_url: Some("https://i".to_string()),
+                    price: Some(30.0),
+                },
+                PurchasedKey {
+                    key: "sk-b".to_string(),
+                    account: None,
+                    password: None,
+                    issuer_url: None,
+                    price: Some(40.0),
+                },
+            ],
+        };
+        let outcome = PurchaseOutcome {
+            purchased: 2,
+            imported: 2,
+            ..Default::default()
+        };
+        let r = build_result(5, &resp, outcome);
+
+        // 部分成交要能被面板识别
+        assert_eq!(r.requested, Some(5));
+        assert_eq!(r.purchased, 2);
+        // 阶梯定价：总价取卖家权威数字，不是数量 × 单价
+        assert_eq!(r.total_debit, Some(70.0));
+        assert_eq!(r.keys.len(), 2);
+        assert_eq!(r.keys[0].price, Some(30.0));
+        assert_eq!(r.keys[1].price, Some(40.0));
+        assert_eq!(r.keys[0].account.as_deref(), Some("user-a"));
+
+        // 密码只透出存在性
+        assert!(r.keys[0].has_password);
+        assert!(!r.keys[1].has_password);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("secret"), "密码不能出现在响应里: {json}");
+        assert!(!json.contains("sk-a"), "密钥明文不能出现在响应里");
+    }
+
+    #[test]
+    fn 空白密码不算有密码() {
+        use super::super::protocol::PurchasedKey;
+        let resp = PurchaseResult {
+            purchased: 1,
+            keys: vec![PurchasedKey {
+                key: "k".to_string(),
+                account: None,
+                password: Some("   ".to_string()),
+                issuer_url: None,
+                price: None,
+            }],
+            ..Default::default()
+        };
+        let r = build_result(1, &resp, PurchaseOutcome::default());
+        assert!(!r.keys[0].has_password);
+    }
+
+    #[test]
+    fn 同一payload不同供应商各自归属() {
+        let raw = br#"{"event":"new_keys_available","event_id":"same"}"#;
+        let a = VendorService::parse_event("a", VendorFlavor::Legacy, raw).unwrap();
+        let b = VendorService::parse_event("b", VendorFlavor::Legacy, raw).unwrap();
+        assert_eq!(a.event_id, b.event_id);
+        assert_ne!(a.vendor_id, b.vendor_id);
     }
 }

@@ -26,13 +26,15 @@ export function VendorPurchaseDialog({
   status,
   open,
   onOpenChange,
+  vendorId,
 }: {
   event: VendorEvent | null
   status?: VendorStatus
   open: boolean
   onOpenChange: (open: boolean) => void
+  vendorId?: string
 }) {
-  const purchase = usePurchaseForEvent()
+  const purchase = usePurchaseForEvent(vendorId)
   const [count, setCount] = useState('')
 
   const locked = event?.boundCount != null
@@ -41,9 +43,9 @@ export function VendorPurchaseDialog({
   useEffect(() => {
     if (!event) return
     // 已绑定则强制显示绑定值；首次提取取事件声明数量与当前上限的较小值
-    const availableCount = Math.min(event.newKeys ?? 1, status?.stockMax ?? Infinity)
+    const availableCount = Math.min(event.newKeys ?? 1, status?.stock?.available ?? status?.stockMax ?? Infinity)
     setCount(String(boundCount ?? availableCount))
-  }, [event, boundCount, status?.stockMax])
+  }, [event, boundCount, status?.stock?.available, status?.stockMax])
 
   const handleSubmit = async () => {
     if (!event) return
@@ -109,7 +111,7 @@ export function VendorPurchaseDialog({
                 <span>
                   数量提交后与该订单号永久绑定，卖家侧不允许改数量重试。
                   {event.newKeys != null && `本次事件声明 ${event.newKeys} 个`}
-                  {status?.stockMax != null && `，当前可提取上限 ${status.stockMax}`}。
+                  {(status?.stock?.available != null || status?.stockMax != null) && `，当前可提取上限 ${status.stock?.available ?? status.stockMax}`}。
                 </span>
               </div>
             )}

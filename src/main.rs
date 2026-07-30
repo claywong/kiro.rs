@@ -289,13 +289,20 @@ async fn main() {
             vendor::VendorStore::open_in_memory().expect("内存卖家事件库初始化失败")
         }),
     );
-    let vendor_state = vendor::VendorState::new(std::sync::Arc::new(vendor::VendorService::new(
-        config.vendor.clone(),
+    // 多卖家注册表：合并 config 的 `vendor` 单例与 `vendors` 列表，各家一个服务实例。
+    let vendor_registry = std::sync::Arc::new(vendor::VendorRegistry::from_config(
+        &config,
         proxy_config_for_vendor.clone(),
         config.tls_backend,
         vendor_store.clone(),
         admin_service.clone(),
-    )));
+    ));
+    if vendor_registry.is_empty() {
+        tracing::info!("未配置卖家对接，vendor 相关接口将返回未配置");
+    } else {
+        tracing::info!("卖家对接已启用，共 {} 家", vendor_registry.len());
+    }
+    let vendor_state = vendor::VendorState::new(vendor_registry);
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),

@@ -6,7 +6,7 @@ import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Store } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
-import { useVendorUnacked } from "@/hooks/use-vendor";
+import { useVendorUnackedCount } from "@/hooks/use-vendor";
 
 function GithubIcon({ className }: { className?: string }) {
   return (
@@ -265,7 +265,7 @@ function DesktopTabs({
   onSwitchTab: (next: Tab) => void;
   tab: Tab;
 }) {
-  const vendorUnacked = useVendorUnacked();
+  const { data: vendorUnacked } = useVendorUnackedCount();
   return (
     <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 xl:flex">
       {TABS.map((t) => (
@@ -338,7 +338,7 @@ function MobileTabs({
   onSwitchTab: (next: Tab) => void;
   tab: Tab;
 }) {
-  const vendorUnacked = useVendorUnacked();
+  const { data: vendorUnacked } = useVendorUnackedCount();
   return (
     <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (

@@ -605,17 +605,56 @@ export interface UpdateGroupRequest {
 
 // ============ 卖家（Key 供应商）对接 ============
 
-/** 卖家账号余额与 webhook 配置（`GET /api/my/profile` 原样透出） */
-export interface VendorProfile {
-  name?: string
-  quota?: number
-  remaining?: number
-  used_quota?: number
-  webhook_url?: string
+/** 单个卖家支持的能力集。前端据此决定是否展示对应卡片。 */
+export interface VendorCapabilities {
+  systemStatus: boolean
+  genLogs: boolean
+  webhookManage: boolean
+  purchaseOrders: boolean
+  redeem: boolean
+  ledger: boolean
+  myKeys: boolean
+  earliestKey: boolean
+  batchScopedPurchase: boolean
+  tieredPricing: boolean
 }
 
-/** 顶部状态条 */
+/** 卖家清单项 */
+export interface VendorListItem {
+  vendorId: string
+  name: string
+  flavor: 'legacy' | 'kiroapp'
+  capabilities: VendorCapabilities
+  inboundEnabled: boolean
+  autoPurchase: boolean
+  unacked: number
+}
+
+/** `GET /api/admin/vendor/vendors` 响应 */
+export interface VendorListResponse {
+  vendors: VendorListItem[]
+  defaultVendorId?: string
+}
+
+/** 卖家账号档案（已统一为 camelCase） */
+export interface VendorProfile {
+  name?: string
+  email?: string
+  balance?: number
+  quota?: number
+  usedQuota?: number
+  minPurchase?: number
+  maxPurchase?: number
+  webhookUrl?: string
+  createdAt?: string
+}
+
+/** 顶部状态条（单个卖家的） */
 export interface VendorStatus {
+  vendorId: string
+  name: string
+  flavor: 'legacy' | 'kiroapp'
+  capabilities: VendorCapabilities
   /** baseUrl + apiKey 均已配置，出站接口可用 */
   configured: boolean
   /** 额外配了路径 token，入站 webhook 可用 */
@@ -643,15 +682,24 @@ export interface VendorStatus {
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
-  /** 本轮最大可提取数量 */
+  /** 库存与报价。stock 是新结构(带价格区间)，stockMax 是兼容字段 */
+  stock?: {
+    available: number
+    priceMin?: number
+    priceMax?: number
+    balance?: number
+  }
   stockMax?: number
   stockError?: string
-  /** 卖家 /api/status：存活 / 失效 / 存货 Key 数 */
+  /** 卖家 /api/status：存活 / 失效 / 存货 Key 数（仅部分卖家支持） */
   system?: VendorSystemStatus
   systemError?: string
-  /** 卖家近期开号批次与平均间隔，用于估算下一批新 Key 何时到 */
+  /** 卖家近期开号批次与平均间隔（仅部分卖家支持） */
   genLogs?: VendorGenLogs
   genLogsError?: string
+  /** 最早密钥时间（仅部分卖家支持） */
+  earliestKey?: { createdAt?: string; count?: number }
+  earliestKeyError?: string
 }
 
 /** 切换提取模式的结果 */
@@ -758,6 +806,8 @@ export interface VendorOrdersResponse {
 export interface VendorPurchaseResult {
   /** 本次绑定并提交的数量 */
   count: number
+  /** 卖家回显的请求数。余额不足时 purchased < requested */
+  requested?: number
   /** 卖家实际出 Key 数 */
   purchased: number
   /** 成功入库数 */
@@ -767,9 +817,26 @@ export interface VendorPurchaseResult {
   failed: number
   /** 提取后卖家侧剩余余额 */
   remaining?: number
+  /** 本单实际扣费总额（阶梯定价下的权威数字） */
+  totalDebit?: number
+  /** 本单实际均价 */
+  unitPrice?: number
+  /** 卖家侧订单 / 批次 id */
+  orderId?: string
+  /** true 表示本次是幂等重放，卖家未重复扣款 */
+  replayed?: boolean
+  /** 逐张 Key 的元数据（不含明文） */
+  keys?: Array<{
+    account?: string
+    issuerUrl?: string
+    price?: number
+    hasPassword?: boolean
+  }>
   error?: string
   /** 直接提取时服务端生成的订单号 */
   clientOrderId?: string
+  /** 提取来自哪一家（直接提取时回显） */
+  vendorId?: string
 }
 
 /** 兑换码充值结果 */

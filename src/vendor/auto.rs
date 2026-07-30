@@ -80,16 +80,39 @@ fn classify(entry: &VendorKeyState) -> KeyHealth {
     KeyHealth::Alive
 }
 
-/// 盘点凭据池里所有来自卖家的 Key。
+/// 从 `source_channel` 解出供应商 id。
 ///
-/// 按 `source_channel` 的 `vendor:` 前缀筛选 —— 自建或其他渠道导入的凭据
-/// 与卖家轮换无关，不该影响补货判断。
-pub fn census(entries: &[VendorKeyState]) -> VendorKeyCensus {
+/// 两种历史格式都要认：
+/// - 多供应商（当前）：`vendor:{vendor_id}:{order_id}`
+/// - 单供应商（存量）：`vendor:{order_id}` —— 归属默认供应商
+///
+/// 非卖家渠道返回 None。存量格式的 order_id 是 32 位十六进制，而供应商 id
+/// 由用户自取，故靠「是否还有第二个冒号」区分，不靠内容猜。
+pub fn vendor_id_of(source_channel: &str) -> Option<&str> {
+    let rest = source_channel.strip_prefix(VENDOR_CHANNEL_PREFIX)?;
+    match rest.split_once(':') {
+        // vendor:{vendor_id}:{order_id}
+        Some((vid, _)) if !vid.is_empty() => Some(vid),
+        // vendor:{order_id} —— 单供应商时期写入的，归默认那一家
+        _ => Some(crate::model::config::DEFAULT_VENDOR_ID),
+    }
+}
+
+/// 盘点凭据池里属于**指定供应商**的 Key。
+///
+/// 两层筛选：
+/// 1. `source_channel` 带 `vendor:` 前缀 —— 自建或其他渠道导入的凭据
+///    与卖家轮换无关，不该影响补货判断。
+/// 2. 前缀里的供应商 id 等于 `vendor_id` —— 多供应商下，A 家推来「全部失效」时
+///    若把 B 家健康的 Key 也算进来，就永远得不出「已无可用 Key」的结论，
+///    A 家的自动补货会被 B 家挡死。
+pub fn census(entries: &[VendorKeyState], vendor_id: &str) -> VendorKeyCensus {
     let mut c = VendorKeyCensus::default();
     for entry in entries.iter().filter(|e| {
         e.source_channel
             .as_deref()
-            .is_some_and(|s| s.starts_with(VENDOR_CHANNEL_PREFIX))
+            .and_then(vendor_id_of)
+            .is_some_and(|vid| vid == vendor_id)
     }) {
         c.total += 1;
         match classify(entry) {
@@ -164,6 +187,9 @@ pub fn decide_count(new_keys: Option<u32>, stock_max: u32, configured_max: u32) 
 mod tests {
     use super::*;
 
+    /// 存量测试用例都写的 `vendor:abc` 形式（单供应商时期格式），归默认那一家
+    const DEFAULT: &str = crate::model::config::DEFAULT_VENDOR_ID;
+
     fn entry(
         channel: Option<&str>,
         disabled: bool,
@@ -185,7 +211,7 @@ mod tests {
             entry(Some("手动导入"), false, None, 0),
             entry(None, false, None, 0),
         ];
-        let c = census(&entries);
+        let c = census(&entries, DEFAULT);
         assert_eq!(c.total, 1);
         assert_eq!(c.dead, 1);
         assert_eq!(c.alive, 0);
@@ -194,7 +220,7 @@ mod tests {
     #[test]
     fn 人工禁用归为待定而非失效() {
         let entries = vec![entry(Some("vendor:abc"), true, Some("Manual"), 0)];
-        let c = census(&entries);
+        let c = census(&entries, DEFAULT);
         assert_eq!(c.ambiguous, 1);
         assert_eq!(c.dead, 0);
         // 待定 Key 同样不可用，不阻塞确认，且无需等窗口走完
@@ -211,7 +237,7 @@ mod tests {
             entry(Some("vendor:b"), true, Some("Manual"), 0),
             entry(Some("vendor:c"), true, Some("TooManyFailures"), 3),
         ];
-        let c = census(&entries);
+        let c = census(&entries, DEFAULT);
         assert_eq!(c.ambiguous, 2);
         assert_eq!(c.dead, 1);
         assert_eq!(c.alive, 0);
@@ -226,7 +252,7 @@ mod tests {
             entry(Some("vendor:a"), true, Some("Manual"), 0),
             entry(Some("vendor:b"), false, None, 0),
         ];
-        let c = census(&entries);
+        let c = census(&entries, DEFAULT);
         assert_eq!(conclude(c, true).0, ValidationStatus::StillAlive);
     }
 
@@ -236,7 +262,7 @@ mod tests {
             entry(Some("vendor:a"), true, Some("TooManyFailures"), 3),
             entry(Some("vendor:b"), true, Some("InvalidRefreshToken"), 0),
         ];
-        let (status, detail) = conclude(census(&entries), false);
+        let (status, detail) = conclude(census(&entries, DEFAULT), false);
         assert_eq!(status, ValidationStatus::ConfirmedDead);
         assert!(detail.contains('2'));
     }
@@ -247,7 +273,7 @@ mod tests {
             entry(Some("vendor:a"), true, Some("TooManyFailures"), 3),
             entry(Some("vendor:b"), false, None, 0),
         ];
-        let c = census(&entries);
+        let c = census(&entries, DEFAULT);
         assert_eq!(conclude(c, false).0, ValidationStatus::Pending);
         // 窗口结束才落定为「仍然健康」
         assert_eq!(conclude(c, true).0, ValidationStatus::StillAlive);
@@ -256,14 +282,14 @@ mod tests {
     #[test]
     fn 未达阈值的失败仍算健康() {
         let entries = vec![entry(Some("vendor:a"), false, None, 2)];
-        assert_eq!(census(&entries).alive, 1);
+        assert_eq!(census(&entries, DEFAULT).alive, 1);
         let entries = vec![entry(Some("vendor:a"), false, None, 3)];
-        assert_eq!(census(&entries).dead, 1);
+        assert_eq!(census(&entries, DEFAULT).dead, 1);
     }
 
     #[test]
     fn 池里没有卖家key时直接确认() {
-        let (status, _) = conclude(census(&[]), false);
+        let (status, _) = conclude(census(&[], DEFAULT), false);
         assert_eq!(status, ValidationStatus::ConfirmedDead);
     }
 
@@ -273,5 +299,63 @@ mod tests {
         assert_eq!(decide_count(Some(10), 0, 3), 0);
         assert_eq!(decide_count(None, 5, 3), 0);
         assert_eq!(decide_count(Some(2), 5, 3), 2);
+    }
+
+    // ============ 多供应商归属 ============
+
+    #[test]
+    fn 解析来源渠道的供应商归属() {
+        // 多供应商格式
+        assert_eq!(vendor_id_of("vendor:kiroapp:abc123"), Some("kiroapp"));
+        // 单供应商存量格式 → 默认那一家
+        assert_eq!(vendor_id_of("vendor:abc123"), Some(DEFAULT));
+        // 非卖家渠道
+        assert_eq!(vendor_id_of("手动导入"), None);
+        assert_eq!(vendor_id_of(""), None);
+    }
+
+    /// 多供应商下最关键的一条：A 家的盘点不能把 B 家的 Key 算进来，
+    /// 否则 B 家健康时 A 家永远得不出「已无可用 Key」，自动补货被挡死。
+    #[test]
+    fn 盘点只算本家的key() {
+        let entries = vec![
+            // A 家两张全失效
+            entry(Some("vendor:a:o1"), true, Some("TooManyFailures"), 3),
+            entry(Some("vendor:a:o2"), true, Some("InvalidRefreshToken"), 0),
+            // B 家一张健康
+            entry(Some("vendor:b:o3"), false, None, 0),
+        ];
+
+        let a = census(&entries, "a");
+        assert_eq!(a.total, 2);
+        assert_eq!(a.dead, 2);
+        assert_eq!(a.alive, 0);
+        // A 家可以确认失效，不受 B 家健康 Key 影响
+        assert_eq!(conclude(a, false).0, ValidationStatus::ConfirmedDead);
+
+        let b = census(&entries, "b");
+        assert_eq!(b.total, 1);
+        assert_eq!(b.alive, 1);
+        assert_eq!(conclude(b, true).0, ValidationStatus::StillAlive);
+    }
+
+    #[test]
+    fn 存量渠道归属默认供应商() {
+        let entries = vec![
+            // 单供应商时期写入的，无供应商段
+            entry(Some("vendor:oldorder"), false, None, 0),
+            entry(Some("vendor:kiroapp:new"), false, None, 0),
+        ];
+        assert_eq!(census(&entries, DEFAULT).total, 1);
+        assert_eq!(census(&entries, "kiroapp").total, 1);
+    }
+
+    #[test]
+    fn 未配置的供应商盘点为空() {
+        let entries = vec![entry(Some("vendor:a:o1"), false, None, 0)];
+        let c = census(&entries, "不存在的家");
+        assert_eq!(c.total, 0);
+        // 池里没有本家的 Key → 补货前提天然成立
+        assert_eq!(conclude(c, false).0, ValidationStatus::ConfirmedDead);
     }
 }
