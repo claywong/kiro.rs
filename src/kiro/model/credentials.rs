@@ -190,6 +190,28 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 凭据创建时间（RFC3339 格式）
+    ///
+    /// 记录凭据首次录入系统的时间。导入已有凭据时可手动指定，否则自动记录当前时间。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    /// 凭据存活时长（秒）
+    ///
+    /// 累计该凭据处于可用状态的时长。从录入开始计时，每次成功调用后更新；
+    /// 被禁用（disabled=true）时停止累计。重新启用后继续从上次值累加。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub alive_duration_secs: u64,
+
+    /// 最后一次更新存活时长的时间（RFC3339 格式）
+    ///
+    /// 用于在凭据处于可用状态时计算增量。仅在凭据可用（disabled=false）时有意义。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_alive_update_at: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -251,6 +273,9 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("created_at", &self.created_at)
+            .field("alive_duration_secs", &self.alive_duration_secs)
+            .field("last_alive_update_at", &self.last_alive_update_at)
             .finish()
     }
 }
@@ -679,6 +704,9 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
+            created_at: None,
+            alive_duration_secs: 0,
+            last_alive_update_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -905,6 +933,9 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
+            created_at: None,
+            alive_duration_secs: 0,
+            last_alive_update_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -950,6 +981,9 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
+            created_at: None,
+            alive_duration_secs: 0,
+            last_alive_update_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1109,6 +1143,9 @@ mod tests {
             groups: vec![],
             supported_models: vec![],
             source_channel: None,
+            created_at: None,
+            alive_duration_secs: 0,
+            last_alive_update_at: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -1499,5 +1536,63 @@ mod tests {
         let empty = KiroCredentials::default();
         let empty_json = empty.to_pretty_json().unwrap();
         assert!(!empty_json.contains("tokenEndpoint"));
+    }
+
+    // ============ 存活时间字段测试 ============
+
+    #[test]
+    fn test_alive_duration_fields_parsing() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "createdAt": "2026-07-01T00:00:00Z",
+            "aliveDurationSecs": 86400,
+            "lastAliveUpdateAt": "2026-07-02T00:00:00Z"
+        }"#;
+        let cred = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(cred.created_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(cred.alive_duration_secs, 86400);
+        assert_eq!(cred.last_alive_update_at.as_deref(), Some("2026-07-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_alive_duration_fields_serialization() {
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("test".to_string());
+        cred.created_at = Some("2026-07-01T00:00:00Z".to_string());
+        cred.alive_duration_secs = 3600;
+        cred.last_alive_update_at = Some("2026-07-01T01:00:00Z".to_string());
+
+        let json = cred.to_pretty_json().unwrap();
+        assert!(json.contains("\"createdAt\""));
+        assert!(json.contains("\"aliveDurationSecs\": 3600"));
+        assert!(json.contains("\"lastAliveUpdateAt\""));
+    }
+
+    #[test]
+    fn test_alive_duration_fields_default_not_serialized() {
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("test".to_string());
+        // 不设置存活时间相关字段
+
+        let json = cred.to_pretty_json().unwrap();
+        assert!(!json.contains("createdAt"));
+        assert!(!json.contains("aliveDurationSecs"));
+        assert!(!json.contains("lastAliveUpdateAt"));
+    }
+
+    #[test]
+    fn test_alive_duration_fields_roundtrip() {
+        let mut original = KiroCredentials::default();
+        original.refresh_token = Some("test".to_string());
+        original.created_at = Some("2026-07-15T10:00:00Z".to_string());
+        original.alive_duration_secs = 7200;
+        original.last_alive_update_at = Some("2026-07-15T12:00:00Z".to_string());
+
+        let json = original.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+
+        assert_eq!(parsed.created_at, original.created_at);
+        assert_eq!(parsed.alive_duration_secs, original.alive_duration_secs);
+        assert_eq!(parsed.last_alive_update_at, original.last_alive_update_at);
     }
 }

@@ -925,6 +925,22 @@ impl CredentialEntry {
         self.throttled_until = None;
         self.clear_self_heal_streak();
     }
+
+    /// 当凭据被禁用时，更新存活时长（从最后更新时间到现在的增量）
+    ///
+    /// 仅在凭据从启用状态变为禁用时调用。禁用后停止计时。
+    fn finalize_alive_duration(&mut self) {
+        if let Some(last_update) = &self.credentials.last_alive_update_at {
+            if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last_update) {
+                let now = Utc::now();
+                let elapsed_secs = (now - last_time.with_timezone(&Utc)).num_seconds();
+                if elapsed_secs > 0 {
+                    self.credentials.alive_duration_secs += elapsed_secs as u64;
+                }
+            }
+        }
+        // 禁用时不更新 last_alive_update_at（停止计时）
+    }
 }
 
 /// 判断 `entries` 中除 `skip_idx` 外是否已存在相同的 refreshToken
@@ -2679,7 +2695,22 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                let now = Utc::now();
+                entry.last_used_at = Some(now.to_rfc3339());
+
+                // 更新存活时长：如果凭据未被禁用，累计自上次更新以来的时长
+                if !entry.disabled {
+                    if let Some(last_update) = &entry.credentials.last_alive_update_at {
+                        if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last_update) {
+                            let elapsed_secs = (now - last_time.with_timezone(&Utc)).num_seconds();
+                            if elapsed_secs > 0 {
+                                entry.credentials.alive_duration_secs += elapsed_secs as u64;
+                            }
+                        }
+                    }
+                    entry.credentials.last_alive_update_at = Some(now.to_rfc3339());
+                }
+
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
                 tracing::debug!(
@@ -2794,6 +2825,8 @@ impl MultiTokenManager {
 
             let mut disabled_now = false;
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                // 禁用前先更新存活时长
+                entries[entry_index].finalize_alive_duration();
                 entries[entry_index].disabled = true;
                 entries[entry_index].disabled_reason = Some(DisabledReason::TooManyFailures);
                 disabled_now = true;
@@ -2861,6 +2894,8 @@ impl MultiTokenManager {
             }
 
             let entry = &mut entries[entry_index];
+            // 禁用前先更新存活时长
+            entry.finalize_alive_duration();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::Suspended);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -3029,6 +3064,8 @@ impl MultiTokenManager {
             }
 
             let entry = &mut entries[entry_index];
+            // 禁用前先更新存活时长
+            entry.finalize_alive_duration();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -3100,6 +3137,8 @@ impl MultiTokenManager {
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
                 (entries.iter().any(|e| !e.disabled), false)
             } else {
+                // 禁用前先更新存活时长
+                entry.finalize_alive_duration();
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
                 entry.clear_self_heal_streak();
@@ -3157,6 +3196,8 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            // 禁用前先更新存活时长
+            entry.finalize_alive_duration();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
             entry.clear_self_heal_streak();
@@ -3341,6 +3382,22 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            let now = Utc::now();
+
+            // 如果是从启用变为禁用，更新存活时长
+            if !entry.disabled && disabled {
+                if let Some(last_update) = &entry.credentials.last_alive_update_at {
+                    if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last_update) {
+                        let elapsed_secs = (now - last_time.with_timezone(&Utc)).num_seconds();
+                        if elapsed_secs > 0 {
+                            entry.credentials.alive_duration_secs += elapsed_secs as u64;
+                        }
+                    }
+                }
+                // 禁用时不再更新 last_alive_update_at（停止计时）
+            }
+
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -3349,6 +3406,8 @@ impl MultiTokenManager {
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
                 entry.clear_self_heal_streak();
+                // 重新启用时，重置最后更新时间为当前时间（重新开始计时）
+                entry.credentials.last_alive_update_at = Some(now.to_rfc3339());
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
                 entry.clear_self_heal_streak();
@@ -3430,6 +3489,10 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // 如果当前未禁用，先更新存活时长
+            if !entry.disabled {
+                entry.finalize_alive_duration();
+            }
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.clear_self_heal_streak();

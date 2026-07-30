@@ -1263,6 +1263,7 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let now = chrono::Utc::now().to_rfc3339();
         let new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
@@ -1299,6 +1300,9 @@ impl AdminService {
             groups: req.groups,
             supported_models: vec![], // 将在首次获取使用额度时自动回填
             source_channel: req.source_channel,
+            created_at: Some(now.clone()), // 记录创建时间
+            alive_duration_secs: 0, // 初始存活时长为 0
+            last_alive_update_at: Some(now), // 初始化最后更新时间为创建时间
         };
 
         // 调用 token_manager 添加凭据
