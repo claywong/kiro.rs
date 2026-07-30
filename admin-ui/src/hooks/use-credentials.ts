@@ -84,10 +84,16 @@ export function useCurrentCredentialModels(enabled: boolean) {
   })
 }
 
-// 对模型发送真实请求
+// 对模型发送真实请求；credentialId 存在时定向测试该凭据
 export function useTestModel() {
   return useMutation({
-    mutationFn: testModel,
+    mutationFn: ({
+      modelId,
+      credentialId,
+    }: {
+      modelId: string
+      credentialId?: number | null
+    }) => testModel(modelId, credentialId),
   })
 }
 

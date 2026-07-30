@@ -408,6 +408,9 @@ pub struct AvailableModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct ModelTestRequest {
     pub model_id: String,
+    /// 指定受测凭据；缺省表示走账号池调度（全局测试）。
+    #[serde(default)]
+    pub credential_id: Option<u64>,
 }
 
 /// 真实模型请求测试结果。
@@ -1188,5 +1191,25 @@ mod rpm_tests {
         let request: UpdateCredentialRequest =
             serde_json::from_str(r#"{"rpmLimit":0}"#).unwrap();
         assert_eq!(request.rpm_limit, Some(0));
+    }
+}
+
+/// 本地新增：模型测试的凭据定向参数。单独成块，避免与上游测试模块相撞。
+#[cfg(test)]
+mod model_test_request_tests {
+    use super::ModelTestRequest;
+
+    #[test]
+    fn 缺省凭据id表示走账号池调度() {
+        let request: ModelTestRequest =
+            serde_json::from_str(r#"{"modelId":"claude-sonnet-4"}"#).unwrap();
+        assert_eq!(request.credential_id, None);
+    }
+
+    #[test]
+    fn 显式凭据id按定向测试解析() {
+        let request: ModelTestRequest =
+            serde_json::from_str(r#"{"modelId":"claude-sonnet-4","credentialId":7}"#).unwrap();
+        assert_eq!(request.credential_id, Some(7));
     }
 }

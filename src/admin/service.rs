@@ -942,7 +942,12 @@ impl AdminService {
         let started = std::time::Instant::now();
         let (credential_id, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
+                // 指定了凭据就必须打在这张上（失败即失败），否则测试结果无法归因；
+                // 未指定才走账号池调度与故障转移。
+                let call = match request.credential_id {
+                    Some(id) => provider.call_api_pinned(&body, id).await?,
+                    None => provider.call_api(&body, None, None).await?,
+                };
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;
                 Ok::<_, anyhow::Error>((credential_id, bytes))

@@ -79,7 +79,11 @@ export function AvailableModelsDialog({
     })
 
     try {
-      const data = await testMutation.mutateAsync(modelId)
+      // 从某张凭据打开的弹窗必须定向测试该凭据，否则会随机落到池子里别的号上
+      const data = await testMutation.mutateAsync({
+        modelId,
+        credentialId: fixedCredentialId,
+      })
       if (requestSequence.current !== sequence) return
       setTestResults((current) => ({
         ...current,

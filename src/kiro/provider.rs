@@ -166,7 +166,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    pub(super) fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
@@ -178,7 +178,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
+    pub(super) fn endpoint_for(
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
@@ -202,7 +202,7 @@ impl KiroProvider {
     ///   之后该凭据的 `streaming_profile_arn()` 直接命中，不再进入此路径。
     /// - 无 Enterprise profile（纯 BuilderID 等）→ 保持占位符回退逻辑，并标记已尝试，
     ///   避免每次请求重复查询。
-    async fn ensure_profile_arn(
+    pub(super) async fn ensure_profile_arn(
         &self,
         ctx: &mut crate::kiro::token_manager::CallContext,
     ) -> anyhow::Result<()> {
