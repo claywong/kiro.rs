@@ -97,6 +97,23 @@ pub struct VendorConfig {
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 
+    /// 提取入库时写入凭据的 API Region（默认不写）。
+    ///
+    /// 卖家 Key 是 API Key 凭据，`effective_api_region` 只看凭据的 `apiRegion`
+    /// 再回退全局 config，**不回退凭据的 `region` 字段**，所以想让入库的 Key 固定
+    /// 落在某个区域，必须显式配这一项。缺省/空串表示不写该字段、沿用全局 region，
+    /// 与未引入本配置项时的行为一致。
+    #[serde(default)]
+    pub default_api_region: String,
+
+    /// 提取入库时写入凭据的 Auth Region（默认不写）。
+    ///
+    /// 用于 Token 刷新域名（`prod.{region}.auth.desktop.kiro.dev`）。纯 API Key
+    /// 凭据不走刷新流程，这一项对它们不起作用；显式配置是为了让凭据的区域归属
+    /// 完整、且卖家日后改发 OAuth 凭据时行为一致。缺省/空串表示不写、沿用全局。
+    #[serde(default)]
+    pub default_auth_region: String,
+
     /// 提取模式：true = 自动，false = 手动（默认）。
     ///
     /// 默认手动 —— 提取会真实扣费，且提取数量一旦提交就与订单号永久绑定
@@ -600,5 +617,48 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+}
+
+/// 本地新增：卖家提取入库的 Region 配置。单独成块，避免与上游测试模块相撞。
+#[cfg(test)]
+mod vendor_api_region_tests {
+    use super::VendorConfig;
+
+    #[test]
+    fn 未配置时不写region沿用全局() {
+        let cfg: VendorConfig =
+            serde_json::from_str(r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x"}"#).unwrap();
+        assert!(cfg.default_api_region.is_empty());
+        assert!(cfg.default_auth_region.is_empty());
+    }
+
+    #[test]
+    fn auth与api的region可分别配置() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x","defaultAuthRegion":"us-east-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_auth_region, "us-east-1");
+        // 未显式配置的一项保持不写
+        assert!(cfg.default_api_region.is_empty());
+    }
+
+    #[test]
+    fn 显式配置覆盖默认值() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x","defaultApiRegion":"us-east-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_api_region, "us-east-1");
+    }
+
+    #[test]
+    fn 显式空串同样表示沿用全局region() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x","defaultApiRegion":""}"#,
+        )
+        .unwrap();
+        assert!(cfg.default_api_region.is_empty());
     }
 }

@@ -8,6 +8,8 @@ import {
 } from '@/components/ui/dialog'
 import { usePurchaseForEvent } from '@/hooks/use-vendor'
 import { extractErrorMessage } from '@/lib/utils'
+// 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
+import { formatVendorRegion } from '@/lib/vendor-region'
 import type { VendorEvent, VendorStatus } from '@/types/api'
 
 /**
@@ -117,6 +119,7 @@ export function VendorPurchaseDialog({
             入库参数：分组{' '}
             {status?.defaultGroups?.length ? status.defaultGroups.join(' / ') : '无'}
             ，RPM {status?.defaultRpmLimit ?? 10}
+            ，Region {formatVendorRegion(status)}
             （在 config.json 的 vendor 段调整）
           </div>
 

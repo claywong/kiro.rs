@@ -372,6 +372,8 @@ mod tests {
             webhook_path_token: token.to_string(),
             default_groups: vec![],
             default_rpm_limit: 10,
+            default_api_region: String::new(),
+            default_auth_region: String::new(),
             auto_purchase: false,
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],

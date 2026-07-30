@@ -188,6 +188,8 @@ pub async fn get_status(State(state): State<VendorState>) -> Response {
         "unacked": unacked,
         "defaultGroups": cfg.map(|c| c.default_groups.clone()).unwrap_or_default(),
         "defaultRpmLimit": cfg.map(|c| c.default_rpm_limit).unwrap_or(10),
+        "defaultApiRegion": cfg.map(|c| c.default_api_region.clone()).unwrap_or_default(),
+        "defaultAuthRegion": cfg.map(|c| c.default_auth_region.clone()).unwrap_or_default(),
         // 运行时值，可能已被面板改过，与 config.json 的启动快照不一定一致
         "autoPurchase": state.service.auto_purchase(),
         // 当前时刻实际生效的上限（已应用时段表），面板展示与判定必须用它，

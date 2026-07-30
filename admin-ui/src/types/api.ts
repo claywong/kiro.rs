@@ -625,6 +625,10 @@ export interface VendorStatus {
   /** 提取入库时写入的默认分组 */
   defaultGroups: string[]
   defaultRpmLimit: number
+  /** 提取入库时写入凭据的 apiRegion；空串表示沿用全局 region */
+  defaultApiRegion?: string
+  /** 提取入库时写入凭据的 authRegion；空串表示沿用全局 region */
+  defaultAuthRegion?: string
   /** 提取模式：true = 自动，false = 手动。运行时值，切换后立即生效 */
   autoPurchase: boolean
   /**

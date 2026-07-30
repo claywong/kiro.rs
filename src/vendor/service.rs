@@ -375,6 +375,17 @@ impl VendorService {
         let cfg = self.config.as_ref();
         let groups = cfg.map(|c| c.default_groups.clone()).unwrap_or_default();
         let rpm_limit = cfg.map(|c| c.default_rpm_limit).unwrap_or(10);
+        // 缺省/空串表示不写该 region 字段，沿用全局 config
+        let non_empty_region = |value: String| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
+        let api_region =
+            non_empty_region(cfg.map(|c| c.default_api_region.clone()).unwrap_or_default());
+        let auth_region = non_empty_region(
+            cfg.map(|c| c.default_auth_region.clone())
+                .unwrap_or_default(),
+        );
 
         let mut outcome = PurchaseOutcome::default();
         for key in keys {
@@ -394,8 +405,8 @@ impl VendorService {
                 priority: 0,
                 rpm_limit,
                 region: None,
-                auth_region: None,
-                api_region: None,
+                auth_region: auth_region.clone(),
+                api_region: api_region.clone(),
                 machine_id: None,
                 email: None,
                 proxy_url: None,

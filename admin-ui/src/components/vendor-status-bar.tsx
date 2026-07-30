@@ -17,6 +17,8 @@ import {
   useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
+// 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
+import { formatVendorRegion } from '@/lib/vendor-region'
 import type { VendorStatus } from '@/types/api'
 
 /** 四格状态卡片中的一格 */
@@ -567,6 +569,7 @@ export function VendorStatusBar() {
               入库参数：分组{' '}
               {status?.defaultGroups?.length ? status.defaultGroups.join(' / ') : '无'}
               ，RPM {status?.defaultRpmLimit ?? 10}
+              ，Region {formatVendorRegion(status)}
               （在 config.json 的 vendor 段调整）
             </div>
           </div>
