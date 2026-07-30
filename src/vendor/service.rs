@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::admin::AdminService;
-use crate::admin::types::AddCredentialRequest;
 use crate::http_client::ProxyConfig;
 use crate::model::config::{TlsBackend, VendorConfig};
 
@@ -467,65 +466,21 @@ impl VendorService {
         let cfg = &self.config;
         let groups = cfg.default_groups.clone();
         let rpm_limit = cfg.default_rpm_limit;
-        // 缺省/空串表示不写该 region 字段，沿用全局 config
-        let non_empty_region = |value: &str| {
-            let trimmed = value.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        };
-        let api_region = non_empty_region(&cfg.default_api_region);
-        let auth_region = non_empty_region(&cfg.default_auth_region);
         // 来源渠道带上供应商 id，便于按家盘点与对账
         let source_channel = format!("{}{}:{}", auto::VENDOR_CHANNEL_PREFIX, self.vendor_id(), order_id);
 
-        let mut outcome = PurchaseOutcome::default();
-        for item in &resp.keys {
-            if item.key.trim().is_empty() {
-                continue;
-            }
-            let req = AddCredentialRequest {
-                refresh_token: None,
-                access_token: None,
-                profile_arn: None,
-                expires_at: None,
-                auth_method: "api_key".to_string(),
-                provider: None,
-                client_id: None,
-                client_secret: None,
-                start_url: None,
-                token_endpoint: None,
-                // 卖家给了 issuer_url 就带上，便于日后按签发方排查
-                issuer_url: item.issuer_url.clone(),
-                scopes: None,
-                priority: 0,
-                rpm_limit,
-                region: None,
-                auth_region: auth_region.clone(),
-                api_region: api_region.clone(),
-                machine_id: None,
-                email: None,
-                proxy_url: None,
-                proxy_username: None,
-                proxy_password: None,
-                kiro_api_key: Some(item.key.clone()),
-                endpoint: None,
-                groups: groups.clone(),
-                source_channel: Some(source_channel.clone()),
-            };
+        let keys: Vec<String> = resp.keys.iter()
+            .filter(|k| !k.key.trim().is_empty())
+            .map(|k| k.key.clone())
+            .collect();
 
-            let result = self.admin.import_one_credential(req, true).await;
-            use crate::admin::ImportStatus;
-            match result.status {
-                ImportStatus::Verified | ImportStatus::Imported => outcome.imported += 1,
-                ImportStatus::Duplicate => outcome.duplicated += 1,
-                ImportStatus::Failed => {
-                    outcome.failed += 1;
-                    if outcome.last_error.is_none() {
-                        outcome.last_error = result.error.clone();
-                    }
-                }
-            }
-        }
-        outcome
+        super::import::import_keys(
+            &self.admin,
+            keys,
+            &source_channel,
+            groups,
+            rpm_limit,
+        ).await
     }
 
     // ============ 自动模式 ============

@@ -30,5 +30,11 @@
         ]
       }
     ]
+  },
+  "kiroapp": {
+    "baseUrl": "https://kiroapp.cc",
+    "apiKey": "替换为 kiroapp 账号的 API Key",
+    "defaultGroups": [],
+    "defaultRpmLimit": 10
   }
 }

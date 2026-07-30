@@ -302,7 +302,14 @@ async fn main() {
     } else {
         tracing::info!("卖家对接已启用，共 {} 家", vendor_registry.len());
     }
-    let vendor_state = vendor::VendorState::new(vendor_registry);
+    // 次级卖家 kiroapp：无 webhook、无事件库，只需配置 + admin 入库能力
+    let kiroapp_service = std::sync::Arc::new(vendor::KiroappService::new(
+        config.kiroapp.clone(),
+        proxy_config_for_vendor.clone(),
+        config.tls_backend,
+        admin_service.clone(),
+    ));
+    let vendor_state = vendor::VendorState::new(vendor_registry, kiroapp_service);
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
