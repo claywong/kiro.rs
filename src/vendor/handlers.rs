@@ -17,6 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::kiroapp_service::{KiroappService, KiroappServiceError};
 use super::service::{VendorService, VendorServiceError};
 use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEventKind};
 
@@ -24,11 +25,16 @@ use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEven
 #[derive(Clone)]
 pub struct VendorState {
     pub service: std::sync::Arc<VendorService>,
+    /// 次级卖家 kiroapp。与主卖家相互独立，仅管理接口用到。
+    pub kiroapp: std::sync::Arc<KiroappService>,
 }
 
 impl VendorState {
-    pub fn new(service: std::sync::Arc<VendorService>) -> Self {
-        Self { service }
+    pub fn new(
+        service: std::sync::Arc<VendorService>,
+        kiroapp: std::sync::Arc<KiroappService>,
+    ) -> Self {
+        Self { service, kiroapp }
     }
 }
 
@@ -392,6 +398,61 @@ pub async fn set_webhook_url(
 }
 
 /// 生成 32 位十六进制订单号
+// ============ 次级卖家 kiroapp ============
+
+fn kiroapp_err_response(e: KiroappServiceError) -> Response {
+    let status = match &e {
+        KiroappServiceError::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+        // 原样透出卖家状态码（库存不足 / 余额不足都靠它区分）
+        KiroappServiceError::Upstream(u) => u
+            .status
+            .and_then(|c| StatusCode::from_u16(c).ok())
+            .unwrap_or(StatusCode::BAD_GATEWAY),
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+}
+
+/// `GET /api/admin/vendor/kiroapp/status` —— 库存 + 余额
+///
+/// 两个请求并发发出，任一失败不影响另一个（各自返回对应 error 字段）。
+pub async fn kiroapp_status(State(state): State<VendorState>) -> Response {
+    let cfg = state.kiroapp.config();
+    let configured = state.kiroapp.enabled();
+
+    let mut body = serde_json::json!({
+        "configured": configured,
+        "defaultGroups": cfg.map(|c| c.default_groups.clone()).unwrap_or_default(),
+        "defaultRpmLimit": cfg.map(|c| c.default_rpm_limit).unwrap_or(10),
+    });
+
+    if !configured {
+        return Json(body).into_response();
+    }
+
+    let (stock, balance) = tokio::join!(state.kiroapp.stock(), state.kiroapp.balance());
+    match stock {
+        Ok(s) => body["stock"] = serde_json::to_value(&s).unwrap_or_default(),
+        Err(e) => body["stockError"] = serde_json::json!(e.to_string()),
+    }
+    match balance {
+        Ok(b) => body["balance"] = serde_json::to_value(&b).unwrap_or_default(),
+        Err(e) => body["balanceError"] = serde_json::json!(e.to_string()),
+    }
+
+    Json(body).into_response()
+}
+
+/// `POST /api/admin/vendor/kiroapp/claim` —— 提取一个 Key 并入库
+///
+/// 会真实扣费。对方接口无幂等键，故这里**不做任何重试**，超时一律返回错误
+/// 由用户到卖家侧核对。
+pub async fn kiroapp_claim(State(state): State<VendorState>) -> Response {
+    match state.kiroapp.claim().await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => kiroapp_err_response(e),
+    }
+}
+
 fn new_order_id() -> String {
     let a = uuid::Uuid::new_v4();
     a.simple().to_string()

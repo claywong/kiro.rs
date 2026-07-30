@@ -8,6 +8,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { VendorStatusBar } from '@/components/vendor-status-bar'
+import { KiroappCard } from '@/components/kiroapp-card'
 import { VendorPurchaseDialog } from '@/components/vendor-purchase-dialog'
 import {
   useVendorStatus, useVendorEvents, useVendorOrders, useAckVendorEvents,
@@ -294,6 +295,9 @@ export function VendorPage() {
   return (
     <div className="space-y-4">
       <VendorStatusBar />
+
+      {/* 次级卖家 kiroapp。未配置时自身不渲染，不占版面 */}
+      <KiroappCard />
 
       <Card>
         <CardContent className="p-0">

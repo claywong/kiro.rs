@@ -23,5 +23,11 @@
     "autoPurchaseSchedule": [
       { "from": "14:00", "to": "23:59", "maxCount": 2 }
     ]
+  },
+  "kiroapp": {
+    "baseUrl": "https://kiroapp.cc",
+    "apiKey": "替换为 kiroapp 账号的 API Key",
+    "defaultGroups": [],
+    "defaultRpmLimit": 10
   }
 }

@@ -289,13 +289,22 @@ async fn main() {
             vendor::VendorStore::open_in_memory().expect("内存卖家事件库初始化失败")
         }),
     );
-    let vendor_state = vendor::VendorState::new(std::sync::Arc::new(vendor::VendorService::new(
-        config.vendor.clone(),
-        proxy_config_for_vendor.clone(),
-        config.tls_backend,
-        vendor_store.clone(),
-        admin_service.clone(),
-    )));
+    let vendor_state = vendor::VendorState::new(
+        std::sync::Arc::new(vendor::VendorService::new(
+            config.vendor.clone(),
+            proxy_config_for_vendor.clone(),
+            config.tls_backend,
+            vendor_store.clone(),
+            admin_service.clone(),
+        )),
+        // 次级卖家 kiroapp：无 webhook、无事件库，只需配置 + admin 入库能力
+        std::sync::Arc::new(vendor::KiroappService::new(
+            config.kiroapp.clone(),
+            proxy_config_for_vendor.clone(),
+            config.tls_backend,
+            admin_service.clone(),
+        )),
+    );
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),

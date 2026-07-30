@@ -7,6 +7,8 @@ import type {
   VendorOrdersResponse,
   VendorPurchaseResult,
   VendorRedeemResult,
+  KiroappStatus,
+  KiroappClaimResult,
 } from '@/types/api'
 
 const api = axios.create({
@@ -134,5 +136,24 @@ export async function testVendorWebhook(): Promise<Record<string, unknown>> {
 /** 把本机 webhook 地址写到卖家侧 */
 export async function setVendorWebhookUrl(webhookUrl: string): Promise<{ ok: boolean }> {
   const { data } = await api.put<{ ok: boolean }>('/webhook', { webhookUrl })
+  return data
+}
+
+// ============ 次级卖家 kiroapp ============
+
+/** kiroapp 状态：可售数量 + 单价 + 余额 */
+export async function getKiroappStatus(): Promise<KiroappStatus> {
+  const { data } = await api.get<KiroappStatus>('/kiroapp/status')
+  return data
+}
+
+/**
+ * kiroapp 提取一个 Key 并入库。会真实扣费。
+ *
+ * 对方接口没有幂等键，**失败后不要自动重发** —— 超时无法区分「未扣费」与
+ * 「已扣费但响应丢失」，重发会二次扣费。
+ */
+export async function claimKiroappKey(): Promise<KiroappClaimResult> {
+  const { data } = await api.post<KiroappClaimResult>('/kiroapp/claim')
   return data
 }

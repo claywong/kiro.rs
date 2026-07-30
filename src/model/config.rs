@@ -131,6 +131,44 @@ fn default_vendor_rpm_limit() -> u32 {
     10
 }
 
+/// 次级卖家（kiroapp）对接配置。
+///
+/// 与 [`VendorConfig`] 是两家不同供应商，接口能力差得远，故不共用结构：
+/// 对方只有 `GET /openapi/stock`、`GET /openapi/balance`、`POST /openapi/claim`
+/// 三个端点，没有 webhook、没有订单号幂等、也没有数量参数（一次一个）。
+/// 因此这里只承载「查状态 + 手动提取」，不接入事件表与自动提取那套机制。
+///
+/// 认证用 `Authorization: Bearer <apiKey>`，与主卖家的 `X-API-Key` 不同。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroappConfig {
+    /// API base URL（如 `https://kiroapp.cc`，末尾斜杠会被规整掉）
+    pub base_url: String,
+
+    /// 账号 API Key，以 `Authorization: Bearer` 发送
+    pub api_key: String,
+
+    /// 提取入库时默认写入的凭据分组（可选）
+    #[serde(default)]
+    pub default_groups: Vec<String>,
+
+    /// 提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    #[serde(default = "default_vendor_rpm_limit")]
+    pub default_rpm_limit: u32,
+}
+
+impl KiroappConfig {
+    /// 规整后的 base URL（去掉末尾斜杠）
+    pub fn normalized_base_url(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
+
+    /// 是否可用（base_url 与 api_key 均非空）
+    pub fn enabled(&self) -> bool {
+        !self.normalized_base_url().is_empty() && !self.api_key.trim().is_empty()
+    }
+}
+
 impl VendorConfig {
     /// 规整后的 base URL（去掉末尾斜杠）
     pub fn normalized_base_url(&self) -> &str {
@@ -332,6 +370,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<VendorConfig>,
 
+    /// 次级卖家 kiroapp 对接配置。与 `vendor` 相互独立，只支持查状态 + 手动提取。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiroapp: Option<KiroappConfig>,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -485,6 +528,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             vendor: None,
+            kiroapp: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             config_path: None,

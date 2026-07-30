@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::admin::AdminService;
-use crate::admin::types::AddCredentialRequest;
 use crate::http_client::ProxyConfig;
 use crate::model::config::{TlsBackend, VendorConfig};
 
@@ -375,52 +374,26 @@ impl VendorService {
         let cfg = self.config.as_ref();
         let groups = cfg.map(|c| c.default_groups.clone()).unwrap_or_default();
         let rpm_limit = cfg.map(|c| c.default_rpm_limit).unwrap_or(10);
+        self.import_keys_with(keys, order_id, groups, rpm_limit).await
+    }
 
-        let mut outcome = PurchaseOutcome::default();
-        for key in keys {
-            let req = AddCredentialRequest {
-                refresh_token: None,
-                access_token: None,
-                profile_arn: None,
-                expires_at: None,
-                auth_method: "api_key".to_string(),
-                provider: None,
-                client_id: None,
-                client_secret: None,
-                start_url: None,
-                token_endpoint: None,
-                issuer_url: None,
-                scopes: None,
-                priority: 0,
-                rpm_limit,
-                region: None,
-                auth_region: None,
-                api_region: None,
-                machine_id: None,
-                email: None,
-                proxy_url: None,
-                proxy_username: None,
-                proxy_password: None,
-                kiro_api_key: Some(key),
-                endpoint: None,
-                groups: groups.clone(),
-                source_channel: Some(format!("vendor:{order_id}")),
-            };
-
-            let result = self.admin.import_one_credential(req, true).await;
-            use crate::admin::ImportStatus;
-            match result.status {
-                ImportStatus::Verified | ImportStatus::Imported => outcome.imported += 1,
-                ImportStatus::Duplicate => outcome.duplicated += 1,
-                ImportStatus::Failed => {
-                    outcome.failed += 1;
-                    if outcome.last_error.is_none() {
-                        outcome.last_error = result.error.clone();
-                    }
-                }
-            }
-        }
-        outcome
+    /// 指定分组与 RPM 的入库。次级卖家（kiroapp）有自己的默认值，
+    /// 不能套用主卖家配置，故把这两项提成参数，具体实现见 [`super::import`]。
+    async fn import_keys_with(
+        &self,
+        keys: Vec<String>,
+        order_id: &str,
+        groups: Vec<String>,
+        rpm_limit: u32,
+    ) -> PurchaseOutcome {
+        super::import::import_keys(
+            &self.admin,
+            keys,
+            &format!("vendor:{order_id}"),
+            groups,
+            rpm_limit,
+        )
+        .await
     }
 
     // ============ 自动模式 ============
