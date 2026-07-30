@@ -1,6 +1,6 @@
-import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
+import { useState } from 'react'
 import {
-  Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
+  Activity, RefreshCw, UploadCloud, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/dialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
-  DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
@@ -248,22 +248,171 @@ interface ToolControls {
   updateCooldown: (secs: number) => void
 }
 
+/**
+ * 桌面端顶栏工具：只保留三个控件，避免与左侧 Tab 争抢横向空间。
+ * - 「运行策略」下拉：负载均衡 / 账号级风控故障转移 / 凭据自愈（原三个独立按钮）
+ * - 可用模型、刷新：高频动作，保持一键可达
+ * - 「更多」下拉：镜像在线更新 / GitHub / 密钥管理
+ */
 function FullTools({ controls }: { controls: ToolControls }) {
   return (
     <>
-      <LoadBalancingButton controls={controls} />
-      <ThrottleConfigButton
-        config={controls.throttleConfig}
-        loading={controls.isLoadingThrottle}
-        saving={controls.isSettingThrottle}
-        onToggleFailover={controls.handleToggleFailover}
-        onChangeCooldown={controls.updateCooldown}
-      />
-      <SelfHealConfigButton />
+      <StrategyMenu controls={controls} />
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
-      <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      <MoreMenu controls={controls} />
+    </>
+  )
+}
+
+function StrategyMenu({ controls }: { controls: ToolControls }) {
+  const { data: selfHeal } = useSelfHealConfig()
+  const throttle = readThrottleState(controls.throttleConfig)
+  const selfHealOn = selfHeal?.enabled ?? true
+  const balanced = controls.loadBalancingMode === 'balanced'
+
+  return (
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          title={strategyTitle(controls.loadBalancingMode, throttle, selfHealOn)}
+        >
+          <Activity className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">
+            {controls.isLoadingMode ? '加载中…' : balanced ? '均衡负载' : '优先级'}
+          </span>
+          {/* 两个开关的状态用小图标挂在按钮上，不展开也能一眼看到 */}
+          {throttle.failover ? (
+            <ShieldCheck className="h-3 w-3 text-emerald-600" />
+          ) : (
+            <ShieldAlert className="h-3 w-3 text-amber-500" />
+          )}
+          {selfHealOn ? (
+            <HeartPulse className="h-3 w-3 text-emerald-600" />
+          ) : (
+            <HeartCrack className="h-3 w-3 text-amber-500" />
+          )}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-[80vh] w-72 overflow-y-auto">
+        <DropdownMenuLabel>负载均衡</DropdownMenuLabel>
+        <DropdownMenuItem
+          disabled={controls.isLoadingMode || controls.isSettingMode}
+          onSelect={controls.handleToggleLoadBalancing}
+        >
+          <Activity />
+          {controls.isLoadingMode
+            ? '负载均衡加载中'
+            : balanced
+              ? '切换到优先级'
+              : '切换到均衡负载'}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <ThrottlePanels
+          config={controls.throttleConfig}
+          loading={controls.isLoadingThrottle}
+          saving={controls.isSettingThrottle}
+          onToggleFailover={controls.handleToggleFailover}
+          onChangeCooldown={controls.updateCooldown}
+        />
+        <DropdownMenuSeparator />
+        <SelfHealPanels />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function MoreMenu({ controls }: { controls: ToolControls }) {
+  return (
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon" title="更多" className="relative">
+          <MoreHorizontal className="h-4 w-4" />
+          {controls.updateCheck?.hasUpdate && <UpdateDot />}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-60">
+        <DropdownMenuLabel>系统</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openImageUpdate}>
+          <UploadCloud />
+          {controls.updateCheck?.hasUpdate
+            ? `镜像在线更新（v${controls.updateCheck.latestVersion}）`
+            : '镜像在线更新'}
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild>
+          <a
+            href="https://github.com/ZyphrZero/kiro.rs"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <GithubIcon className="size-4" />GitHub 仓库
+          </a>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openKeyDialog}>
+          <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function GithubIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+      <path d="M12 .5C5.65.5.5 5.65.5 12.02c0 5.1 3.29 9.42 7.86 10.95.58.11.79-.25.79-.55 0-.27-.01-.99-.02-1.95-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.16 1.18a10.95 10.95 0 0 1 5.75 0c2.2-1.49 3.16-1.18 3.16-1.18.62 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.55A11.51 11.51 0 0 0 23.5 12.02C23.5 5.65 18.35.5 12 .5Z" />
+    </svg>
+  )
+}
+
+function strategyTitle(
+  mode: ToolControls['loadBalancingMode'],
+  throttle: ThrottleState,
+  selfHealOn: boolean,
+) {
+  const modeText = mode === 'balanced' ? '均衡负载' : '优先级'
+  const throttleText = throttle.failover
+    ? `故障转移开（冷却 ${throttle.cooldownMin}m）`
+    : '故障转移关'
+  return `运行策略：${modeText} · ${throttleText} · 自愈${selfHealOn ? '开' : '关'}`
+}
+
+/** 「运行策略」下拉里的故障转移区块（含冷却时长），自带自定义输入的局部状态 */
+function ThrottlePanels(props: ThrottleConfigButtonProps) {
+  const { loading, saving, onToggleFailover, onChangeCooldown } = props
+  const [customMin, setCustomMin] = useState('')
+  const state = readThrottleState(props.config)
+  const busy = loading || saving
+
+  const submitCustom = (e: React.FormEvent) => {
+    e.preventDefault()
+    const min = parseInt(customMin, 10)
+    if (invalidCooldownMinutes(min)) {
+      toast.error('请输入 1-1440 之间的分钟数')
+      return
+    }
+    onChangeCooldown(min * SECONDS_PER_MINUTE)
+    setCustomMin('')
+  }
+
+  return (
+    <>
+      <ThrottleStatusPanel
+        saving={busy}
+        state={state}
+        onToggleFailover={onToggleFailover}
+      />
+      <ThrottleCooldownPanel
+        customMin={customMin}
+        saving={busy}
+        state={state}
+        onChangeCooldown={onChangeCooldown}
+        onCustomMinChange={setCustomMin}
+        onSubmitCustom={submitCustom}
+      />
     </>
   )
 }
@@ -317,27 +466,6 @@ function CompactTools({ controls }: { controls: ToolControls }) {
   )
 }
 
-function LoadBalancingButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={controls.handleToggleLoadBalancing}
-      disabled={controls.isLoadingMode || controls.isSettingMode}
-      title="切换负载均衡模式"
-    >
-      <Activity className="h-3.5 w-3.5" />
-      <span className="hidden md:inline">
-        {controls.isLoadingMode
-          ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
-      </span>
-    </Button>
-  )
-}
-
 function ModelsButton({ onOpen }: { onOpen: () => void }) {
   return (
     <Button variant="ghost" size="icon" onClick={onOpen} title="可用模型">
@@ -352,44 +480,6 @@ function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
       <RefreshCw className="h-4 w-4" />
     </Button>
   )
-}
-
-function ImageUpdateButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      onClick={controls.openImageUpdate}
-      title={imageUpdateTitle(controls.updateCheck)}
-      className="relative"
-    >
-      <UploadCloud className="h-4 w-4" />
-      {controls.updateCheck?.hasUpdate && <UpdateDot />}
-    </Button>
-  )
-}
-
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="设置">
-          <Settings className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={onOpenKeyDialog}>
-          <Key />修改登录API密钥（管理面板登录）
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {
-  if (!updateCheck?.hasUpdate) return '镜像在线更新'
-  return `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
 }
 
 function UpdateDot() {
@@ -423,12 +513,6 @@ interface CustomCooldownFormProps {
   onSubmit: (e: React.FormEvent) => void
 }
 
-interface ThrottleTriggerProps extends ComponentPropsWithoutRef<typeof Button> {
-  loading: boolean
-  saving: boolean
-  state: ThrottleState
-}
-
 const COOLDOWN_PRESETS = [
   { label: '5 分钟', secs: 5 * 60 },
   { label: '15 分钟', secs: 15 * 60 },
@@ -449,77 +533,6 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
  * - 顶部一个 Switch 切换 failover
  * - 5 个预设时长 + 一个自定义输入（分钟）
  */
-function ThrottleConfigButton({
-  config, loading, saving, onToggleFailover, onChangeCooldown,
-}: ThrottleConfigButtonProps) {
-  const [open, setOpen] = useState(false)
-  const [customMin, setCustomMin] = useState('')
-  const state = readThrottleState(config)
-
-  useEffect(() => {
-    if (!open) setCustomMin('')
-  }, [open])
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
-    }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setOpen(false)
-  }
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <ThrottleTrigger loading={loading} saving={saving} state={state} />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <ThrottleStatusPanel
-          saving={saving}
-          state={state}
-          onToggleFailover={onToggleFailover}
-        />
-        <ThrottleCooldownPanel
-          customMin={customMin}
-          saving={saving}
-          state={state}
-          onChangeCooldown={onChangeCooldown}
-          onCustomMinChange={setCustomMin}
-          onDone={() => setOpen(false)}
-          onSubmitCustom={submitCustom}
-        />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
-  function ThrottleTrigger({ loading, saving, state, ...props }, ref) {
-    return (
-      <Button
-        {...props}
-        ref={ref}
-        variant="outline"
-        size="sm"
-        disabled={loading || saving}
-        title={throttleTitle(loading, state)}
-      >
-        {state.failover ? (
-          <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-        ) : (
-          <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
-        )}
-        <span className="hidden md:inline">
-          {throttleTriggerText(loading, state)}
-        </span>
-      </Button>
-    )
-  },
-)
-
 function ThrottleStatusPanel({
   saving, state, onToggleFailover,
 }: {
@@ -679,15 +692,10 @@ const SELF_HEAL_INTERVAL_PRESETS = [
  * - 连续上限：连续自愈达到该轮数且期间无成功则停止（0=不限）
  * - 只读观测：凭据最大连续轮数 / 累计恢复凭据次数
  */
-function SelfHealConfigButton() {
+function SelfHealPanels() {
   const { data: config, isLoading } = useSelfHealConfig()
   const { mutate, isPending } = useSetSelfHealConfig()
-  const [open, setOpen] = useState(false)
   const [roundsInput, setRoundsInput] = useState('')
-
-  useEffect(() => {
-    if (!open) setRoundsInput('')
-  }, [open])
 
   const enabled = config?.enabled ?? true
   const busy = isLoading || isPending
@@ -711,25 +719,7 @@ function SelfHealConfigButton() {
   }
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={busy}
-          title={enabled ? '凭据自愈：已启用' : '凭据自愈：已关闭'}
-        >
-          {enabled ? (
-            <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
-          ) : (
-            <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
-          )}
-          <span className="hidden md:inline">
-            {isLoading ? '自愈…' : enabled ? '自愈开' : '自愈关'}
-          </span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
+    <>
         <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
         <div className="px-2 pb-2">
           <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
@@ -815,8 +805,7 @@ function SelfHealConfigButton() {
             </Button>
           </form>
         </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    </>
   )
 }
 
@@ -918,18 +907,6 @@ function readThrottleState(
     cooldownSecs,
     failover: config?.failover ?? true,
   }
-}
-
-function throttleTitle(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '账号级风控故障转移：关闭'
-  return `账号级风控故障转移：开启（冷却 ${state.cooldownMin} 分钟）`
-}
-
-function throttleTriggerText(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '不切换'
-  return `故障转移 · ${state.cooldownMin}m`
 }
 
 function compactThrottleText(loading: boolean, state: ThrottleState) {

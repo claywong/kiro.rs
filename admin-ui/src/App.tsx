@@ -8,19 +8,6 @@ import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, 
 import { TopbarTools } from "@/components/topbar-tools";
 import { useVendorUnacked } from "@/hooks/use-vendor";
 
-function GithubIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M12 .5C5.65.5.5 5.65.5 12.02c0 5.1 3.29 9.42 7.86 10.95.58.11.79-.25.79-.55 0-.27-.01-.99-.02-1.95-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.16 1.18a10.95 10.95 0 0 1 5.75 0c2.2-1.49 3.16-1.18 3.16-1.18.62 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.55A11.51 11.51 0 0 0 23.5 12.02C23.5 5.65 18.35.5 12 .5Z" />
-    </svg>
-  );
-}
-
 const Dashboard = lazy(() =>
   import("@/components/dashboard").then((m) => ({ default: m.Dashboard })),
 );
@@ -222,7 +209,7 @@ function AppHeader({
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
-      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
+      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 2xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
         <HeaderActions
           darkMode={darkMode}
@@ -243,14 +230,15 @@ function HeaderBrand({
   tab: Tab;
 }) {
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-2 xl:gap-3">
+    <div className="flex min-w-0 flex-1 items-center gap-2 lg:gap-3">
       <img
         src="/admin/kirors.png"
         alt="Kiro"
-        className="size-8 shrink-0 object-contain xl:size-9"
+        className="size-8 shrink-0 object-contain lg:size-9"
         draggable={false}
       />
-      <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base">
+      {/* 品牌名在 lg~xl 让位给 Tab，避免与工具栏挤在一起 */}
+      <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base lg:hidden 2xl:inline">
         Kiro Admin
       </span>
       <DesktopTabs tab={tab} onSwitchTab={onSwitchTab} />
@@ -267,7 +255,7 @@ function DesktopTabs({
 }) {
   const vendorUnacked = useVendorUnacked();
   return (
-    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 xl:flex">
+    <div className="hidden items-center gap-1 rounded-full border border-border/60 p-0.5 lg:ml-2 lg:flex 2xl:ml-4">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -292,14 +280,13 @@ function HeaderActions({
 }) {
   return (
     <div className="flex shrink-0 items-center gap-1">
-      <div className="xl:hidden">
+      <div className="lg:hidden">
         <TopbarTools compact />
       </div>
-      <div className="hidden items-center gap-1 xl:flex">
+      <div className="hidden items-center gap-1 lg:flex">
         <TopbarTools />
       </div>
-      <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
-      <GithubButton />
+      <span className="mx-1 hidden h-5 w-px bg-border/70 lg:inline-block" />
       <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
         {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
       </Button>
@@ -307,27 +294,6 @@ function HeaderActions({
         <LogOut className="h-4 w-4" />
       </Button>
     </div>
-  );
-}
-
-function GithubButton() {
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      asChild
-      title="GitHub 仓库"
-      className="hidden xl:inline-flex"
-    >
-      <a
-        href="https://github.com/ZyphrZero/kiro.rs"
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label="GitHub 仓库"
-      >
-        <GithubIcon className="h-4 w-4" />
-      </a>
-    </Button>
   );
 }
 
@@ -340,7 +306,7 @@ function MobileTabs({
 }) {
   const vendorUnacked = useVendorUnacked();
   return (
-    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 lg:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
