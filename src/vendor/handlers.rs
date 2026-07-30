@@ -691,28 +691,49 @@ pub async fn kiroapp_status(State(state): State<VendorState>) -> Response {
     use super::kiroapp_service::KiroappServiceError;
 
     if !state.kiroapp.enabled() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "未配置 kiroapp 对接" })),
-        )
-            .into_response();
+        return Json(serde_json::json!({
+            "configured": false
+        }))
+        .into_response();
     }
 
-    match state.kiroapp.stock().await {
-        Ok(stock) => Json(stock).into_response(),
-        Err(KiroappServiceError::NotConfigured) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "未配置 kiroapp 对接" })),
-        )
-            .into_response(),
-        Err(KiroappServiceError::Upstream(e)) => {
-            let status = e
-                .status
-                .and_then(|c| StatusCode::from_u16(c).ok())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, Json(serde_json::json!({ "error": e.message }))).into_response()
+    let config = state.kiroapp.config();
+    let default_groups = config.map(|c| c.default_groups.clone()).unwrap_or_default();
+    let default_rpm_limit = config.map(|c| c.default_rpm_limit).unwrap_or(300);
+
+    let mut response = serde_json::json!({
+        "configured": true,
+        "defaultGroups": default_groups,
+        "defaultRpmLimit": default_rpm_limit,
+    });
+
+    // 并发查库存和余额
+    let (stock_result, balance_result) = tokio::join!(
+        state.kiroapp.stock(),
+        state.kiroapp.balance()
+    );
+
+    match stock_result {
+        Ok(stock) => {
+            response["stock"] = serde_json::to_value(stock).unwrap();
         }
+        Err(KiroappServiceError::Upstream(e)) => {
+            response["stockError"] = serde_json::Value::String(e.message);
+        }
+        _ => {}
     }
+
+    match balance_result {
+        Ok(balance) => {
+            response["balance"] = serde_json::to_value(balance).unwrap();
+        }
+        Err(KiroappServiceError::Upstream(e)) => {
+            response["balanceError"] = serde_json::Value::String(e.message);
+        }
+        _ => {}
+    }
+
+    Json(response).into_response()
 }
 
 /// `POST /api/admin/vendor/kiroapp/claim` —— kiroapp 提取一个 Key

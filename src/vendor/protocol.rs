@@ -26,6 +26,9 @@ pub enum VendorFlavor {
     /// kiroapp.io：`/api/me/*` + `Authorization: Bearer km-xxx`。
     /// 独有能力：积分流水、我的密钥、最早密钥时间；阶梯定价。
     Kiroapp,
+    /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km-xxx`。
+    /// 简化版协议：只有库存、余额、提取，无流水、无密钥列表、无阶梯定价。
+    KiroappCc,
 }
 
 impl VendorFlavor {
@@ -33,6 +36,7 @@ impl VendorFlavor {
         match self {
             Self::Legacy => "legacy",
             Self::Kiroapp => "kiroapp",
+            Self::KiroappCc => "kiroapp-cc",
         }
     }
 
@@ -54,13 +58,14 @@ impl VendorFlavor {
         match norm.as_str() {
             "legacy" | "my" | "default" => Some(Self::Legacy),
             "kiroapp" | "kiroappio" | "me" => Some(Self::Kiroapp),
+            "kiroappcc" | "openapi" => Some(Self::KiroappCc),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp"
+        "legacy, kiroapp, kiroapp-cc"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -92,6 +97,18 @@ impl VendorFlavor {
                 batch_scoped_purchase: true,
                 // 单价按母号累计产量分档，同一单里各 Key 可能不同价
                 tiered_pricing: true,
+            },
+            Self::KiroappCc => VendorCapabilities {
+                system_status: false,
+                gen_logs: false,
+                webhook_manage: false,
+                purchase_orders: true,
+                redeem: true,
+                ledger: false,
+                my_keys: false,
+                earliest_key: false,
+                batch_scoped_purchase: false,
+                tiered_pricing: false,
             },
         }
     }

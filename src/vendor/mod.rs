@@ -23,6 +23,7 @@ pub mod store;
 // 多卖家支持：协议抽象 + 各家 flavor 实现 + 注册表。
 // 单独成模块而非塞进既有文件，便于接入第三家时只加文件。
 pub mod flavor_kiroapp;
+pub mod flavor_kiroapp_cc;
 pub mod flavor_legacy;
 pub mod protocol;
 pub mod registry;
