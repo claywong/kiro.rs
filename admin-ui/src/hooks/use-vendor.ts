@@ -9,11 +9,17 @@ import {
   ackVendorEvents,
   redeemVendorCode,
   setVendorMode,
+  setVendorPoolTarget,
   testVendorWebhook,
   setVendorWebhookUrl,
 } from '@/api/vendor'
 
-/** 卖家清单。首次进页面拉取，后续不再刷新（卖家列表运行期不变）。 */
+/**
+ * 卖家清单。首次进页面拉取，后续不主动刷新（卖家列表运行期不变）。
+ *
+ * 例外：响应里的 `poolTarget` 是可变的全局设置，改动后由
+ * [`useSetVendorPoolTarget`] 显式 invalidate 本 key 拉新值。
+ */
 export function useVendorList() {
   return useQuery({
     queryKey: ['vendor-list'],
@@ -107,6 +113,20 @@ export function useSetVendorMode(vendorId?: string) {
   return useMutation({
     mutationFn: (autoPurchase: boolean) => setVendorMode(autoPurchase, vendorId),
     onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
+  })
+}
+
+/**
+ * 设置全局提取限制。
+ *
+ * 用 `onSettled` 而非 `onSuccess`：持久化失败时后端仍返回 200（运行时已生效，
+ * 只是重启会回退），失败分支也该把服务端的实际值拉回来。
+ */
+export function useSetVendorPoolTarget() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (poolTarget: number) => setVendorPoolTarget(poolTarget),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-list'] }),
   })
 }
 

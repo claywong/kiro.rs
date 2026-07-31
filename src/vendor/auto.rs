@@ -124,6 +124,32 @@ pub fn census(entries: &[VendorKeyState], vendor_id: &str) -> VendorKeyCensus {
     c
 }
 
+/// 盘点池里**所有卖家来源**的存活 Key，不分供应商。
+///
+/// 与 [`census`] 的分工：`census` 回答「本家的 Key 是不是都死了」，只看本家；
+/// 本函数回答「池子整体还够不够用」，看所有 `vendor:` 来源。
+///
+/// 多家同时收到「全部失效」时，各家的 `census` 都会得出 `alive == 0`（按设计
+/// 互不可见），于是三家各提一份。全局池闸靠本函数补上那个缺失的视图。
+///
+/// 仍然排除非 `vendor:` 来源：自建或其他渠道导入的凭据与卖家补货无关，
+/// 把它们算进来会让池闸凭无关凭据挡掉真正需要的补货。
+///
+/// 只数 [`KeyHealth::Alive`]：`Ambiguous`（人工禁用 / 禁用未记原因）当下不可用，
+/// 记进「够用」会让池子实际枯竭时仍不补货。
+pub fn pool_alive(entries: &[VendorKeyState]) -> u32 {
+    entries
+        .iter()
+        .filter(|e| {
+            e.source_channel
+                .as_deref()
+                .and_then(vendor_id_of)
+                .is_some()
+        })
+        .filter(|e| classify(e) == KeyHealth::Alive)
+        .count() as u32
+}
+
 /// 由盘点结果得出确认结论。
 ///
 /// `window_expired` 为 false 时（观察窗口内），只有"确认全部失效"是终态，
@@ -373,5 +399,46 @@ mod tests {
         assert_eq!(c.total, 0);
         // 池里没有本家的 Key → 补货前提天然成立
         assert_eq!(conclude(c, false).0, ValidationStatus::ConfirmedDead);
+    }
+
+    /// 池闸的核心用途：三家各自 census 都是 0，但池子整体不空
+    #[test]
+    fn 全局盘点跨供应商累计() {
+        let entries = vec![
+            entry(Some("vendor:a:o1"), false, None, 0),
+            entry(Some("vendor:b:o2"), false, None, 0),
+            entry(Some("vendor:c:o3"), false, None, 0),
+        ];
+        // 每家自己看都只有 1 张，且都活着
+        assert_eq!(census(&entries, "a").alive, 1);
+        assert_eq!(pool_alive(&entries), 3, "池闸要看到三家的总量");
+    }
+
+    #[test]
+    fn 全局盘点排除非卖家来源() {
+        let entries = vec![
+            entry(Some("vendor:a:o1"), false, None, 0),
+            entry(Some("手动导入"), false, None, 0),
+            entry(None, false, None, 0),
+        ];
+        assert_eq!(pool_alive(&entries), 1, "自建渠道的 Key 不能算进池闸");
+    }
+
+    /// 待定态（人工禁用 / 禁用未记原因）当下不可用，不能记进「够用」
+    #[test]
+    fn 全局盘点只数存活() {
+        let entries = vec![
+            entry(Some("vendor:a:o1"), false, None, 0),
+            entry(Some("vendor:a:o2"), true, Some("TooManyFailures"), 3),
+            entry(Some("vendor:b:o3"), true, Some("Manual"), 0),
+            entry(Some("vendor:b:o4"), true, None, 0),
+            entry(Some("vendor:c:o5"), false, None, LOCAL_FAILURE_THRESHOLD),
+        ];
+        assert_eq!(pool_alive(&entries), 1, "失效与待定都不算存活");
+    }
+
+    #[test]
+    fn 空池全局盘点为零() {
+        assert_eq!(pool_alive(&[]), 0);
     }
 }

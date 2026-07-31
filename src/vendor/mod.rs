@@ -17,6 +17,7 @@ pub mod auto;
 pub mod client;
 pub mod handlers;
 pub mod import;
+pub mod pool_gate;
 pub mod router;
 pub mod schedule;
 pub mod service;

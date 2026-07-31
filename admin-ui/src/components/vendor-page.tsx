@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VendorStatusBar } from '@/components/vendor-status-bar'
+import { VendorPoolGate } from '@/components/vendor-pool-gate'
 import { VendorPurchaseDialog } from '@/components/vendor-purchase-dialog'
 import {
   useVendorList, useVendorStatus, useVendorEvents, useVendorOrders, useAckVendorEvents,
@@ -320,6 +321,9 @@ export function VendorPage() {
           </TabsList>
         </Tabs>
       )}
+
+      {/* 全局提取限制：跨所有卖家共享，故摆在标签页与单家状态条之间 */}
+      <VendorPoolGate />
 
       <VendorStatusBar vendorId={activeVendorId} />
 

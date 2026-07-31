@@ -243,6 +243,9 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
     Json(serde_json::json!({
         "vendors": items,
         "defaultVendorId": state.registry.default_service().map(|s| s.vendor_id()),
+        // 全局提取限制。放在这里而不是按家查的 /status —— 它跨供应商，
+        // 塞进单家状态会让「切换标签页后这个值变不变」变成一个需要解释的问题。
+        "poolTarget": state.registry.pool_gate().target(),
     }))
     .into_response()
 }
@@ -595,6 +598,37 @@ pub async fn set_mode(
         auto_purchase = result.auto_purchase,
         persisted = result.persisted,
         "提取模式已切换"
+    );
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPoolTargetRequest {
+    /// 池中存活卖家 Key 达到此数即不再自动补货。0 = 不启用
+    pub pool_target: u32,
+}
+
+/// `PUT /api/admin/vendor/pool-target` —— 设置全局提取限制
+///
+/// 与 [`set_mode`] 的两点不同，都源于「这是全局设置」：
+/// - 不接受 `vendorId`，也不 `pick()` 某一家 —— 阈值跨供应商共享。
+/// - 不校验 `outbound_enabled` —— 全局约束与某一家配没配对接无关。
+///
+/// 仍需至少有一家已注册：持久化要借用服务持有的配置路径，且没有任何卖家时
+/// 这个设置也无从生效。
+pub async fn set_pool_target(
+    State(state): State<VendorState>,
+    Json(req): Json<SetPoolTargetRequest>,
+) -> Response {
+    let Some(service) = state.registry.default_service() else {
+        return err_response(VendorServiceError::NotConfigured);
+    };
+    let result = service.set_pool_target(req.pool_target);
+    tracing::info!(
+        pool_target = result.pool_target,
+        persisted = result.persisted,
+        "全局提取限制已更新"
     );
     Json(result).into_response()
 }

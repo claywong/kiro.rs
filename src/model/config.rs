@@ -478,6 +478,21 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vendors: Vec<VendorConfig>,
 
+    /// 全局提取限制：池中存活的卖家 Key 达到此数即不再自动补货。0 = 不启用（默认）。
+    ///
+    /// 为什么需要它：各家的失效判定按设计互不可见（见 `vendor::auto::census` 的
+    /// 注释——A 家推「全部失效」时若把 B 家健康的 Key 算进来，A 的补货会被 B 挡死）。
+    /// 代价是多家 Key 同期失效时，三家各自都得出「池子空了」的结论，于是各提一份。
+    /// 本值补上那个缺失的全局视图，判据是 `vendor::auto::pool_alive`。
+    ///
+    /// 与各家 `autoPurchaseMaxCount` 是两层闸：后者管单笔提多少，本值管池子总量。
+    /// 语义刻意是「池子够用」而非「别家有存活」，否则会退回被别家挡死的老问题。
+    ///
+    /// 沿用本项目 0 值即关闭的既有约定（同 `autoPurchaseSchedule` 的 `maxCount: 0`），
+    /// 不额外设开关，避免「开关开着但阈值为 0」这种无意义组合。
+    #[serde(default)]
+    pub auto_purchase_pool_target: u32,
+
     /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
     ///
     /// 注意键名 `kiroapp` 指的是 kiroapp**.cc**，而非 `flavor: "kiroapp"` 对应的
@@ -641,6 +656,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             vendor: None,
             vendors: Vec::new(),
+            auto_purchase_pool_target: 0,
             legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
@@ -937,6 +953,29 @@ mod vendor_config_compat_tests {
         let config: Config =
             serde_json::from_str(r#"{"kiroapp":{"baseUrl":"","apiKey":""}}"#).unwrap();
         assert!(config.resolved_vendors().is_empty());
+    }
+
+    /// 存量配置没有这个字段，必须解析为 0（不启用），否则升级后会突然挡掉自动补货
+    #[test]
+    fn 全局池闸默认关闭() {
+        let config: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(config.auto_purchase_pool_target, 0);
+    }
+
+    #[test]
+    fn 全局池闸序列化回写不丢失() {
+        let mut config = Config::default();
+        config.auto_purchase_pool_target = 4;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("autoPurchasePoolTarget"), "落盘要带上本字段");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auto_purchase_pool_target, 4);
+    }
+
+    #[test]
+    fn 全局池闸读取配置值() {
+        let config: Config = serde_json::from_str(r#"{"autoPurchasePoolTarget":3}"#).unwrap();
+        assert_eq!(config.auto_purchase_pool_target, 3);
     }
 
     /// vendors 里显式配了同 id 时，显式配置胜出（迁移项排在最后）

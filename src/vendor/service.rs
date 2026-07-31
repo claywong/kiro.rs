@@ -10,7 +10,8 @@
 //! - 手动模式（默认）：入站 webhook **只落库不花钱**，扣费一律由面板显式触发。
 //! - 自动模式：仅当上一轮 `all_keys_dead` 已确认「名下卖家 Key 全部失效」时，
 //!   才在收到 `new_keys_available` 后自动提取，且只提最小数量。判定规则见
-//!   [`super::auto`]。
+//!   [`super::auto`]。多家同时触发时还要过一道跨供应商的总量闸，
+//!   见 [`super::pool_gate`]。
 //!
 //! @author wangzhong
 
@@ -23,6 +24,7 @@ use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::auto;
 use super::client::VendorClient;
+use super::pool_gate::PoolGate;
 // 本地新增模块单独成行，避免上游改动这批 use 时反复冲突。
 use super::schedule;
 use super::protocol::{
@@ -109,6 +111,19 @@ pub struct ModeChange {
     pub warning: Option<String>,
 }
 
+/// 设置全局提取限制的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolTargetChange {
+    /// 设置后的阈值（运行时已生效）。0 = 不启用
+    pub pool_target: u32,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
@@ -152,6 +167,8 @@ pub struct VendorService {
     /// 提取模式的运行时值。`config.auto_purchase` 只是启动快照，面板切换后
     /// 以本字段为准 —— 读它而不是读 config。
     auto_purchase: AtomicBool,
+    /// 跨供应商共享的全局提取闸门。各家持有同一个 Arc。
+    pool_gate: Arc<PoolGate>,
 }
 
 impl VendorService {
@@ -161,6 +178,7 @@ impl VendorService {
         tls_backend: TlsBackend,
         store: SharedVendorStore,
         admin: Arc<AdminService>,
+        pool_gate: Arc<PoolGate>,
     ) -> Self {
         let auto_purchase = config.auto_purchase;
         Self {
@@ -170,6 +188,7 @@ impl VendorService {
             store,
             admin,
             auto_purchase: AtomicBool::new(auto_purchase),
+            pool_gate,
         }
     }
 
@@ -227,6 +246,57 @@ impl VendorService {
                 }
             }
         }
+    }
+
+    /// 设置全局提取限制：先改运行时值，再尽力写回 config.json。
+    ///
+    /// 与 [`Self::set_auto_purchase`] 同样的取舍 —— 持久化失败不算设置失败，
+    /// 运行时已生效，由返回的 `persisted` 告知面板。
+    ///
+    /// 注意本方法改的是所有家共享的那一个闸门，不限于本实例对应的供应商。
+    /// 挂在 `VendorService` 上只是为了复用它持有的配置路径。
+    pub fn set_pool_target(&self, target: u32) -> PoolTargetChange {
+        self.pool_gate.set_target(target);
+        match self.persist_pool_target(target) {
+            Ok(()) => PoolTargetChange {
+                pool_target: target,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化全局提取限制失败（运行时已生效）: {}", e);
+                PoolTargetChange {
+                    pool_target: target,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// 写回 config.json 顶层的 `autoPurchasePoolTarget`。
+    ///
+    /// 比 [`Self::persist_auto_purchase`] 简单：顶层字段不必在 `vendor` /
+    /// `vendors` 里按 id 找那一项，也就没有「找不到该卖家」的失败分支。
+    fn persist_pool_target(&self, target: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                anyhow::anyhow!("配置文件路径未知，全局提取限制仅在当前进程生效")
+            })?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_purchase_pool_target = target;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
@@ -600,6 +670,8 @@ impl VendorService {
     /// 检查顺序按「代价从小到大、可逆到不可逆」排列：先读本地确认结论（零成本），
     /// 再查卖家可提取上限（一次出站），最后才 `bind_count` —— 绑定是唯一不可逆的
     /// 一步，之前任何一环给出否定结论都只记跳过，订单号仍留给手动提取。
+    ///
+    /// 多家并发时还要过 [`super::pool_gate`] 的总量闸，见 `try_auto_purchase`。
     pub fn spawn_auto_purchase(self: &Arc<Self>, event_id: String, new_keys: Option<u32>) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
@@ -652,7 +724,22 @@ impl VendorService {
             return Err("上一次失效确认已用于此前的自动提取，需新的失效事件".to_string());
         }
 
-        // 2. 数量：三者取最小，为 0 则无可提
+        // 2. 全局提取锁。必须在盘点之前拿到，并持有到下单+导入结束 ——
+        //    否则三家并发时会同时读到「池里 0 个存活」再同时下单，闸门形同虚设。
+        //    未启用池闸时不必付串行化的代价，直接跳过取锁。
+        let _gate = if self.pool_gate.enabled() {
+            Some(self.pool_gate.acquire().await?)
+        } else {
+            None
+        };
+
+        // 3. 全局池量闸。零成本本地读，故排在出站查库存之前。
+        //    这里重新盘点而非复用步骤 1 的结论：等锁期间别家可能已经补过货了，
+        //    锁前的池量视图已经过期。
+        self.pool_gate
+            .check(auto::pool_alive(&self.vendor_key_states()))?;
+
+        // 4. 数量：三者取最小，为 0 则无可提
         let stock = self
             .stock()
             .await
@@ -669,7 +756,7 @@ impl VendorService {
             ));
         }
 
-        // 3. 消费确认额度。抢占式，确保一次确认只授权一轮提取
+        // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取
         let consumed = self
             .store
             .consume_validation(vid, &dead.event_id)
@@ -678,7 +765,8 @@ impl VendorService {
             return Err("失效确认已被其他自动提取取用".to_string());
         }
 
-        // 4. 下单。此处开始不可逆
+        // 6. 下单。此处开始不可逆。`_gate` 持有到本函数结束，
+        //    确保后来者盘点时能看到这批新导入的 Key。
         tracing::info!(
             vendor_id = %vid,
             event_id = %event_id,

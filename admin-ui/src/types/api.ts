@@ -643,6 +643,12 @@ export interface VendorListItem {
 export interface VendorListResponse {
   vendors: VendorListItem[]
   defaultVendorId?: string
+  /**
+   * 全局提取限制：池中存活的卖家 Key 达到此数即不再自动补货，0 = 不启用。
+   *
+   * 跨供应商共享，故随清单一起返回而不在按家查的 `/status` 里。
+   */
+  poolTarget?: number
 }
 
 /** 卖家账号档案（已统一为 camelCase） */
@@ -716,6 +722,16 @@ export interface VendorStatus {
 /** 切换提取模式的结果 */
 export interface VendorModeChange {
   autoPurchase: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 设置全局提取限制的结果 */
+export interface VendorPoolTargetChange {
+  /** 设置后的阈值（运行时已生效）。0 = 不启用 */
+  poolTarget: number
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */
