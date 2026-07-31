@@ -963,7 +963,8 @@ mod vendor_config_compat_tests {
         let raw = include_str!("../../config.example.json");
         let config: Config = serde_json::from_str(raw).expect("config.example.json 必须能解析");
         let resolved = config.resolved_vendors();
-        assert_eq!(resolved.len(), 2, "示例应含 .io 与 .cc 两家");
+        // 刻意不断言家数：往示例里加一家就得改一次测试，而下面逐家的
+        // `expect` 已经能抓出「某家被静默丢掉」——那才是本测试要防的问题。
 
         let io = resolved
             .iter()
@@ -978,6 +979,13 @@ mod vendor_config_compat_tests {
             .find(|v| v.flavor == VendorFlavor::KiroappCc)
             .expect("缺 kiroapp.cc");
         assert!(cc.normalized_base_url().contains("kiroapp.cc"));
+
+        let drop = resolved
+            .iter()
+            .find(|v| v.flavor == VendorFlavor::Drop)
+            .expect("缺 Kiro Drop");
+        assert!(drop.normalized_base_url().contains("drop.kiro.ss"));
+        assert!(drop.inbound_enabled(), "示例里的 webhook token 必须真正生效");
     }
 
     /// 示例配置里**不能有任何被 serde 静默忽略的键**。

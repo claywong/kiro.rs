@@ -324,12 +324,17 @@ impl VendorService {
                 str_field("order_id"),
             ),
             VendorFlavor::KiroappCc => (str_field("purchase_order_id"), None),
-            // Drop 的推送里没有任何订单号，只有 batch_id。订单号得本地派生 ——
-            // 从 event_id 算，同一条推送重投多少次都得到同一个值，幂等仍成立。
+            // Drop 与首家同样用 purchase_order_id，但**文档里的示例值是
+            // `batch_xxx`**，而下单接口要求 client_order_id 是 32 位十六进制 ——
+            // 两处自相矛盾。故：形态合法就直接用（与首家一致），否则从
+            // (vendor_id, event_id) 派生一个合法的。派生值对同一条推送稳定，
+            // 重投仍能命中卖家侧的幂等重放。
             VendorFlavor::Drop => (
                 str_field("purchase_order_id")
                     .or_else(|| str_field("client_order_id"))
+                    .filter(|s| is_hex32(s))
                     .or_else(|| Some(derive_client_order_id(vendor_id, &event_id))),
+                // 早先那版文档用 batch_id 标批次；现版没有，留着不影响
                 str_field("batch_id"),
             ),
         };
@@ -416,7 +421,19 @@ impl VendorService {
         let resp = client
             .purchase(count, client_order_id, None)
             .await
-            .map_err(VendorServiceError::Upstream)?;
+            .map_err(|e| {
+                // 记下订单号：本路径不写事件表，失败后它是唯一能安全重试的凭据。
+                // 尤其是无状态码的失败（超时 / 断连）—— 卖家侧可能已扣费。
+                tracing::warn!(
+                    vendor_id = %self.vendor_id(),
+                    order_id = %client_order_id,
+                    count,
+                    upstream_status = ?e.status,
+                    "主动提取下单失败: {}",
+                    e
+                );
+                VendorServiceError::Upstream(e)
+            })?;
         let outcome = self.import_purchased(&resp, client_order_id).await;
         Ok(build_result(count, &resp, outcome))
     }
@@ -839,15 +856,20 @@ fn fallback_event_id(raw: &[u8]) -> String {
     hex::encode(&digest[..16])
 }
 
-/// 为不给订单号的卖家派生一个 32 位十六进制 `client_order_id`。
+/// 是否为卖家要求的 32 位十六进制订单号形态
+fn is_hex32(s: &str) -> bool {
+    let t = s.trim();
+    t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 为订单号不合法（或缺失）的卖家派生一个 32 位十六进制 `client_order_id`。
 ///
-/// Drop 家的推送只有 `batch_id`，而下单必须自带订单号且要求 32 位十六进制。
-/// 从 `(vendor_id, event_id)` 哈希得来，因此：
+/// Drop 家文档里的 `purchase_order_id` 示例是 `batch_xxx`，而下单接口要求 32 位
+/// 十六进制，直接拿去下单会被 400 拒掉。从 `(vendor_id, event_id)` 哈希得来，因此：
 /// - 同一条推送重投多少次都得到同一个订单号，卖家侧幂等重放生效，不会重复扣费；
 /// - 不同卖家的同名 event_id 不会撞成同一个订单号。
 ///
-/// 不直接拿 event_id 当订单号：它的格式由卖家决定，不保证是 32 位十六进制，
-/// 直接用会被卖家以 400 拒掉。
+/// 不直接拿 event_id 当订单号：它的格式由卖家决定，同样不保证是 32 位十六进制。
 fn derive_client_order_id(vendor_id: &str, event_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -875,49 +897,57 @@ mod tests {
 
     // ============ Drop 家（drop.kiro.ss）============
 
-    /// 用文档给的新批次样本
+    /// 用现行文档给的新货样本。事件名与首家相同。
     #[test]
-    fn drop_新批次事件归一到新key就绪() {
-        let raw = r#"{"event":"batch.completed","event_id":"0123456789abcdef0123456789abcdef",
-            "batch_id":"batch_xxx","message":"新一批 Key 已上架"}"#;
+    fn drop_新key就绪事件() {
+        let raw = r#"{"event":"new_keys_available","event_id":"0123456789abcdef0123456789abcdef",
+            "purchase_order_id":"batch_xxx","message":"新一批 Key 已上架"}"#;
         let e = parse_drop(raw.as_bytes()).unwrap();
-        // 事件名不同但语义相同，必须归一，否则自动提取的判定链条走不通
         assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
-        assert_eq!(e.batch_order_id.as_deref(), Some("batch_xxx"));
         assert_eq!(e.message.as_deref(), Some("新一批 Key 已上架"));
-        // 本家不给数量
+        // 文档未给数量，自动提取据此按卖家上限取小（见 auto::decide_count）
         assert_eq!(e.new_keys, None);
     }
 
-    /// 推送里没有订单号，必须本地派生出一个合法的 32 位十六进制串
+    /// 文档示例里的 `purchase_order_id` 是 `batch_xxx`，不是 32 位十六进制，
+    /// 而下单接口要求 32 位十六进制 —— 必须换成派生值，否则下单被 400 拒。
     #[test]
-    fn drop_订单号本地派生且为32位十六进制() {
-        let raw = br#"{"event":"batch.completed","event_id":"evt-1","batch_id":"b1"}"#;
+    fn drop_非法形态的订单号被换成派生值() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e1","purchase_order_id":"batch_xxx"}"#;
         let order = parse_drop(raw).unwrap().purchase_order_id.unwrap();
-        assert_eq!(order.len(), 32, "卖家要求 32 位");
-        assert!(
-            order.chars().all(|c| c.is_ascii_hexdigit()),
-            "必须全是十六进制字符，否则卖家 400: {order}"
+        assert_ne!(order, "batch_xxx", "原值不合法，不能直接拿去下单");
+        assert!(is_hex32(&order), "派生值必须合法: {order}");
+    }
+
+    /// 卖家给了合法形态时直接用，不多此一举地派生
+    #[test]
+    fn drop_合法订单号直接沿用() {
+        let given = "ffffffffffffffffffffffffffffffff";
+        let raw =
+            format!(r#"{{"event":"new_keys_available","event_id":"e1","purchase_order_id":"{given}"}}"#);
+        assert_eq!(
+            parse_drop(raw.as_bytes()).unwrap().purchase_order_id.as_deref(),
+            Some(given)
         );
     }
 
     /// 同一条推送重投得到同一订单号 —— 幂等重放的前提
     #[test]
     fn drop_同一事件派生同一订单号() {
-        let raw = br#"{"event":"batch.completed","event_id":"evt-1","batch_id":"b1"}"#;
+        let raw = br#"{"event":"new_keys_available","event_id":"evt-1"}"#;
         let a = parse_drop(raw).unwrap().purchase_order_id;
         let b = parse_drop(raw).unwrap().purchase_order_id;
         assert_eq!(a, b);
 
         // 不同事件不能撞成同一单
-        let other = br#"{"event":"batch.completed","event_id":"evt-2","batch_id":"b1"}"#;
+        let other = br#"{"event":"new_keys_available","event_id":"evt-2"}"#;
         assert_ne!(a, parse_drop(other).unwrap().purchase_order_id);
     }
 
     /// 不同卖家的同名 event_id 不能派生出同一个订单号
     #[test]
     fn drop_订单号按卖家隔离() {
-        let raw = br#"{"event":"batch.completed","event_id":"same-id"}"#;
+        let raw = br#"{"event":"new_keys_available","event_id":"same-id"}"#;
         let a = VendorService::parse_event("drop-a", VendorFlavor::Drop, raw)
             .unwrap()
             .purchase_order_id;
@@ -927,23 +957,10 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// 卖家日后开始给订单号时应优先用它，不再派生
-    #[test]
-    fn drop_卖家给了订单号就优先用() {
-        let given = "ffffffffffffffffffffffffffffffff";
-        let raw = format!(
-            r#"{{"event":"batch.completed","event_id":"e1","client_order_id":"{given}"}}"#
-        );
-        assert_eq!(
-            parse_drop(raw.as_bytes()).unwrap().purchase_order_id.as_deref(),
-            Some(given)
-        );
-    }
-
     #[test]
     fn drop_全部失效与测试事件() {
-        let raw = r#"{"event":"all_keys_dead","event_id":"d1","batch_id":"batch_x",
-            "message":"本轮全部 Key 已失效","dead":5}"#;
+        let raw = r#"{"event":"all_keys_dead","event_id":"d1",
+            "message":"全部 Key 已失效，系统正在自动补充","dead":5}"#;
         let e = parse_drop(raw.as_bytes()).unwrap();
         assert_eq!(e.kind, VendorEventKind::AllKeysDead);
         assert_eq!(e.dead, Some(5));

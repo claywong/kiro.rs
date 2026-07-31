@@ -28,9 +28,10 @@ pub enum VendorFlavor {
     /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km_xxx`。
     /// 简化版协议：只有库存、余额、提取，无流水、无密钥列表、无阶梯定价。
     KiroappCc,
-    /// Kiro Drop（drop.kiro.ss）：`/api/v1/*` + `X-API-Key: usr-xxx`。
-    /// 报价接口一次给齐库存/限购/余额；下单可能返回 202，需按 order_id 轮询。
-    /// 金额以人民币计。有 webhook 远程管理，无兑换码、无订单列表。
+    /// Kiro Drop（drop.kiro.ss）：`/api/my/*` + `X-API-Key: usr-xxx`。
+    /// 与 [`Self::Legacy`] 高度相似（同路径、同下单参数、同事件名），差异只有
+    /// 两处：金额是字符串、库存来自 `/api/status` 的 `keys_stock`。
+    /// 实测无兑换码 / 开号记录 / 订单列表（均 404）。
     Drop,
 }
 
@@ -116,17 +117,17 @@ impl VendorFlavor {
                 tiered_pricing: false,
             },
             Self::Drop => VendorCapabilities {
-                system_status: false,
+                // `/api/status` 既是系统状态也是本家唯一的库存来源
+                system_status: true,
+                // 以下四项在本家实测均 404，故关闭，避免面板给出点了报错的按钮
                 gen_logs: false,
-                // 有 PUT /api/my/webhook 与测试推送两个接口
-                webhook_manage: true,
-                // 只能按 order_id 查单条，没有列表接口
                 purchase_orders: false,
                 redeem: false,
+                // 有 PUT /api/my/webhook 与测试推送两个接口
+                webhook_manage: true,
                 ledger: false,
                 my_keys: false,
                 earliest_key: false,
-                // 推送里的 batch_id 不能作为下单参数，只是批次标识
                 batch_scoped_purchase: false,
                 tiered_pricing: false,
             },

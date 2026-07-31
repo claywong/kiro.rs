@@ -1,24 +1,21 @@
-//! Kiro Drop（drop.kiro.ss）的协议实现：`/api/v1/*` + `X-API-Key: usr-xxx`
+//! Kiro Drop（drop.kiro.ss）的协议实现：`/api/my/*` + `X-API-Key: usr-xxx`
 //!
-//! 与首家卖家（[`super::flavor_legacy`]）同用 `X-API-Key` 鉴权，但接口形态完全
-//! 不同，只有四个端点：
+//! **按 2026-07-31 的 <https://drop.kiro.ss/docs> 实现。** 该文档在同一天内改过
+//! 一次：早先那版走 `/api/v1/reservation`（报价 + 下单，可能返 202 待对账、金额分
+//! USD/CNY 两套），现已全部撤掉，改成与首家几乎一致的 `/api/my/*`。若日后又对不上，
+//! 先比对文档而不是猜 —— 上一轮就是照着旧文档实现完才发现接口已换。
 //!
-//! | 端点 | 用途 |
-//! |---|---|
-//! | `GET /api/v1/reservation?quantity=N` | 报价 + 库存 + 余额（一次拿全） |
-//! | `POST /api/v1/reservation` | 扣余额下单，200 出货 / 202 待对账 |
-//! | `GET /api/v1/orders/{order_id}` | 202 后轮询取 Key |
-//! | `PUT /api/my/webhook`、`POST /api/my/webhook/test` | webhook 远程管理 |
+//! 与 [`super::flavor_legacy`] 的关系：路径、鉴权头、下单参数（`count` +
+//! `client_order_id`）、事件名（`new_keys_available` / `all_keys_dead` / `test`）
+//! 与幂等语义**全部相同**，故不再重复建模这些，只处理两处真实差异：
 //!
-//! 本家的两个特点决定了上层处理方式：
+//! 1. **金额是字符串**（`"remaining": "884.400000"`），首家给的是数字。legacy 的
+//!    DTO 用 `f64`，直接复用会整份解析失败，因此本模块自带 DTO，用 [`Decimalish`]
+//!    同时接字符串与数字。
+//! 2. **库存来自 `/api/status` 的 `keys_stock`**，本家没有 `/api/my/stock`（404）。
 //!
-//! 1. **下单可能异步**。返回 202 + `status: "pending"` 时钱已经扣了但 Key 还没
-//!    定下来，必须拿 `order_id` 轮询而不是换单号重下 —— 换单号等于再扣一次。
-//!    轮询在 [`super::client::VendorClient::purchase`] 里做。
-//! 2. **金额以人民币计**。报价同时给 USD 与 CNY，实际扣款走 `total_amount_cny`，
-//!    故中立结构里的价格字段统一取 CNY，与面板上的余额（也是 CNY）同币种。
-//!
-//! 没有兑换码、没有订单列表、没有积分流水、没有名下密钥列表，也没有开号记录。
+//! 实测另有四个 legacy 端点在本家不存在（均 404），故对应能力关闭：
+//! `/api/my/stock`、`/api/my/gen-logs`、`/api/my/purchase-orders`、`/api/my/redeem`。
 //!
 //! @author wangzhong
 
@@ -26,26 +23,18 @@ use serde::Deserialize;
 
 use super::protocol::{ProfileInfo, PurchaseResult, PurchasedKey, StockInfo};
 
-/// 报价与下单共用一个路径，GET 报价、POST 下单。
-pub const PATH_RESERVATION: &str = "/api/v1/reservation";
-/// 订单查询前缀，后面直接拼 `order_id`。
-pub const PATH_ORDER_PREFIX: &str = "/api/v1/orders/";
-/// webhook 地址读写。与首家同路径，但本家没有 profile 接口回显它。
+/// 账户信息（余额 + webhook 配置）。与首家同路径，但金额是字符串。
+pub const PATH_PROFILE: &str = "/api/my/profile";
+/// 下单。参数 `count` + `client_order_id`，与首家一致。
+pub const PATH_PURCHASE: &str = "/api/my/purchase";
+/// 库存来源。本家没有 `/api/my/stock`，可购买数看这里的 `keys_stock`。
+pub const PATH_STATUS: &str = "/api/status";
 pub const PATH_WEBHOOK: &str = "/api/my/webhook";
 pub const PATH_WEBHOOK_TEST: &str = "/api/my/webhook/test";
 
-/// 报价时用的探测数量。取 1 是因为报价接口的 `quantity` 会参与校验：
-/// 超过库存或超过 `max_count` 直接 400，而查库存的场景下我们恰恰还不知道上限。
-pub const PROBE_QUANTITY: u32 = 1;
-
-/// 待对账订单的轮询节奏。文档只说「等待对账完成后查询」，未给时限，
-/// 故取一个够用又不至于把请求打满的间隔。
-pub const ORDER_POLL_INTERVAL_SECS: u64 = 3;
-/// 轮询次数上限。超时不报错 —— 钱已扣，返回已知信息让人工按 order_id 核对。
-pub const ORDER_POLL_MAX_ATTEMPTS: u32 = 20;
-
-/// 卖家用字符串传金额（如 `"115.600000"`），部分字段又可能是数字。
-/// 两种都接，解析失败当缺失，不让一个金额字段拖垮整份响应。
+/// 金额兼容层：本家用字符串传金额（`"884.400000"`），但数字形态也接 ——
+/// 对方哪天改成数字不必回来改代码。解析不了当缺失，不让一个金额字段
+/// 拖垮整份响应（余额显示不出来是小事，profile 整体解析失败是大事）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Decimalish {
@@ -67,170 +56,195 @@ pub fn amount(v: &Option<Decimalish>) -> Option<f64> {
     v.as_ref().and_then(Decimalish::to_f64)
 }
 
-/// `GET /api/v1/reservation?quantity=N` 响应。
-///
-/// 一次给齐库存、限购、单价与余额，故本家的「库存」与「档案」两个视图
-/// 都由它派生，不必分两次请求。
+/// 计数字段的兼容层。理由与 [`Decimalish`] 相同但后果重得多：本家已知会把
+/// 金额字符串化，`purchased` 哪天跟着变成 `"2"` 是完全合理的演进，而这个字段
+/// 在**下单响应**里 —— 一旦整份解析失败，此时 HTTP 已是 2xx、钱已经扣了，
+/// 等于把付过费的 Key 直接扔掉。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct QuoteResponse {
-    /// 本轮可售数量
-    #[serde(default)]
-    pub stock: u32,
-    /// 单次最大购买数
-    #[serde(default)]
-    pub max_count: Option<u32>,
-    /// 人民币单价
-    #[serde(default)]
-    pub unit_price_cny: Option<Decimalish>,
-    /// 账户可用余额（人民币）
-    #[serde(default)]
-    pub available_balance: Option<Decimalish>,
-    #[serde(default)]
-    pub goods_name: Option<String>,
+#[serde(untagged)]
+pub enum Countish {
+    Num(u32),
+    Text(String),
+    /// 字段缺失或是 null
+    #[default]
+    Absent,
 }
 
-impl QuoteResponse {
-    /// 实际可提取上限：库存与限购取小者。
-    ///
-    /// 只报 `stock` 会让面板显示一个下不了的数 —— 超过 `max_count` 的请求
-    /// 卖家直接 400，自动模式会白撞一次。
-    pub fn effective_available(&self) -> u32 {
-        match self.max_count {
-            Some(max) => self.stock.min(max),
-            None => self.stock,
+impl Countish {
+    pub fn to_u32(&self) -> Option<u32> {
+        match self {
+            Self::Num(v) => Some(*v),
+            // 卖家可能给 "2" 也可能给 "2.0"，后者按截断取整
+            Self::Text(s) => {
+                let t = s.trim();
+                t.parse::<u32>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().map(|f| f.max(0.0) as u32))
+            }
+            Self::Absent => None,
         }
     }
 }
 
-impl From<QuoteResponse> for StockInfo {
-    fn from(r: QuoteResponse) -> Self {
-        let price = amount(&r.unit_price_cny);
-        Self {
-            available: r.effective_available(),
-            // 无阶梯定价，min = max
-            price_min: price,
-            price_max: price,
-            // 报价接口顺带给余额，省一次请求
-            balance: amount(&r.available_balance),
+/// 单张 Key 的两种可能形态。
+///
+/// 文档给的是 `[{"key":"ksk_..."}]`，但同一份文档里金额已经出现过「本该是数字
+/// 却给字符串」，故对 Key 数组也留一手：裸字符串数组 `["ksk_..."]` 同样能读。
+/// 这个字段同样在下单响应里，解析失败等于丢弃已付费的 Key。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum KeyEntry {
+    Object { key: String },
+    Bare(String),
+}
+
+impl KeyEntry {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Object { key } => key.trim(),
+            Self::Bare(s) => s.trim(),
         }
     }
 }
 
-impl From<QuoteResponse> for ProfileInfo {
-    fn from(r: QuoteResponse) -> Self {
-        let balance = amount(&r.available_balance);
+/// `GET /api/my/profile` 响应。字段名与首家相同，只有金额类型不同。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileResponse {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 累计充值总额（CNY）
+    #[serde(default)]
+    pub quota: Option<Decimalish>,
+    /// 当前可用余额（CNY）
+    #[serde(default)]
+    pub remaining: Option<Decimalish>,
+    /// 累计消费总额（CNY）
+    #[serde(default)]
+    pub used_quota: Option<Decimalish>,
+    /// 已配置的 webhook 地址，未配置时是空串
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+impl From<ProfileResponse> for ProfileInfo {
+    fn from(r: ProfileResponse) -> Self {
         Self {
-            name: r.goods_name.clone(),
+            name: r.name,
             email: None,
-            balance,
-            // 本家没有配额概念，余额即全部可用额度
-            quota: balance,
-            used_quota: None,
+            // 与首家一致：「可用余额」叫 remaining，不是 quota
+            balance: amount(&r.remaining),
+            quota: amount(&r.quota),
+            used_quota: amount(&r.used_quota),
+            // 文档未给限购字段
             min_purchase: None,
-            max_purchase: r.max_count,
-            // webhook 地址只能写、读不回来
-            webhook_url: None,
+            max_purchase: None,
+            // 空串按未配置处理，否则面板会显示一个空地址当作「已配」
+            webhook_url: r.webhook_url.filter(|s| !s.trim().is_empty()),
             created_at: None,
         }
     }
 }
 
-/// 提取到的单张 Key
+/// `GET /api/status` 里与库存有关的那部分。
+///
+/// 同一个端点还给 `keys_active` / `keys_dead` / `generating`，但那些走
+/// `system_status` 能力、由 [`super::flavor_legacy::VendorSystemStatus`] 承接
+/// （它字段全可选且带 `flatten` 兜未知键，形态与本家一致）。这里只取下单要用的
+/// 可购买数，不重复建模。
 #[derive(Debug, Clone, Deserialize)]
-pub struct DropKey {
+pub struct StatusResponse {
+    /// **可购买的库存数量** —— 下单上限看这个
     #[serde(default)]
-    pub key: String,
+    pub keys_stock: Option<u32>,
 }
 
-/// `POST /api/v1/reservation` 与 `GET /api/v1/orders/{id}` 的共用响应体。
+impl From<StatusResponse> for StockInfo {
+    fn from(r: StatusResponse) -> Self {
+        Self {
+            available: r.keys_stock.unwrap_or(0),
+            // 文档没有单价字段，余额需另调 profile
+            price_min: None,
+            price_max: None,
+            balance: None,
+        }
+    }
+}
+
+/// `POST /api/my/purchase` 响应。
 ///
-/// 两个端点形状一致，故用同一个结构 —— 轮询拿到的就是下单本该返回的东西。
+/// **这条路上的每个字段都用兼容类型**，因为它是扣费路径：响应到手时 HTTP 已是
+/// 2xx、钱已经扣了，任何一个字段的类型不符导致整份解析失败，都等于把付过费的
+/// Key 扔掉。宁可读出一个语义不全的结果，也不能整份失败。
 #[derive(Debug, Clone, Deserialize)]
-pub struct OrderResponse {
-    #[serde(default)]
-    pub order_id: Option<String>,
+pub struct PurchaseResponse {
     #[serde(default)]
     pub client_order_id: Option<String>,
-    /// 请求数量
     #[serde(default)]
-    pub quantity: Option<u32>,
-    /// 实际出货数
+    pub purchased: Countish,
+    /// 购买后的剩余余额（CNY，字符串）
     #[serde(default)]
-    pub purchased_count: Option<u32>,
-    /// 实际扣款（人民币）。阶梯定价不存在，但仍以此为准。
+    pub remaining: Option<Decimalish>,
     #[serde(default)]
-    pub total_amount_cny: Option<Decimalish>,
-    /// `completed` / `pending` / 其它终态
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub remaining_balance: Option<Decimalish>,
-    #[serde(default)]
-    pub keys: Vec<DropKey>,
+    pub keys: Vec<KeyEntry>,
 }
 
-impl OrderResponse {
-    /// 是否仍在等待对账。只有明确的 `pending` 才继续轮询 ——
-    /// 未知状态当终态处理，避免对着一个永不变化的字段死循环。
-    pub fn is_pending(&self) -> bool {
-        self.status
-            .as_deref()
-            .map(|s| s.trim().eq_ignore_ascii_case("pending"))
-            .unwrap_or(false)
-    }
-
-    /// 是否已经拿到 Key。轮询在「有 Key」时也应停 ——
-    /// 有卖家会在出货后仍留着 pending 之外的中间状态。
-    pub fn has_keys(&self) -> bool {
-        self.keys.iter().any(|k| !k.key.trim().is_empty())
-    }
-}
-
-impl From<OrderResponse> for PurchaseResult {
-    fn from(r: OrderResponse) -> Self {
+impl From<PurchaseResponse> for PurchaseResult {
+    fn from(r: PurchaseResponse) -> Self {
         let keys: Vec<PurchasedKey> = r
             .keys
-            .into_iter()
-            .filter(|k| !k.key.trim().is_empty())
+            .iter()
+            .map(KeyEntry::value)
+            .filter(|k| !k.is_empty())
             .map(|k| PurchasedKey {
-                key: k.key.trim().to_string(),
+                key: k.to_string(),
                 account: None,
                 password: None,
                 issuer_url: None,
                 price: None,
             })
             .collect();
-
-        // 卖家回显的 purchased_count 与实际条数不一致时取较大者：
-        // 少算会漏入库，而入库本身按 Key 去重，多算不会重复扣费。
-        let purchased = r
-            .purchased_count
-            .unwrap_or(0)
-            .max(keys.len() as u32);
-        let total_debit = amount(&r.total_amount_cny);
+        // 回显数与实际条数不一致时取较大者：少算会漏入库，而入库本身按 Key
+        // 去重，多算不会重复扣费。与首家同样的兜底。
+        let purchased = r.purchased.to_u32().unwrap_or(0).max(keys.len() as u32);
         Self {
             purchased,
-            requested: r.quantity,
-            // 本家的「剩余」是账户余额，与首家同义
-            remaining: amount(&r.remaining_balance),
-            unit_price: total_debit.filter(|_| purchased > 0).map(|t| t / purchased as f64),
-            total_debit,
-            order_id: r.order_id,
+            requested: None,
+            // 本家的「剩余」是账户余额（CNY）
+            remaining: amount(&r.remaining),
+            // 文档未给单价与扣费明细
+            unit_price: None,
+            total_debit: None,
+            order_id: r.client_order_id,
             keys,
-            // 幂等重放不回显，无从区分，保守记 false
+            // 不回显是否幂等重放，保守记 false
             replayed: false,
         }
     }
 }
 
+/// 按状态码补一句本家的语义。
+///
+/// 本家的 `404` 意为**库存不足**而非路径写错、`403` 是余额不足、`409` 是订单号
+/// 冲突。卖家给了 message 时不必多说；但它返空体或 HTML（网关拦截）时，面板上
+/// 只会剩一个裸状态码 —— 运维看到 404 的第一反应必然是「路径错了/接口又改了」，
+/// 方向完全跑偏。故仅在**没有可读 message 时**补这句兜底。
+pub fn status_hint(status: u16) -> Option<&'static str> {
+    match status {
+        403 => Some("余额不足"),
+        404 => Some("库存不足，无可用 Key（本家此码不表示路径错误）"),
+        409 => Some("订单号冲突：同一订单号此前用过不同数量，或价格超过上限"),
+        _ => None,
+    }
+}
+
 /// 从本家的嵌套错误体里取人类可读信息。
 ///
-/// 形态是 `{"error":{"code":"...","message":"...","request_id":"..."}}`，
+/// 形态是 `{"error":{"code":..,"message":..,"details":{},"request_id":..}}`，
 /// [`super::client::VendorClient::parse`] 里的扁平 `{"error":"文本"}` 认不出来，
 /// 不单独解会把整段 JSON 连 request_id 一起塞进面板。
 ///
-/// `code` 也带上：`AUTH_REQUIRED` 与 `API_TOKEN_INVALID` 在本家是两种不同的
-/// 401（前者是没带头，后者是 Key 不对），只看 message 分不清该改哪里。
+/// `code` 一并带上：本家的 401 分 `AUTH_REQUIRED`（没认到凭证）与
+/// `API_TOKEN_INVALID`（Key 不对）两种，只看 message 分不清该改哪里。
 pub fn error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let err = v.get("error")?;
@@ -252,137 +266,177 @@ pub fn error_message(body: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// 用文档给的报价样本
+    /// 用文档给的 profile 样本
     #[test]
-    fn 解析报价_真实样本() {
-        let raw = r#"{"goods_id":1,"goods_name":"Kiro Key","stock":25,"quantity":2,
-            "max_count":20,"unit_price_usd":"8.50","total_price_usd":"17.00",
-            "exchange_rate":"6.8","unit_price_cny":"57.800000","total_price_cny":"115.600000",
-            "currency":"CNY","available_balance":"1000.000000"}"#;
-        let q: QuoteResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(q.stock, 25);
-        assert_eq!(q.max_count, Some(20));
+    fn 解析账户信息_真实样本() {
+        let raw = r#"{"name":"someone@example.com","quota":"2000.000000",
+            "remaining":"884.400000","used_quota":"1115.600000",
+            "webhook_url":"https://your-server.example/hook"}"#;
+        let p: ProfileInfo = serde_json::from_str::<ProfileResponse>(raw).unwrap().into();
+        assert_eq!(p.balance, Some(884.4), "可用余额取 remaining 而非 quota");
+        assert_eq!(p.quota, Some(2000.0));
+        assert_eq!(p.used_quota, Some(1115.6));
+        assert_eq!(p.webhook_url.as_deref(), Some("https://your-server.example/hook"));
+        assert_eq!(p.name.as_deref(), Some("someone@example.com"));
+    }
 
-        let s: StockInfo = q.into();
-        // 库存 25 但限购 20，可提取上限取小者
-        assert_eq!(s.available, 20);
-        assert_eq!(s.price_min, Some(57.8));
-        assert_eq!(s.price_max, Some(57.8), "无阶梯定价，min = max");
-        assert_eq!(s.balance, Some(1000.0), "报价接口顺带给余额");
+    /// 金额是字符串——这正是不能直接复用 legacy DTO 的原因
+    #[test]
+    fn 金额兼容字符串与数字() {
+        let text: ProfileResponse = serde_json::from_str(r#"{"remaining":"60.560000"}"#).unwrap();
+        assert_eq!(amount(&text.remaining), Some(60.56));
+
+        let num: ProfileResponse = serde_json::from_str(r#"{"remaining":60.56}"#).unwrap();
+        assert_eq!(amount(&num.remaining), Some(60.56));
+
+        // 解析不了的串当缺失，不能让整份 profile 失败
+        let bad: ProfileResponse =
+            serde_json::from_str(r#"{"remaining":"待定","name":"x"}"#).unwrap();
+        assert_eq!(amount(&bad.remaining), None);
+        assert_eq!(bad.name.as_deref(), Some("x"), "其余字段仍要读出来");
+    }
+
+    /// 未配置 webhook 时返回空串，不能当成「已配置一个空地址」
+    #[test]
+    fn 空webhook地址按未配置处理() {
+        let p: ProfileInfo = serde_json::from_str::<ProfileResponse>(r#"{"webhook_url":""}"#)
+            .unwrap()
+            .into();
+        assert!(p.webhook_url.is_none());
+    }
+
+    /// 用文档给的 status 样本。其余字段由 legacy 的 VendorSystemStatus 承接，
+    /// 这里只关心可购买数。
+    #[test]
+    fn 解析库存_真实样本() {
+        let raw = r#"{"keys_active":5,"keys_dead":0,"keys_stock":25,"generating":false}"#;
+        let s: StatusResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.keys_stock, Some(25));
+
+        // keys_stock 就是可购买数——本家没有 /api/my/stock
+        let stock: StockInfo = s.into();
+        assert_eq!(stock.available, 25);
+        // 文档没有单价，余额要另调 profile
+        assert!(stock.price_min.is_none());
+        assert!(stock.balance.is_none());
+    }
+
+    /// 跨模块契约：`/api/status` 的完整响应由 legacy 的 `VendorSystemStatus`
+    /// 承接（见本文件 `StatusResponse` 的注释）。这里用同一份文档样本把它钉住 ——
+    /// 否则 Drop 的响应形态若与那个结构分叉（如 `generating` 变成字符串），
+    /// 整份反序列化失败、状态卡片全空，而只测 `StatusResponse` 的用例仍然全绿。
+    #[test]
+    fn 系统状态由legacy结构承接() {
+        let raw = r#"{"keys_active":5,"keys_dead":0,"keys_stock":25,"generating":false}"#;
+        let s: super::super::flavor_legacy::VendorSystemStatus =
+            serde_json::from_str(raw).expect("legacy 结构必须能吃下 Drop 的 status 响应");
+        assert_eq!(s.keys_active, Some(5));
+        assert_eq!(s.keys_dead, Some(0));
+        assert_eq!(s.keys_stock, Some(25));
+        assert_eq!(s.generating, Some(false));
+        // 四个字段都该落进已建模字段，而非 flatten 兜底
+        assert!(s.extra.is_empty(), "不该有字段落进 extra: {:?}", s.extra);
     }
 
     #[test]
-    fn 库存低于限购时取库存() {
-        let q: QuoteResponse =
-            serde_json::from_str(r#"{"stock":3,"max_count":20}"#).unwrap();
-        assert_eq!(q.effective_available(), 3);
-    }
-
-    #[test]
-    fn 报价缺限购时按库存() {
-        let q: QuoteResponse = serde_json::from_str(r#"{"stock":7}"#).unwrap();
-        assert_eq!(q.effective_available(), 7);
-    }
-
-    #[test]
-    fn 报价转档案_余额与限购() {
-        let raw = r#"{"stock":5,"max_count":20,"available_balance":"884.400000",
-            "goods_name":"Kiro Key"}"#;
-        let p: ProfileInfo = serde_json::from_str::<QuoteResponse>(raw).unwrap().into();
-        assert_eq!(p.balance, Some(884.4));
-        assert_eq!(p.quota, Some(884.4), "无配额概念，余额即全部额度");
-        assert_eq!(p.max_purchase, Some(20));
-        assert_eq!(p.name.as_deref(), Some("Kiro Key"));
-        assert!(p.webhook_url.is_none(), "地址只能写不能读");
-    }
-
-    #[test]
-    fn 金额字段兼容数字与字符串() {
-        let text: QuoteResponse =
-            serde_json::from_str(r#"{"stock":1,"unit_price_cny":"57.8"}"#).unwrap();
-        assert_eq!(amount(&text.unit_price_cny), Some(57.8));
-
-        let num: QuoteResponse =
-            serde_json::from_str(r#"{"stock":1,"unit_price_cny":57.8}"#).unwrap();
-        assert_eq!(amount(&num.unit_price_cny), Some(57.8));
-
-        // 解析不了的串当缺失，不能让整份响应失败
-        let bad: QuoteResponse =
-            serde_json::from_str(r#"{"stock":1,"unit_price_cny":"待定"}"#).unwrap();
-        assert_eq!(amount(&bad.unit_price_cny), None);
-        assert_eq!(bad.stock, 1);
+    fn 库存缺字段时按0而非报错() {
+        let s: StatusResponse = serde_json::from_str("{}").unwrap();
+        let stock: StockInfo = s.into();
+        assert_eq!(stock.available, 0, "缺字段按没货，不能让状态卡片整体失败");
     }
 
     /// 用文档给的下单成功样本
     #[test]
     fn 解析下单成功_真实样本() {
-        let raw = r#"{"order_id":"store_abc","client_order_id":"0123456789abcdef0123456789abcdef",
-            "goods_name":"Kiro Key","quantity":2,"purchased_count":2,
-            "total_amount_cny":"115.600000","status":"completed",
-            "remaining_balance":"884.400000","keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#;
-        let o: OrderResponse = serde_json::from_str(raw).unwrap();
-        assert!(!o.is_pending());
-        assert!(o.has_keys());
-
-        let r: PurchaseResult = o.into();
+        let raw = r#"{"client_order_id":"0123456789abcdef0123456789abcdef","purchased":2,
+            "remaining":"884.400000","keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
         assert_eq!(r.purchased, 2);
-        assert_eq!(r.requested, Some(2));
         assert_eq!(r.keys.len(), 2);
-        assert_eq!(r.total_debit, Some(115.6));
-        assert_eq!(r.unit_price, Some(57.8));
         assert_eq!(r.remaining, Some(884.4), "剩余即账户余额");
-        assert_eq!(r.order_id.as_deref(), Some("store_abc"));
-    }
-
-    #[test]
-    fn 待对账订单需继续轮询() {
-        let raw = r#"{"order_id":"store_x","status":"pending","quantity":1,"keys":[]}"#;
-        let o: OrderResponse = serde_json::from_str(raw).unwrap();
-        assert!(o.is_pending());
-        assert!(!o.has_keys());
-    }
-
-    /// 未知状态当终态：否则字段永不变化会把轮询拖满
-    #[test]
-    fn 未知状态不视为待对账() {
-        for raw in [
-            r#"{"status":"failed"}"#,
-            r#"{"status":""}"#,
-            r#"{"quantity":1}"#,
-        ] {
-            let o: OrderResponse = serde_json::from_str(raw).unwrap();
-            assert!(!o.is_pending(), "不该继续轮询: {raw}");
-        }
-        // 大小写与空白容忍
-        let o: OrderResponse = serde_json::from_str(r#"{"status":" Pending "}"#).unwrap();
-        assert!(o.is_pending());
+        assert_eq!(
+            r.order_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(!r.replayed);
     }
 
     #[test]
     fn 出货数取回显与实际条数的较大者() {
         // 回显 1 但实发 2 条，按实际条数算，否则会漏入库
-        let raw = r#"{"purchased_count":1,"keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#;
-        let r: PurchaseResult = serde_json::from_str::<OrderResponse>(raw).unwrap().into();
+        let raw = r#"{"purchased":1,"keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
+        assert_eq!(r.purchased, 2);
+
+        // 反方向：回显 2 实发 1。取较大者会让统计偏大，但入库只认 keys 数组，
+        // 不会凭空造出凭据，也不会多扣费。
+        let raw = r#"{"purchased":2,"keys":[{"key":"ksk_a"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
+        assert_eq!(r.purchased, 2);
+        assert_eq!(r.keys.len(), 1, "入库只认实际条数");
+    }
+
+    /// 扣费路径的容错：`purchased` 被字符串化时**不能整份解析失败**。
+    ///
+    /// 这不是假想 —— 本家已知把金额写成字符串（`"remaining":"884.4"`），
+    /// `purchased` 跟着变形完全合理。而此时 HTTP 是 2xx、钱已经扣了，
+    /// 整份失败等于把付过费的 Key 扔掉。
+    #[test]
+    fn 字符串化的出货数仍能读出() {
+        let raw = r#"{"purchased":"2","remaining":"884.4","keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw)
+            .expect("purchased 为字符串时不能整份失败")
+            .into();
         assert_eq!(r.purchased, 2);
         assert_eq!(r.keys.len(), 2);
+        assert_eq!(r.remaining, Some(884.4));
+
+        // 带小数的字符串按截断取整
+        let raw = r#"{"purchased":"2.0","keys":[]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
+        assert_eq!(r.purchased, 2);
+
+        // 认不出的值当缺失，靠 keys 条数兜底，仍不整份失败
+        let raw = r#"{"purchased":"未知","keys":[{"key":"ksk_a"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
+        assert_eq!(r.purchased, 1, "回落到实际条数");
+    }
+
+    /// 同上：`keys` 若变成裸字符串数组也要能读
+    #[test]
+    fn 裸字符串形态的key数组仍能读出() {
+        let raw = r#"{"purchased":2,"keys":["ksk_a","ksk_b"]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw)
+            .expect("裸字符串 keys 数组不能整份失败")
+            .into();
+        assert_eq!(r.keys.len(), 2);
+        assert_eq!(r.keys[0].key, "ksk_a");
+
+        // 两种形态混在一起也要能读
+        let raw = r#"{"purchased":2,"keys":[{"key":"ksk_a"},"ksk_b"]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
+        assert_eq!(r.keys.len(), 2);
+        assert_eq!(r.keys[1].key, "ksk_b");
+    }
+
+    #[test]
+    fn 状态码语义兜底() {
+        // 本家的 404 是「没货」而不是「路径错」，这句兜底就是为了防止误判方向
+        assert!(status_hint(404).unwrap().contains("库存不足"));
+        assert!(status_hint(404).unwrap().contains("路径"), "要明确排除路径错的误解");
+        assert!(status_hint(403).unwrap().contains("余额不足"));
+        assert!(status_hint(409).unwrap().contains("订单号"));
+        // 没有特殊语义的码不编造说法
+        assert!(status_hint(500).is_none());
+        assert!(status_hint(401).is_none(), "401 的两种 code 由 error_message 区分");
     }
 
     #[test]
     fn 空key条目被剔除() {
-        let raw = r#"{"purchased_count":0,"keys":[{"key":"  "},{"key":"ksk_a"}]}"#;
-        let r: PurchaseResult = serde_json::from_str::<OrderResponse>(raw).unwrap().into();
+        let raw = r#"{"purchased":0,"keys":[{"key":"  "},{"key":"ksk_a"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
         assert_eq!(r.keys.len(), 1);
         assert_eq!(r.keys[0].key, "ksk_a");
-    }
-
-    #[test]
-    fn 零个key时不产生inf单价() {
-        let raw = r#"{"purchased_count":0,"total_amount_cny":"115.6","keys":[]}"#;
-        let r: PurchaseResult = serde_json::from_str::<OrderResponse>(raw).unwrap().into();
-        assert_eq!(r.purchased, 0);
-        assert!(r.unit_price.is_none(), "0 个 Key 不能算出单价");
-        // 扣费仍要留着，人工核对时需要看到钱确实扣了
-        assert_eq!(r.total_debit, Some(115.6));
     }
 
     /// 用真实的 401 返回做样本
@@ -392,7 +446,7 @@ mod tests {
             "message":"API Key 无效","request_id":"req_9ec835d9"}}"#;
         let msg = error_message(raw).unwrap();
         assert!(msg.contains("API Key 无效"));
-        // code 要带上：两种 401 的处置不同（没带头 vs Key 不对）
+        // 两种 401 的处置不同（没带头 vs Key 不对），code 必须带上
         assert!(msg.contains("API_TOKEN_INVALID"), "实际: {msg}");
         // request_id 不该混进面板文案
         assert!(!msg.contains("req_"), "实际: {msg}");
@@ -400,13 +454,16 @@ mod tests {
 
     #[test]
     fn 解析扁平错误体() {
-        assert_eq!(error_message(r#"{"error":"余额不足"}"#).as_deref(), Some("余额不足"));
+        assert_eq!(
+            error_message(r#"{"error":"余额不足"}"#).as_deref(),
+            Some("余额不足")
+        );
     }
 
     #[test]
     fn 只有code时也给出信息() {
-        let raw = r#"{"error":{"code":"OUT_OF_STOCK","details":{}}}"#;
-        assert_eq!(error_message(raw).as_deref(), Some("OUT_OF_STOCK"));
+        let raw = r#"{"error":{"code":"NOT_FOUND","details":{}}}"#;
+        assert_eq!(error_message(raw).as_deref(), Some("NOT_FOUND"));
     }
 
     #[test]

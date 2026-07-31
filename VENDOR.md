@@ -15,9 +15,10 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 > 写成 `"flavor": "kiroapp"` 却填 kiroapp.cc 的地址，会对着不存在的 `/api/me/*`
 > 发请求，症状是一片 404。
 
-> **`drop` 与 `legacy` 也容易混**：两家都用 `X-API-Key: usr-xxx`，Key 的形态一样，
-> 但接口完全不同（`/api/v1/*` vs `/api/my/*`）。填错的症状是 404 而不是 401 ——
-> 鉴权头对得上，路径对不上。
+> **`drop` 与 `legacy` 也容易混**：两家都用 `/api/my/*` + `X-API-Key: usr-xxx`，
+> 路径和鉴权头几乎一样。区别在于 Drop 的金额是**字符串**、库存来自 `/api/status`
+> 而非 `/api/my/stock`。把 Drop 配成 `legacy` 不会 401，而是余额与下单结果解析
+> 失败、库存查询 404 —— 比报错更难查，因为面板只显示"解析响应失败"。
 
 ## 快速开始
 
@@ -161,50 +162,49 @@ Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，
 
 ### `drop` - Kiro Drop（drop.kiro.ss）协议
 
-`/api/v1/*` + `X-API-Key: usr-xxx`。鉴权头与 `legacy` 相同，但接口形态完全不同，
-**只有四个端点**：
+`/api/my/*` + `X-API-Key: usr-xxx`。**与 `legacy` 高度相似** —— 路径、鉴权头、
+下单参数、事件名、幂等语义全都一样，可以当成 `legacy` 的裁剪版来理解：
 
 | 端点 | 用途 |
 |---|---|
-| `GET /api/v1/reservation?quantity=N` | 报价 + 库存 + 限购 + 余额（一次拿全） |
-| `POST /api/v1/reservation` | 扣余额下单：200 直接出货，202 待对账 |
-| `GET /api/v1/orders/{order_id}` | 202 之后轮询取 Key |
+| `GET /api/my/profile` | 余额（`remaining`）与已配的 webhook 地址 |
+| `GET /api/status` | 系统状态，其中 `keys_stock` 是**可购买数** |
+| `POST /api/my/purchase` | 下单，参数 `count` + `client_order_id` |
 | `PUT /api/my/webhook`、`POST /api/my/webhook/test` | webhook 地址读写与测试推送 |
 
-- ✅ 库存 / 限购 / 余额查询（都由报价接口派生，不额外发请求）
-- ✅ 提取，参数名是 `quantity`（不是别家的 `count`），订单号 `client_order_id`
-- ✅ Webhook 推送与远程管理（地址只能写、读不回来）
-- ❌ 无兑换码充值、无订单列表（只能按 `order_id` 查单条）
-- ❌ 无阶梯定价、无积分流水、无密钥列表、无系统状态与开号记录
+- ✅ 余额查询、库存查询、按订单提取
+- ✅ Webhook 推送（`new_keys_available` / `all_keys_dead` / `test`）与远程管理
+- ✅ 系统状态查询
+- ❌ 无兑换码充值、无开号记录、无订单列表（`/api/my/redeem`、`/api/my/gen-logs`、
+  `/api/my/purchase-orders` 实测均 404）
+- ❌ 无阶梯定价、无积分流水、无密钥列表
 
 **协议名可写** `"drop"` / `"kiro-drop"` / `"drop.kiro.ss"`。
 
-几处与别家不同、值得单独知道的地方：
+与 `legacy` 的两处真实差异：
 
-**金额以人民币计。** 报价同时给 USD 与 CNY，实际扣款走 `total_amount_cny`，
-因此面板上这家的单价、扣费、余额统一是 CNY，与别家的积分不同币种，不要横向比。
+**金额是字符串。** 本家返回 `"remaining": "884.400000"`，首家给的是数字。legacy 的
+DTO 用 `f64`，直接复用会整份解析失败（余额、下单结果全读不出来），因此本家自带
+DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是人民币。
 
-**下单可能是异步的。** 返回 202 + `status:"pending"` 表示钱已经扣了但 Key 还没
-定下来。此时后端会拿 `order_id` 每 3 秒轮询一次、最多 20 次（约 1 分钟）。
-轮询用尽仍未出货**不报错**，而是把已知信息返回并告警 —— 钱确实扣了，报错会让人
-误以为没花钱，请按日志里的 `order_id` 到卖家侧核对。**任何情况下都不要换一个
-订单号重下**，那等于再扣一次。
+**库存来自 `/api/status`。** 本家没有 `/api/my/stock`（404），可购买数取
+`/api/status` 的 `keys_stock`。
 
-**不传 `max_total_cny`。** 卖家文档建议传它做涨价保护，但同一订单号重试时参数
-必须一致（否则 409），而重试时重新报出的价格不保证还是原值 —— 传了会把一次本可
-幂等重放的重试变成永久失败。涨价风险由 `autoPurchaseMaxCount` 兜着。
+另外两点：
 
-**推送里没有订单号。** 本家的 `batch.completed` 只给 `batch_id`，而下单必须自带
-32 位十六进制订单号，因此订单号由后端从 `(供应商 id, event_id)` 哈希派生。同一条
-推送重投多少次都得到同一个订单号，卖家侧幂等重放照常生效。
+**订单号形态要校验。** 文档的 webhook 示例里 `purchase_order_id` 是 `batch_xxx`，
+但下单接口要求 `client_order_id` 是 32 位十六进制 —— 文档这两处自相矛盾。故后端
+先校验形态：合法就直接沿用（与首家一致），不合法则从 `(供应商 id, event_id)` 哈希
+派生一个合法值。派生值对同一条推送稳定，重投仍能命中卖家侧的幂等重放。
 
-**事件名不同。** 新批次上架叫 `batch.completed`（不是别家的 `new_keys_available`），
-后端已归一到同一类，自动提取的判定链条与别家一致。该事件**不带数量**，此时自动
-提取按「卖家当前可提取上限」与 `autoPurchaseMaxCount` 取小，不会因为缺这个数就提不出来。
+**新货事件不带数量。** `new_keys_available` 没有 `new_keys` 字段，此时自动提取按
+「卖家当前 `keys_stock`」与 `autoPurchaseMaxCount` 取小，不会因为缺这个数就提不出来。
 
-**库存为空时报价接口返 400。** 报价的 `quantity` 参与校验，超过库存直接 400。
-后端对「库存不足」这一类文案降级为「可提取 0 个」，面板会正常显示 0 而不是一条
-报错；其余 400（如订单号格式错）仍照常上报。
+> **本家文档改过一次。** 2026-07-31 早先那版走 `/api/v1/reservation`（报价 + 下单，
+> 可能返 202 待对账、金额分 USD/CNY 两套、新货事件叫 `batch.completed`），当天即
+> 全部撤掉换成上表这套。若日后又对不上，**先比对
+> [文档](https://drop.kiro.ss/docs) 而不是猜** —— 上一轮就是照着旧文档实现完，
+> 才发现接口已经换掉了。
 
 ## 时段表配置
 

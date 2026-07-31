@@ -103,9 +103,9 @@ impl VendorEventKind {
 
     pub fn from_str(s: &str) -> Self {
         match s {
-            // `batch.completed` 是 Drop 家「新批次已上架」的叫法，语义与
-            // new_keys_available 相同（都表示有新货可提），归一到同一类，
-            // 自动提取的判定链条才不必按卖家分支。
+            // `batch.completed` 是 Drop 家早先那版文档里「新批次已上架」的叫法。
+            // 现行文档已改用 new_keys_available，但别名留着：两者语义相同（都表示
+            // 有新货可提），而对方实现是否同步改过无从确认，漏认一条会错过补货。
             "new_keys_available" | "batch.completed" => Self::NewKeysAvailable,
             "all_keys_dead" => Self::AllKeysDead,
             "key_revoked_abuse" => Self::KeyRevokedAbuse,

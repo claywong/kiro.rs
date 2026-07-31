@@ -246,115 +246,105 @@ impl VendorClient {
         Ok(kiroapp_cc::ClaimResult { keys, points_cost })
     }
 
-    /// Drop 的报价查询：`GET /api/v1/reservation?quantity=N`。
+    /// Drop 的下单：`POST /api/my/purchase`，**成功响应宽松解析**。
     ///
-    /// 一次给齐库存、限购、单价与余额，故 [`Self::stock`] 与 [`Self::profile`]
-    /// 都走它，不必分两次请求。
-    async fn drop_quote(&self, quantity: u32) -> Result<drop_flavor::QuoteResponse, VendorApiError> {
-        self.get_with(
-            drop_flavor::PATH_RESERVATION,
-            &[("quantity", quantity.max(1).to_string())],
-        )
-        .await
-    }
-
-    /// 同 [`Self::drop_quote`]，但把「库存不足」这一种 400 当成「可提取 0 个」。
+    /// 参数与首家一致（`count` + `client_order_id`），但错误与成功两侧都要特化：
     ///
-    /// 报价接口的 `quantity` 会参与校验，超过库存直接 400 —— 而查库存时我们恰恰
-    /// 还不知道上限。若把这种 400 原样上抛，卖家一卖空面板就只显示一条报错，
-    /// 看不出「就是没货」这个正常状态。
-    ///
-    /// 只对库存类文案降级，其余 400（如订单号格式错）仍照常报错。
-    async fn drop_quote_lenient(&self) -> Result<drop_flavor::QuoteResponse, VendorApiError> {
-        match self.drop_quote(drop_flavor::PROBE_QUANTITY).await {
-            Ok(q) => Ok(q),
-            Err(e) if e.status == Some(400) && mentions_out_of_stock(&e.message) => {
-                tracing::debug!("Drop 报价返回库存不足，按 0 库存处理: {}", e.message);
-                Ok(drop_flavor::QuoteResponse {
-                    stock: 0,
-                    ..Default::default()
-                })
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Drop 的下单：`POST /api/v1/reservation`，202 时按 `order_id` 轮询。
-    ///
-    /// **不传 `max_total_cny`**。文档建议传它做涨价保护，但同一订单号重试时参数
-    /// 必须一致（否则 409），而重试时重新报出的价格不保证还是原值 —— 传了会把
-    /// 一次可幂等重放的重试变成永久失败。涨价风险由自动模式的数量上限兜着。
-    ///
-    /// 202 表示钱已扣、Key 待对账，此时**只能拿 order_id 轮询，绝不能换单号重下**。
-    /// 轮询用尽仍未出货也返回 Ok：钱确实扣了，返回已知信息让人工按 order_id 核对，
-    /// 报错会让人误以为没花钱。
+    /// - **2xx 时严格解析失败要降级**，与 [`Self::claim_kiroapp_cc`] 同一道理：
+    ///   拿到 2xx 就说明钱已经扣了，若因为响应结构不认识就报错，等于把付过费的
+    ///   Key 直接扔掉。本家已知会把金额字符串化（这正是 `flavor_drop` 存在的
+    ///   理由），`purchased` 或 `keys` 哪天跟着变形完全合理。DTO 本身已用
+    ///   `Countish` / `KeyEntry` 吃下常见变形，这里再兜一层「结构完全不认识」
+    ///   的情况：按 `ksk_` 前缀扫，连裸文本响应也能捞出来。
+    /// - **非 2xx 时按状态码补语义**：本家 404 意为库存不足而非路径错，卖家返
+    ///   空体时面板只剩裸状态码，方向会被带偏。
     async fn purchase_drop(
         &self,
-        quantity: u32,
+        body: &serde_json::Value,
         client_order_id: &str,
-    ) -> Result<drop_flavor::OrderResponse, VendorApiError> {
-        let body = serde_json::json!({
-            "quantity": quantity,
-            "client_order_id": client_order_id,
-        });
-        let mut order: drop_flavor::OrderResponse =
-            self.post_json(drop_flavor::PATH_RESERVATION, &body).await?;
+    ) -> Result<PurchaseResult, VendorApiError> {
+        let resp = self
+            .auth(
+                self.http
+                    .post(self.url(drop_flavor::PATH_PURCHASE))
+                    .json(body),
+            )
+            .send()
+            .await
+            .map_err(|e| VendorApiError {
+                status: None,
+                message: e.to_string(),
+            })?;
 
-        // 回显的订单号与我们发出的不一致，说明这单大概不是我们这一单（卖家侧串号，
-        // 或我们把别人的重放当成了自己的）。只告警不阻断 —— 钱可能已经扣了，
-        // 报错会让人误以为没花钱；Key 仍照常入库，凭 order_id 可人工追。
-        if let Some(echoed) = order.client_order_id.as_deref()
-            && echoed.trim() != client_order_id.trim()
-        {
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| VendorApiError {
+            status: Some(status.as_u16()),
+            message: format!("读取响应体失败: {e}"),
+        })?;
+
+        if !status.is_success() {
+            let code = status.as_u16();
+            // 卖家给了可读 message 就用它；给空体 / HTML 时才退到状态码语义
+            let message = drop_flavor::error_message(&text)
+                .or_else(|| {
+                    let t = text.trim();
+                    (!t.is_empty() && serde_json::from_str::<serde_json::Value>(t).is_ok())
+                        .then(|| truncate(t, 300))
+                })
+                .or_else(|| drop_flavor::status_hint(code).map(str::to_string))
+                .unwrap_or_else(|| truncate(&text, 300));
+            return Err(VendorApiError {
+                status: Some(code),
+                message,
+            });
+        }
+
+        // 先按文档形态解析（DTO 已容忍字符串化的 purchased 与裸字符串 keys）
+        if let Ok(r) = serde_json::from_str::<drop_flavor::PurchaseResponse>(&text) {
+            let result: PurchaseResult = r.into();
+            if !result.keys.is_empty() {
+                return Ok(result);
+            }
+            // 解析成功但一个 Key 都没有：可能是卖家真的出货 0 个（合法），
+            // 也可能是 keys 字段改了名。降级扫一遍，捞到就用捞到的。
+            let scanned = scan_keys(&text);
+            if scanned.is_empty() {
+                return Ok(result);
+            }
             tracing::warn!(
-                sent = %client_order_id,
-                echoed = %echoed,
-                "Drop 回显的 client_order_id 与发出的不一致，请人工核对该单"
+                order_id = %client_order_id,
+                found = scanned.len(),
+                "Drop 下单响应的 keys 字段为空但正文里有 ksk_ Key，已按前缀降级捞出"
+            );
+            return Ok(PurchaseResult {
+                purchased: result.purchased.max(scanned.len() as u32),
+                keys: scanned,
+                ..result
+            });
+        }
+
+        // 结构完全不认识。钱已经扣了，捞不到也返回 Ok(空) 而不是 Err ——
+        // 上层据此提示人工按订单号核对，报错会让人误以为没花钱。
+        let scanned = scan_keys(&text);
+        if scanned.is_empty() {
+            tracing::warn!(
+                order_id = %client_order_id,
+                "Drop 下单返回 2xx 但结构无法识别且未捞到 ksk_ Key，可能已扣费: {}",
+                truncate(&text, 300)
+            );
+        } else {
+            tracing::warn!(
+                order_id = %client_order_id,
+                found = scanned.len(),
+                "Drop 下单响应结构不符合文档，已按前缀降级捞出 Key"
             );
         }
-
-        if !order.is_pending() || order.has_keys() {
-            return Ok(order);
-        }
-
-        let Some(order_id) = order.order_id.clone().filter(|s| !s.trim().is_empty()) else {
-            // pending 却没给 order_id：无从轮询，也无从人工核对，只能上抛
-            return Err(VendorApiError {
-                status: Some(202),
-                message: "卖家返回待对账订单但未给出 order_id，无法查询结果，请在卖家侧核对是否已扣费"
-                    .to_string(),
-            });
-        };
-        let path = format!("{}{}", drop_flavor::PATH_ORDER_PREFIX, order_id.trim());
-
-        for attempt in 1..=drop_flavor::ORDER_POLL_MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                drop_flavor::ORDER_POLL_INTERVAL_SECS,
-            ))
-            .await;
-            match self.get::<drop_flavor::OrderResponse>(&path).await {
-                Ok(latest) => {
-                    let done = !latest.is_pending() || latest.has_keys();
-                    order = latest;
-                    if done {
-                        return Ok(order);
-                    }
-                }
-                // 查询失败不终止：钱已扣，值得把剩下的机会用完
-                Err(e) => tracing::warn!(
-                    order_id = %order_id,
-                    attempt,
-                    "Drop 订单查询失败，稍后重试: {}",
-                    e
-                ),
-            }
-        }
-
-        tracing::warn!(
-            order_id = %order_id,
-            "Drop 订单轮询用尽仍未出货，可能已扣费，请人工按 order_id 核对"
-        );
-        Ok(order)
+        Ok(PurchaseResult {
+            purchased: scanned.len() as u32,
+            order_id: Some(client_order_id.to_string()),
+            keys: scanned,
+            ..Default::default()
+        })
     }
 
     // ============ 提取（消费侧）============
@@ -373,10 +363,7 @@ impl VendorClient {
         client_order_id: &str,
         batch_order_id: Option<&str>,
     ) -> Result<PurchaseResult, VendorApiError> {
-        let mut body = serde_json::json!({
-            "count": count,
-            "client_order_id": client_order_id,
-        });
+        let mut body = purchase_body(count, client_order_id);
         match self.flavor {
             VendorFlavor::Legacy => {
                 let r: legacy::PurchaseResponse =
@@ -402,11 +389,7 @@ impl VendorClient {
                 let result = self.claim_kiroapp_cc(&body, count).await?;
                 Ok(result.into_purchase_result(client_order_id.to_string(), count))
             }
-            VendorFlavor::Drop => {
-                // 本家的数量参数叫 quantity，且下单可能异步（202 → 轮询）
-                let order = self.purchase_drop(count, client_order_id).await?;
-                Ok(order.into())
-            }
+            VendorFlavor::Drop => self.purchase_drop(&body, client_order_id).await,
         }
     }
 
@@ -425,7 +408,11 @@ impl VendorClient {
                 let r: kiroapp_cc::StockResponse = self.get(kiroapp_cc::PATH_STOCK).await?;
                 Ok(r.into())
             }
-            VendorFlavor::Drop => Ok(self.drop_quote_lenient().await?.into()),
+            VendorFlavor::Drop => {
+                // 本家没有 /api/my/stock（404），可购买数看 /api/status 的 keys_stock
+                let r: drop_flavor::StatusResponse = self.get(drop_flavor::PATH_STATUS).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -455,8 +442,11 @@ impl VendorClient {
                     webhook_url: None,
                 })
             }
-            // 本家没有独立档案接口，余额与限购都在报价里
-            VendorFlavor::Drop => Ok(self.drop_quote_lenient().await?.into()),
+            VendorFlavor::Drop => {
+                // 与首家同路径，但金额是字符串，故用本家自己的 DTO
+                let r: drop_flavor::ProfileResponse = self.get(drop_flavor::PATH_PROFILE).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -515,7 +505,14 @@ impl VendorClient {
         if !self.capabilities().system_status {
             return Err(VendorApiError::unsupported("系统状态查询"));
         }
-        self.get(legacy::PATH_STATUS).await
+        // 首家与 Drop 的路径恰好同名，但分开取：Drop 的 stock() 走
+        // drop_flavor::PATH_STATUS，若只改那一处、这里继续用 legacy 的常量，
+        // 同一端点就有了两个真相来源，且没有测试会失败。同 webhook_path()。
+        let path = match self.flavor {
+            VendorFlavor::Drop => drop_flavor::PATH_STATUS,
+            _ => legacy::PATH_STATUS,
+        };
+        self.get(path).await
     }
 
     /// 卖家近期开号批次与平均间隔，用于估算下一批新 Key 大概什么时候到。
@@ -625,22 +622,35 @@ impl VendorClient {
     }
 }
 
-/// 错误文案是否在说「没货 / 货不够」。
+/// 下单请求体。抽成纯函数是为了能直接断言参数名 ——
+/// 没有 HTTP mock 库时，这是唯一能锁住「发的是 `count` 而不是 `quantity`」的办法。
 ///
-/// 用于 Drop 的报价降级（见 [`VendorClient::drop_quote_lenient`]）：卖家没给
-/// 机器可读的错误码区分「参数错」与「没货」，只能认文案。中英都列上，卖家
-/// 换语言不至于立刻失效；认不出就照常报错，不会把真错误吞掉。
-fn mentions_out_of_stock(message: &str) -> bool {
-    const NEEDLES: [&str; 6] = [
-        "库存",
-        "缺货",
-        "售罄",
-        "out of stock",
-        "insufficient stock",
-        "no stock",
-    ];
-    let lower = message.to_lowercase();
-    NEEDLES.iter().any(|n| lower.contains(n))
+/// 三家（Legacy / Kiroapp / Drop）的主名都是 `count` + `client_order_id`。
+/// Drop 家文档注明「也接受 quantity」，但我们发主名。
+fn purchase_body(count: u32, client_order_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "count": count,
+        "client_order_id": client_order_id,
+    })
+}
+
+/// 从任意响应正文里按 `ksk_` 前缀捞 Key，转成中立结构。
+///
+/// 复用 [`kiroapp_cc::extract_keys`]（它递归遍历 JSON、按 Key 字符集切 token、
+/// 去重）。不是合法 JSON 时整体当一个字符串再扫，故裸文本响应也能捞出。
+fn scan_keys(text: &str) -> Vec<crate::vendor::protocol::PurchasedKey> {
+    let value = serde_json::from_str::<serde_json::Value>(text)
+        .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+    kiroapp_cc::extract_keys(&value)
+        .into_iter()
+        .map(|k| crate::vendor::protocol::PurchasedKey {
+            key: k,
+            account: None,
+            password: None,
+            issuer_url: None,
+            price: None,
+        })
+        .collect()
 }
 
 /// 构造分页查询参数。`page_size` 超过卖家上限时收敛，避免白拿一个 400。
@@ -745,13 +755,14 @@ mod tests {
         c.flavor = VendorFlavor::Drop;
         let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
         let caps = client.capabilities();
-        // 有 webhook 远程管理
+        // /api/status 既是系统状态也是库存来源
+        assert!(caps.system_status);
         assert!(caps.webhook_manage);
-        // 只能按 order_id 查单条，没有列表
+        // 以下四项在本家实测均 404
         assert!(!caps.purchase_orders);
         assert!(!caps.redeem);
+        assert!(!caps.gen_logs);
         assert!(!caps.ledger);
-        assert!(!caps.system_status);
         assert!(!caps.tiered_pricing);
     }
 
@@ -764,7 +775,6 @@ mod tests {
 
         let e = client.redeem("code").await.unwrap_err();
         assert!(e.message.contains("兑换码"), "实际: {}", e.message);
-        assert!(client.system_status().await.is_err());
         assert!(client.gen_logs().await.is_err());
         assert!(client.ledger(None, None, None).await.is_err());
         assert!(client.my_keys(false, None, None).await.is_err());
@@ -773,6 +783,32 @@ mod tests {
         let paged = client.purchase_orders(None, None).await.unwrap();
         assert!(paged.items.is_empty());
         assert_eq!(paged.total, Some(0));
+    }
+
+    /// 锁住下单参数名。文档主名是 `count`，改成 `quantity` 此前不会有任何测试失败。
+    #[test]
+    fn 下单请求体用count而非quantity() {
+        let body = purchase_body(2, "0123456789abcdef0123456789abcdef");
+        assert_eq!(body["count"], 2, "参数名必须是 count（文档主名）");
+        assert!(body.get("quantity").is_none(), "不该发 quantity");
+        assert_eq!(
+            body["client_order_id"],
+            "0123456789abcdef0123456789abcdef",
+            "订单号字段名必须是 client_order_id"
+        );
+        // 幂等保护字段不发：报价接口已撤，拿不到当前单价，填不出合理上限
+        assert!(body.get("max_total_cny").is_none());
+    }
+
+    /// Drop 与首家的 /api/status 今天同路径，system_status() 与 stock() 必须
+    /// 指向同一个端点。哪天分叉了这条会失败，提醒去改另一处。
+    #[test]
+    fn drop_的status路径与首家一致() {
+        assert_eq!(
+            legacy::PATH_STATUS,
+            crate::vendor::flavor_drop::PATH_STATUS,
+            "两家的 status 路径若分叉，system_status() 与 stock() 会指向不同端点"
+        );
     }
 
     #[test]
@@ -789,22 +825,6 @@ mod tests {
         let legacy_client =
             VendorClient::new(&cfg("https://v", "usr-x", "t"), None, TlsBackend::Rustls).unwrap();
         assert_eq!(legacy_client.webhook_path(), legacy::PATH_WEBHOOK);
-    }
-
-    #[test]
-    fn 识别库存不足的错误文案() {
-        // 中文（卖家当前的文案）
-        assert!(mentions_out_of_stock("库存不足：需要 1 个，当前可售 0 个"));
-        assert!(mentions_out_of_stock("商品已售罄"));
-        assert!(mentions_out_of_stock("缺货"));
-        // 英文，大小写不敏感
-        assert!(mentions_out_of_stock("Out Of Stock"));
-        assert!(mentions_out_of_stock("insufficient stock for this request"));
-
-        // 其余 400 不能被当成没货吞掉
-        assert!(!mentions_out_of_stock("数量或订单号格式不正确"));
-        assert!(!mentions_out_of_stock("API Key 无效"));
-        assert!(!mentions_out_of_stock("余额不足"));
     }
 
     #[test]

@@ -35,6 +35,14 @@ impl VendorState {
 }
 
 fn err_response(e: VendorServiceError) -> Response {
+    err_response_with(e, &[])
+}
+
+/// 同 [`err_response`]，但往正文里额外并入若干字段。
+///
+/// 提取失败时用它带上订单号：钱可能已经扣了，而用**同一个订单号**原样重试是
+/// 卖家提供的唯一安全取回手段，换号重试等于再扣一次。
+fn err_response_with(e: VendorServiceError, extra: &[(&str, serde_json::Value)]) -> Response {
     let status = match &e {
         VendorServiceError::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
         VendorServiceError::EventNotFound => StatusCode::NOT_FOUND,
@@ -54,6 +62,9 @@ fn err_response(e: VendorServiceError) -> Response {
     let mut body = serde_json::json!({ "error": e.to_string() });
     if let Some(b) = bound {
         body["boundCount"] = serde_json::json!(b);
+    }
+    for (k, v) in extra {
+        body[*k] = v.clone();
     }
     (status, Json(body)).into_response()
 }
@@ -514,6 +525,16 @@ pub async fn purchase_ad_hoc(
         .filter(|s| is_hex32(s))
         .unwrap_or_else(new_order_id);
 
+    // 下单**前**先把订单号落日志。这条路径不写事件表，订单号只存在于本次请求的
+    // 内存里 —— 若下单超时或断连，卖家侧很可能已扣费并锁定 Key，而订单号一丢
+    // 就再也取不回那笔单（重试要用同一个号才会命中幂等重放）。日志是唯一线索。
+    tracing::info!(
+        vendor_id = %service.vendor_id(),
+        order_id = %order_id,
+        count = req.count,
+        "主动提取开始"
+    );
+
     match service.purchase_ad_hoc(req.count, &order_id).await {
         Ok(result) => {
             let mut body = serde_json::to_value(&result).unwrap_or_default();
@@ -521,7 +542,23 @@ pub async fn purchase_ad_hoc(
             body["vendorId"] = serde_json::json!(service.vendor_id());
             Json(body).into_response()
         }
-        Err(e) => err_response(e),
+        Err(e) => {
+            // 失败也必须回显订单号：钱可能已经扣了，面板要能提示「用这个号原样
+            // 重试」。换号重试等于再扣一次，而本家没有订单列表可供事后对账。
+            tracing::warn!(
+                vendor_id = %service.vendor_id(),
+                order_id = %order_id,
+                "主动提取失败（若为超时/断连，卖家侧可能已扣费，请用同一订单号重试）: {}",
+                e
+            );
+            err_response_with(
+                e,
+                &[
+                    ("clientOrderId", serde_json::json!(order_id)),
+                    ("vendorId", serde_json::json!(service.vendor_id())),
+                ],
+            )
+        }
     }
 }
 
