@@ -612,6 +612,44 @@ impl TraceStore {
         }
     }
 
+    /// 最近若干秒内的报错数与重试数（用于概览的实时健康指标）。
+    ///
+    /// - 报错：`traces.final_status = 'error'` 的**请求**条数（整条链路最终失败）。
+    ///   不含 `interrupted`（客户端断开不算服务端错误）。
+    /// - 重试：`trace_attempts.attempt > 0` 的**跳**数，即首次尝试之外的重投次数。
+    ///   `attempt` 由 `for attempt in 0..max_retries` 产生，是 0-based，所以 0 号跳是
+    ///   首发而非重试。一条请求重试 2 次记 2。归组依据是所属请求的 `ts_epoch`（请求开始时间）。
+    ///
+    /// 失败仅 warn 并返回全 0，不让概览接口挂掉。
+    pub fn recent_counters(&self, window_secs: i64) -> RecentCounters {
+        let cutoff = Utc::now().timestamp() - window_secs;
+        let conn = self.conn.lock();
+        let errors = match conn.query_row(
+            "SELECT COUNT(*) FROM traces WHERE ts_epoch >= ?1 AND final_status = 'error'",
+            [cutoff],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => v as u64,
+            Err(e) => {
+                tracing::warn!("trace recent_counters 报错数查询失败: {}", e);
+                return RecentCounters::default();
+            }
+        };
+        let retries = match conn.query_row(
+            "SELECT COUNT(*) FROM trace_attempts a JOIN traces t ON t.trace_id = a.trace_id \
+             WHERE t.ts_epoch >= ?1 AND a.attempt > 0",
+            [cutoff],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => v as u64,
+            Err(e) => {
+                tracing::warn!("trace recent_counters 重试数查询失败: {}", e);
+                return RecentCounters { errors, retries: 0 };
+            }
+        };
+        RecentCounters { errors, retries }
+    }
+
     /// 按凭据聚合失败跳数，归并为三类：鉴权 / 账号风控 / 其他。
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。
@@ -655,6 +693,14 @@ impl TraceStore {
         }
         out
     }
+}
+
+/// 某个时间窗口内的报错数与重试数
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentCounters {
+    pub errors: u64,
+    pub retries: u64,
 }
 
 /// 按凭据的失败分类计数（鉴权 / 账号风控 / 其他）
@@ -787,6 +833,54 @@ mod tests {
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         }
+    }
+
+    /// recent_counters：报错只数 final_status='error' 的请求，重试只数 attempt>0 的跳，
+    /// 窗口外的记录不计入。attempt 是 0-based，0 号跳是首发不算重试。
+    #[test]
+    fn recent_counters_counts_errors_and_retries_in_window() {
+        let store = mem_store();
+        // 窗口内：1 条 error（含 2 跳 → 1 次重试）
+        store.insert(&sample(TraceSample {
+            trace_id: "err-recent",
+            status: "error",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        }));
+        // 窗口内：1 条 success（同样 2 跳 → 也贡献 1 次重试，但不算报错）
+        store.insert(&sample(TraceSample {
+            trace_id: "ok-recent",
+            status: "success",
+            credential_id: 6,
+            model: "claude-opus-4-7",
+        }));
+        // 窗口内：1 条 interrupted，不算报错
+        store.insert(&sample(TraceSample {
+            trace_id: "int-recent",
+            status: "interrupted",
+            credential_id: 7,
+            model: "claude-opus-4-7",
+        }));
+        // 窗口外（10 分钟前）：1 条 error，应被 cutoff 排除
+        let mut old = sample(TraceSample {
+            trace_id: "err-old",
+            status: "error",
+            credential_id: 8,
+            model: "claude-opus-4-7",
+        });
+        old.ts = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        store.insert(&old);
+
+        let c = store.recent_counters(300);
+        // error 只有 err-recent（err-old 超窗、interrupted/success 不算）
+        assert_eq!(c.errors, 1);
+        // 3 条窗口内记录各有 1 跳 attempt=1 → 3 次重试；attempt=0 的首发不计
+        assert_eq!(c.retries, 3);
+
+        // 窗口放大到 1 小时后，err-old 进入统计
+        let wide = store.recent_counters(3600);
+        assert_eq!(wide.errors, 2);
+        assert_eq!(wide.retries, 4);
     }
 
     #[test]

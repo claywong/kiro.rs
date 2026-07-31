@@ -1188,6 +1188,10 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
     let active_credentials = snapshot.credentials.iter().filter(|c| !c.disabled).count() as u64;
+    // 近窗口健康指标走 trace 库（重试数只有那里有）。trace 关闭时无新数据写入，
+    // 返回的计数会停在关闭前的残留上，故显式带出开关状态供前端提示。
+    let last_1m = state.trace_store.recent_counters(60);
+    let last_5m = state.trace_store.recent_counters(300);
     let response = serde_json::json!({
         "todayCalls": overview.today_calls,
         "todayInputTokens": overview.today_input_tokens,
@@ -1200,6 +1204,11 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
         "weekCredits": overview.week_credits,
         "activeClientKeys": active_keys,
         "activeCredentials": active_credentials,
+        "errors1m": last_1m.errors,
+        "errors5m": last_5m.errors,
+        "retries1m": last_1m.retries,
+        "retries5m": last_5m.retries,
+        "traceEnabled": state.trace_store.is_enabled(),
     });
     Json(response)
 }

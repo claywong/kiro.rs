@@ -455,6 +455,14 @@ export interface OverviewStats {
   weekCredits: number
   activeClientKeys: number
   activeCredentials: number
+  /** 最近 1 / 5 分钟报错数（整条请求最终失败，来自 trace 库） */
+  errors1m: number
+  errors5m: number
+  /** 最近 1 / 5 分钟重试数（首次尝试之外的重投跳数） */
+  retries1m: number
+  retries5m: number
+  /** trace 是否启用；关闭时上面 4 个近窗口计数不再更新 */
+  traceEnabled: boolean
 }
 
 export interface TimeSeriesPoint {
