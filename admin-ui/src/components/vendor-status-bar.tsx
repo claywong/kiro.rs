@@ -207,6 +207,11 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
 
   const profile = status?.profile
   const system = status?.system
+  /**
+   * 能力集缺失时按「全不支持」处理：状态还在加载时先不渲染这些按钮，
+   * 免得先亮出来再消失，也免得点了对不支持的接口发请求拿 404。
+   */
+  const caps = status?.capabilities
 
   const handleRedeem = async () => {
     const trimmed = code.trim()
@@ -397,34 +402,48 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onClick={handleTest} disabled={testWebhook.isPending}>
-          <Send className="mr-1.5 h-3.5 w-3.5" />
-          测试推送
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            setWebhookInput(profile?.webhookUrl ?? '')
-            setWebhookOpen(true)
-          }}
-        >
-          <Upload className="mr-1.5 h-3.5 w-3.5" />
-          写入卖家
-        </Button>
-        <Button variant="outline" size="sm" onClick={() => setRedeemOpen(true)}>
-          <Ticket className="mr-1.5 h-3.5 w-3.5" />
-          兑换充值
-        </Button>
-        <Button variant="outline" size="sm" onClick={() => setGenLogsOpen(true)}>
-          <History className="mr-1.5 h-3.5 w-3.5" />
-          开号记录
-          {status?.genLogs?.avg_interval_min != null && (
-            <span className="ml-1.5 text-xs text-muted-foreground">
-              均 {formatDuration(status.genLogs.avg_interval_min * 60)}
-            </span>
-          )}
-        </Button>
+        {/* 测试推送与写入地址都走卖家的 webhook 管理 API，没这能力的家一律隐藏 */}
+        {caps?.webhookManage && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleTest}
+              disabled={testWebhook.isPending}
+            >
+              <Send className="mr-1.5 h-3.5 w-3.5" />
+              测试推送
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setWebhookInput(profile?.webhookUrl ?? '')
+                setWebhookOpen(true)
+              }}
+            >
+              <Upload className="mr-1.5 h-3.5 w-3.5" />
+              写入卖家
+            </Button>
+          </>
+        )}
+        {caps?.redeem && (
+          <Button variant="outline" size="sm" onClick={() => setRedeemOpen(true)}>
+            <Ticket className="mr-1.5 h-3.5 w-3.5" />
+            兑换充值
+          </Button>
+        )}
+        {caps?.genLogs && (
+          <Button variant="outline" size="sm" onClick={() => setGenLogsOpen(true)}>
+            <History className="mr-1.5 h-3.5 w-3.5" />
+            开号记录
+            {status?.genLogs?.avg_interval_min != null && (
+              <span className="ml-1.5 text-xs text-muted-foreground">
+                均 {formatDuration(status.genLogs.avg_interval_min * 60)}
+              </span>
+            )}
+          </Button>
+        )}
         <Button
           size="sm"
           onClick={() => {
@@ -478,6 +497,8 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
           }
           tone="normal"
         />
+        {/* 卖家系统状态是 legacy 独有；没这能力时后端压根不发请求，卡里只会是空值 */}
+        {caps?.systemStatus && (
         <StatCard
           icon={<Boxes className="h-3.5 w-3.5" />}
           label="卖家存货 Key"
@@ -500,6 +521,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
                 : 'normal'
           }
         />
+        )}
       </div>
 
       <GenLogsDialog status={status} open={genLogsOpen} onOpenChange={setGenLogsOpen} />
