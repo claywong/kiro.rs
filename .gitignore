@@ -25,6 +25,28 @@
 /traces.db
 /traces.db-shm
 /traces.db-wal
+# 运行时数据目录：凭据、明文客户端 Key、adminApiKey、各类 SQLite 库与用量日志全在这里。
+# 上面那些 /xxx 规则只锚定仓库根目录，数据落到子目录后一律失效，所以整目录忽略。
+# 入库的模板是根目录的 config.example.json，不在此列。
+/config/
+# 环境变量（含密钥）
+/.env
+/.env.*
+!/.env.example
+# 运行日志（-c 指定工作目录时会落在仓库里）
+*.log
+# 其余运行时落盘产物：不写 / 前缀，这样换工作目录也能兜住
+request_logs.db
+request_logs.db-shm
+request_logs.db-wal
+vendor_events.db
+vendor_events.db-shm
+vendor_events.db-wal
+cost_ledger.json
+proxy_pool.json
+# 配置/凭据的自动备份（.bak、.bak-<时间戳>）
+*.bak
+*.bak-*
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
