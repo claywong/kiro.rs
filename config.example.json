@@ -17,8 +17,8 @@
       "id": "kiroapp-io",
       "name": "kiroapp.io",
       "flavor": "kiroapp",
-      "baseUrl": "https://api.kiroapp.io",
-      "apiKey": "km-xxxxxxxxxxxxxxxx",
+      "baseUrl": "https://kiroapp.io",
+      "apiKey": "km_替换为 kiroapp.io 账号的 API Key",
       "webhookPathToken": "whk_替换为自己生成的随机串_1",
       "defaultGroups": [],
       "defaultRpmLimit": 10,
@@ -33,7 +33,7 @@
       "name": "kiroapp.cc",
       "flavor": "kiroapp-cc",
       "baseUrl": "https://kiroapp.cc",
-      "apiKey": "km-替换为 kiroapp.cc 账号的 API Key",
+      "apiKey": "km_替换为 kiroapp.cc 账号的 API Key",
       "defaultGroups": [],
       "defaultRpmLimit": 10
     }

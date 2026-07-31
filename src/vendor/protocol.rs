@@ -22,10 +22,10 @@ pub enum VendorFlavor {
     /// 独有能力：系统状态、开号记录、webhook 远程管理。
     #[default]
     Legacy,
-    /// kiroapp.io：`/api/me/*` + `Authorization: Bearer km-xxx`。
+    /// kiroapp.io：`/api/me/*` + `Authorization: Bearer km_xxx`。
     /// 独有能力：积分流水、我的密钥、最早密钥时间；阶梯定价。
     Kiroapp,
-    /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km-xxx`。
+    /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km_xxx`。
     /// 简化版协议：只有库存、余额、提取，无流水、无密钥列表、无阶梯定价。
     KiroappCc,
 }

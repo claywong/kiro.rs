@@ -24,8 +24,8 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 ```json
 {
   "vendor": {
-    "baseUrl": "https://api.kiroapp.io",
-    "apiKey": "km-xxxxxxxxxxxxxxxx",
+    "baseUrl": "https://kiroapp.io",
+    "apiKey": "km_xxxxxxxxxxxxxxxx",
     "flavor": "kiroapp",
     "webhookPathToken": "whk_your_webhook_token",
     "autoPurchase": true,
@@ -45,8 +45,8 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
       "id": "kiroapp-io",
       "name": "kiroapp.io",
       "flavor": "kiroapp",
-      "baseUrl": "https://api.kiroapp.io",
-      "apiKey": "km-key-1",
+      "baseUrl": "https://kiroapp.io",
+      "apiKey": "km_key_1",
       "webhookPathToken": "whk_token_1",
       "autoPurchase": true,
       "autoPurchaseMaxCount": 10,
@@ -58,7 +58,7 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
       "name": "kiroapp.cc",
       "flavor": "kiroapp-cc",
       "baseUrl": "https://kiroapp.cc",
-      "apiKey": "km-key-2",
+      "apiKey": "km_key_2",
       "defaultGroups": ["standard"],
       "defaultRpmLimit": 50
     }
@@ -77,8 +77,8 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 | `id` | 供应商唯一标识（英文、数字、`_`、`-`） | `"primary"` |
 | `name` | 显示名称（前端标签页显示） | `"主供应商"` |
 | `flavor` | 协议类型（见下文） | `"kiroapp"` |
-| `baseUrl` | API 基础地址 | `"https://api.kiroapp.io"` |
-| `apiKey` | 鉴权密钥 | `"km-xxxx"` |
+| `baseUrl` | API 基础地址 | `"https://kiroapp.io"` |
+| `apiKey` | 鉴权密钥（`legacy` 为 `usr-xxx`，两家 kiroapp 为 `km_xxx`） | `"km_xxxx"` |
 
 ### 可选字段
 
@@ -123,7 +123,7 @@ Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，
 
 ### `kiroapp` - kiroapp.io 协议
 
-`/api/me/*` + `Authorization: Bearer km-xxx`。
+`/api/me/*` + `Authorization: Bearer km_xxx`。
 
 - ✅ 余额查询、库存查询、按订单提取、兑换码充值
 - ✅ Webhook 推送（载荷带 `client_order_id`，幂等键由卖家派生）
@@ -138,7 +138,7 @@ Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，
 
 ### `kiroapp-cc` - kiroapp.cc 协议
 
-`/openapi/*` + `Authorization: Bearer km-xxx`。**只有三个接口**，是能力最少的一家：
+`/openapi/*` + `Authorization: Bearer km_xxx`。**只有三个接口**，是能力最少的一家：
 
 - ✅ 库存查询 (`GET /openapi/stock`)
 - ✅ 余额查询 (`GET /openapi/balance`)
