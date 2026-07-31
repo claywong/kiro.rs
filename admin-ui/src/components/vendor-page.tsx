@@ -206,9 +206,9 @@ function OrdersPanel({ vendorId }: { vendorId?: string }) {
                   </thead>
                   <tbody>
                     {orders.map((o, i) => (
-                      <tr key={o.client_order_id ?? i} className="border-b last:border-0">
+                      <tr key={o.clientOrderId ?? i} className="border-b last:border-0">
                         <td className="px-4 py-2 font-mono text-xs">
-                          {o.client_order_id ?? '—'}
+                          {o.clientOrderId ?? '—'}
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums">
                           {o.requested ?? '—'}
@@ -217,7 +217,7 @@ function OrdersPanel({ vendorId }: { vendorId?: string }) {
                           {o.purchased ?? '—'}
                         </td>
                         <td className="px-4 py-2 text-xs text-muted-foreground">
-                          {o.created_at ?? '—'}
+                          {o.createdAt ?? '—'}
                         </td>
                       </tr>
                     ))}

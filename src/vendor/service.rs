@@ -323,6 +323,7 @@ impl VendorService {
                 str_field("client_order_id").or_else(|| str_field("purchase_order_id")),
                 str_field("order_id"),
             ),
+            VendorFlavor::KiroappCc => (str_field("purchase_order_id"), None),
         };
 
         Some(IncomingEvent {

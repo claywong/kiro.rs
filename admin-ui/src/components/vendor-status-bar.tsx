@@ -438,7 +438,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           icon={<Wallet className="h-3.5 w-3.5" />}
           label="卖家余额"
@@ -458,6 +458,25 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
           value={status?.stockError ? '—' : (status?.stock?.available ?? status?.stockMax ?? '—')}
           hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
           tone={status?.stockError ? 'warn' : 'normal'}
+        />
+        <StatCard
+          icon={<ShoppingCart className="h-3.5 w-3.5" />}
+          label="当前单价"
+          value={
+            status?.stockError
+              ? '—'
+              : status?.stock?.priceMin != null && status?.stock?.priceMax != null
+                ? status.stock.priceMin === status.stock.priceMax
+                  ? status.stock.priceMin
+                  : `${status.stock.priceMin}~${status.stock.priceMax}`
+                : '—'
+          }
+          hint={
+            status?.capabilities?.tieredPricing && !status?.stockError
+              ? '阶梯定价，价格随提取数量变化'
+              : undefined
+          }
+          tone="normal"
         />
         <StatCard
           icon={<Boxes className="h-3.5 w-3.5" />}

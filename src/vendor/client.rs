@@ -15,6 +15,7 @@ use crate::http_client::{self, ProxyConfig};
 use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::flavor_kiroapp as kiroapp;
+use super::flavor_kiroapp_cc as kiroapp_cc;
 use super::flavor_legacy as legacy;
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
@@ -71,7 +72,7 @@ impl VendorClient {
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.flavor {
             VendorFlavor::Legacy => req.header("X-API-Key", &self.api_key),
-            VendorFlavor::Kiroapp => req.bearer_auth(&self.api_key),
+            VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
         }
     }
 
@@ -182,6 +183,26 @@ impl VendorClient {
                     self.post_json(kiroapp::PATH_PURCHASE, &body).await?;
                 Ok(r.into())
             }
+            VendorFlavor::KiroappCc => {
+                // kiroapp.cc: count=1 时无参数（单次提取），count>1 时传 {"count": N}
+                let result = if count == 1 {
+                    let r: kiroapp_cc::ClaimSingleResponse =
+                        self.post_json(kiroapp_cc::PATH_CLAIM, &serde_json::json!({})).await?;
+                    kiroapp_cc::ClaimResult {
+                        keys: vec![r.key],
+                        points_cost: None,
+                    }
+                } else {
+                    let r: kiroapp_cc::ClaimBatchResponse =
+                        self.post_json(kiroapp_cc::PATH_CLAIM, &serde_json::json!({"count": count}))
+                            .await?;
+                    kiroapp_cc::ClaimResult {
+                        keys: r.keys,
+                        points_cost: r.points_cost,
+                    }
+                };
+                Ok(result.into_purchase_result(client_order_id.to_string(), count))
+            }
         }
     }
 
@@ -194,6 +215,10 @@ impl VendorClient {
             }
             VendorFlavor::Kiroapp => {
                 let r: kiroapp::StockResponse = self.get(kiroapp::PATH_STOCK).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::KiroappCc => {
+                let r: kiroapp_cc::StockResponse = self.get(kiroapp_cc::PATH_STOCK).await?;
                 Ok(r.into())
             }
         }
@@ -209,6 +234,21 @@ impl VendorClient {
             VendorFlavor::Kiroapp => {
                 let r: kiroapp::ProfileResponse = self.get(kiroapp::PATH_PROFILE).await?;
                 Ok(r.into())
+            }
+            VendorFlavor::KiroappCc => {
+                // kiroapp.cc 只有余额接口，无完整档案，构造简化的 ProfileInfo
+                let r: kiroapp_cc::BalanceResponse = self.get(kiroapp_cc::PATH_BALANCE).await?;
+                Ok(ProfileInfo {
+                    email: None,
+                    name: None,
+                    created_at: None,
+                    balance: r.balance,
+                    quota: r.balance,
+                    used_quota: None,
+                    max_purchase: None,
+                    min_purchase: None,
+                    webhook_url: None,
+                })
             }
         }
     }
@@ -231,6 +271,16 @@ impl VendorClient {
                     .await?;
                 Ok(env.map_into())
             }
+            VendorFlavor::KiroappCc => {
+                // kiroapp.cc 不支持订单列表，返回空分页
+                Ok(Paged {
+                    items: vec![],
+                    total: Some(0),
+                    page: Some(page.unwrap_or(1)),
+                    page_size: Some(page_size.unwrap_or(50)),
+                    pages: Some(0),
+                })
+            }
         }
     }
 
@@ -246,6 +296,9 @@ impl VendorClient {
                 let r: kiroapp::RedeemResponse =
                     self.post_json(kiroapp::PATH_REDEEM, &body).await?;
                 Ok(r.into())
+            }
+            VendorFlavor::KiroappCc => {
+                Err(VendorApiError::unsupported("兑换码充值"))
             }
         }
     }

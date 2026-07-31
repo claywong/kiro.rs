@@ -828,10 +828,12 @@ export interface VendorEventsResponse {
 
 /** 卖家侧提取订单（对账用） */
 export interface VendorOrder {
-  client_order_id?: string
+  clientOrderId?: string
+  orderId?: string
   requested?: number
   purchased?: number
-  created_at?: string
+  totalDebit?: number
+  createdAt?: string
 }
 
 export interface VendorOrdersResponse {
