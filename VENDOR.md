@@ -89,7 +89,7 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 | `autoPurchaseMaxCount` | 单次提取上限 | `1` |
 | `autoPurchaseSchedule` | 时段表（见下文） | 无 |
 | `defaultGroups` | 提取入库时写入凭据的分组 | `[]` |
-| `defaultRpmLimit` | RPM 限流值 | `10` |
+| `defaultRpmLimit` | RPM 限流值 | `300` |
 | `defaultApiRegion` | 凭据的 `apiRegion`（空串=沿用全局） | `""` |
 | `defaultAuthRegion` | 凭据的 `authRegion`（空串=沿用全局） | `""` |
 

@@ -116,7 +116,7 @@ pub struct VendorConfig {
     #[serde(default)]
     pub default_groups: Vec<String>,
 
-    /// 手动提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    /// 手动提取入库时默认的每分钟请求数上限（默认 300，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 
@@ -170,7 +170,7 @@ fn default_vendor_auto_max_count() -> u32 {
 }
 
 fn default_vendor_rpm_limit() -> u32 {
-    10
+    300
 }
 
 /// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
@@ -205,7 +205,7 @@ pub struct LegacyKiroappCcConfig {
     #[serde(default)]
     pub default_groups: Vec<String>,
 
-    /// 提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    /// 提取入库时默认的每分钟请求数上限（默认 300，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 }

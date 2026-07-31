@@ -21,7 +21,7 @@
       "apiKey": "km_替换为 kiroapp.io 账号的 API Key",
       "webhookPathToken": "whk_替换为自己生成的随机串_1",
       "defaultGroups": [],
-      "defaultRpmLimit": 10,
+      "defaultRpmLimit": 300,
       "autoPurchase": false,
       "autoPurchaseMaxCount": 1,
       "autoPurchaseSchedule": [
@@ -35,7 +35,7 @@
       "baseUrl": "https://kiroapp.cc",
       "apiKey": "km_替换为 kiroapp.cc 账号的 API Key",
       "defaultGroups": [],
-      "defaultRpmLimit": 10
+      "defaultRpmLimit": 300
     }
   ]
 }

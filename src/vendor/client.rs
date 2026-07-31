@@ -506,7 +506,7 @@ mod tests {
             api_key: key.to_string(),
             webhook_path_token: token.to_string(),
             default_groups: vec![],
-            default_rpm_limit: 10,
+            default_rpm_limit: 300,
             default_api_region: String::new(),
             default_auth_region: String::new(),
             auto_purchase: false,

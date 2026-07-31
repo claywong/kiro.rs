@@ -160,7 +160,7 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub priority: u32,
 
-    /// 每分钟请求数上限（新凭据默认 10；0 表示不限速）
+    /// 每分钟请求数上限（新凭据默认 300；0 表示不限速）
     #[serde(default = "default_rpm_limit")]
     pub rpm_limit: u32,
 
@@ -212,7 +212,7 @@ fn default_auth_method() -> String {
 }
 
 fn default_rpm_limit() -> u32 {
-    10
+    300
 }
 
 /// 更新 refreshToken 请求
@@ -1180,10 +1180,10 @@ mod rpm_tests {
     use super::{AddCredentialRequest, UpdateCredentialRequest};
 
     #[test]
-    fn add_credential_defaults_rpm_to_ten() {
+    fn add_credential_defaults_rpm_to_three_hundred() {
         let request: AddCredentialRequest =
             serde_json::from_str(r#"{"refreshToken":"token"}"#).unwrap();
-        assert_eq!(request.rpm_limit, 10);
+        assert_eq!(request.rpm_limit, 300);
     }
 
     #[test]
