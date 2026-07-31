@@ -28,6 +28,10 @@ pub enum VendorFlavor {
     /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km_xxx`。
     /// 简化版协议：只有库存、余额、提取，无流水、无密钥列表、无阶梯定价。
     KiroappCc,
+    /// Kiro Drop（drop.kiro.ss）：`/api/v1/*` + `X-API-Key: usr-xxx`。
+    /// 报价接口一次给齐库存/限购/余额；下单可能返回 202，需按 order_id 轮询。
+    /// 金额以人民币计。有 webhook 远程管理，无兑换码、无订单列表。
+    Drop,
 }
 
 impl VendorFlavor {
@@ -36,6 +40,7 @@ impl VendorFlavor {
             Self::Legacy => "legacy",
             Self::Kiroapp => "kiroapp",
             Self::KiroappCc => "kiroapp-cc",
+            Self::Drop => "drop",
         }
     }
 
@@ -58,13 +63,14 @@ impl VendorFlavor {
             "legacy" | "my" | "default" => Some(Self::Legacy),
             "kiroapp" | "kiroappio" | "me" => Some(Self::Kiroapp),
             "kiroappcc" | "openapi" => Some(Self::KiroappCc),
+            "drop" | "dropkiross" | "kirodrop" => Some(Self::Drop),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc"
+        "legacy, kiroapp, kiroapp-cc, drop"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -106,6 +112,21 @@ impl VendorFlavor {
                 ledger: false,
                 my_keys: false,
                 earliest_key: false,
+                batch_scoped_purchase: false,
+                tiered_pricing: false,
+            },
+            Self::Drop => VendorCapabilities {
+                system_status: false,
+                gen_logs: false,
+                // 有 PUT /api/my/webhook 与测试推送两个接口
+                webhook_manage: true,
+                // 只能按 order_id 查单条，没有列表接口
+                purchase_orders: false,
+                redeem: false,
+                ledger: false,
+                my_keys: false,
+                earliest_key: false,
+                // 推送里的 batch_id 不能作为下单参数，只是批次标识
                 batch_scoped_purchase: false,
                 tiered_pricing: false,
             },

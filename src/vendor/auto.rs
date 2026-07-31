@@ -179,8 +179,13 @@ pub fn conclude(c: VendorKeyCensus, window_expired: bool) -> (ValidationStatus, 
 ///
 /// 数量一旦提交就与订单号永久绑定、无法改小，自动模式没有人工复核，
 /// 因此宁可少提 —— 少提还能再手动补，多提是永久的。
+///
+/// `new_keys` 为 None 时按「卖家上限」参与取小，而不是按 0。有的卖家（Drop 家的
+/// `batch.completed`）只说「新一批已上架」不说几张，按 0 算会让自动模式永远提不出
+/// 东西；而缺这个数并不意味着没货 —— 真实上限由**刚查到的** `stock_max` 与配置
+/// 上限共同兜着，两者都不受本函数影响，所以这里放宽不会导致超量提取。
 pub fn decide_count(new_keys: Option<u32>, stock_max: u32, configured_max: u32) -> u32 {
-    new_keys.unwrap_or(0).min(stock_max).min(configured_max)
+    new_keys.unwrap_or(stock_max).min(stock_max).min(configured_max)
 }
 
 #[cfg(test)]
@@ -297,8 +302,19 @@ mod tests {
     fn 提取数量取三者最小() {
         assert_eq!(decide_count(Some(10), 5, 1), 1);
         assert_eq!(decide_count(Some(10), 0, 3), 0);
-        assert_eq!(decide_count(None, 5, 3), 0);
         assert_eq!(decide_count(Some(2), 5, 3), 2);
+    }
+
+    /// 事件不带数量时按卖家上限参与取小，不按 0 —— 否则 Drop 家的
+    /// `batch.completed`（只说上架、不说几张）会让自动模式永远提不出东西。
+    #[test]
+    fn 事件缺数量时按卖家上限取小() {
+        // 卖家还有 5 个，配置上限 3 → 提 3
+        assert_eq!(decide_count(None, 5, 3), 3);
+        // 配置上限比库存大 → 收敛到库存
+        assert_eq!(decide_count(None, 2, 10), 2);
+        // 真没货时仍是 0，放宽不会凭空造出提取
+        assert_eq!(decide_count(None, 0, 10), 0);
     }
 
     // ============ 多供应商归属 ============

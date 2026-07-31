@@ -324,6 +324,14 @@ impl VendorService {
                 str_field("order_id"),
             ),
             VendorFlavor::KiroappCc => (str_field("purchase_order_id"), None),
+            // Drop 的推送里没有任何订单号，只有 batch_id。订单号得本地派生 ——
+            // 从 event_id 算，同一条推送重投多少次都得到同一个值，幂等仍成立。
+            VendorFlavor::Drop => (
+                str_field("purchase_order_id")
+                    .or_else(|| str_field("client_order_id"))
+                    .or_else(|| Some(derive_client_order_id(vendor_id, &event_id))),
+                str_field("batch_id"),
+            ),
         };
 
         Some(IncomingEvent {
@@ -831,6 +839,24 @@ fn fallback_event_id(raw: &[u8]) -> String {
     hex::encode(&digest[..16])
 }
 
+/// 为不给订单号的卖家派生一个 32 位十六进制 `client_order_id`。
+///
+/// Drop 家的推送只有 `batch_id`，而下单必须自带订单号且要求 32 位十六进制。
+/// 从 `(vendor_id, event_id)` 哈希得来，因此：
+/// - 同一条推送重投多少次都得到同一个订单号，卖家侧幂等重放生效，不会重复扣费；
+/// - 不同卖家的同名 event_id 不会撞成同一个订单号。
+///
+/// 不直接拿 event_id 当订单号：它的格式由卖家决定，不保证是 32 位十六进制，
+/// 直接用会被卖家以 400 拒掉。
+fn derive_client_order_id(vendor_id: &str, event_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(vendor_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event_id.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +867,90 @@ mod tests {
 
     fn parse_kiroapp(raw: &[u8]) -> Option<IncomingEvent> {
         VendorService::parse_event("kiroapp", VendorFlavor::Kiroapp, raw)
+    }
+
+    fn parse_drop(raw: &[u8]) -> Option<IncomingEvent> {
+        VendorService::parse_event("drop", VendorFlavor::Drop, raw)
+    }
+
+    // ============ Drop 家（drop.kiro.ss）============
+
+    /// 用文档给的新批次样本
+    #[test]
+    fn drop_新批次事件归一到新key就绪() {
+        let raw = r#"{"event":"batch.completed","event_id":"0123456789abcdef0123456789abcdef",
+            "batch_id":"batch_xxx","message":"新一批 Key 已上架"}"#;
+        let e = parse_drop(raw.as_bytes()).unwrap();
+        // 事件名不同但语义相同，必须归一，否则自动提取的判定链条走不通
+        assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
+        assert_eq!(e.batch_order_id.as_deref(), Some("batch_xxx"));
+        assert_eq!(e.message.as_deref(), Some("新一批 Key 已上架"));
+        // 本家不给数量
+        assert_eq!(e.new_keys, None);
+    }
+
+    /// 推送里没有订单号，必须本地派生出一个合法的 32 位十六进制串
+    #[test]
+    fn drop_订单号本地派生且为32位十六进制() {
+        let raw = br#"{"event":"batch.completed","event_id":"evt-1","batch_id":"b1"}"#;
+        let order = parse_drop(raw).unwrap().purchase_order_id.unwrap();
+        assert_eq!(order.len(), 32, "卖家要求 32 位");
+        assert!(
+            order.chars().all(|c| c.is_ascii_hexdigit()),
+            "必须全是十六进制字符，否则卖家 400: {order}"
+        );
+    }
+
+    /// 同一条推送重投得到同一订单号 —— 幂等重放的前提
+    #[test]
+    fn drop_同一事件派生同一订单号() {
+        let raw = br#"{"event":"batch.completed","event_id":"evt-1","batch_id":"b1"}"#;
+        let a = parse_drop(raw).unwrap().purchase_order_id;
+        let b = parse_drop(raw).unwrap().purchase_order_id;
+        assert_eq!(a, b);
+
+        // 不同事件不能撞成同一单
+        let other = br#"{"event":"batch.completed","event_id":"evt-2","batch_id":"b1"}"#;
+        assert_ne!(a, parse_drop(other).unwrap().purchase_order_id);
+    }
+
+    /// 不同卖家的同名 event_id 不能派生出同一个订单号
+    #[test]
+    fn drop_订单号按卖家隔离() {
+        let raw = br#"{"event":"batch.completed","event_id":"same-id"}"#;
+        let a = VendorService::parse_event("drop-a", VendorFlavor::Drop, raw)
+            .unwrap()
+            .purchase_order_id;
+        let b = VendorService::parse_event("drop-b", VendorFlavor::Drop, raw)
+            .unwrap()
+            .purchase_order_id;
+        assert_ne!(a, b);
+    }
+
+    /// 卖家日后开始给订单号时应优先用它，不再派生
+    #[test]
+    fn drop_卖家给了订单号就优先用() {
+        let given = "ffffffffffffffffffffffffffffffff";
+        let raw = format!(
+            r#"{{"event":"batch.completed","event_id":"e1","client_order_id":"{given}"}}"#
+        );
+        assert_eq!(
+            parse_drop(raw.as_bytes()).unwrap().purchase_order_id.as_deref(),
+            Some(given)
+        );
+    }
+
+    #[test]
+    fn drop_全部失效与测试事件() {
+        let raw = r#"{"event":"all_keys_dead","event_id":"d1","batch_id":"batch_x",
+            "message":"本轮全部 Key 已失效","dead":5}"#;
+        let e = parse_drop(raw.as_bytes()).unwrap();
+        assert_eq!(e.kind, VendorEventKind::AllKeysDead);
+        assert_eq!(e.dead, Some(5));
+
+        let t = parse_drop(r#"{"event":"test","event_id":"t1","message":"这是一条测试"}"#.as_bytes())
+            .unwrap();
+        assert_eq!(t.kind, VendorEventKind::Test);
     }
 
     #[test]

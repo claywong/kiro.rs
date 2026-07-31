@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::http_client::{self, ProxyConfig};
 use crate::model::config::{TlsBackend, VendorConfig};
 
+use super::flavor_drop as drop_flavor;
 use super::flavor_kiroapp as kiroapp;
 use super::flavor_kiroapp_cc as kiroapp_cc;
 use super::flavor_legacy as legacy;
@@ -71,13 +72,19 @@ impl VendorClient {
     /// 按 flavor 附加鉴权头。两家形态不同，集中在此一处。
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.flavor {
-            VendorFlavor::Legacy => req.header("X-API-Key", &self.api_key),
+            // Drop 与首家同用 X-API-Key（都是 usr-xxx 形态的 Key）
+            VendorFlavor::Legacy | VendorFlavor::Drop => req.header("X-API-Key", &self.api_key),
             VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
         }
     }
 
-    /// 统一处理响应：非 2xx 时解析 `{"error":...}` 并带上状态码。
+    /// 统一处理响应：非 2xx 时解析错误体并带上状态码。
+    ///
+    /// 错误体形状按 flavor 分：多数家是扁平的 `{"error":"文本"}`，Drop 是嵌套的
+    /// `{"error":{"code":..,"message":..,"request_id":..}}`。后者若按扁平解会整段
+    /// JSON 连 request_id 一起塞进面板。
     async fn parse<T: for<'de> Deserialize<'de>>(
+        &self,
         resp: reqwest::Response,
     ) -> Result<T, VendorApiError> {
         let status = resp.status();
@@ -87,9 +94,16 @@ impl VendorClient {
         })?;
 
         if !status.is_success() {
-            let message = serde_json::from_str::<VendorError>(&body)
-                .ok()
-                .and_then(|e| e.error)
+            let nested = match self.flavor {
+                VendorFlavor::Drop => drop_flavor::error_message(&body),
+                _ => None,
+            };
+            let message = nested
+                .or_else(|| {
+                    serde_json::from_str::<VendorError>(&body)
+                        .ok()
+                        .and_then(|e| e.error)
+                })
                 .unwrap_or_else(|| truncate(&body, 300));
             return Err(VendorApiError {
                 status: Some(status.as_u16()),
@@ -112,7 +126,7 @@ impl VendorClient {
                 status: None,
                 message: e.to_string(),
             })?;
-        Self::parse(resp).await
+        self.parse(resp).await
     }
 
     /// 带查询参数的 GET（分页接口用）
@@ -129,7 +143,7 @@ impl VendorClient {
                 status: None,
                 message: e.to_string(),
             })?;
-        Self::parse(resp).await
+        self.parse(resp).await
     }
 
     async fn post_json<T: for<'de> Deserialize<'de>>(
@@ -145,7 +159,7 @@ impl VendorClient {
                 status: None,
                 message: e.to_string(),
             })?;
-        Self::parse(resp).await
+        self.parse(resp).await
     }
 
     /// kiroapp.cc 的 `POST /openapi/claim`，**成功响应宽松解析**。
@@ -232,6 +246,117 @@ impl VendorClient {
         Ok(kiroapp_cc::ClaimResult { keys, points_cost })
     }
 
+    /// Drop 的报价查询：`GET /api/v1/reservation?quantity=N`。
+    ///
+    /// 一次给齐库存、限购、单价与余额，故 [`Self::stock`] 与 [`Self::profile`]
+    /// 都走它，不必分两次请求。
+    async fn drop_quote(&self, quantity: u32) -> Result<drop_flavor::QuoteResponse, VendorApiError> {
+        self.get_with(
+            drop_flavor::PATH_RESERVATION,
+            &[("quantity", quantity.max(1).to_string())],
+        )
+        .await
+    }
+
+    /// 同 [`Self::drop_quote`]，但把「库存不足」这一种 400 当成「可提取 0 个」。
+    ///
+    /// 报价接口的 `quantity` 会参与校验，超过库存直接 400 —— 而查库存时我们恰恰
+    /// 还不知道上限。若把这种 400 原样上抛，卖家一卖空面板就只显示一条报错，
+    /// 看不出「就是没货」这个正常状态。
+    ///
+    /// 只对库存类文案降级，其余 400（如订单号格式错）仍照常报错。
+    async fn drop_quote_lenient(&self) -> Result<drop_flavor::QuoteResponse, VendorApiError> {
+        match self.drop_quote(drop_flavor::PROBE_QUANTITY).await {
+            Ok(q) => Ok(q),
+            Err(e) if e.status == Some(400) && mentions_out_of_stock(&e.message) => {
+                tracing::debug!("Drop 报价返回库存不足，按 0 库存处理: {}", e.message);
+                Ok(drop_flavor::QuoteResponse {
+                    stock: 0,
+                    ..Default::default()
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop 的下单：`POST /api/v1/reservation`，202 时按 `order_id` 轮询。
+    ///
+    /// **不传 `max_total_cny`**。文档建议传它做涨价保护，但同一订单号重试时参数
+    /// 必须一致（否则 409），而重试时重新报出的价格不保证还是原值 —— 传了会把
+    /// 一次可幂等重放的重试变成永久失败。涨价风险由自动模式的数量上限兜着。
+    ///
+    /// 202 表示钱已扣、Key 待对账，此时**只能拿 order_id 轮询，绝不能换单号重下**。
+    /// 轮询用尽仍未出货也返回 Ok：钱确实扣了，返回已知信息让人工按 order_id 核对，
+    /// 报错会让人误以为没花钱。
+    async fn purchase_drop(
+        &self,
+        quantity: u32,
+        client_order_id: &str,
+    ) -> Result<drop_flavor::OrderResponse, VendorApiError> {
+        let body = serde_json::json!({
+            "quantity": quantity,
+            "client_order_id": client_order_id,
+        });
+        let mut order: drop_flavor::OrderResponse =
+            self.post_json(drop_flavor::PATH_RESERVATION, &body).await?;
+
+        // 回显的订单号与我们发出的不一致，说明这单大概不是我们这一单（卖家侧串号，
+        // 或我们把别人的重放当成了自己的）。只告警不阻断 —— 钱可能已经扣了，
+        // 报错会让人误以为没花钱；Key 仍照常入库，凭 order_id 可人工追。
+        if let Some(echoed) = order.client_order_id.as_deref()
+            && echoed.trim() != client_order_id.trim()
+        {
+            tracing::warn!(
+                sent = %client_order_id,
+                echoed = %echoed,
+                "Drop 回显的 client_order_id 与发出的不一致，请人工核对该单"
+            );
+        }
+
+        if !order.is_pending() || order.has_keys() {
+            return Ok(order);
+        }
+
+        let Some(order_id) = order.order_id.clone().filter(|s| !s.trim().is_empty()) else {
+            // pending 却没给 order_id：无从轮询，也无从人工核对，只能上抛
+            return Err(VendorApiError {
+                status: Some(202),
+                message: "卖家返回待对账订单但未给出 order_id，无法查询结果，请在卖家侧核对是否已扣费"
+                    .to_string(),
+            });
+        };
+        let path = format!("{}{}", drop_flavor::PATH_ORDER_PREFIX, order_id.trim());
+
+        for attempt in 1..=drop_flavor::ORDER_POLL_MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                drop_flavor::ORDER_POLL_INTERVAL_SECS,
+            ))
+            .await;
+            match self.get::<drop_flavor::OrderResponse>(&path).await {
+                Ok(latest) => {
+                    let done = !latest.is_pending() || latest.has_keys();
+                    order = latest;
+                    if done {
+                        return Ok(order);
+                    }
+                }
+                // 查询失败不终止：钱已扣，值得把剩下的机会用完
+                Err(e) => tracing::warn!(
+                    order_id = %order_id,
+                    attempt,
+                    "Drop 订单查询失败，稍后重试: {}",
+                    e
+                ),
+            }
+        }
+
+        tracing::warn!(
+            order_id = %order_id,
+            "Drop 订单轮询用尽仍未出货，可能已扣费，请人工按 order_id 核对"
+        );
+        Ok(order)
+    }
+
     // ============ 提取（消费侧）============
 
     /// 下单提取 Key。
@@ -277,6 +402,11 @@ impl VendorClient {
                 let result = self.claim_kiroapp_cc(&body, count).await?;
                 Ok(result.into_purchase_result(client_order_id.to_string(), count))
             }
+            VendorFlavor::Drop => {
+                // 本家的数量参数叫 quantity，且下单可能异步（202 → 轮询）
+                let order = self.purchase_drop(count, client_order_id).await?;
+                Ok(order.into())
+            }
         }
     }
 
@@ -295,6 +425,7 @@ impl VendorClient {
                 let r: kiroapp_cc::StockResponse = self.get(kiroapp_cc::PATH_STOCK).await?;
                 Ok(r.into())
             }
+            VendorFlavor::Drop => Ok(self.drop_quote_lenient().await?.into()),
         }
     }
 
@@ -324,6 +455,8 @@ impl VendorClient {
                     webhook_url: None,
                 })
             }
+            // 本家没有独立档案接口，余额与限购都在报价里
+            VendorFlavor::Drop => Ok(self.drop_quote_lenient().await?.into()),
         }
     }
 
@@ -345,16 +478,14 @@ impl VendorClient {
                     .await?;
                 Ok(env.map_into())
             }
-            VendorFlavor::KiroappCc => {
-                // kiroapp.cc 不支持订单列表，返回空分页
-                Ok(Paged {
-                    items: vec![],
-                    total: Some(0),
-                    page: Some(page.unwrap_or(1)),
-                    page_size: Some(page_size.unwrap_or(50)),
-                    pages: Some(0),
-                })
-            }
+            // 这两家都只能按 id 查单条，没有列表接口，返回空分页
+            VendorFlavor::KiroappCc | VendorFlavor::Drop => Ok(Paged {
+                items: vec![],
+                total: Some(0),
+                page: Some(page.unwrap_or(1)),
+                page_size: Some(page_size.unwrap_or(50)),
+                pages: Some(0),
+            }),
         }
     }
 
@@ -371,7 +502,7 @@ impl VendorClient {
                     self.post_json(kiroapp::PATH_REDEEM, &body).await?;
                 Ok(r.into())
             }
-            VendorFlavor::KiroappCc => {
+            VendorFlavor::KiroappCc | VendorFlavor::Drop => {
                 Err(VendorApiError::unsupported("兑换码充值"))
             }
         }
@@ -406,7 +537,7 @@ impl VendorClient {
         let resp = self
             .auth(
                 self.http
-                    .put(self.url(legacy::PATH_WEBHOOK))
+                    .put(self.url(self.webhook_path()))
                     .json(&serde_json::json!({ "webhook_url": webhook_url })),
             )
             .send()
@@ -415,7 +546,7 @@ impl VendorClient {
                 status: None,
                 message: e.to_string(),
             })?;
-        Self::parse::<serde_json::Value>(resp).await.map(|_| ())
+        self.parse::<serde_json::Value>(resp).await.map(|_| ())
     }
 
     /// 让卖家往已保存的 URL 推一条测试消息。仅 `webhook_manage` 能力。
@@ -423,8 +554,24 @@ impl VendorClient {
         if !self.capabilities().webhook_manage {
             return Err(VendorApiError::unsupported("由 API 触发 webhook 测试推送"));
         }
-        self.post_json(legacy::PATH_WEBHOOK_TEST, &serde_json::json!({}))
+        self.post_json(self.webhook_test_path(), &serde_json::json!({}))
             .await
+    }
+
+    /// webhook 地址读写路径。首家与 Drop 恰好同名，但分开取以免日后一家改路径
+    /// 时误改另一家。
+    fn webhook_path(&self) -> &'static str {
+        match self.flavor {
+            VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK,
+            _ => legacy::PATH_WEBHOOK,
+        }
+    }
+
+    fn webhook_test_path(&self) -> &'static str {
+        match self.flavor {
+            VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK_TEST,
+            _ => legacy::PATH_WEBHOOK_TEST,
+        }
     }
 
     /// 积分流水。仅 `ledger` 能力。
@@ -476,6 +623,24 @@ impl VendorClient {
         let r: kiroapp::CreatedAtResponse = self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
         Ok(r.into())
     }
+}
+
+/// 错误文案是否在说「没货 / 货不够」。
+///
+/// 用于 Drop 的报价降级（见 [`VendorClient::drop_quote_lenient`]）：卖家没给
+/// 机器可读的错误码区分「参数错」与「没货」，只能认文案。中英都列上，卖家
+/// 换语言不至于立刻失效；认不出就照常报错，不会把真错误吞掉。
+fn mentions_out_of_stock(message: &str) -> bool {
+    const NEEDLES: [&str; 6] = [
+        "库存",
+        "缺货",
+        "售罄",
+        "out of stock",
+        "insufficient stock",
+        "no stock",
+    ];
+    let lower = message.to_lowercase();
+    NEEDLES.iter().any(|n| lower.contains(n))
 }
 
 /// 构造分页查询参数。`page_size` 超过卖家上限时收敛，避免白拿一个 400。
@@ -572,6 +737,74 @@ mod tests {
         assert!(legacy_client.ledger(None, None, None).await.is_err());
         assert!(legacy_client.my_keys(false, None, None).await.is_err());
         assert!(legacy_client.earliest_key().await.is_err());
+    }
+
+    #[test]
+    fn drop_家的能力集与鉴权() {
+        let mut c = cfg("https://drop.kiro.ss", "usr-x", "t");
+        c.flavor = VendorFlavor::Drop;
+        let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
+        let caps = client.capabilities();
+        // 有 webhook 远程管理
+        assert!(caps.webhook_manage);
+        // 只能按 order_id 查单条，没有列表
+        assert!(!caps.purchase_orders);
+        assert!(!caps.redeem);
+        assert!(!caps.ledger);
+        assert!(!caps.system_status);
+        assert!(!caps.tiered_pricing);
+    }
+
+    #[tokio::test]
+    async fn drop_不支持的能力不发请求() {
+        // 黑洞地址：真发了请求会超时，立刻返回就证明短路生效
+        let mut c = cfg("http://127.0.0.1:1", "usr-x", "t");
+        c.flavor = VendorFlavor::Drop;
+        let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
+
+        let e = client.redeem("code").await.unwrap_err();
+        assert!(e.message.contains("兑换码"), "实际: {}", e.message);
+        assert!(client.system_status().await.is_err());
+        assert!(client.gen_logs().await.is_err());
+        assert!(client.ledger(None, None, None).await.is_err());
+        assert!(client.my_keys(false, None, None).await.is_err());
+
+        // 订单列表无接口但不报错，返回空分页（面板展示「暂无」而非一条错误）
+        let paged = client.purchase_orders(None, None).await.unwrap();
+        assert!(paged.items.is_empty());
+        assert_eq!(paged.total, Some(0));
+    }
+
+    #[test]
+    fn drop_家用webhook自己的路径() {
+        let mut c = cfg("https://drop.kiro.ss", "usr-x", "t");
+        c.flavor = VendorFlavor::Drop;
+        let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
+        assert_eq!(client.webhook_path(), crate::vendor::flavor_drop::PATH_WEBHOOK);
+        assert_eq!(
+            client.webhook_test_path(),
+            crate::vendor::flavor_drop::PATH_WEBHOOK_TEST
+        );
+
+        let legacy_client =
+            VendorClient::new(&cfg("https://v", "usr-x", "t"), None, TlsBackend::Rustls).unwrap();
+        assert_eq!(legacy_client.webhook_path(), legacy::PATH_WEBHOOK);
+    }
+
+    #[test]
+    fn 识别库存不足的错误文案() {
+        // 中文（卖家当前的文案）
+        assert!(mentions_out_of_stock("库存不足：需要 1 个，当前可售 0 个"));
+        assert!(mentions_out_of_stock("商品已售罄"));
+        assert!(mentions_out_of_stock("缺货"));
+        // 英文，大小写不敏感
+        assert!(mentions_out_of_stock("Out Of Stock"));
+        assert!(mentions_out_of_stock("insufficient stock for this request"));
+
+        // 其余 400 不能被当成没货吞掉
+        assert!(!mentions_out_of_stock("数量或订单号格式不正确"));
+        assert!(!mentions_out_of_stock("API Key 无效"));
+        assert!(!mentions_out_of_stock("余额不足"));
     }
 
     #[test]

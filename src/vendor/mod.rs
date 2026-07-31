@@ -9,6 +9,7 @@
 //! 注意 `kiroapp` 这个词有歧义：[`flavor_kiroapp`] 是 kiroapp**.io**（`/api/me/*`，
 //! 功能完整），[`flavor_kiroapp_cc`] 是 kiroapp**.cc**（`/openapi/*`，只有库存 /
 //! 余额 / 提取三个接口，无 webhook）。两者是不同的卖家。
+//! [`flavor_drop`] 是第四家 drop.kiro.ss（`/api/v1/*`，人民币计价、下单可能异步）。
 //!
 //! @author wangzhong
 
@@ -22,6 +23,7 @@ pub mod service;
 pub mod store;
 // 多卖家支持：协议抽象 + 各家 flavor 实现 + 注册表。
 // 单独成模块而非塞进既有文件，便于接入第三家时只加文件。
+pub mod flavor_drop;
 pub mod flavor_kiroapp;
 pub mod flavor_kiroapp_cc;
 pub mod flavor_legacy;

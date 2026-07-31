@@ -631,8 +631,8 @@ export interface VendorCapabilities {
 export interface VendorListItem {
   vendorId: string
   name: string
-  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
-  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc；drop = drop.kiro.ss，互为不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc' | 'drop'
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
@@ -662,8 +662,8 @@ export interface VendorProfile {
 export interface VendorStatus {
   vendorId: string
   name: string
-  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
-  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc；drop = drop.kiro.ss，互为不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc' | 'drop'
   capabilities: VendorCapabilities
   /** baseUrl + apiKey 均已配置，出站接口可用 */
   configured: boolean
