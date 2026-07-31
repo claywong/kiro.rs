@@ -18,7 +18,6 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::kiroapp_service::KiroappService;
 use super::registry::VendorRegistry;
 use super::service::{VendorService, VendorServiceError};
 use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEventKind};
@@ -27,16 +26,11 @@ use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEven
 #[derive(Clone)]
 pub struct VendorState {
     pub registry: std::sync::Arc<VendorRegistry>,
-    /// 次级卖家 kiroapp。与主卖家相互独立，仅管理接口用到。
-    pub kiroapp: std::sync::Arc<KiroappService>,
 }
 
 impl VendorState {
-    pub fn new(
-        registry: std::sync::Arc<VendorRegistry>,
-        kiroapp: std::sync::Arc<KiroappService>,
-    ) -> Self {
-        Self { registry, kiroapp }
+    pub fn new(registry: std::sync::Arc<VendorRegistry>) -> Self {
+        Self { registry }
     }
 }
 
@@ -682,87 +676,6 @@ fn new_order_id() -> String {
 /// 校验是否为 32 位十六进制串
 fn is_hex32(s: &str) -> bool {
     s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-// ============ 次级卖家 kiroapp ============
-
-/// `GET /api/admin/vendor/kiroapp/status` —— kiroapp 库存与余额
-pub async fn kiroapp_status(State(state): State<VendorState>) -> Response {
-    use super::kiroapp_service::KiroappServiceError;
-
-    if !state.kiroapp.enabled() {
-        return Json(serde_json::json!({
-            "configured": false
-        }))
-        .into_response();
-    }
-
-    let config = state.kiroapp.config();
-    let default_groups = config.map(|c| c.default_groups.clone()).unwrap_or_default();
-    let default_rpm_limit = config.map(|c| c.default_rpm_limit).unwrap_or(300);
-
-    let mut response = serde_json::json!({
-        "configured": true,
-        "defaultGroups": default_groups,
-        "defaultRpmLimit": default_rpm_limit,
-    });
-
-    // 并发查库存和余额
-    let (stock_result, balance_result) = tokio::join!(
-        state.kiroapp.stock(),
-        state.kiroapp.balance()
-    );
-
-    match stock_result {
-        Ok(stock) => {
-            response["stock"] = serde_json::to_value(stock).unwrap();
-        }
-        Err(KiroappServiceError::Upstream(e)) => {
-            response["stockError"] = serde_json::Value::String(e.message);
-        }
-        _ => {}
-    }
-
-    match balance_result {
-        Ok(balance) => {
-            response["balance"] = serde_json::to_value(balance).unwrap();
-        }
-        Err(KiroappServiceError::Upstream(e)) => {
-            response["balanceError"] = serde_json::Value::String(e.message);
-        }
-        _ => {}
-    }
-
-    Json(response).into_response()
-}
-
-/// `POST /api/admin/vendor/kiroapp/claim` —— kiroapp 提取一个 Key
-pub async fn kiroapp_claim(State(state): State<VendorState>) -> Response {
-    use super::kiroapp_service::KiroappServiceError;
-
-    if !state.kiroapp.enabled() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "未配置 kiroapp 对接" })),
-        )
-            .into_response();
-    }
-
-    match state.kiroapp.claim().await {
-        Ok(result) => Json(result).into_response(),
-        Err(KiroappServiceError::NotConfigured) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "未配置 kiroapp 对接" })),
-        )
-            .into_response(),
-        Err(KiroappServiceError::Upstream(e)) => {
-            let status = e
-                .status
-                .and_then(|c| StatusCode::from_u16(c).ok())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, Json(serde_json::json!({ "error": e.message }))).into_response()
-        }
-    }
 }
 
 #[cfg(test)]

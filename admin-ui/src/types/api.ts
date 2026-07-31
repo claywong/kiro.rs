@@ -623,7 +623,8 @@ export interface VendorCapabilities {
 export interface VendorListItem {
   vendorId: string
   name: string
-  flavor: 'legacy' | 'kiroapp'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
@@ -653,7 +654,8 @@ export interface VendorProfile {
 export interface VendorStatus {
   vendorId: string
   name: string
-  flavor: 'legacy' | 'kiroapp'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
   capabilities: VendorCapabilities
   /** baseUrl + apiKey 均已配置，出站接口可用 */
   configured: boolean
@@ -702,41 +704,6 @@ export interface VendorStatus {
   earliestKeyError?: string
 }
 
-/** 次级卖家 kiroapp 库存 */
-export interface KiroappStock {
-  /** 当前可售 Key 数 */
-  availableKeys?: number
-  /** 单个 Key 单价 */
-  keyPrice?: number
-}
-
-/** 次级卖家 kiroapp 状态：库存 + 余额 */
-export interface KiroappStatus {
-  /** baseUrl + apiKey 均已配置 */
-  configured: boolean
-  /** 提取入库时写入的默认分组 */
-  defaultGroups: string[]
-  defaultRpmLimit: number
-  stock?: KiroappStock
-  stockError?: string
-  balance?: { balance?: number }
-  balanceError?: string
-}
-
-/** kiroapp 单次提取结果 */
-export interface KiroappClaimResult {
-  /** 从响应里识别出的 Key 数 */
-  claimed: number
-  imported: number
-  duplicated: number
-  failed: number
-  error?: string
-  /**
-   * 一个 Key 都没识别出来时的原始响应。出现即意味着可能已扣费但没入库，
-   * 必须提示用户去卖家侧核对。
-   */
-  raw?: Record<string, unknown>
-}
 
 /** 切换提取模式的结果 */
 export interface VendorModeChange {

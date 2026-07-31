@@ -11,8 +11,6 @@ import {
   setVendorMode,
   testVendorWebhook,
   setVendorWebhookUrl,
-  getKiroappStatus,
-  claimKiroappKey,
 } from '@/api/vendor'
 
 /** 卖家清单。首次进页面拉取，后续不再刷新（卖家列表运行期不变）。 */
@@ -132,29 +130,3 @@ export function useSetVendorWebhookUrl(vendorId?: string) {
   })
 }
 
-/** kiroapp 状态：可售 / 余额要打对方接口，30s 刷新一次，与主卖家一致 */
-export function useKiroappStatus() {
-  return useQuery({
-    queryKey: ['kiroapp-status'],
-    queryFn: getKiroappStatus,
-    refetchInterval: 30000,
-    staleTime: 10000,
-  })
-}
-
-/**
- * kiroapp 提取。成功后刷凭据池与自身状态。
- *
- * 刻意不设 retry：对方接口无幂等键，重发会二次扣费。
- */
-export function useClaimKiroappKey() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: claimKiroappKey,
-    retry: false,
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: ['kiroapp-status'] })
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-  })
-}

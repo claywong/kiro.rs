@@ -105,7 +105,11 @@ pub struct VendorConfig {
 
     /// 入站 webhook 路径 token。请求路径需完整匹配，否则 404。
     /// 为空视为入站未启用（出站接口仍可用）。
-    #[serde(default)]
+    ///
+    /// `inboundToken` 是别名：早期文档与 `config.example.json` 用的是这个名字，
+    /// 而本结构没有 `deny_unknown_fields`，不加别名会让按旧文档配的人被静默
+    /// 忽略成空串 —— 症状是 webhook 一直 404，极难定位。
+    #[serde(default, alias = "inboundToken")]
     pub webhook_path_token: String,
 
     /// 手动提取入库时默认写入的凭据分组（可选）。提取弹窗仅展示，不在弹窗内编辑。
@@ -155,7 +159,9 @@ pub struct VendorConfig {
     ///
     /// 用于「下午与晚上压力大、需多持有一张 Key」这类规律性需求。时刻按**本地
     /// 时区**判定（同 usageStats，容器内需正确设置 `TZ`）。
-    #[serde(default)]
+    ///
+    /// `autoPurchaseWindows` 是别名，原因同 [`VendorConfig::webhook_path_token`]。
+    #[serde(default, alias = "autoPurchaseWindows")]
     pub auto_purchase_schedule: Vec<crate::vendor::schedule::AutoPurchaseWindow>,
 }
 
@@ -174,17 +180,21 @@ fn default_vendor_id() -> String {
     DEFAULT_VENDOR_ID.to_string()
 }
 
-/// 次级卖家（kiroapp）对接配置。
+/// **已废弃**的 kiroapp.cc 独立配置块，仅为兼容存量 `config.json` 保留。
 ///
-/// 与 [`VendorConfig`] 是两家不同供应商，接口能力差得远，故不共用结构：
-/// 对方只有 `GET /openapi/stock`、`GET /openapi/balance`、`POST /openapi/claim`
-/// 三个端点，没有 webhook、没有订单号幂等、也没有数量参数（一次一个）。
-/// 因此这里只承载「查状态 + 手动提取」，不接入事件表与自动提取那套机制。
+/// 历史背景：kiroapp.cc 最早是作为「次级卖家」单独接入的，走自己的客户端与
+/// 服务层，配置写在顶层 `kiroapp` 键下。后来协议抽象层落地，它成了普通的
+/// [`VendorFlavor::KiroappCc`](crate::vendor::protocol::VendorFlavor::KiroappCc)，
+/// 与其余卖家共用一套实现，独立那条路径已删除。
 ///
-/// 认证用 `Authorization: Bearer <apiKey>`，与主卖家的 `X-API-Key` 不同。
+/// 顶层键名 `kiroapp` 是这段历史留下的**命名陷阱**：它指的是 kiroapp**.cc**，
+/// 而 `flavor: "kiroapp"` 指的是 kiroapp**.io**，两者是不同的卖家。新配置请直接
+/// 写进 `vendors` 数组并显式声明 `"flavor": "kiroapp-cc"`，不要再用这个块。
+///
+/// 存量配置由 [`Config::resolved_vendors`] 自动转换，无需手工迁移。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroappConfig {
+pub struct LegacyKiroappCcConfig {
     /// API base URL（如 `https://kiroapp.cc`，末尾斜杠会被规整掉）
     pub base_url: String,
 
@@ -200,7 +210,13 @@ pub struct KiroappConfig {
     pub default_rpm_limit: u32,
 }
 
-impl KiroappConfig {
+/// 存量 kiroapp.cc 配置转换后占用的卖家 id。
+///
+/// 固定值而非 `default`：`default` 属于单供应商时期的存量事件，两者混用会让
+/// 事件归属错乱。
+pub const LEGACY_KIROAPP_CC_VENDOR_ID: &str = "kiroapp-cc";
+
+impl LegacyKiroappCcConfig {
     /// 规整后的 base URL（去掉末尾斜杠）
     pub fn normalized_base_url(&self) -> &str {
         self.base_url.trim_end_matches('/')
@@ -209,6 +225,28 @@ impl KiroappConfig {
     /// 是否可用（base_url 与 api_key 均非空）
     pub fn enabled(&self) -> bool {
         !self.normalized_base_url().is_empty() && !self.api_key.trim().is_empty()
+    }
+
+    /// 转成标准 [`VendorConfig`]。
+    ///
+    /// kiroapp.cc 没有 webhook，故 `webhook_path_token` 留空（入站不启用）；
+    /// 也不开自动提取 —— 对方 claim 无幂等键，保持与独立路径时期一致的保守默认。
+    pub fn to_vendor_config(&self) -> VendorConfig {
+        VendorConfig {
+            id: LEGACY_KIROAPP_CC_VENDOR_ID.to_string(),
+            name: "kiroapp.cc".to_string(),
+            flavor: crate::vendor::protocol::VendorFlavor::KiroappCc,
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            webhook_path_token: String::new(),
+            default_groups: self.default_groups.clone(),
+            default_rpm_limit: self.default_rpm_limit,
+            default_api_region: String::new(),
+            default_auth_region: String::new(),
+            auto_purchase: false,
+            auto_purchase_max_count: default_vendor_auto_max_count(),
+            auto_purchase_schedule: Vec::new(),
+        }
     }
 }
 
@@ -440,10 +478,14 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vendors: Vec<VendorConfig>,
 
-    /// 次级卖家 kiroapp 对接配置。与 `vendor` 相互独立，只支持查状态 + 手动提取。
-    #[serde(default)]
+    /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
+    ///
+    /// 注意键名 `kiroapp` 指的是 kiroapp**.cc**，而非 `flavor: "kiroapp"` 对应的
+    /// kiroapp**.io**。由 [`Config::resolved_vendors`] 自动转成 `kiroapp-cc` flavor
+    /// 的普通卖家项。新配置请直接写 `vendors`，详见 [`LegacyKiroappCcConfig`]。
+    #[serde(default, rename = "kiroapp")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kiroapp: Option<KiroappConfig>,
+    pub legacy_kiroapp_cc: Option<LegacyKiroappCcConfig>,
 
     /// 端点特定的配置
     ///
@@ -599,7 +641,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             vendor: None,
             vendors: Vec::new(),
-            kiroapp: None,
+            legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             config_path: None,
@@ -616,9 +658,22 @@ impl Config {
     ///    webhook 也无法区分来源，故重复项直接丢弃并告警，而不是静默合并。
     /// 3. 出站配置不完整（base_url / api_key 为空）的项一并丢弃 —— 留着只会
     ///    在面板上多一个永远报错的标签页。
+    /// 4. 存量的顶层 `kiroapp` 块（其实是 kiroapp.cc，见 [`LegacyKiroappCcConfig`]）
+    ///    转成 `kiroapp-cc` flavor 的一项，排在最后。若 `vendors` 里已显式配了同 id
+    ///    的项，按第 2 条由显式配置胜出。
     pub fn resolved_vendors(&self) -> Vec<VendorConfig> {
         let mut out: Vec<VendorConfig> = Vec::new();
-        let candidates = self.vendor.iter().chain(self.vendors.iter());
+        // 存量 kiroapp.cc 块放在最后：显式的 vendors 配置应当覆盖自动迁移的结果。
+        let migrated = self
+            .legacy_kiroapp_cc
+            .as_ref()
+            .filter(|c| c.enabled())
+            .map(|c| c.to_vendor_config());
+        let candidates = self
+            .vendor
+            .iter()
+            .chain(self.vendors.iter())
+            .chain(migrated.iter());
 
         for cfg in candidates {
             if !cfg.outbound_enabled() {
@@ -790,5 +845,231 @@ mod vendor_api_region_tests {
         )
         .unwrap();
         assert!(cfg.default_api_region.is_empty());
+    }
+}
+
+/// 本地新增：卖家配置的字段别名与 kiroapp.cc 存量配置迁移。
+/// 单独成块，避免插进上游 `mod tests` 中间引发合并冲突。
+#[cfg(test)]
+mod vendor_config_compat_tests {
+    use super::{Config, LEGACY_KIROAPP_CC_VENDOR_ID, VendorConfig};
+    use crate::vendor::protocol::VendorFlavor;
+
+    /// 旧文档与 config.example.json 用的是 `inboundToken`，不加别名会被静默忽略，
+    /// 症状是 webhook 一直 404。
+    #[test]
+    fn inbound_token_别名生效() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k","inboundToken":"whk_abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.webhook_path_token, "whk_abc");
+        assert!(cfg.inbound_enabled(), "配了 token 就该启用入站");
+    }
+
+    /// 正名仍然优先可用
+    #[test]
+    fn webhook_path_token_正名生效() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k","webhookPathToken":"whk_xyz"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.webhook_path_token, "whk_xyz");
+    }
+
+    #[test]
+    fn 未配token时入站不启用() {
+        let cfg: VendorConfig =
+            serde_json::from_str(r#"{"baseUrl":"https://x","apiKey":"k"}"#).unwrap();
+        assert!(!cfg.inbound_enabled());
+        assert!(cfg.outbound_enabled(), "出站仍应可用");
+    }
+
+    #[test]
+    fn auto_purchase_schedule_正名生效() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k",
+                "autoPurchaseSchedule":[{"from":"09:00","to":"12:00","maxCount":3}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.auto_purchase_schedule.len(), 1);
+    }
+
+    /// 旧文档写的是 `autoPurchaseWindows` + `start`/`end`，三处名字都得兼容，
+    /// 否则要么被静默丢弃、要么直接启动失败。
+    #[test]
+    fn auto_purchase_windows_旧名整套生效() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k",
+                "autoPurchaseWindows":[{"start":"09:00","end":"12:00","maxCount":3}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.auto_purchase_schedule.len(), 1, "时段表不能被静默丢弃");
+        let w = &cfg.auto_purchase_schedule[0];
+        assert_eq!(w.from, "09:00");
+        assert_eq!(w.to, "12:00");
+        assert_eq!(w.max_count, 3);
+    }
+
+    /// 存量顶层 `kiroapp` 块（其实是 kiroapp.cc）应自动变成 kiroapp-cc flavor 的卖家
+    #[test]
+    fn 存量kiroapp_cc配置自动迁移() {
+        let config: Config = serde_json::from_str(
+            r#"{"kiroapp":{"baseUrl":"https://kiroapp.cc","apiKey":"km-x",
+                "defaultGroups":["g1"],"defaultRpmLimit":7}}"#,
+        )
+        .unwrap();
+        let resolved = config.resolved_vendors();
+        assert_eq!(resolved.len(), 1);
+        let v = &resolved[0];
+        assert_eq!(v.vendor_id(), LEGACY_KIROAPP_CC_VENDOR_ID);
+        assert_eq!(v.flavor, VendorFlavor::KiroappCc, "必须是 .cc 而非 .io");
+        assert_eq!(v.normalized_base_url(), "https://kiroapp.cc");
+        assert_eq!(v.default_groups, vec!["g1".to_string()]);
+        assert_eq!(v.default_rpm_limit, 7);
+        // kiroapp.cc 没有 webhook，也不该默认开自动提取
+        assert!(!v.inbound_enabled());
+        assert!(!v.auto_purchase);
+    }
+
+    #[test]
+    fn 存量kiroapp_cc配置不完整时跳过() {
+        let config: Config =
+            serde_json::from_str(r#"{"kiroapp":{"baseUrl":"","apiKey":""}}"#).unwrap();
+        assert!(config.resolved_vendors().is_empty());
+    }
+
+    /// vendors 里显式配了同 id 时，显式配置胜出（迁移项排在最后）
+    #[test]
+    fn 显式配置覆盖存量迁移项() {
+        let config: Config = serde_json::from_str(
+            r#"{"vendors":[{"id":"kiroapp-cc","flavor":"kiroapp-cc",
+                 "baseUrl":"https://explicit","apiKey":"k2"}],
+                "kiroapp":{"baseUrl":"https://kiroapp.cc","apiKey":"km-x"}}"#,
+        )
+        .unwrap();
+        let resolved = config.resolved_vendors();
+        assert_eq!(resolved.len(), 1, "同 id 只保留先出现的");
+        assert_eq!(resolved[0].normalized_base_url(), "https://explicit");
+    }
+
+    /// config.example.json 必须能真正被解析出预期的卖家。
+    ///
+    /// 这个测试是补上历史缺口：示例里曾把字段名写成 `inboundToken` /
+    /// `autoPurchaseWindows`，与结构体对不上却没人发现，因为没有任何测试
+    /// 拿真实结构体解析过它。
+    #[test]
+    fn 示例配置能解析且卖家齐全() {
+        let raw = include_str!("../../config.example.json");
+        let config: Config = serde_json::from_str(raw).expect("config.example.json 必须能解析");
+        let resolved = config.resolved_vendors();
+        assert_eq!(resolved.len(), 2, "示例应含 .io 与 .cc 两家");
+
+        let io = resolved
+            .iter()
+            .find(|v| v.flavor == VendorFlavor::Kiroapp)
+            .expect("缺 kiroapp.io");
+        assert!(io.normalized_base_url().contains("kiroapp.io"));
+        assert!(io.inbound_enabled(), "示例里的 webhook token 必须真正生效");
+        assert_eq!(io.auto_purchase_schedule.len(), 1, "示例时段表必须真正生效");
+
+        let cc = resolved
+            .iter()
+            .find(|v| v.flavor == VendorFlavor::KiroappCc)
+            .expect("缺 kiroapp.cc");
+        assert!(cc.normalized_base_url().contains("kiroapp.cc"));
+    }
+
+    /// 示例配置里**不能有任何被 serde 静默忽略的键**。
+    ///
+    /// 「能解析」不等于「配置生效」：未知键不会报错，只会被丢掉。历史上
+    /// `inboundToken` / `autoPurchaseWindows` 就是这样静静失效的。本测试反序列化
+    /// 后再序列化回来逐键比对，被忽略的键在回程里会消失，从而被抓住。
+    ///
+    /// 同时也校验往返值稳定 —— 面板切换提取模式会把整个 config.json 写回，
+    /// 若序列化形态与用户手写的不一致（如 `kiroapp-cc` 被改写成 `kiroappCc`），
+    /// 文件会被悄悄改动。
+    #[test]
+    fn 示例配置无静默忽略的键且往返稳定() {
+        let raw = include_str!("../../config.example.json");
+        let orig: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let back = serde_json::to_value(&cfg).unwrap();
+
+        let mut problems = Vec::new();
+        diff_json(&orig, &back, "", &mut problems);
+        assert!(
+            problems.is_empty(),
+            "config.example.json 与 Config 结构体不一致：\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// 逐键比对原始 JSON 与往返后的 JSON，记录「键被忽略」与「值被改写」。
+    ///
+    /// 只检查原始里出现过的键 —— 回程多出的键是 serde 默认值补全，属正常。
+    fn diff_json(
+        orig: &serde_json::Value,
+        back: &serde_json::Value,
+        path: &str,
+        out: &mut Vec<String>,
+    ) {
+        match (orig, back) {
+            (serde_json::Value::Object(o), serde_json::Value::Object(b)) => {
+                for (k, v) in o {
+                    let p = format!("{path}.{k}");
+                    match b.get(k) {
+                        None => out.push(format!("  {p} —— 该键被 serde 静默忽略，配置不会生效")),
+                        Some(bv) => diff_json(v, bv, &p, out),
+                    }
+                }
+            }
+            (serde_json::Value::Array(o), serde_json::Value::Array(b)) => {
+                for (i, v) in o.iter().enumerate() {
+                    match b.get(i) {
+                        None => out.push(format!("  {path}[{i}] —— 元素丢失")),
+                        Some(bv) => diff_json(v, bv, &format!("{path}[{i}]"), out),
+                    }
+                }
+            }
+            (a, b) if a != b => {
+                out.push(format!("  {path} —— 往返后值变了: {a} -> {b}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// flavor 的序列化形态必须与 `as_str()` / 文档 / 报错提示一致
+    #[test]
+    fn flavor序列化用连字符形态() {
+        let json = serde_json::to_string(&VendorFlavor::KiroappCc).unwrap();
+        assert_eq!(json, r#""kiroapp-cc""#, "不能写成 kiroappCc");
+        assert_eq!(serde_json::to_string(&VendorFlavor::Kiroapp).unwrap(), r#""kiroapp""#);
+        assert_eq!(serde_json::to_string(&VendorFlavor::Legacy).unwrap(), r#""legacy""#);
+        // 往返稳定
+        for f in [VendorFlavor::Legacy, VendorFlavor::Kiroapp, VendorFlavor::KiroappCc] {
+            let s = serde_json::to_string(&f).unwrap();
+            let back: VendorFlavor = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, f);
+        }
+    }
+
+    /// `kiroapp` 指 .io、`kiroapp-cc` 指 .cc，两者必须解析成不同 flavor
+    #[test]
+    fn 两个kiroapp不能混淆() {
+        assert_eq!(VendorFlavor::parse("kiroapp"), Some(VendorFlavor::Kiroapp));
+        assert_eq!(
+            VendorFlavor::parse("kiroapp.io"),
+            Some(VendorFlavor::Kiroapp)
+        );
+        assert_eq!(
+            VendorFlavor::parse("kiroapp-cc"),
+            Some(VendorFlavor::KiroappCc)
+        );
+        assert_eq!(
+            VendorFlavor::parse("kiroapp.cc"),
+            Some(VendorFlavor::KiroappCc)
+        );
+        assert_ne!(VendorFlavor::Kiroapp, VendorFlavor::KiroappCc);
     }
 }

@@ -5,8 +5,10 @@
 //!   自动模式下会在通过失效确认后异步提取（见 [`auto`]）。
 //! - 出站：`/api/admin/vendor/*` 由管理面板显式调用，提取 Key、查余额库存、兑换充值。
 //!
-//! 另有次级卖家 kiroapp（[`kiroapp`] / [`kiroapp_service`]），只支持查库存余额与
-//! 手动提取一个 Key，挂在 `/api/admin/vendor/kiroapp/*`。两家共用 [`import`] 入库。
+//! 各家卖家的协议差异收敛在 [`protocol`] 与 `flavor_*` 里，上层只见中立结构。
+//! 注意 `kiroapp` 这个词有歧义：[`flavor_kiroapp`] 是 kiroapp**.io**（`/api/me/*`，
+//! 功能完整），[`flavor_kiroapp_cc`] 是 kiroapp**.cc**（`/openapi/*`，只有库存 /
+//! 余额 / 提取三个接口，无 webhook）。两者是不同的卖家。
 //!
 //! @author wangzhong
 
@@ -14,8 +16,6 @@ pub mod auto;
 pub mod client;
 pub mod handlers;
 pub mod import;
-pub mod kiroapp;
-pub mod kiroapp_service;
 pub mod router;
 pub mod schedule;
 pub mod service;
@@ -29,7 +29,6 @@ pub mod protocol;
 pub mod registry;
 
 pub use handlers::VendorState;
-pub use kiroapp_service::KiroappService;
 pub use router::{create_vendor_admin_router, create_vendor_webhook_router};
 pub use store::{SharedVendorStore, VendorStore};
 // 本地新增导出单独成行。

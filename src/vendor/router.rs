@@ -9,9 +9,8 @@ use axum::{
 };
 
 use super::handlers::{
-    VendorState, ack_events, get_status, kiroapp_claim, kiroapp_status, list_events,
-    purchase_ad_hoc, purchase_for_event, receive_webhook, redeem, set_mode, set_webhook_url,
-    test_webhook, list_orders,
+    VendorState, ack_events, get_status, list_events, purchase_ad_hoc, purchase_for_event,
+    receive_webhook, redeem, set_mode, set_webhook_url, test_webhook, list_orders,
 };
 // 本地新增的多卖家接口单独成行，避免与上游改动撞在同一批 use 上。
 use super::handlers::{list_ledger, list_my_keys, list_vendors};
@@ -46,8 +45,5 @@ pub fn create_vendor_admin_router(state: VendorState) -> Router {
         .route("/redeem", post(redeem))
         .route("/webhook", put(set_webhook_url))
         .route("/webhook/test", post(test_webhook))
-        // 次级卖家 kiroapp：只有查状态与提取两个动作
-        .route("/kiroapp/status", get(kiroapp_status))
-        .route("/kiroapp/claim", post(kiroapp_claim))
         .with_state(state)
 }

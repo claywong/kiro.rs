@@ -58,6 +58,61 @@
 - **凭证近 1 分钟额度消耗**：`src/admin/recent_spend.rs` + `GET /api/admin/credentials/recent-spend`，
   凭证卡「1分钟耗」读数。计的是上游 credits 消耗速率，用于观测单凭证负载。
 
+### 2026-07-31 kiroapp.io / kiroapp.cc 命名去歧义 + 独立路径合并
+
+**背景**：`kiroapp` 这个词在三处指向不同东西，导致配置和文档长期错位：
+
+| 出现位置 | 实际指向 |
+|---|---|
+| `flavor: "kiroapp"` | kiroapp**.io**（`/api/me/*`，功能完整，有 webhook） |
+| `flavor: "kiroapp-cc"` | kiroapp**.cc**（`/openapi/*`，仅库存/余额/提取，无 webhook） |
+| 顶层 `kiroapp` 配置块 | kiroapp**.cc**（历史命名，最早作为「次级卖家」独立接入） |
+
+**做的决策**：
+
+1. **kiroapp.cc 的两套实现合并为一套**。`ec3ab19` 建了 `kiroapp-cc` flavor 但没删老的独立路径，
+   同一家卖家有两条代码路径。已删除 `src/vendor/kiroapp.rs`、`kiroapp_service.rs`、
+   `admin-ui/src/components/kiroapp-card.tsx` 与 `/api/admin/vendor/kiroapp/*` 两个接口，
+   统一走 flavor。`VendorState` 随之只剩 `registry` 一个字段。
+2. **老路径的防御性解析必须保住**，已移植进 `flavor_kiroapp_cc.rs`：claim 返回 2xx 时先按文档形态
+   严格解析，失败则按 `ksk_` 前缀扫（连裸文本响应也能捞）。原因是该接口无幂等键，2xx 即已扣费，
+   按 JSON 硬解失败就等于把付过费的 Key 丢掉。配套 10 个测试一并移植。
+   同时把 kiroapp.cc 的**嵌套错误体** `{"error":{"message":..}}` 解析也带了过来 ——
+   `client.rs` 里通用的 `VendorError` 只认扁平的 `{"error":"文本"}`，直接复用会把错误信息丢成原文片段。
+3. **顶层 `kiroapp` 配置块保留但标记废弃**，重命名为 `LegacyKiroappCcConfig`，
+   由 `Config::resolved_vendors()` 自动转成 id/flavor 均为 `kiroapp-cc` 的普通卖家项，排在最后
+   （显式 `vendors` 配置同 id 时胜出）。不直接删是为了不让存量 `config.json` 启动失败。
+4. **修了三组字段名错位**（都加了 serde alias 兼容存量配置）：
+   - `inboundToken` → 正名 `webhookPathToken`。旧名会被**静默忽略**，
+     导致 `inbound_enabled()` 为 false、webhook 一律 404，极难定位。
+   - `autoPurchaseWindows` → 正名 `autoPurchaseSchedule`，同样静默忽略。
+   - 时段表内的 `start`/`end` → 正名 `from`/`to`。这两个是**必填字段**，
+     旧名会导致启动直接失败（`missing field from`），不是静默忽略。
+5. **`config.example.json` 原本根本无法解析**（`vendors` 被错误地嵌在 `vendor` 里，
+   报 `missing field baseUrl`）—— 照抄示例的人起不来服务。已改为顶层 `vendors` 数组，
+   并新增测试 `示例配置能解析且卖家齐全` 用 `include_str!` 拿真实结构体解析它。
+   **这个测试是防回归的关键**：此前示例与结构体错位这么久没被发现，就是因为没有任何测试碰过它。
+
+6. **`VendorFlavor` 的 `Serialize` 改成手写**，输出 `kiroapp-cc` 而非 derive 的 `kiroappCc`。
+   面板切换提取模式会 `config.save()` 把整个文件写回（`VendorService::set_mode`），
+   derive 形态会把用户手写的 `kiroapp-cc` 悄悄改成另一种拼法。两种都能解析，但文档、
+   `as_str()`、`all_names()` 报错提示统一用连字符形态，写回也必须一致。
+
+**踩过的坑**：给外层加 `autoPurchaseWindows` 别名后测试反而失败，暴露出内层 `start`/`end` 也对不上。
+只加外层别名会把「静默忽略」变成「硬启动失败」，反而更糟。三层名字要一起兼容。
+
+**验证示例配置的正确方法**：光断言「能解析」是不够的 —— 未知键不报错、只被丢掉，
+这正是 `inboundToken` 静静失效的机制。测试 `示例配置无静默忽略的键且往返稳定` 用的是
+**反序列化后再序列化回来逐键比对**：被忽略的键在回程里会消失，被改写的值也会暴露
+（第 6 条就是这么发现的）。往后改示例配置或增删配置字段，以这个测试为准。
+
+**顺手修的 bug**：`ClaimResult::into_purchase_result` 在 0 个 Key 时用 `points_cost / 0` 算单价，
+得到 inf/NaN，序列化进 JSON 会变 null 或报错。已加 `purchased > 0` 守卫，但保留 `total_debit`
+（人工核对扣费时需要看到钱确实扣了）。
+
+**上游关系**：`src/vendor/` 整个模块是本地独有，上游没有对应实现，这次改动无融合风险。
+但注意第 2 条移植的宽松解析是本地特有的保命逻辑，若上游日后自己做卖家对接，合并时不要被取代。
+
 ## 三、需要「融合」而非取舍的点
 
 `token_manager.rs` 的 `select_next_credential_excluding` / `acquire_context_impl` 是双方改动的

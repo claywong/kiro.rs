@@ -148,6 +148,90 @@ impl VendorClient {
         Self::parse(resp).await
     }
 
+    /// kiroapp.cc 的 `POST /openapi/claim`，**成功响应宽松解析**。
+    ///
+    /// 与其余接口刻意不同：2xx 时先按文档形态严格解析（`{"key":..}` /
+    /// `{"keys":[..]}`），失败则降级到 [`kiroapp_cc::extract_keys`] 按 `ksk_` 前缀扫，
+    /// 连裸文本响应也能捞出来。原因是这个接口**无幂等键**，一旦返回 2xx 钱就已经
+    /// 扣了 —— 若因为响应结构不认识就报错，等于把付过费的 Key 直接扔掉。
+    ///
+    /// 非 2xx 仍走严格路径，并按 kiroapp.cc 的嵌套错误体 `{"error":{"message":..}}`
+    /// 取信息（[`Self::parse`] 里的 `VendorError` 只认扁平的 `{"error":"文本"}`）。
+    async fn claim_kiroapp_cc(
+        &self,
+        body: &serde_json::Value,
+        count: u32,
+    ) -> Result<kiroapp_cc::ClaimResult, VendorApiError> {
+        let resp = self
+            .auth(self.http.post(self.url(kiroapp_cc::PATH_CLAIM)).json(body))
+            .send()
+            .await
+            .map_err(|e| VendorApiError {
+                status: None,
+                message: e.to_string(),
+            })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| VendorApiError {
+            status: Some(status.as_u16()),
+            message: format!("读取响应体失败: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(VendorApiError {
+                status: Some(status.as_u16()),
+                message: kiroapp_cc::error_message(&text)
+                    .unwrap_or_else(|| truncate(&text, 300)),
+            });
+        }
+
+        // 先按文档形态严格解析
+        if count == 1 {
+            let single = serde_json::from_str::<kiroapp_cc::ClaimSingleResponse>(&text)
+                .ok()
+                .map(|r| r.key.trim().to_string())
+                .filter(|k| !k.is_empty());
+            if let Some(key) = single {
+                return Ok(kiroapp_cc::ClaimResult {
+                    keys: vec![key],
+                    points_cost: None,
+                });
+            }
+        } else {
+            let batch = serde_json::from_str::<kiroapp_cc::ClaimBatchResponse>(&text)
+                .ok()
+                .filter(|r| !r.keys.is_empty());
+            if let Some(r) = batch {
+                return Ok(kiroapp_cc::ClaimResult {
+                    keys: r.keys,
+                    points_cost: r.points_cost,
+                });
+            }
+        }
+
+        // 降级：能当 JSON 就当 JSON，不能就整体视作一个字符串再按前缀扫。
+        // 捞不到也返回 Ok(空) 而不是 Err —— 上层据此提示人工核对是否已扣费，
+        // 报错会让人误以为没花钱。
+        let value = serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.clone()));
+        let keys = kiroapp_cc::extract_keys(&value);
+        if keys.is_empty() {
+            tracing::warn!(
+                "kiroapp.cc claim 返回中未识别出 ksk_ Key，可能已扣费: {}",
+                truncate(&text, 300)
+            );
+        } else {
+            tracing::warn!(
+                "kiroapp.cc claim 响应结构不符合文档，已按前缀降级捞出 {} 个 Key",
+                keys.len()
+            );
+        }
+        let points_cost = serde_json::from_str::<kiroapp_cc::ClaimBatchResponse>(&text)
+            .ok()
+            .and_then(|r| r.points_cost);
+        Ok(kiroapp_cc::ClaimResult { keys, points_cost })
+    }
+
     // ============ 提取（消费侧）============
 
     /// 下单提取 Key。
@@ -185,22 +269,12 @@ impl VendorClient {
             }
             VendorFlavor::KiroappCc => {
                 // kiroapp.cc: count=1 时无参数（单次提取），count>1 时传 {"count": N}
-                let result = if count == 1 {
-                    let r: kiroapp_cc::ClaimSingleResponse =
-                        self.post_json(kiroapp_cc::PATH_CLAIM, &serde_json::json!({})).await?;
-                    kiroapp_cc::ClaimResult {
-                        keys: vec![r.key],
-                        points_cost: None,
-                    }
+                let body = if count == 1 {
+                    serde_json::json!({})
                 } else {
-                    let r: kiroapp_cc::ClaimBatchResponse =
-                        self.post_json(kiroapp_cc::PATH_CLAIM, &serde_json::json!({"count": count}))
-                            .await?;
-                    kiroapp_cc::ClaimResult {
-                        keys: r.keys,
-                        points_cost: r.points_cost,
-                    }
+                    serde_json::json!({ "count": count })
                 };
+                let result = self.claim_kiroapp_cc(&body, count).await?;
                 Ok(result.into_purchase_result(client_order_id.to_string(), count))
             }
         }

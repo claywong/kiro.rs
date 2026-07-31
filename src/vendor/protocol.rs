@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 /// 反序列化走 [`VendorFlavor::parse`] 的宽松匹配（大小写、点号、下划线都容忍），
 /// 且**无法识别时直接报错而非静默回退** —— 拼错的 flavor 名若被当成默认值，
 /// 会对着错误的路径和鉴权头发请求，症状是一片 401/404，很难定位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VendorFlavor {
     /// 首家对接的卖家：`/api/my/*` + `X-API-Key: usr-xxx`。
     /// 独有能力：系统状态、开号记录、webhook 远程管理。
@@ -111,6 +110,18 @@ impl VendorFlavor {
                 tiered_pricing: false,
             },
         }
+    }
+}
+
+/// 手写而非 derive：必须与 [`VendorFlavor::as_str`] 一致输出 `kiroapp-cc`。
+///
+/// derive + `rename_all = "camelCase"` 会写成 `kiroappCc`，而文档、`all_names()`
+/// 的报错提示、`as_str()` 用的都是 `kiroapp-cc`。面板切换提取模式时会把整个
+/// config.json 写回（见 `VendorService::set_mode`），两者不一致会让用户手写的
+/// `kiroapp-cc` 被悄悄改成另一种拼法。
+impl Serialize for VendorFlavor {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
     }
 }
 

@@ -16,12 +16,18 @@ use chrono::NaiveTime;
 use serde::{Deserialize, Serialize};
 
 /// 一条时段规则：`[from, to]` 内自动提取上限取 `max_count`
+///
+/// `start` / `end` 是 `from` / `to` 的别名：早期文档与 `config.example.json`
+/// 用的是这组名字。两者都是必填字段（无 serde 默认值），不加别名会让按旧文档
+/// 配置的人直接启动失败（`missing field from`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoPurchaseWindow {
     /// 起始时刻，`HH:MM`（本地时间）
+    #[serde(alias = "start")]
     pub from: String,
     /// 结束时刻，`HH:MM`（本地时间），含该分钟。`to` 早于 `from` 视为跨午夜
+    #[serde(alias = "end")]
     pub to: String,
     /// 该时段内的单次提取上限
     pub max_count: u32,

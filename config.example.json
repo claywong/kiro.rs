@@ -12,29 +12,30 @@
   "traceEnabled": true,
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
-  "vendor": {
-    "vendors": [
-      {
-        "id": "primary",
-        "name": "主供应商",
-        "flavor": "kiroapp",
-        "baseUrl": "https://api.kiroapp.io",
-        "apiKey": "usr-xxxxxxxxxxxxxxxx",
-        "inboundToken": "whk_替换为自己生成的随机串_1",
-        "defaultGroups": [],
-        "defaultRpmLimit": 10,
-        "autoPurchase": false,
-        "autoPurchaseMaxCount": 1,
-        "autoPurchaseWindows": [
-          { "start": "14:00", "end": "23:59", "maxCount": 2 }
-        ]
-      }
-    ]
-  },
-  "kiroapp": {
-    "baseUrl": "https://kiroapp.cc",
-    "apiKey": "替换为 kiroapp 账号的 API Key",
-    "defaultGroups": [],
-    "defaultRpmLimit": 10
-  }
+  "vendors": [
+    {
+      "id": "kiroapp-io",
+      "name": "kiroapp.io",
+      "flavor": "kiroapp",
+      "baseUrl": "https://api.kiroapp.io",
+      "apiKey": "km-xxxxxxxxxxxxxxxx",
+      "webhookPathToken": "whk_替换为自己生成的随机串_1",
+      "defaultGroups": [],
+      "defaultRpmLimit": 10,
+      "autoPurchase": false,
+      "autoPurchaseMaxCount": 1,
+      "autoPurchaseSchedule": [
+        { "from": "14:00", "to": "23:59", "maxCount": 2 }
+      ]
+    },
+    {
+      "id": "kiroapp-cc",
+      "name": "kiroapp.cc",
+      "flavor": "kiroapp-cc",
+      "baseUrl": "https://kiroapp.cc",
+      "apiKey": "km-替换为 kiroapp.cc 账号的 API Key",
+      "defaultGroups": [],
+      "defaultRpmLimit": 10
+    }
+  ]
 }
