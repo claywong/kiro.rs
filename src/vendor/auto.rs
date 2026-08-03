@@ -4,6 +4,12 @@
 //! 确认名下卖家 Key 确已全部失效 → 下一轮 `new_keys_available` 才允许自动扣费，
 //! 且只提最小数量。任何一环给不出肯定结论，就退回手动。
 //!
+//! 上述链条依赖卖家持续推送 `all_keys_dead`，而实测**并非每家都推**（Drop 家只在
+//! 最初推过一次，此后 60+ 次新货通知期间再没推过）。失效确认是一次性额度，用后即
+//! 废，所以这类卖家在消费掉第一张额度后自动提取会永久死锁。故 [`decide_authorization`]
+//! 补了一条兜底：拿不到可用额度时就地盘点本家凭据，无存活即放行。该兜底不消费额度、
+//! 会反复成立，因此**必须**由全局池闸兜住上限，池闸未启用时不走这条路。
+//!
 //! 判定只读本地凭据状态（`disabled` / `disabled_reason` / `failure_count`），
 //! 不打上游探活 —— 本地状态本就是真实请求失败累积出来的，够用且零成本。
 //!
@@ -201,6 +207,87 @@ pub fn conclude(c: VendorKeyCensus, window_expired: bool) -> (ValidationStatus, 
     )
 }
 
+/// 卖家失效确认在本地的落库状态，供 [`decide_authorization`] 判定。
+///
+/// 刻意不直接收 `VendorEventRecord`：判定只需要这三样，收整行会把纯函数
+/// 绑到存储结构上，加个无关字段就得改这里。
+pub struct DeadEventVerdict {
+    /// 确认结论。None 表示尚未写入结论（观察还没跑过）。
+    pub status: Option<ValidationStatus>,
+    /// 额度是否已被此前的自动提取取用
+    pub used: bool,
+    /// 结论详情，用于拼错误原因
+    pub detail: Option<String>,
+}
+
+/// 授权判定结果
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthDecision {
+    /// 用卖家的失效额度。一次性，调用方**必须**消费掉。
+    DeadEvent,
+    /// 就地盘点通过。不消费任何额度，上限全靠池闸。
+    LocalCensus { detail: String },
+    /// 无授权，本轮不提取
+    Denied { reason: String },
+}
+
+/// 定下自动提取的授权来源。
+///
+/// 优先认卖家推来的失效额度；拿不到可用额度时，改用就地盘点的结论兜底 ——
+/// 有的卖家并不按文档持续推 `all_keys_dead`（实测 Drop 家只在最初推过一次，
+/// 此后 60+ 次新货通知期间再没推过），只认卖家事件会让这些家的自动提取在
+/// 消费掉第一张额度后**永久死锁**：额度作废了，而补发额度的事件永远不来。
+///
+/// `pool_gate_enabled` 是兜底路径的**前置条件**，这是有意的联锁：就地盘点不
+/// 消费额度，只要本家无存活 Key 就会反复成立，唯一的上限是池闸。若池闸没开还
+/// 放行，等于每条新货通知都下一单且没有任何刹车。故池闸未启用时维持原行为 ——
+/// 只认卖家事件，宁可不自动提取，也不留一条无上限的扣费路径。
+pub fn decide_authorization(
+    dead: Option<&DeadEventVerdict>,
+    pool_gate_enabled: bool,
+    census: VendorKeyCensus,
+) -> AuthDecision {
+    // 卖家给了可用额度就直接用。其余情形都记下原因转入兜底 ——
+    // 兜底判据是当下盘点出来的，比这个落库结论更新，由它给最终答案。
+    let vendor_verdict = match dead {
+        None => "尚未收到「全部失效」事件".to_string(),
+        Some(d) => match d.status {
+            Some(ValidationStatus::ConfirmedDead) if !d.used => return AuthDecision::DeadEvent,
+            Some(ValidationStatus::ConfirmedDead) => {
+                "上一次失效确认已用于此前的自动提取".to_string()
+            }
+            Some(ValidationStatus::Pending) => "失效确认仍在观察中".to_string(),
+            Some(ValidationStatus::StillAlive) => d
+                .detail
+                .clone()
+                .unwrap_or_else(|| "本地仍有健康的卖家 Key".to_string()),
+            Some(ValidationStatus::Inconclusive) | None => d
+                .detail
+                .clone()
+                .unwrap_or_else(|| "旧 Key 是否失效无法确认".to_string()),
+        },
+    };
+
+    if !pool_gate_enabled {
+        return AuthDecision::Denied {
+            reason: format!(
+                "{vendor_verdict}，且未启用全局提取限制（autoPurchasePoolTarget=0），\
+                 不做就地盘点 —— 该兜底不消费额度，需池闸兜住上限"
+            ),
+        };
+    }
+
+    // window_expired 取 true：这里要的是当下的终局结论，不是观察窗口里的中间态。
+    // 传 false 会把「仍有存活」记成待定，而此刻没有后续轮次会来复查它。
+    let (status, detail) = conclude(census, true);
+    if status == ValidationStatus::ConfirmedDead {
+        return AuthDecision::LocalCensus { detail };
+    }
+    AuthDecision::Denied {
+        reason: format!("{vendor_verdict}；就地盘点结论: {detail}"),
+    }
+}
+
 /// 自动模式的提取数量：三者取最小。
 ///
 /// 数量一旦提交就与订单号永久绑定、无法改小，自动模式没有人工复核，
@@ -232,6 +319,126 @@ mod tests {
             disabled,
             disabled_reason: reason.map(String::from),
             failure_count: failures,
+        }
+    }
+
+    // ============ 授权判定 ============
+
+    /// 空池的盘点结果 —— 对应「本地没有该家的凭据」，conclude 直接给 ConfirmedDead
+    fn 空池() -> VendorKeyCensus {
+        census(&[], DEFAULT)
+    }
+
+    /// 有一张健康 Key 的盘点结果
+    fn 有存活() -> VendorKeyCensus {
+        census(&[entry(Some("vendor:abc"), false, None, 0)], DEFAULT)
+    }
+
+    fn verdict(status: Option<ValidationStatus>, used: bool) -> DeadEventVerdict {
+        DeadEventVerdict {
+            status,
+            used,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn 授权_卖家额度可用时优先用它() {
+        let v = verdict(Some(ValidationStatus::ConfirmedDead), false);
+        // 即便池闸没开、即便本地仍有存活 Key，卖家的未消费额度依然作数 ——
+        // 这是原有行为，不能因为加了兜底而改变
+        assert_eq!(
+            decide_authorization(Some(&v), false, 有存活()),
+            AuthDecision::DeadEvent
+        );
+        assert_eq!(
+            decide_authorization(Some(&v), true, 有存活()),
+            AuthDecision::DeadEvent
+        );
+    }
+
+    /// 这是 Drop 家的实际处境：额度用光了，而补发额度的事件永远不来
+    #[test]
+    fn 授权_额度已消费时就地盘点接手() {
+        let v = verdict(Some(ValidationStatus::ConfirmedDead), true);
+        match decide_authorization(Some(&v), true, 空池()) {
+            AuthDecision::LocalCensus { detail } => {
+                assert!(detail.contains("没有来自卖家的凭据"), "detail={detail}");
+            }
+            other => panic!("本地无存活 Key 时该由就地盘点授权，实际: {other:?}"),
+        }
+    }
+
+    /// 从未推过失效事件的卖家，同样该能走兜底
+    #[test]
+    fn 授权_从无失效事件时就地盘点接手() {
+        match decide_authorization(None, true, 空池()) {
+            AuthDecision::LocalCensus { .. } => {}
+            other => panic!("无事件也该能兜底授权，实际: {other:?}"),
+        }
+    }
+
+    /// 联锁：兜底不消费额度，池闸没开就不放行
+    #[test]
+    fn 授权_池闸未启用时不走兜底() {
+        let v = verdict(Some(ValidationStatus::ConfirmedDead), true);
+        match decide_authorization(Some(&v), false, 空池()) {
+            AuthDecision::Denied { reason } => {
+                assert!(reason.contains("autoPurchasePoolTarget"), "reason={reason}");
+                assert!(reason.contains("已用于此前"), "应带上卖家侧原因: {reason}");
+            }
+            other => panic!("池闸未启用时必须拒绝，否则是一条无上限的扣费路径: {other:?}"),
+        }
+        // 从无事件 + 池闸未开，同样拒绝
+        match decide_authorization(None, false, 空池()) {
+            AuthDecision::Denied { .. } => {}
+            other => panic!("池闸未启用时必须拒绝，实际: {other:?}"),
+        }
+    }
+
+    /// 本地还有健康 Key 时不该补货 —— 兜底判据必须能拒绝，不能只会放行
+    #[test]
+    fn 授权_本地仍有存活时拒绝() {
+        let v = verdict(Some(ValidationStatus::ConfirmedDead), true);
+        match decide_authorization(Some(&v), true, 有存活()) {
+            AuthDecision::Denied { reason } => {
+                assert!(reason.contains("就地盘点结论"), "reason={reason}");
+            }
+            other => panic!("仍有存活 Key 时必须拒绝，实际: {other:?}"),
+        }
+    }
+
+    /// 观察窗口内（Pending）拿不到额度，但兜底给的是当下的终局结论：
+    /// 此刻已无存活就直接放行，不必等窗口走完 —— 那个窗口的结论也只会是同一个。
+    #[test]
+    fn 授权_观察中但已无存活则兜底放行() {
+        let v = verdict(Some(ValidationStatus::Pending), false);
+        match decide_authorization(Some(&v), true, 空池()) {
+            AuthDecision::LocalCensus { .. } => {}
+            other => panic!("已无存活时该放行，实际: {other:?}"),
+        }
+        // 观察中且仍有存活 → 拒绝，且原因里保留「观察中」这个上下文
+        match decide_authorization(Some(&v), true, 有存活()) {
+            AuthDecision::Denied { reason } => {
+                assert!(reason.contains("观察中"), "reason={reason}");
+            }
+            other => panic!("仍有存活时该拒绝，实际: {other:?}"),
+        }
+    }
+
+    /// 结论为 StillAlive / 未写入结论时，卖家侧原因要透出来，便于面板显示
+    #[test]
+    fn 授权_拒绝原因带上卖家侧结论() {
+        let v = DeadEventVerdict {
+            status: Some(ValidationStatus::StillAlive),
+            used: false,
+            detail: Some("窗口结束仍有 2 张健康".to_string()),
+        };
+        match decide_authorization(Some(&v), true, 有存活()) {
+            AuthDecision::Denied { reason } => {
+                assert!(reason.contains("窗口结束仍有 2 张健康"), "reason={reason}");
+            }
+            other => panic!("实际: {other:?}"),
         }
     }
 

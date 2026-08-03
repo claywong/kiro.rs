@@ -176,6 +176,41 @@ impl std::fmt::Display for VendorServiceError {
     }
 }
 
+/// 自动提取的授权来源。
+///
+/// 两条路的**额度语义不同**，这是它们必须区分的原因：
+/// - [`Self::DeadEvent`] 是一次性额度，用后置 `validation_used` 作废，
+///   一条失效事件只授权一轮提取。
+/// - [`Self::LocalCensus`] 不消费任何东西，只要本家仍无存活 Key 就会反复成立。
+///   因此它必须由全局池闸兜住上限，见 [`VendorService::resolve_authorization`]。
+#[derive(Debug, Clone)]
+enum PurchaseAuthorization {
+    /// 卖家推来的 `all_keys_dead` 已确认失效，且额度未被取用
+    DeadEvent { event_id: String },
+    /// 就地盘点本家凭据得出「已无可用 Key」。用于不推 `all_keys_dead` 的卖家
+    /// （实测 Drop 家只在最初推过一次，此后 60+ 次新货通知都没有）。
+    LocalCensus { detail: String },
+}
+
+impl PurchaseAuthorization {
+    /// 写进日志的来源标识，便于事后区分这笔是谁授权的
+    fn source(&self) -> &'static str {
+        match self {
+            Self::DeadEvent { .. } => "卖家失效事件",
+            Self::LocalCensus { .. } => "就地盘点",
+        }
+    }
+
+    /// 授权依据。就地盘点这条路没有事件行可回溯，依据只存在于日志里，
+    /// 故必须记下来 —— 否则事后无法解释这笔扣费凭什么发生。
+    fn detail(&self) -> &str {
+        match self {
+            Self::DeadEvent { event_id } => event_id,
+            Self::LocalCensus { detail } => detail,
+        }
+    }
+}
+
 /// 单个卖家的对接服务
 pub struct VendorService {
     config: VendorConfig,
@@ -775,40 +810,58 @@ impl VendorService {
         });
     }
 
+    /// 定下本轮自动提取的授权来源。`Err(原因)` 表示无授权、不该提取。
+    ///
+    /// 优先认卖家推来的失效确认；拿不到可用的确认时，**就地盘点本家凭据**作为
+    /// 兜底 —— 有的卖家并不按文档持续推 `all_keys_dead`（实测 Drop 家只在最初
+    /// 推过一次，此后 60+ 次新货通知期间再没推过），只认卖家事件会让这些家的
+    /// 自动提取在消费掉第一张额度后永久死锁。
+    ///
+    /// 兜底路径要求**已启用全局池闸**，这是有意的联锁：就地盘点不消费额度，
+    /// 只要本家无存活 Key 就会反复成立，唯一的上限是池闸。若池闸没开就放行，
+    /// 等于每条新货通知都下一单且没有任何刹车。故池闸未启用时维持原行为 ——
+    /// 只认卖家事件，宁可不自动提取，也不留一条无上限的扣费路径。
+    /// 判定规则本身是纯函数 [`auto::decide_authorization`]，本方法只负责取数
+    /// 与把结果接上事件 id。
+    fn resolve_authorization(&self) -> Result<PurchaseAuthorization, String> {
+        let vid = self.vendor_id();
+
+        // 读不到记录不算错误，交由判定函数转入兜底
+        let dead = self
+            .store
+            .latest_dead_event(vid)
+            .map_err(|e| format!("读取失效确认记录失败: {e}"))?;
+
+        let verdict = dead.as_ref().map(|d| auto::DeadEventVerdict {
+            status: d
+                .validation_status
+                .as_deref()
+                .and_then(ValidationStatus::from_str),
+            used: d.validation_used,
+            detail: d.validation_detail.clone(),
+        });
+
+        let census = auto::census(&self.vendor_key_states(), vid);
+        match auto::decide_authorization(verdict.as_ref(), self.pool_gate.enabled(), census) {
+            auto::AuthDecision::DeadEvent => Ok(PurchaseAuthorization::DeadEvent {
+                // 走到这个分支必然有记录，否则判定函数不会给出 DeadEvent
+                event_id: dead
+                    .map(|d| d.event_id)
+                    .expect("DeadEvent 授权必然来自一条已存在的失效事件"),
+            }),
+            auto::AuthDecision::LocalCensus { detail } => {
+                Ok(PurchaseAuthorization::LocalCensus { detail })
+            }
+            auto::AuthDecision::Denied { reason } => Err(reason),
+        }
+    }
+
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
         let vid = self.vendor_id();
 
-        // 1. 失效确认：必须有一条**本供应商的**、已确认失效且尚未被消费的 all_keys_dead
-        let dead = self
-            .store
-            .latest_dead_event(vid)
-            .map_err(|e| format!("读取失效确认记录失败: {e}"))?
-            .ok_or_else(|| "尚未收到「全部失效」事件，无法确认旧 Key 已失效".to_string())?;
-
-        let status = dead
-            .validation_status
-            .as_deref()
-            .and_then(ValidationStatus::from_str);
-        match status {
-            Some(ValidationStatus::ConfirmedDead) => {}
-            Some(ValidationStatus::Pending) => {
-                return Err("旧 Key 失效确认仍在观察中，本轮不自动提取".to_string());
-            }
-            Some(ValidationStatus::StillAlive) => {
-                return Err(dead
-                    .validation_detail
-                    .unwrap_or_else(|| "本地仍有健康的卖家 Key".to_string()));
-            }
-            Some(ValidationStatus::Inconclusive) | None => {
-                return Err(dead
-                    .validation_detail
-                    .unwrap_or_else(|| "旧 Key 是否失效无法确认".to_string()));
-            }
-        }
-        if dead.validation_used {
-            return Err("上一次失效确认已用于此前的自动提取，需新的失效事件".to_string());
-        }
+        // 1. 授权：卖家的失效确认，或就地盘点的兜底结论
+        let auth = self.resolve_authorization()?;
 
         // 2. 全局提取锁。必须在盘点之前拿到，并持有到下单+导入结束 ——
         //    否则三家并发时会同时读到「池里 0 个存活」再同时下单，闸门形同虚设。
@@ -853,13 +906,17 @@ impl VendorService {
         // 结果与数量一起绑定。此处重选的意义只在于把数量算对。
         let zone_hint = picked.map(|z| z.zone.clone());
 
-        // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取
-        let consumed = self
-            .store
-            .consume_validation(vid, &dead.event_id)
-            .map_err(|e| format!("消费失效确认失败: {e}"))?;
-        if !consumed {
-            return Err("失效确认已被其他自动提取取用".to_string());
+        // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取。
+        //    仅卖家事件那条路有额度可消费；就地盘点不消费任何东西，
+        //    它的上限由上一步的池闸负责（见 `resolve_authorization` 的联锁）。
+        if let PurchaseAuthorization::DeadEvent { event_id: dead_id } = &auth {
+            let consumed = self
+                .store
+                .consume_validation(vid, dead_id)
+                .map_err(|e| format!("消费失效确认失败: {e}"))?;
+            if !consumed {
+                return Err("失效确认已被其他自动提取取用".to_string());
+            }
         }
 
         // 6. 下单。此处开始不可逆。`_gate` 持有到本函数结束，
@@ -869,7 +926,8 @@ impl VendorService {
             event_id = %event_id,
             count,
             zone = ?zone_hint,
-            dead_event = %dead.event_id,
+            auth = auth.source(),
+            auth_detail = auth.detail(),
             "自动提取开始"
         );
         match self
