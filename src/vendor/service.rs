@@ -646,12 +646,22 @@ impl VendorService {
             .map(|k| k.key.clone())
             .collect();
 
+        // 根据实际成交区域设置 api_region：eu 需要 eu-central-1，us 或不分区用默认
+        let api_region = resp.zone.as_deref().and_then(|z| {
+            if z == "eu" {
+                Some("eu-central-1".to_string())
+            } else {
+                None
+            }
+        });
+
         super::import::import_keys(
             &self.admin,
             keys,
             &source_channel,
             groups,
             rpm_limit,
+            api_region,
         ).await
     }
 
