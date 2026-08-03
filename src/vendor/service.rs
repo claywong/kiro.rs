@@ -87,6 +87,10 @@ pub struct PurchaseImportResult {
     /// 卖家侧订单 / 批次 id
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
+    /// 本单实际成交的区域。分区卖家必须展示 —— 各区单价不同，
+    /// 不显示就看不出这笔积分花在哪个区。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     /// true 表示本次是幂等重放，卖家未重复扣款
     pub replayed: bool,
     /// 逐张 Key 的元数据（不含明文）。阶梯定价下各张单价不同，
@@ -135,6 +139,10 @@ pub enum VendorServiceError {
     NotPurchasable,
     /// 该订单号已绑定其它数量，必须改用该值重试
     CountLocked { bound: u32 },
+    /// 前端指定了卖家没有的区域。不静默回退 —— 回退等于把钱花在用户没选的区。
+    UnknownZone { zone: String, known: Vec<String> },
+    /// 所有区都无货，下单必然缺货，不必白发一次请求
+    NoZoneInStock,
     /// 调用卖家接口失败
     Upstream(VendorApiError),
     /// 本地存储错误
@@ -151,6 +159,17 @@ impl std::fmt::Display for VendorServiceError {
                 f,
                 "该订单号已绑定数量 {bound}，卖家侧不允许改数量重试，请按 {bound} 重新提交"
             ),
+            Self::UnknownZone { zone, known } => write!(
+                f,
+                "卖家没有区域 {:?}，可选值: {}",
+                zone,
+                if known.is_empty() {
+                    "（该卖家不分区）".to_string()
+                } else {
+                    known.join(" / ")
+                }
+            ),
+            Self::NoZoneInStock => write!(f, "各区均无库存，暂时无法提取"),
             Self::Upstream(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "本地存储错误: {e}"),
         }
@@ -422,24 +441,55 @@ impl VendorService {
         })
     }
 
-    /// 按事件手动提取并入库。
+    /// 定下本单要用哪个区。
+    ///
+    /// - 不具备 `zoned_purchase` 能力的卖家：恒为 `None`，下单不带 zone。
+    /// - `requested` 有值：校验该区真的存在且开放有货，不存在直接报错而非回退 ——
+    ///   静默换区等于把积分花在用户没选的区上。
+    /// - `requested` 为空：按 [`StockInfo::pick_zone`] 自动选「开放有货中最便宜」的区。
+    ///   **不能不传** —— 卖家不传 zone 时只从它的默认区（us）取货且不跨区补，
+    ///   而该区常常正是 0 库存的那个。
+    async fn resolve_zone(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, VendorServiceError> {
+        if !self.capabilities().zoned_purchase {
+            return Ok(None);
+        }
+        let stock = self.stock().await?;
+        match requested.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(z) => match stock.find_zone(z) {
+                Some(found) if found.enabled => Ok(Some(found.zone.clone())),
+                // 存在但已关停，与不存在同样处理：提不出来
+                _ => Err(VendorServiceError::UnknownZone {
+                    zone: z.to_string(),
+                    known: stock
+                        .zones
+                        .iter()
+                        .filter(|z| z.enabled)
+                        .map(|z| z.zone.clone())
+                        .collect(),
+                }),
+            },
+            None => stock
+                .pick_zone()
+                .map(|z| Some(z.zone.clone()))
+                .ok_or(VendorServiceError::NoZoneInStock),
+        }
+    }
+
+    /// 按事件提取并入库。
     ///
     /// `count` 为本次希望提取的数量；若该事件此前已绑定过其它数量，直接返回
     /// [`VendorServiceError::CountLocked`]，不会向卖家发请求 —— 避免白撞一次 409。
-    pub async fn purchase_for_event(
+    ///
+    /// `zone` 为空时自动选区；该事件此前已绑定过区域时，**以绑定值为准**并忽略
+    /// 本次入参 —— 换区重试会被卖家当成新单再扣一次积分。
+    pub async fn purchase_for_event_zoned(
         &self,
         event_id: &str,
         count: u32,
-    ) -> Result<PurchaseImportResult, VendorServiceError> {
-        self.purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Manual)
-            .await
-    }
-
-    /// 同 [`Self::purchase_for_event`]，但记录触发方式（自动模式用）
-    pub async fn purchase_for_event_with_trigger(
-        &self,
-        event_id: &str,
-        count: u32,
+        zone: Option<&str>,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
@@ -458,15 +508,32 @@ impl VendorService {
         // 有批次 id 的卖家可定向拉取，避免买到别的批次
         let batch = record.batch_order_id.clone();
 
-        // 抢占绑定：并发点击只有一个能拿到本次 count，其余得到已绑定值
-        let effective = match self
+        // 选区必须在绑定之前：绑定要把数量和区域一起写进去，
+        // 之后任何重试都只能按这一对值走。
+        let picked = self.resolve_zone(zone).await?;
+
+        // 抢占绑定：并发点击只有一个能拿到本次 (count, zone)，其余得到已绑定值
+        let (effective, effective_zone) = match self
             .store
-            .bind_count(vid, event_id, count)
+            .bind_count_zone(vid, event_id, count, picked.as_deref())
             .map_err(|e| VendorServiceError::Storage(e.to_string()))?
         {
             Ok(v) => v,
-            Err(bound) if bound == count => bound, // 同数量重试，卖家侧幂等重放
-            Err(bound) => return Err(VendorServiceError::CountLocked { bound }),
+            // 同数量重试，卖家侧幂等重放。区域一律用已绑定值 ——
+            // 本次自动选区可能选到了另一个区（库存变了），换区就是第二笔单。
+            Err((bound, bound_zone)) if bound == count => {
+                if bound_zone.as_deref() != picked.as_deref() {
+                    tracing::info!(
+                        vendor_id = %vid,
+                        event_id = %event_id,
+                        bound_zone = ?bound_zone,
+                        this_time = ?picked,
+                        "重试沿用已绑定区域，忽略本次选区结果"
+                    );
+                }
+                (bound, bound_zone)
+            }
+            Err((bound, _)) => return Err(VendorServiceError::CountLocked { bound }),
         };
 
         self.purchase_and_import(
@@ -475,6 +542,7 @@ impl VendorService {
             &order_id,
             batch.as_deref(),
             effective,
+            effective_zone.as_deref(),
             trigger,
         )
         .await
@@ -486,10 +554,14 @@ impl VendorService {
         &self,
         count: u32,
         client_order_id: &str,
+        zone: Option<&str>,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
+        // 本路径不写事件表，选区结果无处持久化。调用方重试时必须自行带上同一个
+        // zone（面板会回显本次实际用的区），否则自动选区可能改主意、变成第二笔单。
+        let picked = self.resolve_zone(zone).await?;
         let resp = client
-            .purchase(count, client_order_id, None)
+            .purchase(count, client_order_id, None, picked.as_deref())
             .await
             .map_err(|e| {
                 // 记下订单号：本路径不写事件表，失败后它是唯一能安全重试的凭据。
@@ -505,7 +577,7 @@ impl VendorService {
                 VendorServiceError::Upstream(e)
             })?;
         let outcome = self.import_purchased(&resp, client_order_id).await;
-        Ok(build_result(count, &resp, outcome))
+        Ok(build_result(count, &resp, outcome, picked.as_deref()))
     }
 
     /// 提取 + 入库 + 结果写回事件行
@@ -516,10 +588,14 @@ impl VendorService {
         order_id: &str,
         batch_order_id: Option<&str>,
         count: u32,
+        zone: Option<&str>,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let vid = self.vendor_id();
-        let resp = match client.purchase(count, order_id, batch_order_id).await {
+        let resp = match client
+            .purchase(count, order_id, batch_order_id, zone)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // 记失败但保留 bound_count，便于按同一数量重试
@@ -553,7 +629,7 @@ impl VendorService {
             tracing::warn!("写回提取结果失败 event_id={}: {}", event_id, e);
         }
 
-        Ok(build_result(count, &resp, outcome))
+        Ok(build_result(count, &resp, outcome, zone))
     }
 
     /// 把提取到的 Key 逐条入库。复用 admin 的 `import_one_credential`：
@@ -744,17 +820,28 @@ impl VendorService {
             .stock()
             .await
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
+        // 分区卖家的 stock.available 是各区之和，拿它算数量会超出单区实际库存 ——
+        // 下单只落在一个区，超出部分必然提不到。故按实际要用的那个区的量算。
+        let picked = stock.pick_zone();
+        let zone_max = picked.map_or(stock.available, |z| z.available);
+        if self.capabilities().zoned_purchase && picked.is_none() {
+            return Err("各区均无库存，本轮不自动提取".to_string());
+        }
         // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
         let configured_max = self.auto_max_count();
-        let count = auto::decide_count(new_keys, stock.available, configured_max);
+        let count = auto::decide_count(new_keys, zone_max, configured_max);
         if count == 0 {
             return Err(format!(
-                "可提取数量为 0（事件声明 {}，卖家上限 {}，配置上限 {}）",
+                "可提取数量为 0（事件声明 {}，卖家上限 {}{}，配置上限 {}）",
                 new_keys.map(|v| v.to_string()).unwrap_or("-".into()),
-                stock.available,
+                zone_max,
+                picked.map(|z| format!("@{}", z.zone)).unwrap_or_default(),
                 configured_max
             ));
         }
+        // 选区结果不在这里传下去：purchase_for_event_zoned 会自己再选一次并把
+        // 结果与数量一起绑定。此处重选的意义只在于把数量算对。
+        let zone_hint = picked.map(|z| z.zone.clone());
 
         // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取
         let consumed = self
@@ -771,11 +858,17 @@ impl VendorService {
             vendor_id = %vid,
             event_id = %event_id,
             count,
+            zone = ?zone_hint,
             dead_event = %dead.event_id,
             "自动提取开始"
         );
         match self
-            .purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Auto)
+            .purchase_for_event_zoned(
+                event_id,
+                count,
+                zone_hint.as_deref(),
+                PurchaseTrigger::Auto,
+            )
             .await
         {
             Ok(r) => {
@@ -784,6 +877,7 @@ impl VendorService {
                     event_id = %event_id,
                     purchased = r.purchased,
                     imported = r.imported,
+                    zone = ?r.zone,
                     total_debit = ?r.total_debit,
                     "自动提取完成"
                 );
@@ -908,9 +1002,15 @@ fn build_result(
     count: u32,
     resp: &PurchaseResult,
     outcome: PurchaseOutcome,
+    zone: Option<&str>,
 ) -> PurchaseImportResult {
     PurchaseImportResult {
         count,
+        // 卖家回显的区优先；没回显时用我们下单时指定的那个
+        zone: resp
+            .zone
+            .clone()
+            .or_else(|| zone.map(|s| s.to_string())),
         requested: resp.requested,
         purchased: resp.purchased,
         imported: outcome.imported,
@@ -1167,6 +1267,7 @@ mod tests {
             total_debit: Some(70.0),
             order_id: Some("batch-1".to_string()),
             replayed: false,
+            zone: None,
             keys: vec![
                 PurchasedKey {
                     key: "sk-a".to_string(),
@@ -1189,7 +1290,7 @@ mod tests {
             imported: 2,
             ..Default::default()
         };
-        let r = build_result(5, &resp, outcome);
+        let r = build_result(5, &resp, outcome, None);
 
         // 部分成交要能被面板识别
         assert_eq!(r.requested, Some(5));
@@ -1223,7 +1324,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let r = build_result(1, &resp, PurchaseOutcome::default());
+        let r = build_result(1, &resp, PurchaseOutcome::default(), None);
         assert!(!r.keys[0].has_password);
     }
 

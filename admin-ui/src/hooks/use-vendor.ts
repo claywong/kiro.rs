@@ -77,8 +77,8 @@ export function useVendorOrders(vendorId?: string) {
 export function usePurchaseForEvent(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ eventId, count }: { eventId: string; count: number }) =>
-      purchaseForEvent(eventId, count, vendorId),
+    mutationFn: ({ eventId, count, zone }: { eventId: string; count: number; zone?: string }) =>
+      purchaseForEvent(eventId, count, vendorId, zone),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vendor-events', undefined, vendorId] })
       qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
@@ -90,8 +90,8 @@ export function usePurchaseForEvent(vendorId?: string) {
 export function usePurchaseAdHoc(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ count, clientOrderId }: { count: number; clientOrderId?: string }) =>
-      purchaseAdHoc(count, clientOrderId, vendorId),
+    mutationFn: ({ count, clientOrderId, zone }: { count: number; clientOrderId?: string; zone?: string }) =>
+      purchaseAdHoc(count, clientOrderId, vendorId, zone),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }

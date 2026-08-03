@@ -166,6 +166,8 @@ impl From<StatusResponse> for StockInfo {
             price_min: None,
             price_max: None,
             balance: None,
+            // 该卖家不分区
+            zones: Vec::new(),
         }
     }
 }
@@ -218,6 +220,7 @@ impl From<PurchaseResponse> for PurchaseResult {
             keys,
             // 不回显是否幂等重放，保守记 false
             replayed: false,
+            zone: None,
         }
     }
 }

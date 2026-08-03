@@ -10,6 +10,9 @@ import { Input } from '@/components/ui/input'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -203,6 +206,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   const [webhookUrl, setWebhookInput] = useState('')
   const [directOpen, setDirectOpen] = useState(false)
   const [directCount, setDirectCount] = useState('1')
+  const [directZone, setDirectZone] = useState('')
   const [genLogsOpen, setGenLogsOpen] = useState(false)
 
   const profile = status?.profile
@@ -328,9 +332,13 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
     })
     if (!ok) return
     try {
-      const r = await purchaseAdHoc.mutateAsync({ count: n })
+      const r = await purchaseAdHoc.mutateAsync({
+        count: n,
+        zone: directZone || undefined,
+      })
       toast.success(`提取完成：出 ${r.purchased} 个，入库 ${r.imported} 个`, {
         description: [
+          r.zone ? `区域 ${r.zone}` : null,
           r.duplicated ? `重复 ${r.duplicated} 个` : null,
           r.failed ? `失败 ${r.failed} 个` : null,
           r.remaining != null ? `剩余余额 ${r.remaining}` : null,
@@ -447,7 +455,17 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         <Button
           size="sm"
           onClick={() => {
+            const zones = status?.stock?.zones?.filter((z) => z.enabled && z.available > 0) ?? []
+            const picked = zones.length > 0
+              ? zones.reduce((best, z) =>
+                  (z.unitPrice ?? Infinity) < (best.unitPrice ?? Infinity) ||
+                  ((z.unitPrice ?? Infinity) === (best.unitPrice ?? Infinity) && z.available > best.available)
+                    ? z
+                    : best
+                ).zone
+              : ''
             setDirectCount(String(status?.stock?.available && status.stock.available > 0 ? 1 : 1))
+            setDirectZone(picked)
             setDirectOpen(true)
           }}
         >
@@ -474,7 +492,16 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         <StatCard
           icon={<PackageOpen className="h-3.5 w-3.5" />}
           label="本轮可提取"
-          value={status?.stockError ? '—' : (status?.stock?.available ?? status?.stockMax ?? '—')}
+          value={
+            status?.stockError
+              ? '—'
+              : status?.stock?.zones && status.stock.zones.length > 0
+                ? status.stock.zones
+                    .filter((z) => z.enabled)
+                    .map((z) => `${z.label ?? z.zone} ${z.available}`)
+                    .join(' / ')
+                : status?.stock?.available ?? status?.stockMax ?? '—'
+          }
           hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
           tone={status?.stockError ? 'warn' : 'normal'}
         />
@@ -484,16 +511,23 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
           value={
             status?.stockError
               ? '—'
-              : status?.stock?.priceMin != null && status?.stock?.priceMax != null
-                ? status.stock.priceMin === status.stock.priceMax
-                  ? status.stock.priceMin
-                  : `${status.stock.priceMin}~${status.stock.priceMax}`
-                : '—'
+              : status?.stock?.zones && status.stock.zones.length > 0
+                ? status.stock.zones
+                    .filter((z) => z.enabled && z.available > 0 && z.unitPrice != null)
+                    .map((z) => `${z.label ?? z.zone} ${z.unitPrice}`)
+                    .join(' / ') || '—'
+                : status?.stock?.priceMin != null && status?.stock?.priceMax != null
+                  ? status.stock.priceMin === status.stock.priceMax
+                    ? status.stock.priceMin
+                    : `${status.stock.priceMin}~${status.stock.priceMax}`
+                  : '—'
           }
           hint={
             status?.capabilities?.tieredPricing && !status?.stockError
               ? '阶梯定价，价格随提取数量变化'
-              : undefined
+              : status?.capabilities?.zonedPurchase && !status?.stockError
+                ? '各区单价独立'
+                : undefined
           }
           tone="normal"
         />
@@ -606,6 +640,31 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
                 {profile?.balance != null ? `，当前余额 ${profile.balance}` : ''}
               </div>
             </div>
+
+            {status?.stock?.zones && status.stock.zones.length > 0 && (
+              <div>
+                <label className="text-xs text-muted-foreground">提取区域</label>
+                <Select value={directZone} onValueChange={setDirectZone}>
+                  <SelectTrigger className="mt-1">
+                    <SelectValue placeholder="自动选择最便宜的区" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {status.stock.zones
+                      .filter((z) => z.enabled && z.available > 0)
+                      .map((z) => (
+                        <SelectItem key={z.zone} value={z.zone}>
+                          {z.label ?? z.zone} · {z.available} 个可提
+                          {z.unitPrice != null && ` · ${z.unitPrice} 积分/个`}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+                <div className="mt-1.5 text-xs text-muted-foreground">
+                  各区单价独立。直接提取不落库，重试时需手动带上响应回显的 zone。
+                </div>
+              </div>
+            )}
+
             <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
               入库参数：分组{' '}
               {status?.defaultGroups?.length ? status.defaultGroups.join(' / ') : '无'}

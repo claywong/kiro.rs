@@ -357,15 +357,24 @@ impl VendorClient {
     ///
     /// `batch_order_id` 仅 `batch_scoped_purchase` 能力可用时有意义（kiroapp 的
     /// 开号批次 id），传入后只拉取该批次产出的 Key。
+    ///
+    /// `zone` 仅 `zoned_purchase` 能力可用时有意义。**幂等键与 zone 也要配死**：
+    /// 同一订单号重试时必须传同一个 zone，换区等于换了笔单。
     pub async fn purchase(
         &self,
         count: u32,
         client_order_id: &str,
         batch_order_id: Option<&str>,
+        zone: Option<&str>,
     ) -> Result<PurchaseResult, VendorApiError> {
         let mut body = purchase_body(count, client_order_id);
         match self.flavor {
             VendorFlavor::Legacy => {
+                // 不带 zone 时卖家只从它自己的默认区（us）取货，且不跨区补 ——
+                // 该区缺货就直接返回缺货。故有分区能力时必须显式指定。
+                if let Some(z) = zone.filter(|s| !s.trim().is_empty()) {
+                    body["zone"] = serde_json::json!(z.trim());
+                }
                 let r: legacy::PurchaseResponse =
                     self.post_json(legacy::PATH_PURCHASE, &body).await?;
                 Ok(r.into())

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::protocol::{
-    OrderInfo, Paged, ProfileInfo, PurchaseResult, PurchasedKey, RedeemResult, StockInfo,
+    OrderInfo, Paged, ProfileInfo, PurchaseResult, PurchasedKey, RedeemResult, StockInfo, ZoneStock,
 };
 
 /// 路径前缀。该卖家的账号维度接口在 `/api/my` 下，系统状态在 `/api/status`。
@@ -22,10 +22,16 @@ pub const PATH_GEN_LOGS: &str = "/api/my/gen-logs";
 pub const PATH_WEBHOOK: &str = "/api/my/webhook";
 pub const PATH_WEBHOOK_TEST: &str = "/api/my/webhook/test";
 
-/// 单个 Key 条目。该卖家只保证 `key` 字段。
+/// 单个 Key 条目。除 `key` 外三个字段是后来补的，老号可能只有 `key`，故都可选。
 #[derive(Debug, Clone, Deserialize)]
 pub struct VendorKey {
     pub key: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub issuer_url: Option<String>,
 }
 
 /// `POST /api/my/purchase` 响应
@@ -37,6 +43,16 @@ pub struct PurchaseResponse {
     pub remaining: Option<f64>,
     #[serde(default)]
     pub keys: Vec<VendorKey>,
+    /// 实际成交区域
+    #[serde(default)]
+    pub zone: Option<String>,
+    #[serde(default)]
+    pub unit_price: Option<f64>,
+    /// 本单实际扣的积分。卖家按 `unit_price × purchased` 算，但以它为准。
+    #[serde(default)]
+    pub total_credits: Option<f64>,
+    #[serde(default)]
+    pub order_id: Option<String>,
 }
 
 impl From<PurchaseResponse> for PurchaseResult {
@@ -46,10 +62,11 @@ impl From<PurchaseResponse> for PurchaseResult {
             .into_iter()
             .map(|k| PurchasedKey {
                 key: k.key,
-                account: None,
-                password: None,
-                issuer_url: None,
-                price: None,
+                account: k.account,
+                password: k.password,
+                issuer_url: k.issuer_url,
+                // 该卖家单一定价，逐张单价就是本区单价
+                price: r.unit_price,
             })
             .collect();
         // 该卖家不回显 purchased 与实际条数的差异，取较大者兜底
@@ -58,14 +75,39 @@ impl From<PurchaseResponse> for PurchaseResult {
             purchased,
             requested: None,
             remaining: r.remaining,
-            unit_price: None,
-            total_debit: None,
-            order_id: None,
+            unit_price: r.unit_price,
+            // 卖家给了权威扣费额就用它，没给则按单价 × 成交数兜底
+            total_debit: r
+                .total_credits
+                .or_else(|| r.unit_price.map(|p| p * purchased as f64)),
+            order_id: r.order_id,
             keys,
             // 该卖家不回显是否重放，无法区分，保守记 false
             replayed: false,
+            zone: r.zone,
         }
     }
+}
+
+/// `GET /api/my/stock` 单个区域条目
+#[derive(Debug, Clone, Deserialize)]
+pub struct StockZone {
+    pub zone: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub max: u32,
+    #[serde(default)]
+    pub stock: Option<u32>,
+    #[serde(default)]
+    pub unit_price: Option<f64>,
+    /// 卖家不给时按开放处理 —— 老版本响应没有这个字段
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `GET /api/my/stock` 响应
@@ -73,16 +115,46 @@ impl From<PurchaseResponse> for PurchaseResult {
 pub struct StockResponse {
     #[serde(default)]
     pub max: u32,
+    /// 账户积分余额，省一次 profile 请求
+    #[serde(default)]
+    pub quota: Option<f64>,
+    /// 分区库存。老版本响应没有这个字段，此时退化成不分区行为。
+    #[serde(default)]
+    pub zones: Vec<StockZone>,
 }
 
 impl From<StockResponse> for StockInfo {
     fn from(r: StockResponse) -> Self {
+        let zones: Vec<ZoneStock> = r
+            .zones
+            .into_iter()
+            .map(|z| ZoneStock {
+                zone: z.zone,
+                label: z.label,
+                available: z.max,
+                stock: z.stock,
+                unit_price: z.unit_price,
+                enabled: z.enabled,
+            })
+            .collect();
+        // 各区单价不同，报价取区间。只算「开放且有货」的区 —— 把 0 库存区的价
+        // 算进来会让面板显示一个实际提不到的价位。
+        let prices: Vec<f64> = zones
+            .iter()
+            .filter(|z| z.enabled && z.available > 0)
+            .filter_map(|z| z.unit_price)
+            .collect();
         Self {
-            available: r.max,
-            // 该卖家不在库存接口给价格与余额，余额需另调 profile
-            price_min: None,
-            price_max: None,
-            balance: None,
+            // 顶层 max 是卖家给的聚合值；缺失时按各区之和兜底
+            available: if r.max > 0 {
+                r.max
+            } else {
+                zones.iter().filter(|z| z.enabled).map(|z| z.available).sum()
+            },
+            price_min: prices.iter().copied().reduce(f64::min),
+            price_max: prices.iter().copied().reduce(f64::max),
+            balance: r.quota,
+            zones,
         }
     }
 }
@@ -321,12 +393,183 @@ mod tests {
     }
 
     #[test]
-    fn 库存转中立结构() {
-        let s: StockInfo = StockResponse { max: 7 }.into();
+    fn 库存转中立结构_无分区() {
+        // 老版本响应没有 zones，退化成单区行为
+        let s: StockInfo = StockResponse {
+            max: 7,
+            quota: None,
+            zones: Vec::new(),
+        }
+        .into();
         assert_eq!(s.available, 7);
-        // 该卖家不给价格与余额
+        assert!(s.zones.is_empty(), "无 zones 时不应凭空造出区");
         assert!(s.price_min.is_none());
         assert!(s.balance.is_none());
+        // 不分区时选区必须返回 None，让下单不带 zone
+        assert!(s.pick_zone().is_none());
+    }
+
+    /// 用线上 `/api/my/stock` 的真实返回做样本（美国区已空、欧洲区有货）
+    #[test]
+    fn 库存转中立结构_分区真实样本() {
+        let raw = r#"{"max":10,"max_purchase":10,"min":1,"quota":812,"reserved":0,
+            "zones":[
+              {"available":0,"enabled":true,"label":"美国区","max":0,"stock":0,
+               "unit_price":20,"zone":"us"},
+              {"available":17,"enabled":true,"label":"欧洲区","max":10,"stock":17,
+               "unit_price":15,"zone":"eu"}]}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 10);
+        assert_eq!(s.balance, Some(812.0), "库存接口的 quota 可当余额用");
+        assert_eq!(s.zones.len(), 2);
+        assert_eq!(s.zones[0].zone, "us");
+        assert_eq!(s.zones[0].available, 0);
+        assert_eq!(s.zones[0].unit_price, Some(20.0));
+        assert_eq!(s.zones[1].label.as_deref(), Some("欧洲区"));
+        assert_eq!(s.zones[1].stock, Some(17));
+
+        // 报价区间只算有货的区：美国区 0 库存，20 这个价实际提不到
+        assert_eq!(s.price_min, Some(15.0));
+        assert_eq!(s.price_max, Some(15.0));
+
+        // 关键：必须选到欧洲区。选美国区（卖家的默认区）会直接缺货
+        assert_eq!(s.pick_zone().map(|z| z.zone.as_str()), Some("eu"));
+    }
+
+    #[test]
+    fn 选区_按单价取低并跳过无货与关停() {
+        let mk = |zone: &str, max: u32, price: f64, enabled: bool| StockZone {
+            zone: zone.to_string(),
+            label: None,
+            max,
+            stock: None,
+            unit_price: Some(price),
+            enabled,
+        };
+        // 最便宜的区关停了，次便宜的区无货 —— 只能选第三个
+        let s: StockInfo = StockResponse {
+            max: 0,
+            quota: None,
+            zones: vec![
+                mk("cheap-off", 50, 5.0, false),
+                mk("cheap-empty", 0, 8.0, true),
+                mk("ok", 3, 12.0, true),
+                mk("pricey", 99, 30.0, true),
+            ],
+        }
+        .into();
+        assert_eq!(s.pick_zone().map(|z| z.zone.as_str()), Some("ok"));
+        // 顶层 max 缺失时按各区之和兜底，关停区不计入
+        assert_eq!(s.available, 0 + 3 + 99);
+    }
+
+    #[test]
+    fn 选区_全部无货返回none() {
+        let s: StockInfo = StockResponse {
+            max: 0,
+            quota: None,
+            zones: vec![StockZone {
+                zone: "us".to_string(),
+                label: None,
+                max: 0,
+                stock: Some(0),
+                unit_price: Some(20.0),
+                enabled: true,
+            }],
+        }
+        .into();
+        assert!(s.pick_zone().is_none());
+        // 全区无货时不应给出报价区间
+        assert!(s.price_min.is_none());
+    }
+
+    #[test]
+    fn 选区_同价时结果稳定() {
+        // 同价同量的两个区，多次调用必须选同一个 —— 否则幂等重试会换区，
+        // 被卖家当成第二笔单再扣一次积分
+        let zones: Vec<StockZone> = ["eu", "us", "ap"]
+            .iter()
+            .map(|z| StockZone {
+                zone: z.to_string(),
+                label: None,
+                max: 5,
+                stock: None,
+                unit_price: Some(10.0),
+                enabled: true,
+            })
+            .collect();
+        let s: StockInfo = StockResponse {
+            max: 0,
+            quota: None,
+            zones,
+        }
+        .into();
+        assert_eq!(s.pick_zone().map(|z| z.zone.as_str()), Some("ap"));
+        assert_eq!(s.pick_zone().map(|z| z.zone.as_str()), Some("ap"));
+    }
+
+    #[test]
+    fn 选区_缺单价的区不被优先() {
+        let s: StockInfo = StockResponse {
+            max: 0,
+            quota: None,
+            zones: vec![
+                StockZone {
+                    zone: "unknown-price".to_string(),
+                    label: None,
+                    max: 100,
+                    stock: None,
+                    unit_price: None,
+                    enabled: true,
+                },
+                StockZone {
+                    zone: "known".to_string(),
+                    label: None,
+                    max: 1,
+                    stock: None,
+                    unit_price: Some(99.0),
+                    enabled: true,
+                },
+            ],
+        }
+        .into();
+        // 价格未知的区可能任意贵，不该因为量大就被选中
+        assert_eq!(s.pick_zone().map(|z| z.zone.as_str()), Some("known"));
+    }
+
+    #[test]
+    fn 下单转中立结构_带区域与扣费() {
+        let raw = r#"{"client_order_id":"0123456789abcdef0123456789abcdef","purchased":2,
+            "remaining":4500,"zone":"eu","unit_price":15,"total_credits":30,
+            "order_id":"a1b2c3",
+            "keys":[{"key":"kiro-1","account":"u@e.com","password":"p1",
+                     "issuer_url":"https://i1"},
+                    {"key":"kiro-2","account":"v@e.com","password":"p2",
+                     "issuer_url":"https://i2"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw)
+            .unwrap()
+            .into();
+        assert_eq!(r.zone.as_deref(), Some("eu"));
+        assert_eq!(r.unit_price, Some(15.0));
+        assert_eq!(r.total_debit, Some(30.0), "扣费以卖家的 total_credits 为准");
+        assert_eq!(r.order_id.as_deref(), Some("a1b2c3"));
+        // 四个字段都要接住，早先只留了 key
+        assert_eq!(r.keys[0].account.as_deref(), Some("u@e.com"));
+        assert_eq!(r.keys[0].password.as_deref(), Some("p1"));
+        assert_eq!(r.keys[1].issuer_url.as_deref(), Some("https://i2"));
+        assert_eq!(r.keys[1].price, Some(15.0));
+    }
+
+    #[test]
+    fn 下单转中立结构_缺total时按单价兜底() {
+        let raw = r#"{"purchased":3,"unit_price":15,"keys":[{"key":"a"},{"key":"b"},
+            {"key":"c"}]}"#;
+        let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw)
+            .unwrap()
+            .into();
+        assert_eq!(r.total_debit, Some(45.0));
+        // 老响应只有 key，其余三个字段缺失不能解析失败
+        assert!(r.keys[0].account.is_none());
     }
 
     #[test]

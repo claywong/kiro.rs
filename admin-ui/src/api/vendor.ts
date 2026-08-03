@@ -104,11 +104,12 @@ export async function listVendorOrders(vendorId?: string): Promise<VendorOrdersR
 export async function purchaseForEvent(
   eventId: string,
   count: number,
-  vendorId?: string
+  vendorId?: string,
+  zone?: string
 ): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>(
     `/events/${eventId}/purchase`,
-    { count, vendorId },
+    { count, vendorId, zone },
     { params: vendorId ? { vendorId } : {} }
   )
   return data
@@ -118,11 +119,12 @@ export async function purchaseForEvent(
 export async function purchaseAdHoc(
   count: number,
   clientOrderId?: string,
-  vendorId?: string
+  vendorId?: string,
+  zone?: string
 ): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>(
     '/purchase',
-    { count, clientOrderId, vendorId },
+    { count, clientOrderId, vendorId, zone },
     { params: vendorId ? { vendorId } : {} }
   )
   return data

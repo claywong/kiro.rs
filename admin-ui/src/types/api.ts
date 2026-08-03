@@ -625,6 +625,24 @@ export interface VendorCapabilities {
   earliestKey: boolean
   batchScopedPurchase: boolean
   tieredPricing: boolean
+  /** 分区库存：库存按区隔离、各区单价独立，下单需指定 zone */
+  zonedPurchase: boolean
+}
+
+/** 单个区域的库存与报价（仅 zonedPurchase 能力的卖家有） */
+export interface VendorZoneStock {
+  /** 区域代码，下单时原样回传，如 us / eu */
+  zone: string
+  /** 人类可读名称，如「美国区」。缺失时回退显示 zone。 */
+  label?: string
+  /** 本区当前可提取数量 */
+  available: number
+  /** 本区仓库存货数，可能大于 available（受单次上限压制） */
+  stock?: number
+  /** 本区单价。各区独立设置，不要硬编码。 */
+  unitPrice?: number
+  /** 本区是否开放。关闭的区即使有存货也提不出来。 */
+  enabled: boolean
 }
 
 /** 卖家清单项 */
@@ -700,10 +718,16 @@ export interface VendorStatus {
   profileError?: string
   /** 库存与报价。stock 是新结构(带价格区间)，stockMax 是兼容字段 */
   stock?: {
+    /**
+     * 分区卖家这里是**各区之和**。它大于 0 只说明某个区有货，
+     * 不代表任一指定区有货 —— 判断能否提取要看 zones。
+     */
     available: number
     priceMin?: number
     priceMax?: number
     balance?: number
+    /** 分区库存。为空表示该卖家不分区。 */
+    zones?: VendorZoneStock[]
   }
   stockMax?: number
   stockError?: string
@@ -793,6 +817,8 @@ export interface VendorEvent {
   acked: boolean
   /** 首次提交提取时绑定的数量；非空即不可更改 */
   boundCount?: number
+  /** 首次提交时绑定的区域；与 boundCount 一起锁死，换区重试会再扣一次积分 */
+  boundZone?: string
   /** done / failed / skipped；未提取过则为空 */
   purchaseStatus?: string
   purchased?: number
@@ -852,6 +878,8 @@ export interface VendorPurchaseResult {
   unitPrice?: number
   /** 卖家侧订单 / 批次 id */
   orderId?: string
+  /** 本单实际成交的区域。各区单价不同，必须展示。 */
+  zone?: string
   /** true 表示本次是幂等重放，卖家未重复扣款 */
   replayed?: boolean
   /** 逐张 Key 的元数据（不含明文） */

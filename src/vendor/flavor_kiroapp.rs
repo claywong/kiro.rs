@@ -54,6 +54,8 @@ impl From<StockResponse> for StockInfo {
             price_max: r.price_max,
             // 库存接口顺带给余额，可省一次 profile 请求
             balance: r.balance,
+            // 该卖家不分区
+            zones: Vec::new(),
         }
     }
 }
@@ -122,6 +124,7 @@ impl From<PurchaseResponse> for PurchaseResult {
             order_id: r.order_id,
             keys,
             replayed: r.replayed,
+            zone: None,
         }
     }
 }

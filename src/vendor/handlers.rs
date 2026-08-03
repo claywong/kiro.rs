@@ -20,7 +20,9 @@ use serde::Deserialize;
 
 use super::registry::VendorRegistry;
 use super::service::{VendorService, VendorServiceError};
-use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEventKind};
+use super::store::{
+    DEFAULT_QUERY_LIMIT, IncomingEvent, PurchaseTrigger, RecordOutcome, VendorEventKind,
+};
 
 /// 入站 webhook 与管理接口共享的状态
 #[derive(Clone)]
@@ -48,6 +50,9 @@ fn err_response_with(e: VendorServiceError, extra: &[(&str, serde_json::Value)])
         VendorServiceError::EventNotFound => StatusCode::NOT_FOUND,
         VendorServiceError::NotPurchasable => StatusCode::BAD_REQUEST,
         VendorServiceError::CountLocked { .. } => StatusCode::CONFLICT,
+        VendorServiceError::UnknownZone { .. } => StatusCode::BAD_REQUEST,
+        // 与卖家缺货同义，沿用它的 409
+        VendorServiceError::NoZoneInStock => StatusCode::CONFLICT,
         VendorServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // 原样透出卖家状态码（403 余额不足 / 404 无可用 Key / 409 数量冲突）
         VendorServiceError::Upstream(u) => u
@@ -62,6 +67,10 @@ fn err_response_with(e: VendorServiceError, extra: &[(&str, serde_json::Value)])
     let mut body = serde_json::json!({ "error": e.to_string() });
     if let Some(b) = bound {
         body["boundCount"] = serde_json::json!(b);
+    }
+    // 让面板能把可选区域直接渲染成下拉项，不必再查一次库存
+    if let VendorServiceError::UnknownZone { known, .. } = &e {
+        body["knownZones"] = serde_json::json!(known);
     }
     for (k, v) in extra {
         body[*k] = v.clone();
@@ -462,6 +471,10 @@ pub struct PurchaseRequest {
     pub count: u32,
     #[serde(default)]
     pub vendor_id: Option<String>,
+    /// 指定区域（分区卖家）。留空则自动选「开放有货中单价最低」的区。
+    /// 事件已绑定过区域时以绑定值为准，本字段被忽略。
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// `POST /api/admin/vendor/events/{event_id}/purchase` —— 按事件提取并入库
@@ -486,7 +499,15 @@ pub async fn purchase_for_event(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    match service.purchase_for_event(&event_id, req.count).await {
+    match service
+        .purchase_for_event_zoned(
+            &event_id,
+            req.count,
+            req.zone.as_deref(),
+            PurchaseTrigger::Manual,
+        )
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(e) => err_response(e),
     }
@@ -501,6 +522,10 @@ pub struct AdHocPurchaseRequest {
     pub client_order_id: Option<String>,
     #[serde(default)]
     pub vendor_id: Option<String>,
+    /// 指定区域（分区卖家）。留空则自动选「开放有货中单价最低」的区。
+    /// 本路径不落库，重试时须自行带上响应回显的 zone。
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// `POST /api/admin/vendor/purchase` —— 不依赖事件的主动提取
@@ -538,7 +563,10 @@ pub async fn purchase_ad_hoc(
         "主动提取开始"
     );
 
-    match service.purchase_ad_hoc(req.count, &order_id).await {
+    match service
+        .purchase_ad_hoc(req.count, &order_id, req.zone.as_deref())
+        .await
+    {
         Ok(result) => {
             let mut body = serde_json::to_value(&result).unwrap_or_default();
             body["clientOrderId"] = serde_json::json!(order_id);

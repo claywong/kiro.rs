@@ -6,6 +6,9 @@ import { Input } from '@/components/ui/input'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { usePurchaseForEvent } from '@/hooks/use-vendor'
 import { extractErrorMessage } from '@/lib/utils'
 // 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
@@ -36,16 +39,36 @@ export function VendorPurchaseDialog({
 }) {
   const purchase = usePurchaseForEvent(vendorId)
   const [count, setCount] = useState('')
+  const [zone, setZone] = useState<string>('')
 
   const locked = event?.boundCount != null
   const boundCount = event?.boundCount
+  const boundZone = event?.boundZone
+
+  const zones = status?.stock?.zones?.filter((z) => z.enabled && z.available > 0) ?? []
+  const hasZones = zones.length > 0
+  // 自动选一个：优先用已绑定的，否则按单价最低（同价按 available 大的）
+  const pickZone = () => {
+    if (boundZone) return boundZone
+    if (zones.length === 0) return undefined
+    return zones.reduce((best, z) =>
+      (z.unitPrice ?? Infinity) < (best.unitPrice ?? Infinity) ||
+      ((z.unitPrice ?? Infinity) === (best.unitPrice ?? Infinity) && z.available > best.available)
+        ? z
+        : best
+    ).zone
+  }
 
   useEffect(() => {
     if (!event) return
     // 已绑定则强制显示绑定值；首次提取取事件声明数量与当前上限的较小值
-    const availableCount = Math.min(event.newKeys ?? 1, status?.stock?.available ?? status?.stockMax ?? Infinity)
+    const picked = pickZone()
+    const zoneMax = picked ? zones.find((z) => z.zone === picked)?.available : (status?.stock?.available ?? status?.stockMax)
+    const availableCount = Math.min(event.newKeys ?? 1, zoneMax ?? Infinity)
     setCount(String(boundCount ?? availableCount))
-  }, [event, boundCount, status?.stock?.available, status?.stockMax])
+    setZone(picked ?? '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [event, boundCount, boundZone, status?.stock?.available, status?.stockMax])
 
   const handleSubmit = async () => {
     if (!event) return
@@ -55,9 +78,14 @@ export function VendorPurchaseDialog({
       return
     }
     try {
-      const r = await purchase.mutateAsync({ eventId: event.eventId, count: n })
+      const r = await purchase.mutateAsync({
+        eventId: event.eventId,
+        count: n,
+        zone: hasZones && zone ? zone : undefined,
+      })
       toast.success(`提取完成：出 ${r.purchased} 个，入库 ${r.imported} 个`, {
         description: [
+          r.zone ? `区域 ${r.zone}` : null,
           r.duplicated ? `重复 ${r.duplicated} 个` : null,
           r.failed ? `失败 ${r.failed} 个` : null,
           r.remaining != null ? `剩余余额 ${r.remaining}` : null,
@@ -116,6 +144,38 @@ export function VendorPurchaseDialog({
               </div>
             )}
           </div>
+
+          {hasZones && (
+            <div>
+              <label className="text-xs text-muted-foreground">
+                提取区域{locked && boundZone ? '（已绑定）' : ''}
+              </label>
+              <Select value={zone} onValueChange={setZone} disabled={locked && !!boundZone}>
+                <SelectTrigger className="mt-1">
+                  <SelectValue placeholder="自动选择最便宜的区" />
+                </SelectTrigger>
+                <SelectContent>
+                  {zones.map((z) => (
+                    <SelectItem key={z.zone} value={z.zone}>
+                      {z.label ?? z.zone} · {z.available} 个可提
+                      {z.unitPrice != null && ` · ${z.unitPrice} 积分/个`}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {locked && boundZone && (
+                <div className="mt-1.5 flex items-start gap-1.5 text-xs text-muted-foreground">
+                  <Lock className="mt-0.5 h-3 w-3 shrink-0" />
+                  <span>该订单已绑定区域 {boundZone}，重试必须用同一区。</span>
+                </div>
+              )}
+              {!locked && (
+                <div className="mt-1.5 text-xs text-muted-foreground">
+                  各区单价独立。区域与数量一起绑定，换区重试会被当成新订单再扣一次积分。
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
             入库参数：分组{' '}
