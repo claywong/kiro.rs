@@ -12,10 +12,12 @@
 //! 1. **金额是字符串**（`"remaining": "884.400000"`），首家给的是数字。legacy 的
 //!    DTO 用 `f64`，直接复用会整份解析失败，因此本模块自带 DTO，用 [`Decimalish`]
 //!    同时接字符串与数字。
-//! 2. **库存来自 `/api/status` 的 `keys_stock`**，本家没有 `/api/my/stock`（404）。
+//! 2. **库存走 `/api/me/stock`**（注意是 `me` 不是 `my`）。它一次给出库存、单价与
+//!    余额；`/api/status` 的 `keys_stock` 只有数量，作为兜底保留。本家的
+//!    `/api/my/stock` 实测 404 —— 只有这一个端点落在 `/api/me` 下。
 //!
-//! 实测另有四个 legacy 端点在本家不存在（均 404），故对应能力关闭：
-//! `/api/my/stock`、`/api/my/gen-logs`、`/api/my/purchase-orders`、`/api/my/redeem`。
+//! 实测另有三个 legacy 端点在本家不存在（均 404），故对应能力关闭：
+//! `/api/my/gen-logs`、`/api/my/purchase-orders`、`/api/my/redeem`。
 //!
 //! @author wangzhong
 
@@ -27,8 +29,11 @@ use super::protocol::{ProfileInfo, PurchaseResult, PurchasedKey, StockInfo};
 pub const PATH_PROFILE: &str = "/api/my/profile";
 /// 下单。参数 `count` + `client_order_id`，与首家一致。
 pub const PATH_PURCHASE: &str = "/api/my/purchase";
-/// 库存来源。本家没有 `/api/my/stock`，可购买数看这里的 `keys_stock`。
+/// 系统状态。也是库存的兜底来源（`keys_stock`），见 [`PATH_STOCK`]。
 pub const PATH_STATUS: &str = "/api/status";
+/// 库存与报价。**路径是 `/api/me/stock`**，本家的 `/api/my/stock` 实测 404 ——
+/// 只有这一个端点在 `/api/me` 下，其余账号维度接口都在 `/api/my`。
+pub const PATH_STOCK: &str = "/api/me/stock";
 pub const PATH_WEBHOOK: &str = "/api/my/webhook";
 pub const PATH_WEBHOOK_TEST: &str = "/api/my/webhook/test";
 
@@ -151,6 +156,9 @@ impl From<ProfileResponse> for ProfileInfo {
 /// `system_status` 能力、由 [`super::flavor_legacy::VendorSystemStatus`] 承接
 /// （它字段全可选且带 `flatten` 兜未知键，形态与本家一致）。这里只取下单要用的
 /// 可购买数，不重复建模。
+///
+/// 这条路现在是 [`StockResponse`] 的**兜底**：`/api/me/stock` 能一次给出库存、
+/// 单价与余额，信息更全，故优先走它；它不可用时才退回这里。
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatusResponse {
     /// **可购买的库存数量** —— 下单上限看这个
@@ -162,10 +170,46 @@ impl From<StatusResponse> for StockInfo {
     fn from(r: StatusResponse) -> Self {
         Self {
             available: r.keys_stock.unwrap_or(0),
-            // 文档没有单价字段，余额需另调 profile
+            // 该端点没有单价字段，余额需另调 profile
             price_min: None,
             price_max: None,
             balance: None,
+            // 该卖家不分区
+            zones: Vec::new(),
+        }
+    }
+}
+
+/// `GET /api/me/stock` 响应 —— 库存、单价与余额一次给全。
+///
+/// 注意路径是 `/api/me/stock`（**不是** `/api/my/stock`，后者实测 404）。本家其余
+/// 账号维度接口都在 `/api/my` 下，只有这一个在 `/api/me`，别顺手改成 my。
+///
+/// 金额沿用 [`Decimalish`]：本家 `price` 与 `balance` 都是字符串
+/// （`"2.20"` / `"340.500000"`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StockResponse {
+    /// 当前可提取库存数
+    #[serde(default)]
+    pub stock: Option<u32>,
+    /// 单价。本家单一定价，故 min 与 max 同值。
+    #[serde(default)]
+    pub price: Option<Decimalish>,
+    /// 可用余额（CNY），与 `/api/my/profile` 的 `remaining` 同一个数，
+    /// 接上后面板不必再为余额单独发一次 profile 请求。
+    #[serde(default)]
+    pub balance: Option<Decimalish>,
+}
+
+impl From<StockResponse> for StockInfo {
+    fn from(r: StockResponse) -> Self {
+        let price = amount(&r.price);
+        Self {
+            available: r.stock.unwrap_or(0),
+            // 单一定价：区间的两端都是同一个价，面板会因此显示单值而非范围
+            price_min: price,
+            price_max: price,
+            balance: amount(&r.balance),
             // 该卖家不分区
             zones: Vec::new(),
         }
@@ -309,19 +353,62 @@ mod tests {
     }
 
     /// 用文档给的 status 样本。其余字段由 legacy 的 VendorSystemStatus 承接，
-    /// 这里只关心可购买数。
+    /// 这里只关心可购买数。这条路现在是 `/api/me/stock` 的兜底。
     #[test]
-    fn 解析库存_真实样本() {
+    fn 解析库存_status兜底样本() {
         let raw = r#"{"keys_active":5,"keys_dead":0,"keys_stock":25,"generating":false}"#;
         let s: StatusResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(s.keys_stock, Some(25));
 
-        // keys_stock 就是可购买数——本家没有 /api/my/stock
         let stock: StockInfo = s.into();
         assert_eq!(stock.available, 25);
-        // 文档没有单价，余额要另调 profile
+        // 兜底路径只有数量，单价与余额拿不到
         assert!(stock.price_min.is_none());
         assert!(stock.balance.is_none());
+    }
+
+    /// 用线上 `/api/me/stock` 的真实返回做样本。金额是字符串，是本家的既有特征。
+    #[test]
+    fn 解析库存报价_真实样本() {
+        let raw = r#"{"balance":"340.500000","price":"2.20","stock":0}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 0);
+        // 单一定价：区间两端同值，面板据此显示单值而非范围
+        assert_eq!(s.price_min, Some(2.2));
+        assert_eq!(s.price_max, Some(2.2));
+        // 余额顺带给出，省一次 profile 请求
+        assert_eq!(s.balance, Some(340.5));
+        // 该家不分区
+        assert!(s.zones.is_empty());
+        assert!(s.pick_zone().is_none());
+    }
+
+    #[test]
+    fn 解析库存报价_金额给数字也能吃下() {
+        // 对方哪天把字符串改成数字，不该整份解析失败
+        let raw = r#"{"stock":7,"price":2.2,"balance":340.5}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 7);
+        assert_eq!(s.price_min, Some(2.2));
+        assert_eq!(s.balance, Some(340.5));
+    }
+
+    #[test]
+    fn 解析库存报价_缺字段不报错() {
+        let s: StockInfo = serde_json::from_str::<StockResponse>("{}").unwrap().into();
+        assert_eq!(s.available, 0, "缺库存按没货");
+        assert!(s.price_min.is_none());
+        assert!(s.balance.is_none());
+    }
+
+    #[test]
+    fn 解析库存报价_金额无法解析时只丢该字段() {
+        // 单价读不出来不该连库存一起丢 —— 库存是下单要用的，单价只是展示
+        let raw = r#"{"stock":3,"price":"暂无","balance":"340.5"}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 3);
+        assert!(s.price_min.is_none());
+        assert_eq!(s.balance, Some(340.5));
     }
 
     /// 跨模块契约：`/api/status` 的完整响应由 legacy 的 `VendorSystemStatus`

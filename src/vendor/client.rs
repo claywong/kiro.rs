@@ -424,9 +424,26 @@ impl VendorClient {
                 Ok(r.into())
             }
             VendorFlavor::Drop => {
-                // 本家没有 /api/my/stock（404），可购买数看 /api/status 的 keys_stock
-                let r: drop_flavor::StatusResponse = self.get(drop_flavor::PATH_STATUS).await?;
-                Ok(r.into())
+                // /api/me/stock 一次给出库存 + 单价 + 余额，优先走它。
+                // 该端点曾经不存在（旧版文档时期 404），故失败时退回 /api/status 的
+                // keys_stock —— 那里只有数量，但至少库存卡片不会空着。
+                match self
+                    .get::<drop_flavor::StockResponse>(drop_flavor::PATH_STOCK)
+                    .await
+                {
+                    Ok(r) => Ok(r.into()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Drop {} 不可用（{}），退回 {} 取库存（无单价与余额）",
+                            drop_flavor::PATH_STOCK,
+                            e,
+                            drop_flavor::PATH_STATUS
+                        );
+                        let r: drop_flavor::StatusResponse =
+                            self.get(drop_flavor::PATH_STATUS).await?;
+                        Ok(r.into())
+                    }
+                }
             }
         }
     }
