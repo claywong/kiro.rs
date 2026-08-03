@@ -384,8 +384,14 @@ impl VendorClient {
                 if let Some(batch) = batch_order_id.filter(|s| !s.trim().is_empty()) {
                     body["order_id"] = serde_json::json!(batch.trim());
                 }
-                let r: kiroapp::PurchaseResponse =
+                // 区域字段名是 region（不是 zone）。文档：us / eu，也接受 us-east-1 / eu-central-1
+                if let Some(z) = zone.filter(|s| !s.trim().is_empty()) {
+                    body["region"] = serde_json::json!(z.trim());
+                }
+                let mut r: kiroapp::PurchaseResponse =
                     self.post_json(kiroapp::PATH_PURCHASE, &body).await?;
+                // 响应不回显 region，手动补上以便前端展示实际成交区域
+                r.region = zone.map(|s| s.to_string());
                 Ok(r.into())
             }
             VendorFlavor::KiroappCc => {
