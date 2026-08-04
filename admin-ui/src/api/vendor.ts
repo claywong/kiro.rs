@@ -8,6 +8,7 @@ import type {
   VendorPurchaseResult,
   VendorRedeemResult,
   VendorListResponse,
+  VendorPoolTargetChange,
 } from '@/types/api'
 
 const api = axios.create({
@@ -103,11 +104,12 @@ export async function listVendorOrders(vendorId?: string): Promise<VendorOrdersR
 export async function purchaseForEvent(
   eventId: string,
   count: number,
-  vendorId?: string
+  vendorId?: string,
+  zone?: string
 ): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>(
     `/events/${eventId}/purchase`,
-    { count, vendorId },
+    { count, vendorId, zone },
     { params: vendorId ? { vendorId } : {} }
   )
   return data
@@ -117,11 +119,12 @@ export async function purchaseForEvent(
 export async function purchaseAdHoc(
   count: number,
   clientOrderId?: string,
-  vendorId?: string
+  vendorId?: string,
+  zone?: string
 ): Promise<VendorPurchaseResult> {
   const { data } = await api.post<VendorPurchaseResult>(
     '/purchase',
-    { count, clientOrderId, vendorId },
+    { count, clientOrderId, vendorId, zone },
     { params: vendorId ? { vendorId } : {} }
   )
   return data
@@ -168,6 +171,19 @@ export async function setVendorMode(
     { autoPurchase, vendorId },
     { params: vendorId ? { vendorId } : {} }
   )
+  return data
+}
+
+/**
+ * 设置全局提取限制。不带 vendorId —— 阈值跨供应商共享，
+ * 后端也不按家分发这个请求。
+ */
+export async function setVendorPoolTarget(
+  poolTarget: number
+): Promise<VendorPoolTargetChange> {
+  const { data } = await api.put<VendorPoolTargetChange>('/pool-target', {
+    poolTarget,
+  })
   return data
 }
 

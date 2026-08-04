@@ -17,12 +17,14 @@ use super::store::PurchaseOutcome;
 ///
 /// `source_channel` 写成 `vendor:<order_id>` 形式，用于事后追溯这批 Key 的来源；
 /// kiroapp 无订单号，由调用方传入自己的标识。
+/// `api_region` 传入实际成交区域（如 `eu-central-1`），用于设置凭证的 API 区域。
 pub async fn import_keys(
     admin: &Arc<AdminService>,
     keys: Vec<String>,
     source_channel: &str,
     groups: Vec<String>,
     rpm_limit: u32,
+    api_region: Option<String>,
 ) -> PurchaseOutcome {
     let mut outcome = PurchaseOutcome::default();
     for key in keys {
@@ -43,7 +45,7 @@ pub async fn import_keys(
             rpm_limit,
             region: None,
             auth_region: None,
-            api_region: None,
+            api_region: api_region.clone(),
             machine_id: None,
             email: None,
             proxy_url: None,

@@ -455,6 +455,14 @@ export interface OverviewStats {
   weekCredits: number
   activeClientKeys: number
   activeCredentials: number
+  /** 最近 1 / 5 分钟报错数（整条请求最终失败，来自 trace 库） */
+  errors1m: number
+  errors5m: number
+  /** 最近 1 / 5 分钟重试数（首次尝试之外的重投跳数） */
+  retries1m: number
+  retries5m: number
+  /** trace 是否启用；关闭时上面 4 个近窗口计数不再更新 */
+  traceEnabled: boolean
 }
 
 export interface TimeSeriesPoint {
@@ -617,14 +625,32 @@ export interface VendorCapabilities {
   earliestKey: boolean
   batchScopedPurchase: boolean
   tieredPricing: boolean
+  /** 分区库存：库存按区隔离、各区单价独立，下单需指定 zone */
+  zonedPurchase: boolean
+}
+
+/** 单个区域的库存与报价（仅 zonedPurchase 能力的卖家有） */
+export interface VendorZoneStock {
+  /** 区域代码，下单时原样回传，如 us / eu */
+  zone: string
+  /** 人类可读名称，如「美国区」。缺失时回退显示 zone。 */
+  label?: string
+  /** 本区当前可提取数量 */
+  available: number
+  /** 本区仓库存货数，可能大于 available（受单次上限压制） */
+  stock?: number
+  /** 本区单价。各区独立设置，不要硬编码。 */
+  unitPrice?: number
+  /** 本区是否开放。关闭的区即使有存货也提不出来。 */
+  enabled: boolean
 }
 
 /** 卖家清单项 */
 export interface VendorListItem {
   vendorId: string
   name: string
-  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
-  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc；drop = drop.kiro.ss，互为不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc' | 'drop'
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
@@ -635,6 +661,12 @@ export interface VendorListItem {
 export interface VendorListResponse {
   vendors: VendorListItem[]
   defaultVendorId?: string
+  /**
+   * 全局提取限制：池中存活的卖家 Key 达到此数即不再自动补货，0 = 不启用。
+   *
+   * 跨供应商共享，故随清单一起返回而不在按家查的 `/status` 里。
+   */
+  poolTarget?: number
 }
 
 /** 卖家账号档案（已统一为 camelCase） */
@@ -654,8 +686,8 @@ export interface VendorProfile {
 export interface VendorStatus {
   vendorId: string
   name: string
-  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc，两者是不同卖家 */
-  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc'
+  /** kiroapp = kiroapp.io；kiroapp-cc = kiroapp.cc；drop = drop.kiro.ss，互为不同卖家 */
+  flavor: 'legacy' | 'kiroapp' | 'kiroapp-cc' | 'drop'
   capabilities: VendorCapabilities
   /** baseUrl + apiKey 均已配置，出站接口可用 */
   configured: boolean
@@ -686,10 +718,16 @@ export interface VendorStatus {
   profileError?: string
   /** 库存与报价。stock 是新结构(带价格区间)，stockMax 是兼容字段 */
   stock?: {
+    /**
+     * 分区卖家这里是**各区之和**。它大于 0 只说明某个区有货，
+     * 不代表任一指定区有货 —— 判断能否提取要看 zones。
+     */
     available: number
     priceMin?: number
     priceMax?: number
     balance?: number
+    /** 分区库存。为空表示该卖家不分区。 */
+    zones?: VendorZoneStock[]
   }
   stockMax?: number
   stockError?: string
@@ -708,6 +746,16 @@ export interface VendorStatus {
 /** 切换提取模式的结果 */
 export interface VendorModeChange {
   autoPurchase: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 设置全局提取限制的结果 */
+export interface VendorPoolTargetChange {
+  /** 设置后的阈值（运行时已生效）。0 = 不启用 */
+  poolTarget: number
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */
@@ -769,6 +817,8 @@ export interface VendorEvent {
   acked: boolean
   /** 首次提交提取时绑定的数量；非空即不可更改 */
   boundCount?: number
+  /** 首次提交时绑定的区域；与 boundCount 一起锁死，换区重试会再扣一次积分 */
+  boundZone?: string
   /** done / failed / skipped；未提取过则为空 */
   purchaseStatus?: string
   purchased?: number
@@ -828,6 +878,8 @@ export interface VendorPurchaseResult {
   unitPrice?: number
   /** 卖家侧订单 / 批次 id */
   orderId?: string
+  /** 本单实际成交的区域。各区单价不同，必须展示。 */
+  zone?: string
   /** true 表示本次是幂等重放，卖家未重复扣款 */
   replayed?: boolean
   /** 逐张 Key 的元数据（不含明文） */

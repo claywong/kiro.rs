@@ -10,7 +10,8 @@
 //! - 手动模式（默认）：入站 webhook **只落库不花钱**，扣费一律由面板显式触发。
 //! - 自动模式：仅当上一轮 `all_keys_dead` 已确认「名下卖家 Key 全部失效」时，
 //!   才在收到 `new_keys_available` 后自动提取，且只提最小数量。判定规则见
-//!   [`super::auto`]。
+//!   [`super::auto`]。多家同时触发时还要过一道跨供应商的总量闸，
+//!   见 [`super::pool_gate`]。
 //!
 //! @author wangzhong
 
@@ -23,6 +24,7 @@ use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::auto;
 use super::client::VendorClient;
+use super::pool_gate::PoolGate;
 // 本地新增模块单独成行，避免上游改动这批 use 时反复冲突。
 use super::schedule;
 use super::protocol::{
@@ -85,6 +87,10 @@ pub struct PurchaseImportResult {
     /// 卖家侧订单 / 批次 id
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
+    /// 本单实际成交的区域。分区卖家必须展示 —— 各区单价不同，
+    /// 不显示就看不出这笔积分花在哪个区。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     /// true 表示本次是幂等重放，卖家未重复扣款
     pub replayed: bool,
     /// 逐张 Key 的元数据（不含明文）。阶梯定价下各张单价不同，
@@ -109,6 +115,19 @@ pub struct ModeChange {
     pub warning: Option<String>,
 }
 
+/// 设置全局提取限制的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolTargetChange {
+    /// 设置后的阈值（运行时已生效）。0 = 不启用
+    pub pool_target: u32,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
@@ -120,6 +139,10 @@ pub enum VendorServiceError {
     NotPurchasable,
     /// 该订单号已绑定其它数量，必须改用该值重试
     CountLocked { bound: u32 },
+    /// 前端指定了卖家没有的区域。不静默回退 —— 回退等于把钱花在用户没选的区。
+    UnknownZone { zone: String, known: Vec<String> },
+    /// 所有区都无货，下单必然缺货，不必白发一次请求
+    NoZoneInStock,
     /// 调用卖家接口失败
     Upstream(VendorApiError),
     /// 本地存储错误
@@ -136,8 +159,54 @@ impl std::fmt::Display for VendorServiceError {
                 f,
                 "该订单号已绑定数量 {bound}，卖家侧不允许改数量重试，请按 {bound} 重新提交"
             ),
+            Self::UnknownZone { zone, known } => write!(
+                f,
+                "卖家没有区域 {:?}，可选值: {}",
+                zone,
+                if known.is_empty() {
+                    "（该卖家不分区）".to_string()
+                } else {
+                    known.join(" / ")
+                }
+            ),
+            Self::NoZoneInStock => write!(f, "各区均无库存，暂时无法提取"),
             Self::Upstream(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "本地存储错误: {e}"),
+        }
+    }
+}
+
+/// 自动提取的授权来源。
+///
+/// 两条路的**额度语义不同**，这是它们必须区分的原因：
+/// - [`Self::DeadEvent`] 是一次性额度，用后置 `validation_used` 作废，
+///   一条失效事件只授权一轮提取。
+/// - [`Self::LocalCensus`] 不消费任何东西，只要本家仍无存活 Key 就会反复成立。
+///   因此它必须由全局池闸兜住上限，见 [`VendorService::resolve_authorization`]。
+#[derive(Debug, Clone)]
+enum PurchaseAuthorization {
+    /// 卖家推来的 `all_keys_dead` 已确认失效，且额度未被取用
+    DeadEvent { event_id: String },
+    /// 就地盘点本家凭据得出「已无可用 Key」。用于不推 `all_keys_dead` 的卖家
+    /// （实测 Drop 家只在最初推过一次，此后 60+ 次新货通知都没有）。
+    LocalCensus { detail: String },
+}
+
+impl PurchaseAuthorization {
+    /// 写进日志的来源标识，便于事后区分这笔是谁授权的
+    fn source(&self) -> &'static str {
+        match self {
+            Self::DeadEvent { .. } => "卖家失效事件",
+            Self::LocalCensus { .. } => "就地盘点",
+        }
+    }
+
+    /// 授权依据。就地盘点这条路没有事件行可回溯，依据只存在于日志里，
+    /// 故必须记下来 —— 否则事后无法解释这笔扣费凭什么发生。
+    fn detail(&self) -> &str {
+        match self {
+            Self::DeadEvent { event_id } => event_id,
+            Self::LocalCensus { detail } => detail,
         }
     }
 }
@@ -152,6 +221,8 @@ pub struct VendorService {
     /// 提取模式的运行时值。`config.auto_purchase` 只是启动快照，面板切换后
     /// 以本字段为准 —— 读它而不是读 config。
     auto_purchase: AtomicBool,
+    /// 跨供应商共享的全局提取闸门。各家持有同一个 Arc。
+    pool_gate: Arc<PoolGate>,
 }
 
 impl VendorService {
@@ -161,6 +232,7 @@ impl VendorService {
         tls_backend: TlsBackend,
         store: SharedVendorStore,
         admin: Arc<AdminService>,
+        pool_gate: Arc<PoolGate>,
     ) -> Self {
         let auto_purchase = config.auto_purchase;
         Self {
@@ -170,6 +242,7 @@ impl VendorService {
             store,
             admin,
             auto_purchase: AtomicBool::new(auto_purchase),
+            pool_gate,
         }
     }
 
@@ -227,6 +300,57 @@ impl VendorService {
                 }
             }
         }
+    }
+
+    /// 设置全局提取限制：先改运行时值，再尽力写回 config.json。
+    ///
+    /// 与 [`Self::set_auto_purchase`] 同样的取舍 —— 持久化失败不算设置失败，
+    /// 运行时已生效，由返回的 `persisted` 告知面板。
+    ///
+    /// 注意本方法改的是所有家共享的那一个闸门，不限于本实例对应的供应商。
+    /// 挂在 `VendorService` 上只是为了复用它持有的配置路径。
+    pub fn set_pool_target(&self, target: u32) -> PoolTargetChange {
+        self.pool_gate.set_target(target);
+        match self.persist_pool_target(target) {
+            Ok(()) => PoolTargetChange {
+                pool_target: target,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化全局提取限制失败（运行时已生效）: {}", e);
+                PoolTargetChange {
+                    pool_target: target,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// 写回 config.json 顶层的 `autoPurchasePoolTarget`。
+    ///
+    /// 比 [`Self::persist_auto_purchase`] 简单：顶层字段不必在 `vendor` /
+    /// `vendors` 里按 id 找那一项，也就没有「找不到该卖家」的失败分支。
+    fn persist_pool_target(&self, target: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                anyhow::anyhow!("配置文件路径未知，全局提取限制仅在当前进程生效")
+            })?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_purchase_pool_target = target;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
@@ -324,6 +448,19 @@ impl VendorService {
                 str_field("order_id"),
             ),
             VendorFlavor::KiroappCc => (str_field("purchase_order_id"), None),
+            // Drop 与首家同样用 purchase_order_id，但**文档里的示例值是
+            // `batch_xxx`**，而下单接口要求 client_order_id 是 32 位十六进制 ——
+            // 两处自相矛盾。故：形态合法就直接用（与首家一致），否则从
+            // (vendor_id, event_id) 派生一个合法的。派生值对同一条推送稳定，
+            // 重投仍能命中卖家侧的幂等重放。
+            VendorFlavor::Drop => (
+                str_field("purchase_order_id")
+                    .or_else(|| str_field("client_order_id"))
+                    .filter(|s| is_hex32(s))
+                    .or_else(|| Some(derive_client_order_id(vendor_id, &event_id))),
+                // 早先那版文档用 batch_id 标批次；现版没有，留着不影响
+                str_field("batch_id"),
+            ),
         };
 
         Some(IncomingEvent {
@@ -339,24 +476,55 @@ impl VendorService {
         })
     }
 
-    /// 按事件手动提取并入库。
+    /// 定下本单要用哪个区。
+    ///
+    /// - 不具备 `zoned_purchase` 能力的卖家：恒为 `None`，下单不带 zone。
+    /// - `requested` 有值：校验该区真的存在且开放有货，不存在直接报错而非回退 ——
+    ///   静默换区等于把积分花在用户没选的区上。
+    /// - `requested` 为空：按 [`StockInfo::pick_zone`] 自动选「开放有货中最便宜」的区。
+    ///   **不能不传** —— 卖家不传 zone 时只从它的默认区（us）取货且不跨区补，
+    ///   而该区常常正是 0 库存的那个。
+    async fn resolve_zone(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, VendorServiceError> {
+        if !self.capabilities().zoned_purchase {
+            return Ok(None);
+        }
+        let stock = self.stock().await?;
+        match requested.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(z) => match stock.find_zone(z) {
+                Some(found) if found.enabled => Ok(Some(found.zone.clone())),
+                // 存在但已关停，与不存在同样处理：提不出来
+                _ => Err(VendorServiceError::UnknownZone {
+                    zone: z.to_string(),
+                    known: stock
+                        .zones
+                        .iter()
+                        .filter(|z| z.enabled)
+                        .map(|z| z.zone.clone())
+                        .collect(),
+                }),
+            },
+            None => stock
+                .pick_zone()
+                .map(|z| Some(z.zone.clone()))
+                .ok_or(VendorServiceError::NoZoneInStock),
+        }
+    }
+
+    /// 按事件提取并入库。
     ///
     /// `count` 为本次希望提取的数量；若该事件此前已绑定过其它数量，直接返回
     /// [`VendorServiceError::CountLocked`]，不会向卖家发请求 —— 避免白撞一次 409。
-    pub async fn purchase_for_event(
+    ///
+    /// `zone` 为空时自动选区；该事件此前已绑定过区域时，**以绑定值为准**并忽略
+    /// 本次入参 —— 换区重试会被卖家当成新单再扣一次积分。
+    pub async fn purchase_for_event_zoned(
         &self,
         event_id: &str,
         count: u32,
-    ) -> Result<PurchaseImportResult, VendorServiceError> {
-        self.purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Manual)
-            .await
-    }
-
-    /// 同 [`Self::purchase_for_event`]，但记录触发方式（自动模式用）
-    pub async fn purchase_for_event_with_trigger(
-        &self,
-        event_id: &str,
-        count: u32,
+        zone: Option<&str>,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
@@ -375,15 +543,32 @@ impl VendorService {
         // 有批次 id 的卖家可定向拉取，避免买到别的批次
         let batch = record.batch_order_id.clone();
 
-        // 抢占绑定：并发点击只有一个能拿到本次 count，其余得到已绑定值
-        let effective = match self
+        // 选区必须在绑定之前：绑定要把数量和区域一起写进去，
+        // 之后任何重试都只能按这一对值走。
+        let picked = self.resolve_zone(zone).await?;
+
+        // 抢占绑定：并发点击只有一个能拿到本次 (count, zone)，其余得到已绑定值
+        let (effective, effective_zone) = match self
             .store
-            .bind_count(vid, event_id, count)
+            .bind_count_zone(vid, event_id, count, picked.as_deref())
             .map_err(|e| VendorServiceError::Storage(e.to_string()))?
         {
             Ok(v) => v,
-            Err(bound) if bound == count => bound, // 同数量重试，卖家侧幂等重放
-            Err(bound) => return Err(VendorServiceError::CountLocked { bound }),
+            // 同数量重试，卖家侧幂等重放。区域一律用已绑定值 ——
+            // 本次自动选区可能选到了另一个区（库存变了），换区就是第二笔单。
+            Err((bound, bound_zone)) if bound == count => {
+                if bound_zone.as_deref() != picked.as_deref() {
+                    tracing::info!(
+                        vendor_id = %vid,
+                        event_id = %event_id,
+                        bound_zone = ?bound_zone,
+                        this_time = ?picked,
+                        "重试沿用已绑定区域，忽略本次选区结果"
+                    );
+                }
+                (bound, bound_zone)
+            }
+            Err((bound, _)) => return Err(VendorServiceError::CountLocked { bound }),
         };
 
         self.purchase_and_import(
@@ -392,6 +577,7 @@ impl VendorService {
             &order_id,
             batch.as_deref(),
             effective,
+            effective_zone.as_deref(),
             trigger,
         )
         .await
@@ -403,14 +589,30 @@ impl VendorService {
         &self,
         count: u32,
         client_order_id: &str,
+        zone: Option<&str>,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
+        // 本路径不写事件表，选区结果无处持久化。调用方重试时必须自行带上同一个
+        // zone（面板会回显本次实际用的区），否则自动选区可能改主意、变成第二笔单。
+        let picked = self.resolve_zone(zone).await?;
         let resp = client
-            .purchase(count, client_order_id, None)
+            .purchase(count, client_order_id, None, picked.as_deref())
             .await
-            .map_err(VendorServiceError::Upstream)?;
+            .map_err(|e| {
+                // 记下订单号：本路径不写事件表，失败后它是唯一能安全重试的凭据。
+                // 尤其是无状态码的失败（超时 / 断连）—— 卖家侧可能已扣费。
+                tracing::warn!(
+                    vendor_id = %self.vendor_id(),
+                    order_id = %client_order_id,
+                    count,
+                    upstream_status = ?e.status,
+                    "主动提取下单失败: {}",
+                    e
+                );
+                VendorServiceError::Upstream(e)
+            })?;
         let outcome = self.import_purchased(&resp, client_order_id).await;
-        Ok(build_result(count, &resp, outcome))
+        Ok(build_result(count, &resp, outcome, picked.as_deref()))
     }
 
     /// 提取 + 入库 + 结果写回事件行
@@ -421,10 +623,14 @@ impl VendorService {
         order_id: &str,
         batch_order_id: Option<&str>,
         count: u32,
+        zone: Option<&str>,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let vid = self.vendor_id();
-        let resp = match client.purchase(count, order_id, batch_order_id).await {
+        let resp = match client
+            .purchase(count, order_id, batch_order_id, zone)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // 记失败但保留 bound_count，便于按同一数量重试
@@ -458,7 +664,7 @@ impl VendorService {
             tracing::warn!("写回提取结果失败 event_id={}: {}", event_id, e);
         }
 
-        Ok(build_result(count, &resp, outcome))
+        Ok(build_result(count, &resp, outcome, zone))
     }
 
     /// 把提取到的 Key 逐条入库。复用 admin 的 `import_one_credential`：
@@ -475,12 +681,22 @@ impl VendorService {
             .map(|k| k.key.clone())
             .collect();
 
+        // 根据实际成交区域设置 api_region：eu 需要 eu-central-1，us 或不分区用默认
+        let api_region = resp.zone.as_deref().and_then(|z| {
+            if z == "eu" {
+                Some("eu-central-1".to_string())
+            } else {
+                None
+            }
+        });
+
         super::import::import_keys(
             &self.admin,
             keys,
             &source_channel,
             groups,
             rpm_limit,
+            api_region,
         ).await
     }
 
@@ -575,6 +791,8 @@ impl VendorService {
     /// 检查顺序按「代价从小到大、可逆到不可逆」排列：先读本地确认结论（零成本），
     /// 再查卖家可提取上限（一次出站），最后才 `bind_count` —— 绑定是唯一不可逆的
     /// 一步，之前任何一环给出否定结论都只记跳过，订单号仍留给手动提取。
+    ///
+    /// 多家并发时还要过 [`super::pool_gate`] 的总量闸，见 `try_auto_purchase`。
     pub fn spawn_auto_purchase(self: &Arc<Self>, event_id: String, new_keys: Option<u32>) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
@@ -592,77 +810,133 @@ impl VendorService {
         });
     }
 
+    /// 定下本轮自动提取的授权来源。`Err(原因)` 表示无授权、不该提取。
+    ///
+    /// 优先认卖家推来的失效确认；拿不到可用的确认时，**就地盘点本家凭据**作为
+    /// 兜底 —— 有的卖家并不按文档持续推 `all_keys_dead`（实测 Drop 家只在最初
+    /// 推过一次，此后 60+ 次新货通知期间再没推过），只认卖家事件会让这些家的
+    /// 自动提取在消费掉第一张额度后永久死锁。
+    ///
+    /// 兜底路径要求**已启用全局池闸**，这是有意的联锁：就地盘点不消费额度，
+    /// 只要本家无存活 Key 就会反复成立，唯一的上限是池闸。若池闸没开就放行，
+    /// 等于每条新货通知都下一单且没有任何刹车。故池闸未启用时维持原行为 ——
+    /// 只认卖家事件，宁可不自动提取，也不留一条无上限的扣费路径。
+    /// 判定规则本身是纯函数 [`auto::decide_authorization`]，本方法只负责取数
+    /// 与把结果接上事件 id。
+    fn resolve_authorization(&self) -> Result<PurchaseAuthorization, String> {
+        let vid = self.vendor_id();
+
+        // 读不到记录不算错误，交由判定函数转入兜底
+        let dead = self
+            .store
+            .latest_dead_event(vid)
+            .map_err(|e| format!("读取失效确认记录失败: {e}"))?;
+
+        let verdict = dead.as_ref().map(|d| auto::DeadEventVerdict {
+            status: d
+                .validation_status
+                .as_deref()
+                .and_then(ValidationStatus::from_str),
+            used: d.validation_used,
+            detail: d.validation_detail.clone(),
+        });
+
+        let census = auto::census(&self.vendor_key_states(), vid);
+        match auto::decide_authorization(verdict.as_ref(), self.pool_gate.enabled(), census) {
+            auto::AuthDecision::DeadEvent => Ok(PurchaseAuthorization::DeadEvent {
+                // 走到这个分支必然有记录，否则判定函数不会给出 DeadEvent
+                event_id: dead
+                    .map(|d| d.event_id)
+                    .expect("DeadEvent 授权必然来自一条已存在的失效事件"),
+            }),
+            auto::AuthDecision::LocalCensus { detail } => {
+                Ok(PurchaseAuthorization::LocalCensus { detail })
+            }
+            auto::AuthDecision::Denied { reason } => Err(reason),
+        }
+    }
+
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
         let vid = self.vendor_id();
 
-        // 1. 失效确认：必须有一条**本供应商的**、已确认失效且尚未被消费的 all_keys_dead
-        let dead = self
-            .store
-            .latest_dead_event(vid)
-            .map_err(|e| format!("读取失效确认记录失败: {e}"))?
-            .ok_or_else(|| "尚未收到「全部失效」事件，无法确认旧 Key 已失效".to_string())?;
+        // 1. 授权：卖家的失效确认，或就地盘点的兜底结论
+        let auth = self.resolve_authorization()?;
 
-        let status = dead
-            .validation_status
-            .as_deref()
-            .and_then(ValidationStatus::from_str);
-        match status {
-            Some(ValidationStatus::ConfirmedDead) => {}
-            Some(ValidationStatus::Pending) => {
-                return Err("旧 Key 失效确认仍在观察中，本轮不自动提取".to_string());
-            }
-            Some(ValidationStatus::StillAlive) => {
-                return Err(dead
-                    .validation_detail
-                    .unwrap_or_else(|| "本地仍有健康的卖家 Key".to_string()));
-            }
-            Some(ValidationStatus::Inconclusive) | None => {
-                return Err(dead
-                    .validation_detail
-                    .unwrap_or_else(|| "旧 Key 是否失效无法确认".to_string()));
-            }
-        }
-        if dead.validation_used {
-            return Err("上一次失效确认已用于此前的自动提取，需新的失效事件".to_string());
-        }
+        // 2. 全局提取锁。必须在盘点之前拿到，并持有到下单+导入结束 ——
+        //    否则三家并发时会同时读到「池里 0 个存活」再同时下单，闸门形同虚设。
+        //    未启用池闸时不必付串行化的代价，直接跳过取锁。
+        let _gate = if self.pool_gate.enabled() {
+            Some(self.pool_gate.acquire().await?)
+        } else {
+            None
+        };
 
-        // 2. 数量：三者取最小，为 0 则无可提
+        // 3. 全局池量闸。零成本本地读，故排在出站查库存之前。
+        //    这里重新盘点而非复用步骤 1 的结论：等锁期间别家可能已经补过货了，
+        //    锁前的池量视图已经过期。
+        self.pool_gate
+            .check(auto::pool_alive(&self.vendor_key_states()))?;
+
+        // 4. 数量：三者取最小，为 0 则无可提
         let stock = self
             .stock()
             .await
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
+        // 分区卖家的 stock.available 是各区之和，拿它算数量会超出单区实际库存 ——
+        // 下单只落在一个区，超出部分必然提不到。故按实际要用的那个区的量算。
+        let picked = stock.pick_zone();
+        let zone_max = picked.map_or(stock.available, |z| z.available);
+        if self.capabilities().zoned_purchase && picked.is_none() {
+            return Err("各区均无库存，本轮不自动提取".to_string());
+        }
         // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
         let configured_max = self.auto_max_count();
-        let count = auto::decide_count(new_keys, stock.available, configured_max);
+        let count = auto::decide_count(new_keys, zone_max, configured_max);
         if count == 0 {
             return Err(format!(
-                "可提取数量为 0（事件声明 {}，卖家上限 {}，配置上限 {}）",
+                "可提取数量为 0（事件声明 {}，卖家上限 {}{}，配置上限 {}）",
                 new_keys.map(|v| v.to_string()).unwrap_or("-".into()),
-                stock.available,
+                zone_max,
+                picked.map(|z| format!("@{}", z.zone)).unwrap_or_default(),
                 configured_max
             ));
         }
+        // 选区结果不在这里传下去：purchase_for_event_zoned 会自己再选一次并把
+        // 结果与数量一起绑定。此处重选的意义只在于把数量算对。
+        let zone_hint = picked.map(|z| z.zone.clone());
 
-        // 3. 消费确认额度。抢占式，确保一次确认只授权一轮提取
-        let consumed = self
-            .store
-            .consume_validation(vid, &dead.event_id)
-            .map_err(|e| format!("消费失效确认失败: {e}"))?;
-        if !consumed {
-            return Err("失效确认已被其他自动提取取用".to_string());
+        // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取。
+        //    仅卖家事件那条路有额度可消费；就地盘点不消费任何东西，
+        //    它的上限由上一步的池闸负责（见 `resolve_authorization` 的联锁）。
+        if let PurchaseAuthorization::DeadEvent { event_id: dead_id } = &auth {
+            let consumed = self
+                .store
+                .consume_validation(vid, dead_id)
+                .map_err(|e| format!("消费失效确认失败: {e}"))?;
+            if !consumed {
+                return Err("失效确认已被其他自动提取取用".to_string());
+            }
         }
 
-        // 4. 下单。此处开始不可逆
+        // 6. 下单。此处开始不可逆。`_gate` 持有到本函数结束，
+        //    确保后来者盘点时能看到这批新导入的 Key。
         tracing::info!(
             vendor_id = %vid,
             event_id = %event_id,
             count,
-            dead_event = %dead.event_id,
+            zone = ?zone_hint,
+            auth = auth.source(),
+            auth_detail = auth.detail(),
             "自动提取开始"
         );
         match self
-            .purchase_for_event_with_trigger(event_id, count, PurchaseTrigger::Auto)
+            .purchase_for_event_zoned(
+                event_id,
+                count,
+                zone_hint.as_deref(),
+                PurchaseTrigger::Auto,
+            )
             .await
         {
             Ok(r) => {
@@ -671,6 +945,7 @@ impl VendorService {
                     event_id = %event_id,
                     purchased = r.purchased,
                     imported = r.imported,
+                    zone = ?r.zone,
                     total_debit = ?r.total_debit,
                     "自动提取完成"
                 );
@@ -795,9 +1070,15 @@ fn build_result(
     count: u32,
     resp: &PurchaseResult,
     outcome: PurchaseOutcome,
+    zone: Option<&str>,
 ) -> PurchaseImportResult {
     PurchaseImportResult {
         count,
+        // 卖家回显的区优先；没回显时用我们下单时指定的那个
+        zone: resp
+            .zone
+            .clone()
+            .or_else(|| zone.map(|s| s.to_string())),
         requested: resp.requested,
         purchased: resp.purchased,
         imported: outcome.imported,
@@ -831,6 +1112,29 @@ fn fallback_event_id(raw: &[u8]) -> String {
     hex::encode(&digest[..16])
 }
 
+/// 是否为卖家要求的 32 位十六进制订单号形态
+fn is_hex32(s: &str) -> bool {
+    let t = s.trim();
+    t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 为订单号不合法（或缺失）的卖家派生一个 32 位十六进制 `client_order_id`。
+///
+/// Drop 家文档里的 `purchase_order_id` 示例是 `batch_xxx`，而下单接口要求 32 位
+/// 十六进制，直接拿去下单会被 400 拒掉。从 `(vendor_id, event_id)` 哈希得来，因此：
+/// - 同一条推送重投多少次都得到同一个订单号，卖家侧幂等重放生效，不会重复扣费；
+/// - 不同卖家的同名 event_id 不会撞成同一个订单号。
+///
+/// 不直接拿 event_id 当订单号：它的格式由卖家决定，同样不保证是 32 位十六进制。
+fn derive_client_order_id(vendor_id: &str, event_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(vendor_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event_id.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +1145,85 @@ mod tests {
 
     fn parse_kiroapp(raw: &[u8]) -> Option<IncomingEvent> {
         VendorService::parse_event("kiroapp", VendorFlavor::Kiroapp, raw)
+    }
+
+    fn parse_drop(raw: &[u8]) -> Option<IncomingEvent> {
+        VendorService::parse_event("drop", VendorFlavor::Drop, raw)
+    }
+
+    // ============ Drop 家（drop.kiro.ss）============
+
+    /// 用现行文档给的新货样本。事件名与首家相同。
+    #[test]
+    fn drop_新key就绪事件() {
+        let raw = r#"{"event":"new_keys_available","event_id":"0123456789abcdef0123456789abcdef",
+            "purchase_order_id":"batch_xxx","message":"新一批 Key 已上架"}"#;
+        let e = parse_drop(raw.as_bytes()).unwrap();
+        assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
+        assert_eq!(e.message.as_deref(), Some("新一批 Key 已上架"));
+        // 文档未给数量，自动提取据此按卖家上限取小（见 auto::decide_count）
+        assert_eq!(e.new_keys, None);
+    }
+
+    /// 文档示例里的 `purchase_order_id` 是 `batch_xxx`，不是 32 位十六进制，
+    /// 而下单接口要求 32 位十六进制 —— 必须换成派生值，否则下单被 400 拒。
+    #[test]
+    fn drop_非法形态的订单号被换成派生值() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e1","purchase_order_id":"batch_xxx"}"#;
+        let order = parse_drop(raw).unwrap().purchase_order_id.unwrap();
+        assert_ne!(order, "batch_xxx", "原值不合法，不能直接拿去下单");
+        assert!(is_hex32(&order), "派生值必须合法: {order}");
+    }
+
+    /// 卖家给了合法形态时直接用，不多此一举地派生
+    #[test]
+    fn drop_合法订单号直接沿用() {
+        let given = "ffffffffffffffffffffffffffffffff";
+        let raw =
+            format!(r#"{{"event":"new_keys_available","event_id":"e1","purchase_order_id":"{given}"}}"#);
+        assert_eq!(
+            parse_drop(raw.as_bytes()).unwrap().purchase_order_id.as_deref(),
+            Some(given)
+        );
+    }
+
+    /// 同一条推送重投得到同一订单号 —— 幂等重放的前提
+    #[test]
+    fn drop_同一事件派生同一订单号() {
+        let raw = br#"{"event":"new_keys_available","event_id":"evt-1"}"#;
+        let a = parse_drop(raw).unwrap().purchase_order_id;
+        let b = parse_drop(raw).unwrap().purchase_order_id;
+        assert_eq!(a, b);
+
+        // 不同事件不能撞成同一单
+        let other = br#"{"event":"new_keys_available","event_id":"evt-2"}"#;
+        assert_ne!(a, parse_drop(other).unwrap().purchase_order_id);
+    }
+
+    /// 不同卖家的同名 event_id 不能派生出同一个订单号
+    #[test]
+    fn drop_订单号按卖家隔离() {
+        let raw = br#"{"event":"new_keys_available","event_id":"same-id"}"#;
+        let a = VendorService::parse_event("drop-a", VendorFlavor::Drop, raw)
+            .unwrap()
+            .purchase_order_id;
+        let b = VendorService::parse_event("drop-b", VendorFlavor::Drop, raw)
+            .unwrap()
+            .purchase_order_id;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn drop_全部失效与测试事件() {
+        let raw = r#"{"event":"all_keys_dead","event_id":"d1",
+            "message":"全部 Key 已失效，系统正在自动补充","dead":5}"#;
+        let e = parse_drop(raw.as_bytes()).unwrap();
+        assert_eq!(e.kind, VendorEventKind::AllKeysDead);
+        assert_eq!(e.dead, Some(5));
+
+        let t = parse_drop(r#"{"event":"test","event_id":"t1","message":"这是一条测试"}"#.as_bytes())
+            .unwrap();
+        assert_eq!(t.kind, VendorEventKind::Test);
     }
 
     #[test]
@@ -952,6 +1335,7 @@ mod tests {
             total_debit: Some(70.0),
             order_id: Some("batch-1".to_string()),
             replayed: false,
+            zone: None,
             keys: vec![
                 PurchasedKey {
                     key: "sk-a".to_string(),
@@ -974,7 +1358,7 @@ mod tests {
             imported: 2,
             ..Default::default()
         };
-        let r = build_result(5, &resp, outcome);
+        let r = build_result(5, &resp, outcome, None);
 
         // 部分成交要能被面板识别
         assert_eq!(r.requested, Some(5));
@@ -1008,7 +1392,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let r = build_result(1, &resp, PurchaseOutcome::default());
+        let r = build_result(1, &resp, PurchaseOutcome::default(), None);
         assert!(!r.keys[0].has_password);
     }
 

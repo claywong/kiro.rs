@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS vendor_events (
     validation_detail  TEXT,
     validated_at       TEXT,
     validation_used    INTEGER NOT NULL DEFAULT 0,
+    bound_zone         TEXT,
     PRIMARY KEY (vendor_id, event_id)
 );
 "#;
@@ -75,6 +76,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE vendor_events ADD COLUMN validated_at TEXT",
     "ALTER TABLE vendor_events ADD COLUMN validation_used INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE vendor_events ADD COLUMN batch_order_id TEXT",
+    // 分区卖家的成交区域。与 bound_count 同时写入、同样不可改 ——
+    // 换区重试等于换了笔单，会重复扣积分。
+    "ALTER TABLE vendor_events ADD COLUMN bound_zone TEXT",
 ];
 
 /// 事件类型。未知类型也落库（`Unknown`），避免卖家新增事件时丢数据。
@@ -103,7 +107,10 @@ impl VendorEventKind {
 
     pub fn from_str(s: &str) -> Self {
         match s {
-            "new_keys_available" => Self::NewKeysAvailable,
+            // `batch.completed` 是 Drop 家早先那版文档里「新批次已上架」的叫法。
+            // 现行文档已改用 new_keys_available，但别名留着：两者语义相同（都表示
+            // 有新货可提），而对方实现是否同步改过无从确认，漏认一条会错过补货。
+            "new_keys_available" | "batch.completed" => Self::NewKeysAvailable,
             "all_keys_dead" => Self::AllKeysDead,
             "key_revoked_abuse" => Self::KeyRevokedAbuse,
             "test" => Self::Test,
@@ -525,39 +532,57 @@ impl VendorStore {
         }
     }
 
-    /// 抢占式绑定提取数量。
-    ///
-    /// 这是防重复扣费的核心：只有 `bound_count IS NULL`（从未提交过 purchase）时
-    /// 才写入并返回 `Ok(count)`；否则返回 `Err(已绑定的值)`，调用方必须改用该值重试。
-    /// 单条 UPDATE 完成判断与写入，并发点击「提取」只有一个能抢到。
+    /// 抢占式绑定提取数量。等价于 `bind_count_zone(.., None)`，
+    /// 即不分区卖家的情形。
+    #[cfg(test)]
     pub fn bind_count(
         &self,
         vendor_id: &str,
         event_id: &str,
         count: u32,
     ) -> rusqlite::Result<Result<u32, u32>> {
+        self.bind_count_zone(vendor_id, event_id, count, None)
+            .map(|r| r.map(|(c, _)| c).map_err(|(c, _)| c))
+    }
+
+    /// 抢占式绑定提取数量与区域。
+    ///
+    /// 这是防重复扣费的核心：只有 `bound_count IS NULL`（从未提交过 purchase）时
+    /// 才写入并返回 `Ok((count, zone))`；否则返回 `Err((已绑定数量, 已绑定区域))`，
+    /// 调用方必须改用这对值重试。单条 UPDATE 完成判断与写入，并发点击「提取」
+    /// 只有一个能抢到。
+    ///
+    /// 数量与区域必须**一起**绑定：卖家的幂等键覆盖整个请求体，同一订单号换区
+    /// 重试会被当成新单再扣一次积分。
+    pub fn bind_count_zone(
+        &self,
+        vendor_id: &str,
+        event_id: &str,
+        count: u32,
+        zone: Option<&str>,
+    ) -> rusqlite::Result<Result<(u32, Option<String>), (u32, Option<String>)>> {
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "UPDATE vendor_events SET bound_count = ?3
+            "UPDATE vendor_events SET bound_count = ?3, bound_zone = ?4
              WHERE vendor_id = ?1 AND event_id = ?2 AND bound_count IS NULL",
-            rusqlite::params![vendor_id, event_id, count],
+            rusqlite::params![vendor_id, event_id, count, zone],
         )?;
         if changed > 0 {
-            return Ok(Ok(count));
+            return Ok(Ok((count, zone.map(|s| s.to_string()))));
         }
-        let existing: Option<u32> = conn
+        let existing: Option<(Option<u32>, Option<String>)> = conn
             .query_row(
-                "SELECT bound_count FROM vendor_events
+                "SELECT bound_count, bound_zone FROM vendor_events
                  WHERE vendor_id = ?1 AND event_id = ?2",
                 rusqlite::params![vendor_id, event_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .flatten();
+            .optional()?;
         match existing {
-            Some(v) => Ok(Err(v)),
-            // 行不存在：交由调用方按「事件不存在」处理
-            None => Ok(Ok(count)),
+            Some((Some(v), z)) => Ok(Err((v, z))),
+            // 行存在但从未绑定过（并发下另一方刚清空？）与行不存在同样处理：
+            // 交由调用方按「事件不存在」判定
+            Some((None, _)) | None => Ok(Ok((count, zone.map(|s| s.to_string())))),
         }
     }
 
@@ -681,6 +706,7 @@ fn migrate_to_multi_vendor(conn: &Connection) -> rusqlite::Result<()> {
             validation_detail  TEXT,
             validated_at       TEXT,
             validation_used    INTEGER NOT NULL DEFAULT 0,
+            bound_zone         TEXT,
             PRIMARY KEY (vendor_id, event_id)
         );
         INSERT INTO vendor_events_new
@@ -688,12 +714,13 @@ fn migrate_to_multi_vendor(conn: &Connection) -> rusqlite::Result<()> {
              new_keys, dead, raw_payload, received_at, delivery_count, acked, bound_count,
              purchase_status, purchased, imported, duplicated, failed, last_error,
              processed_at, purchase_trigger, validation_status, validation_detail,
-             validated_at, validation_used)
+             validated_at, validation_used, bound_zone)
         SELECT '{DEFAULT_VENDOR_ID}', event_id, event_type, purchase_order_id,
              batch_order_id, message, new_keys, dead, raw_payload, received_at,
              delivery_count, acked, bound_count, purchase_status, purchased, imported,
              duplicated, failed, last_error, processed_at, purchase_trigger,
-             validation_status, validation_detail, validated_at, validation_used
+             validation_status, validation_detail, validated_at, validation_used,
+             bound_zone
         FROM vendor_events;
         DROP TABLE vendor_events;
         ALTER TABLE vendor_events_new RENAME TO vendor_events;
@@ -826,6 +853,37 @@ mod tests {
         // 换数量重试 → 返回已绑定值，调用方必须复用
         assert_eq!(s.bind_count(V, "e1", 10).unwrap(), Err(5));
         assert_eq!(s.bind_count(V, "e1", 5).unwrap(), Err(5));
+    }
+
+    #[test]
+    fn 数量与区域一起绑定且区域不可改() {
+        let s = store();
+        s.record_event(&event("e1")).unwrap();
+        assert_eq!(
+            s.bind_count_zone(V, "e1", 5, Some("eu")).unwrap(),
+            Ok((5, Some("eu".to_string())))
+        );
+        // 同数量重试：返回已绑定的区，调用方必须沿用它而不是本次选出的区
+        assert_eq!(
+            s.bind_count_zone(V, "e1", 5, Some("us")).unwrap(),
+            Err((5, Some("eu".to_string())))
+        );
+        // 换数量同样被拒，并带回区域
+        assert_eq!(
+            s.bind_count_zone(V, "e1", 9, Some("eu")).unwrap(),
+            Err((5, Some("eu".to_string())))
+        );
+    }
+
+    #[test]
+    fn 绑定区域可为空_不分区卖家() {
+        let s = store();
+        s.record_event(&event("e1")).unwrap();
+        assert_eq!(s.bind_count_zone(V, "e1", 3, None).unwrap(), Ok((3, None)));
+        assert_eq!(
+            s.bind_count_zone(V, "e1", 3, None).unwrap(),
+            Err((3, None))
+        );
     }
 
     #[test]
@@ -1092,6 +1150,16 @@ mod tests {
         assert_eq!(rec.validation_status, None);
         assert_eq!(rec.batch_order_id, None);
         assert!(!rec.validation_used);
+        // bound_zone 是本轮新增列：迁移后必须可写可读，否则分区绑定在存量库上会炸
+        s.record_event(&event("new-1")).unwrap();
+        assert_eq!(
+            s.bind_count_zone(V, "new-1", 2, Some("eu")).unwrap(),
+            Ok((2, Some("eu".to_string())))
+        );
+        assert_eq!(
+            s.bind_count_zone(V, "new-1", 2, Some("eu")).unwrap(),
+            Err((2, Some("eu".to_string())))
+        );
 
         // 补列后新字段可正常读写
         s.set_validation(V, "old-1", ValidationStatus::ConfirmedDead, "测试")
@@ -1118,7 +1186,13 @@ mod tests {
         drop(s);
         let s = VendorStore::open(path.clone()).expect("二次打开失败");
         assert_eq!(s.get_event(V, "old-1").unwrap().unwrap().bound_count, Some(7));
-        assert_eq!(s.list_events(None, 100).unwrap().len(), 2, "二次迁移丢了数据");
+        // 存量 old-1、本测试新写的 new-1、以及第二家的 old-1，共 3 行
+        assert_eq!(s.list_events(None, 100).unwrap().len(), 3, "二次迁移丢了数据");
+        // 分区绑定要能跨重开存活
+        assert_eq!(
+            s.get_event(V, "new-1").unwrap().unwrap().bound_count,
+            Some(2)
+        );
 
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);

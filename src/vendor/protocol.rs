@@ -28,6 +28,11 @@ pub enum VendorFlavor {
     /// kiroapp.cc：`/openapi/*` + `Authorization: Bearer km_xxx`。
     /// 简化版协议：只有库存、余额、提取，无流水、无密钥列表、无阶梯定价。
     KiroappCc,
+    /// Kiro Drop（drop.kiro.ss）：`/api/my/*` + `X-API-Key: usr-xxx`。
+    /// 与 [`Self::Legacy`] 高度相似（同路径、同下单参数、同事件名），差异只有
+    /// 两处：金额是字符串、库存来自 `/api/status` 的 `keys_stock`。
+    /// 实测无兑换码 / 开号记录 / 订单列表（均 404）。
+    Drop,
 }
 
 impl VendorFlavor {
@@ -36,6 +41,7 @@ impl VendorFlavor {
             Self::Legacy => "legacy",
             Self::Kiroapp => "kiroapp",
             Self::KiroappCc => "kiroapp-cc",
+            Self::Drop => "drop",
         }
     }
 
@@ -58,13 +64,14 @@ impl VendorFlavor {
             "legacy" | "my" | "default" => Some(Self::Legacy),
             "kiroapp" | "kiroappio" | "me" => Some(Self::Kiroapp),
             "kiroappcc" | "openapi" => Some(Self::KiroappCc),
+            "drop" | "dropkiross" | "kirodrop" => Some(Self::Drop),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc"
+        "legacy, kiroapp, kiroapp-cc, drop"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -81,6 +88,8 @@ impl VendorFlavor {
                 earliest_key: false,
                 batch_scoped_purchase: false,
                 tiered_pricing: false,
+                // 该卖家库存按 us / eu 分区，各区单价独立、不跨区补货
+                zoned_purchase: true,
             },
             Self::Kiroapp => VendorCapabilities {
                 system_status: false,
@@ -96,6 +105,7 @@ impl VendorFlavor {
                 batch_scoped_purchase: true,
                 // 单价按母号累计产量分档，同一单里各 Key 可能不同价
                 tiered_pricing: true,
+                zoned_purchase: false,
             },
             Self::KiroappCc => VendorCapabilities {
                 system_status: false,
@@ -108,6 +118,23 @@ impl VendorFlavor {
                 earliest_key: false,
                 batch_scoped_purchase: false,
                 tiered_pricing: false,
+                zoned_purchase: false,
+            },
+            Self::Drop => VendorCapabilities {
+                // `/api/status` 既是系统状态也是本家唯一的库存来源
+                system_status: true,
+                // 以下四项在本家实测均 404，故关闭，避免面板给出点了报错的按钮
+                gen_logs: false,
+                purchase_orders: false,
+                redeem: false,
+                // 有 PUT /api/my/webhook 与测试推送两个接口
+                webhook_manage: true,
+                ledger: false,
+                my_keys: false,
+                earliest_key: false,
+                batch_scoped_purchase: false,
+                tiered_pricing: false,
+                zoned_purchase: false,
             },
         }
     }
@@ -163,13 +190,41 @@ pub struct VendorCapabilities {
     pub batch_scoped_purchase: bool,
     /// 阶梯定价：同一单里各 Key 单价可能不同，总价需以卖家返回为准
     pub tiered_pricing: bool,
+    /// 分区库存：库存按区隔离、各区单价独立，下单需指定 zone
+    pub zoned_purchase: bool,
+}
+
+/// 单个区域的库存与报价（中立）。
+///
+/// 仅 `zoned_purchase` 能力的卖家会给。各区**严格隔离、不跨区补货**：
+/// 下单不显式指定区时卖家只从它自己的默认区取货，该区缺货就直接返回缺货，
+/// 不会用别区的号顶上。因此选区必须由我们主动做，见 [`StockInfo::pick_zone`]。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoneStock {
+    /// 区域代码，下单时原样回传给卖家（如 `us` / `eu`）
+    pub zone: String,
+    /// 人类可读名称，如「美国区」。缺失时前端回退显示 `zone`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// 本区当前可提取数量（已综合余额、库存与每母号上限）
+    pub available: u32,
+    /// 本区仓库存货数。可能大于 `available`（受单次上限压制）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stock: Option<u32>,
+    /// 本区单价。各区独立设置，**不要按文档硬编码** —— 实测线上与文档不一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<f64>,
+    /// 本区是否开放。关闭的区即使有存货也提不出来。
+    pub enabled: bool,
 }
 
 /// 库存与报价（中立）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StockInfo {
-    /// 本轮最大可提取数量
+    /// 本轮最大可提取数量。分区卖家这里是**各区之和**，单独看它会误导 ——
+    /// 它大于 0 只说明「某个区有货」，不代表默认区有货。
     pub available: u32,
     /// 最低单价。阶梯定价的卖家给区间，单一定价的卖家不给。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +235,38 @@ pub struct StockInfo {
     /// 账户余额。部分卖家在库存接口里一并给出，可省一次 profile 请求。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<f64>,
+    /// 分区库存。空表示该卖家不分区，下单不必带 zone。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<ZoneStock>,
+}
+
+impl StockInfo {
+    /// 选一个可下单的区：**开放 + 有货，其中单价最低者**。
+    ///
+    /// 同价时取 `available` 大的，让单次能提的量尽可能多；仍相同则按 `zone`
+    /// 字典序，保证结果稳定（否则同一份库存两次调用可能选到不同区，
+    /// 幂等重试就会撞上卖家侧的 409）。
+    ///
+    /// 返回 `None` 有两种情形，调用方无需区分：不分区（zones 为空），
+    /// 或所有区都无货。前者应当不带 zone 下单，后者下单必然缺货。
+    pub fn pick_zone(&self) -> Option<&ZoneStock> {
+        self.zones
+            .iter()
+            .filter(|z| z.enabled && z.available > 0)
+            .min_by(|a, b| {
+                // 缺单价的区排在最后：价格未知时不该被优先选中
+                let pa = a.unit_price.unwrap_or(f64::INFINITY);
+                let pb = b.unit_price.unwrap_or(f64::INFINITY);
+                pa.total_cmp(&pb)
+                    .then(b.available.cmp(&a.available))
+                    .then_with(|| a.zone.cmp(&b.zone))
+            })
+    }
+
+    /// 按区代码找，用于校验前端传来的 zone 是否真的存在
+    pub fn find_zone(&self, zone: &str) -> Option<&ZoneStock> {
+        self.zones.iter().find(|z| z.zone == zone)
+    }
 }
 
 /// 单张提取到的密钥（中立）。
@@ -214,6 +301,9 @@ pub struct PurchaseResult {
     pub keys: Vec<PurchasedKey>,
     /// true 表示本次是幂等重放，未重复扣款
     pub replayed: bool,
+    /// 本单实际成交的区域（卖家回显）。分区卖家必须透出到面板 ——
+    /// 否则积分扣了却看不出花在哪个区。
+    pub zone: Option<String>,
 }
 
 /// 账户档案（中立）

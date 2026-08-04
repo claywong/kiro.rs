@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, BellRing, Calendar, Coins, Cpu, Server } from 'lucide-react'
-import { useByCredential, useByModel, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, AlertTriangle, BellRing, Calendar, Coins, Cpu, Server } from 'lucide-react'
+import { useByCredential, useByModel, useRecentHealth, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useVendorUnackedCount } from '@/hooks/use-vendor'
@@ -125,6 +125,7 @@ export function OverviewPage() {
       <PageHeader />
       <VendorAlertBanner />
       <StatsCards stats={rangeStats} timeText={timeLabel(filters.timeFilter)} />
+      <RecentHealthCards />
       <KeyFilterCard
         keyFilter={filters.keyFilter}
         keys={keysData?.keys ?? []}
@@ -272,6 +273,42 @@ function StatsCards({ stats, timeText }: { stats: RangeStats; timeText: string }
     <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-4">
       {cards.map((card) => (
         <StatCard key={card.label} meta={timeText} {...card} />
+      ))}
+    </div>
+  )
+}
+
+/**
+ * 近窗口健康指标：最近 1/5 分钟的报错数与重试数。
+ *
+ * 与上面 StatsCards 的区别：那组跟随用户选的时间范围，这组固定看"刚刚"，
+ * 用来判断此刻是否正在出问题。数据来自 trace 库，不受页面上的 Key/分组筛选影响。
+ */
+function RecentHealthCards() {
+  const { data } = useRecentHealth()
+  if (!data) return null
+  const traceOff = data.traceEnabled === false
+  const meta = traceOff ? 'trace 已关闭 · 数据不再更新' : '实时 · 每 10s 刷新'
+  const cards = [
+    { label: '报错 · 近 1 分钟', value: data.errors1m, warn: data.errors1m > 0 },
+    { label: '报错 · 近 5 分钟', value: data.errors5m, warn: data.errors5m > 0 },
+    { label: '重试 · 近 1 分钟', value: data.retries1m, warn: false },
+    { label: '重试 · 近 5 分钟', value: data.retries5m, warn: false },
+  ]
+  return (
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-4">
+      {cards.map((card) => (
+        <StatCard
+          key={card.label}
+          icon={<AlertTriangle className="h-4 w-4" />}
+          label={card.label}
+          meta={meta}
+          value={formatNumber(card.value)}
+          className={cn(traceOff && 'opacity-60')}
+          extra={
+            card.warn && !traceOff ? <Badge variant="destructive">有异常</Badge> : null
+          }
+        />
       ))}
     </div>
   )

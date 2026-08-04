@@ -46,7 +46,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
-  const [rpmLimit, setRpmLimit] = useState('10')
+  const [rpmLimit, setRpmLimit] = useState('300')
+  const [priority, setPriority] = useState('0')
 
   const groupOptions = useGroupOptions()
 
@@ -70,7 +71,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
-    setRpmLimit('10')
+    setRpmLimit('300')
+    setPriority('0')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -123,6 +125,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
         rpmLimit: Number(rpmLimit),
+        priority: Number(priority),
       },
       {
         onSuccess: (data) => {
@@ -398,6 +401,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 required
               />
               <p className="text-xs text-muted-foreground">0 表示不限速</p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="priority" className="text-sm font-medium">
+                优先级
+              </label>
+              <Input
+                id="priority"
+                type="number"
+                min={0}
+                step={1}
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                disabled={isPending}
+                required
+              />
+              <p className="text-xs text-muted-foreground">
+                数值越小越优先调度，默认 0。仅在负载均衡为「优先级」模式时生效
+              </p>
             </div>
 
             {/* 代理配置 */}

@@ -15,6 +15,11 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 > 写成 `"flavor": "kiroapp"` 却填 kiroapp.cc 的地址，会对着不存在的 `/api/me/*`
 > 发请求，症状是一片 404。
 
+> **`drop` 与 `legacy` 也容易混**：两家都用 `/api/my/*` + `X-API-Key: usr-xxx`，
+> 路径和鉴权头几乎一样。区别在于 Drop 的金额是**字符串**、库存来自 `/api/status`
+> 而非 `/api/my/stock`。把 Drop 配成 `legacy` 不会 401，而是余额与下单结果解析
+> 失败、库存查询 404 —— 比报错更难查，因为面板只显示"解析响应失败"。
+
 ## 快速开始
 
 ### 单供应商配置（简化格式）
@@ -89,7 +94,7 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 | `autoPurchaseMaxCount` | 单次提取上限 | `1` |
 | `autoPurchaseSchedule` | 时段表（见下文） | 无 |
 | `defaultGroups` | 提取入库时写入凭据的分组 | `[]` |
-| `defaultRpmLimit` | RPM 限流值 | `10` |
+| `defaultRpmLimit` | RPM 限流值 | `300` |
 | `defaultApiRegion` | 凭据的 `apiRegion`（空串=沿用全局） | `""` |
 | `defaultAuthRegion` | 凭据的 `authRegion`（空串=沿用全局） | `""` |
 
@@ -155,6 +160,52 @@ Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，
 > 原因是这个接口一旦返回 2xx 钱就已经扣了，若因响应结构不认识就报错，
 > 等于把付过费的 Key 丢掉。一个都没捞到时会告警并提示人工核对扣费。
 
+### `drop` - Kiro Drop（drop.kiro.ss）协议
+
+`/api/my/*` + `X-API-Key: usr-xxx`。**与 `legacy` 高度相似** —— 路径、鉴权头、
+下单参数、事件名、幂等语义全都一样，可以当成 `legacy` 的裁剪版来理解：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/my/profile` | 余额（`remaining`）与已配的 webhook 地址 |
+| `GET /api/status` | 系统状态，其中 `keys_stock` 是**可购买数** |
+| `POST /api/my/purchase` | 下单，参数 `count` + `client_order_id` |
+| `PUT /api/my/webhook`、`POST /api/my/webhook/test` | webhook 地址读写与测试推送 |
+
+- ✅ 余额查询、库存查询、按订单提取
+- ✅ Webhook 推送（`new_keys_available` / `all_keys_dead` / `test`）与远程管理
+- ✅ 系统状态查询
+- ❌ 无兑换码充值、无开号记录、无订单列表（`/api/my/redeem`、`/api/my/gen-logs`、
+  `/api/my/purchase-orders` 实测均 404）
+- ❌ 无阶梯定价、无积分流水、无密钥列表
+
+**协议名可写** `"drop"` / `"kiro-drop"` / `"drop.kiro.ss"`。
+
+与 `legacy` 的两处真实差异：
+
+**金额是字符串。** 本家返回 `"remaining": "884.400000"`，首家给的是数字。legacy 的
+DTO 用 `f64`，直接复用会整份解析失败（余额、下单结果全读不出来），因此本家自带
+DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是人民币。
+
+**库存来自 `/api/status`。** 本家没有 `/api/my/stock`（404），可购买数取
+`/api/status` 的 `keys_stock`。
+
+另外两点：
+
+**订单号形态要校验。** 文档的 webhook 示例里 `purchase_order_id` 是 `batch_xxx`，
+但下单接口要求 `client_order_id` 是 32 位十六进制 —— 文档这两处自相矛盾。故后端
+先校验形态：合法就直接沿用（与首家一致），不合法则从 `(供应商 id, event_id)` 哈希
+派生一个合法值。派生值对同一条推送稳定，重投仍能命中卖家侧的幂等重放。
+
+**新货事件不带数量。** `new_keys_available` 没有 `new_keys` 字段，此时自动提取按
+「卖家当前 `keys_stock`」与 `autoPurchaseMaxCount` 取小，不会因为缺这个数就提不出来。
+
+> **本家文档改过一次。** 2026-07-31 早先那版走 `/api/v1/reservation`（报价 + 下单，
+> 可能返 202 待对账、金额分 USD/CNY 两套、新货事件叫 `batch.completed`），当天即
+> 全部撤掉换成上表这套。若日后又对不上，**先比对
+> [文档](https://drop.kiro.ss/docs) 而不是猜** —— 上一轮就是照着旧文档实现完，
+> 才发现接口已经换掉了。
+
 ## 时段表配置
 
 通过 `autoPurchaseSchedule` 限制自动提取仅在特定时段生效，可设置不同时段的不同上限：
@@ -181,7 +232,7 @@ Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，
 
 ## Webhook 配置
 
-仅 `legacy` 与 `kiroapp`（.io）支持推送，`kiroapp-cc` 没有 webhook。
+`legacy`、`kiroapp`（.io）与 `drop` 支持推送，`kiroapp-cc` 没有 webhook。
 
 每家供应商需要独立配置 webhook 入站地址：
 

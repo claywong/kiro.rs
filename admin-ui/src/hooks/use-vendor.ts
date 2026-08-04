@@ -9,11 +9,17 @@ import {
   ackVendorEvents,
   redeemVendorCode,
   setVendorMode,
+  setVendorPoolTarget,
   testVendorWebhook,
   setVendorWebhookUrl,
 } from '@/api/vendor'
 
-/** 卖家清单。首次进页面拉取，后续不再刷新（卖家列表运行期不变）。 */
+/**
+ * 卖家清单。首次进页面拉取，后续不主动刷新（卖家列表运行期不变）。
+ *
+ * 例外：响应里的 `poolTarget` 是可变的全局设置，改动后由
+ * [`useSetVendorPoolTarget`] 显式 invalidate 本 key 拉新值。
+ */
 export function useVendorList() {
   return useQuery({
     queryKey: ['vendor-list'],
@@ -71,8 +77,8 @@ export function useVendorOrders(vendorId?: string) {
 export function usePurchaseForEvent(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ eventId, count }: { eventId: string; count: number }) =>
-      purchaseForEvent(eventId, count, vendorId),
+    mutationFn: ({ eventId, count, zone }: { eventId: string; count: number; zone?: string }) =>
+      purchaseForEvent(eventId, count, vendorId, zone),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vendor-events', undefined, vendorId] })
       qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
@@ -84,8 +90,8 @@ export function usePurchaseForEvent(vendorId?: string) {
 export function usePurchaseAdHoc(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ count, clientOrderId }: { count: number; clientOrderId?: string }) =>
-      purchaseAdHoc(count, clientOrderId, vendorId),
+    mutationFn: ({ count, clientOrderId, zone }: { count: number; clientOrderId?: string; zone?: string }) =>
+      purchaseAdHoc(count, clientOrderId, vendorId, zone),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }
@@ -107,6 +113,20 @@ export function useSetVendorMode(vendorId?: string) {
   return useMutation({
     mutationFn: (autoPurchase: boolean) => setVendorMode(autoPurchase, vendorId),
     onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
+  })
+}
+
+/**
+ * 设置全局提取限制。
+ *
+ * 用 `onSettled` 而非 `onSuccess`：持久化失败时后端仍返回 200（运行时已生效，
+ * 只是重启会回退），失败分支也该把服务端的实际值拉回来。
+ */
+export function useSetVendorPoolTarget() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (poolTarget: number) => setVendorPoolTarget(poolTarget),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-list'] }),
   })
 }
 

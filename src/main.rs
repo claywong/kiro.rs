@@ -302,6 +302,13 @@ async fn main() {
     } else {
         tracing::info!("卖家对接已启用，共 {} 家", vendor_registry.len());
     }
+    // 端点提示在下方路由清单里打印，注册表随后被 VendorState 接管，先取出所需计数。
+    let vendor_count = vendor_registry.len();
+    let vendor_inbound_count = vendor_registry
+        .all()
+        .iter()
+        .filter(|s| s.config().inbound_enabled())
+        .count();
     let vendor_state = vendor::VendorState::new(vendor_registry);
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
@@ -389,17 +396,15 @@ async fn main() {
     tracing::info!("  GET  /api/admin/credentials/:index/balance");
     tracing::info!("Admin UI:");
     tracing::info!("  GET  /admin");
-    match config.vendor.as_ref() {
-        Some(v) if v.inbound_enabled() => {
-            tracing::info!("卖家对接已启用（入站 + 出站）:");
+    // 卖家端点：各家的启用情况已由 VendorRegistry 逐家打印，这里只列路由。
+    if vendor_count > 0 {
+        tracing::info!("卖家对接:");
+        if vendor_inbound_count > 0 {
             // 不打 token 明文：它等同于入站凭证
             tracing::info!("  POST /webhook/vendor/<webhookPathToken>");
-            tracing::info!("  GET  /api/admin/vendor/status");
         }
-        Some(v) if v.outbound_enabled() => {
-            tracing::info!("卖家对接已启用（仅出站，未配置 webhookPathToken）");
-        }
-        _ => {}
+        tracing::info!("  GET  /api/admin/vendor/vendors");
+        tracing::info!("  GET  /api/admin/vendor/status?vendorId=<id>");
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

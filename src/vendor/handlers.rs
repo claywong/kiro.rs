@@ -20,7 +20,9 @@ use serde::Deserialize;
 
 use super::registry::VendorRegistry;
 use super::service::{VendorService, VendorServiceError};
-use super::store::{DEFAULT_QUERY_LIMIT, IncomingEvent, RecordOutcome, VendorEventKind};
+use super::store::{
+    DEFAULT_QUERY_LIMIT, IncomingEvent, PurchaseTrigger, RecordOutcome, VendorEventKind,
+};
 
 /// 入站 webhook 与管理接口共享的状态
 #[derive(Clone)]
@@ -35,11 +37,22 @@ impl VendorState {
 }
 
 fn err_response(e: VendorServiceError) -> Response {
+    err_response_with(e, &[])
+}
+
+/// 同 [`err_response`]，但往正文里额外并入若干字段。
+///
+/// 提取失败时用它带上订单号：钱可能已经扣了，而用**同一个订单号**原样重试是
+/// 卖家提供的唯一安全取回手段，换号重试等于再扣一次。
+fn err_response_with(e: VendorServiceError, extra: &[(&str, serde_json::Value)]) -> Response {
     let status = match &e {
         VendorServiceError::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
         VendorServiceError::EventNotFound => StatusCode::NOT_FOUND,
         VendorServiceError::NotPurchasable => StatusCode::BAD_REQUEST,
         VendorServiceError::CountLocked { .. } => StatusCode::CONFLICT,
+        VendorServiceError::UnknownZone { .. } => StatusCode::BAD_REQUEST,
+        // 与卖家缺货同义，沿用它的 409
+        VendorServiceError::NoZoneInStock => StatusCode::CONFLICT,
         VendorServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // 原样透出卖家状态码（403 余额不足 / 404 无可用 Key / 409 数量冲突）
         VendorServiceError::Upstream(u) => u
@@ -54,6 +67,13 @@ fn err_response(e: VendorServiceError) -> Response {
     let mut body = serde_json::json!({ "error": e.to_string() });
     if let Some(b) = bound {
         body["boundCount"] = serde_json::json!(b);
+    }
+    // 让面板能把可选区域直接渲染成下拉项，不必再查一次库存
+    if let VendorServiceError::UnknownZone { known, .. } = &e {
+        body["knownZones"] = serde_json::json!(known);
+    }
+    for (k, v) in extra {
+        body[*k] = v.clone();
     }
     (status, Json(body)).into_response()
 }
@@ -232,6 +252,9 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
     Json(serde_json::json!({
         "vendors": items,
         "defaultVendorId": state.registry.default_service().map(|s| s.vendor_id()),
+        // 全局提取限制。放在这里而不是按家查的 /status —— 它跨供应商，
+        // 塞进单家状态会让「切换标签页后这个值变不变」变成一个需要解释的问题。
+        "poolTarget": state.registry.pool_gate().target(),
     }))
     .into_response()
 }
@@ -448,6 +471,10 @@ pub struct PurchaseRequest {
     pub count: u32,
     #[serde(default)]
     pub vendor_id: Option<String>,
+    /// 指定区域（分区卖家）。留空则自动选「开放有货中单价最低」的区。
+    /// 事件已绑定过区域时以绑定值为准，本字段被忽略。
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// `POST /api/admin/vendor/events/{event_id}/purchase` —— 按事件提取并入库
@@ -472,7 +499,15 @@ pub async fn purchase_for_event(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    match service.purchase_for_event(&event_id, req.count).await {
+    match service
+        .purchase_for_event_zoned(
+            &event_id,
+            req.count,
+            req.zone.as_deref(),
+            PurchaseTrigger::Manual,
+        )
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(e) => err_response(e),
     }
@@ -487,6 +522,10 @@ pub struct AdHocPurchaseRequest {
     pub client_order_id: Option<String>,
     #[serde(default)]
     pub vendor_id: Option<String>,
+    /// 指定区域（分区卖家）。留空则自动选「开放有货中单价最低」的区。
+    /// 本路径不落库，重试时须自行带上响应回显的 zone。
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// `POST /api/admin/vendor/purchase` —— 不依赖事件的主动提取
@@ -514,14 +553,43 @@ pub async fn purchase_ad_hoc(
         .filter(|s| is_hex32(s))
         .unwrap_or_else(new_order_id);
 
-    match service.purchase_ad_hoc(req.count, &order_id).await {
+    // 下单**前**先把订单号落日志。这条路径不写事件表，订单号只存在于本次请求的
+    // 内存里 —— 若下单超时或断连，卖家侧很可能已扣费并锁定 Key，而订单号一丢
+    // 就再也取不回那笔单（重试要用同一个号才会命中幂等重放）。日志是唯一线索。
+    tracing::info!(
+        vendor_id = %service.vendor_id(),
+        order_id = %order_id,
+        count = req.count,
+        "主动提取开始"
+    );
+
+    match service
+        .purchase_ad_hoc(req.count, &order_id, req.zone.as_deref())
+        .await
+    {
         Ok(result) => {
             let mut body = serde_json::to_value(&result).unwrap_or_default();
             body["clientOrderId"] = serde_json::json!(order_id);
             body["vendorId"] = serde_json::json!(service.vendor_id());
             Json(body).into_response()
         }
-        Err(e) => err_response(e),
+        Err(e) => {
+            // 失败也必须回显订单号：钱可能已经扣了，面板要能提示「用这个号原样
+            // 重试」。换号重试等于再扣一次，而本家没有订单列表可供事后对账。
+            tracing::warn!(
+                vendor_id = %service.vendor_id(),
+                order_id = %order_id,
+                "主动提取失败（若为超时/断连，卖家侧可能已扣费，请用同一订单号重试）: {}",
+                e
+            );
+            err_response_with(
+                e,
+                &[
+                    ("clientOrderId", serde_json::json!(order_id)),
+                    ("vendorId", serde_json::json!(service.vendor_id())),
+                ],
+            )
+        }
     }
 }
 
@@ -558,6 +626,37 @@ pub async fn set_mode(
         auto_purchase = result.auto_purchase,
         persisted = result.persisted,
         "提取模式已切换"
+    );
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPoolTargetRequest {
+    /// 池中存活卖家 Key 达到此数即不再自动补货。0 = 不启用
+    pub pool_target: u32,
+}
+
+/// `PUT /api/admin/vendor/pool-target` —— 设置全局提取限制
+///
+/// 与 [`set_mode`] 的两点不同，都源于「这是全局设置」：
+/// - 不接受 `vendorId`，也不 `pick()` 某一家 —— 阈值跨供应商共享。
+/// - 不校验 `outbound_enabled` —— 全局约束与某一家配没配对接无关。
+///
+/// 仍需至少有一家已注册：持久化要借用服务持有的配置路径，且没有任何卖家时
+/// 这个设置也无从生效。
+pub async fn set_pool_target(
+    State(state): State<VendorState>,
+    Json(req): Json<SetPoolTargetRequest>,
+) -> Response {
+    let Some(service) = state.registry.default_service() else {
+        return err_response(VendorServiceError::NotConfigured);
+    };
+    let result = service.set_pool_target(req.pool_target);
+    tracing::info!(
+        pool_target = result.pool_target,
+        persisted = result.persisted,
+        "全局提取限制已更新"
     );
     Json(result).into_response()
 }

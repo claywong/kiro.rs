@@ -116,7 +116,7 @@ pub struct VendorConfig {
     #[serde(default)]
     pub default_groups: Vec<String>,
 
-    /// 手动提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    /// 手动提取入库时默认的每分钟请求数上限（默认 300，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 
@@ -170,7 +170,7 @@ fn default_vendor_auto_max_count() -> u32 {
 }
 
 fn default_vendor_rpm_limit() -> u32 {
-    10
+    300
 }
 
 /// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
@@ -205,7 +205,7 @@ pub struct LegacyKiroappCcConfig {
     #[serde(default)]
     pub default_groups: Vec<String>,
 
-    /// 提取入库时默认的每分钟请求数上限（默认 10，与新增凭据保持一致）
+    /// 提取入库时默认的每分钟请求数上限（默认 300，与新增凭据保持一致）
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 }
@@ -478,6 +478,21 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vendors: Vec<VendorConfig>,
 
+    /// 全局提取限制：池中存活的卖家 Key 达到此数即不再自动补货。0 = 不启用（默认）。
+    ///
+    /// 为什么需要它：各家的失效判定按设计互不可见（见 `vendor::auto::census` 的
+    /// 注释——A 家推「全部失效」时若把 B 家健康的 Key 算进来，A 的补货会被 B 挡死）。
+    /// 代价是多家 Key 同期失效时，三家各自都得出「池子空了」的结论，于是各提一份。
+    /// 本值补上那个缺失的全局视图，判据是 `vendor::auto::pool_alive`。
+    ///
+    /// 与各家 `autoPurchaseMaxCount` 是两层闸：后者管单笔提多少，本值管池子总量。
+    /// 语义刻意是「池子够用」而非「别家有存活」，否则会退回被别家挡死的老问题。
+    ///
+    /// 沿用本项目 0 值即关闭的既有约定（同 `autoPurchaseSchedule` 的 `maxCount: 0`），
+    /// 不额外设开关，避免「开关开着但阈值为 0」这种无意义组合。
+    #[serde(default)]
+    pub auto_purchase_pool_target: u32,
+
     /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
     ///
     /// 注意键名 `kiroapp` 指的是 kiroapp**.cc**，而非 `flavor: "kiroapp"` 对应的
@@ -641,6 +656,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             vendor: None,
             vendors: Vec::new(),
+            auto_purchase_pool_target: 0,
             legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
@@ -939,6 +955,29 @@ mod vendor_config_compat_tests {
         assert!(config.resolved_vendors().is_empty());
     }
 
+    /// 存量配置没有这个字段，必须解析为 0（不启用），否则升级后会突然挡掉自动补货
+    #[test]
+    fn 全局池闸默认关闭() {
+        let config: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(config.auto_purchase_pool_target, 0);
+    }
+
+    #[test]
+    fn 全局池闸序列化回写不丢失() {
+        let mut config = Config::default();
+        config.auto_purchase_pool_target = 4;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("autoPurchasePoolTarget"), "落盘要带上本字段");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auto_purchase_pool_target, 4);
+    }
+
+    #[test]
+    fn 全局池闸读取配置值() {
+        let config: Config = serde_json::from_str(r#"{"autoPurchasePoolTarget":3}"#).unwrap();
+        assert_eq!(config.auto_purchase_pool_target, 3);
+    }
+
     /// vendors 里显式配了同 id 时，显式配置胜出（迁移项排在最后）
     #[test]
     fn 显式配置覆盖存量迁移项() {
@@ -963,7 +1002,8 @@ mod vendor_config_compat_tests {
         let raw = include_str!("../../config.example.json");
         let config: Config = serde_json::from_str(raw).expect("config.example.json 必须能解析");
         let resolved = config.resolved_vendors();
-        assert_eq!(resolved.len(), 2, "示例应含 .io 与 .cc 两家");
+        // 刻意不断言家数：往示例里加一家就得改一次测试，而下面逐家的
+        // `expect` 已经能抓出「某家被静默丢掉」——那才是本测试要防的问题。
 
         let io = resolved
             .iter()
@@ -978,6 +1018,13 @@ mod vendor_config_compat_tests {
             .find(|v| v.flavor == VendorFlavor::KiroappCc)
             .expect("缺 kiroapp.cc");
         assert!(cc.normalized_base_url().contains("kiroapp.cc"));
+
+        let drop = resolved
+            .iter()
+            .find(|v| v.flavor == VendorFlavor::Drop)
+            .expect("缺 Kiro Drop");
+        assert!(drop.normalized_base_url().contains("drop.kiro.ss"));
+        assert!(drop.inbound_enabled(), "示例里的 webhook token 必须真正生效");
     }
 
     /// 示例配置里**不能有任何被 serde 静默忽略的键**。

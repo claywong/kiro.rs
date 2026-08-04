@@ -38,6 +38,8 @@ impl From<StockResponse> for StockInfo {
             price_min: r.key_price,
             price_max: r.key_price, // 无阶梯定价，min = max
             balance: None,           // 库存接口不带余额，需单独查
+            // 该卖家不分区
+            zones: Vec::new(),
         }
     }
 }
@@ -105,6 +107,7 @@ impl ClaimResult {
                 })
                 .collect(),
             replayed: false,
+            zone: None,
         }
     }
 }

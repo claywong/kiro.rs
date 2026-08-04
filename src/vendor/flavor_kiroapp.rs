@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, PurchasedKey,
-    RedeemResult, StockInfo, VendorKeyInfo,
+    RedeemResult, StockInfo, VendorKeyInfo, ZoneStock,
 };
 
 pub const PATH_STOCK: &str = "/api/me/stock";
@@ -31,8 +31,10 @@ pub const PATH_KEYS_CREATED_AT: &str = "/api/me/keys/created-at";
 pub const MAX_PAGE_SIZE: u32 = 500;
 
 /// `GET /api/me/stock` 响应。`price` 是 `price_min` 的向后兼容别名。
+/// 新版按区分开库存与单价：`stock_us` / `stock_eu` / `price_us` / `price_eu`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct StockResponse {
+    /// 旧字段：全局可售量（不分区时用）
     #[serde(default)]
     pub stock: u32,
     #[serde(default)]
@@ -43,17 +45,80 @@ pub struct StockResponse {
     pub price_max: Option<f64>,
     #[serde(default)]
     pub balance: Option<f64>,
+
+    /// 新字段：分区库存与报价
+    #[serde(default)]
+    pub stock_us: Option<u32>,
+    #[serde(default)]
+    pub stock_eu: Option<u32>,
+    #[serde(default)]
+    pub price_us: Option<f64>,
+    #[serde(default)]
+    pub price_eu: Option<f64>,
 }
 
 impl From<StockResponse> for StockInfo {
     fn from(r: StockResponse) -> Self {
+        // 优先检测分区字段。只要 stock_us / stock_eu 任一存在就走分区逻辑
+        let has_zones = r.stock_us.is_some() || r.stock_eu.is_some();
+        let zones = if has_zones {
+            let mut v = Vec::new();
+            if let Some(us) = r.stock_us {
+                v.push(ZoneStock {
+                    zone: "us".to_string(),
+                    label: Some("美国区".to_string()),
+                    available: us,
+                    stock: Some(us),
+                    unit_price: r.price_us,
+                    enabled: true,
+                });
+            }
+            if let Some(eu) = r.stock_eu {
+                v.push(ZoneStock {
+                    zone: "eu".to_string(),
+                    label: Some("欧洲区".to_string()),
+                    available: eu,
+                    stock: Some(eu),
+                    unit_price: r.price_eu,
+                    enabled: true,
+                });
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        // available：分区时取各区之和，不分区时用 stock 字段
+        let available = if has_zones {
+            r.stock_us.unwrap_or(0) + r.stock_eu.unwrap_or(0)
+        } else {
+            r.stock
+        };
+
+        // price_min/max：分区时从 zones 重算，不分区时用响应原值
+        let (price_min, price_max) = if has_zones {
+            let prices: Vec<f64> = [r.price_us, r.price_eu]
+                .iter()
+                .filter_map(|&p| p)
+                .collect();
+            if prices.is_empty() {
+                (None, None)
+            } else {
+                let min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                (Some(min), Some(max))
+            }
+        } else {
+            // price 是 price_min 的兼容别名
+            (r.price_min.or(r.price), r.price_max)
+        };
+
         Self {
-            available: r.stock,
-            // price 是 price_min 的兼容别名，优先取显式的 price_min
-            price_min: r.price_min.or(r.price),
-            price_max: r.price_max,
-            // 库存接口顺带给余额，可省一次 profile 请求
+            available,
+            price_min,
+            price_max,
             balance: r.balance,
+            zones,
         }
     }
 }
@@ -97,6 +162,9 @@ pub struct PurchaseResponse {
     pub keys: Vec<KiroappKey>,
     #[serde(default)]
     pub replayed: bool,
+    /// 实际成交区域（响应不带此字段，由调用方从请求参数补上）
+    #[serde(skip)]
+    pub region: Option<String>,
 }
 
 impl From<PurchaseResponse> for PurchaseResult {
@@ -122,6 +190,7 @@ impl From<PurchaseResponse> for PurchaseResult {
             order_id: r.order_id,
             keys,
             replayed: r.replayed,
+            zone: r.region,
         }
     }
 }
@@ -359,6 +428,35 @@ mod tests {
         assert_eq!(s.price_max, Some(65.0));
         // 余额顺带给出，可省一次 profile
         assert_eq!(s.balance, Some(2060.0));
+        assert!(s.zones.is_empty(), "旧格式不带分区");
+    }
+
+    #[test]
+    fn 解析库存报价_分区新格式() {
+        let raw = r#"{"stock_us":108,"stock_eu":12,"price_us":20,"price_eu":15,"balance":2060}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 120, "available = stock_us + stock_eu");
+        assert_eq!(s.price_min, Some(15.0), "最低价从 zones 重算");
+        assert_eq!(s.price_max, Some(20.0));
+        assert_eq!(s.balance, Some(2060.0));
+        assert_eq!(s.zones.len(), 2);
+        assert_eq!(s.zones[0].zone, "us");
+        assert_eq!(s.zones[0].available, 108);
+        assert_eq!(s.zones[0].unit_price, Some(20.0));
+        assert_eq!(s.zones[1].zone, "eu");
+        assert_eq!(s.zones[1].label.as_deref(), Some("欧洲区"));
+        assert_eq!(s.zones[1].available, 12);
+        assert_eq!(s.zones[1].unit_price, Some(15.0));
+    }
+
+    #[test]
+    fn 解析库存报价_分区单区无货() {
+        let raw = r#"{"stock_us":0,"stock_eu":12,"price_us":20,"price_eu":15}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 12);
+        // 美区 0 库存，但 zone 仍要保留，让前端能渲染成禁用项
+        assert_eq!(s.zones.len(), 2);
+        assert_eq!(s.zones[0].available, 0);
     }
 
     #[test]

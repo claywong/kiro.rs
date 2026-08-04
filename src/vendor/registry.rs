@@ -12,6 +12,7 @@ use crate::admin::AdminService;
 use crate::http_client::ProxyConfig;
 use crate::model::config::{Config, TlsBackend, VendorConfig};
 
+use super::pool_gate::PoolGate;
 use super::service::VendorService;
 use super::store::SharedVendorStore;
 
@@ -19,6 +20,9 @@ use super::store::SharedVendorStore;
 pub struct VendorRegistry {
     /// 按配置顺序排列。第一项是面板默认选中的那一家。
     services: Vec<Arc<VendorService>>,
+    /// 全局提取闸门，各家共用同一个实例 —— 它的意义正在于跨供应商，
+    /// 每家一份就退化成了各家自己的上限。
+    pool_gate: Arc<PoolGate>,
 }
 
 impl VendorRegistry {
@@ -30,7 +34,12 @@ impl VendorRegistry {
         tls_backend: TlsBackend,
         store: SharedVendorStore,
         admin: Arc<AdminService>,
+        pool_target: u32,
     ) -> Self {
+        let pool_gate = PoolGate::new(pool_target);
+        if pool_target > 0 {
+            tracing::info!(pool_target, "全局提取限制已启用");
+        }
         let services = vendors
             .into_iter()
             .map(|cfg| {
@@ -48,10 +57,14 @@ impl VendorRegistry {
                     tls_backend,
                     store.clone(),
                     admin.clone(),
+                    Arc::clone(&pool_gate),
                 ))
             })
             .collect();
-        Self { services }
+        Self {
+            services,
+            pool_gate,
+        }
     }
 
     /// 从完整配置构建（合并 `vendor` 单例与 `vendors` 列表）
@@ -68,7 +81,13 @@ impl VendorRegistry {
             tls_backend,
             store,
             admin,
+            config.auto_purchase_pool_target,
         )
+    }
+
+    /// 全局提取闸门。面板读写阈值走这里，不经过任何单家服务。
+    pub fn pool_gate(&self) -> &Arc<PoolGate> {
+        &self.pool_gate
     }
 
     /// 是否配置了任何卖家
@@ -128,7 +147,7 @@ mod tests {
             api_key: "k".to_string(),
             webhook_path_token: token.to_string(),
             default_groups: vec![],
-            default_rpm_limit: 10,
+            default_rpm_limit: 300,
             default_api_region: String::new(),
             default_auth_region: String::new(),
             auto_purchase: false,

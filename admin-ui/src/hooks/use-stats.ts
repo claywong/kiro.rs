@@ -25,6 +25,24 @@ export function useOverview() {
   })
 }
 
+/**
+ * 概览的近窗口健康指标（最近 1/5 分钟报错、重试）专用。
+ *
+ * 复用同一个 /stats/overview 接口，但刷新更快：COMMON 的 30s 间隔对"最近 1 分钟"
+ * 这种窗口来说太慢（数据最多能陈旧半个窗口），这里收到 10s。queryKey 与
+ * useOverview 区分开，避免两者共享缓存后互相拉高/拉低刷新频率。
+ */
+export function useRecentHealth() {
+  return useQuery({
+    queryKey: ['stats', 'overview', 'recent-health'],
+    queryFn: getOverview,
+    refetchInterval: 10_000,
+    staleTime: 8_000,
+    placeholderData: keepPreviousData,
+    refetchOnWindowFocus: false,
+  })
+}
+
 function timeKey(time: StatsTimeFilter) {
   return [
     time.range ?? 'custom',
