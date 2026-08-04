@@ -273,6 +273,22 @@ async fn main() {
         )
     });
 
+    // 健康联动看门狗：按近 1 分钟报错数反向推外部系统的账号调度开关
+    // （本地稳 → 关掉外部调度；本地不稳 → 打开）。配置不完整时内部直接跳过。
+    // 用独立 Client：对方是普通 JSON 接口，不需要流式那套读超时。
+    match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
+        Ok(client) => {
+            admin::health_gate::spawn(
+                config.health_gate.clone(),
+                admin_trace_store.clone(),
+                client,
+            );
+        }
+        Err(e) => {
+            tracing::warn!("健康联动：HTTP 客户端构建失败，联动不启动: {}", e);
+        }
+    }
+
     // AdminService 在此统一构建（而非仅在 Admin API 分支内）：卖家 webhook 提取 Key 后
     // 要复用它的 import_one_credential 入库，而入站 webhook 不该依赖 adminApiKey 是否配置。
     // 后台调度器仍只在 Admin API 启用时才启动，不会多跑任务。

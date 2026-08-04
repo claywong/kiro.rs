@@ -30,6 +30,7 @@ pub mod usage_stats;
 pub mod trace_db;
 // 本地新增模块单独成行，避免上游增删模块时反复冲突。
 pub mod recent_spend;
+pub mod health_gate;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;

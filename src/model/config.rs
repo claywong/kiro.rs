@@ -287,6 +287,138 @@ impl VendorConfig {
     }
 }
 
+/// 健康联动：把本地「近 1 分钟报错数」反向映射为外部系统的账号调度开关。
+///
+/// 语义刻意是**反的**：本地稳（报错 < 阈值）就把外部账号的调度**关掉**，本地一旦
+/// 不稳（报错 >= 阈值）再把它**打开**。外部账号在这里的角色是兜底池——平时不让它
+/// 接量（省额度 / 保它的账号健康度），只在本地扛不住时放进来接一段。
+///
+/// 判据取 `traces.db` 的 60 秒窗口报错数（同概览页「报错 · 近 1 分钟」那张卡）。
+/// trace 关闭时该计数不再更新，此时整个联动会跳过而非按残留读数误判。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthGateConfig {
+    /// 总开关。默认关闭 —— 这是本地运维特性，不配就完全不跑。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 外部系统基址，如 `https://4code.us`。末尾斜杠会被自动去掉。
+    #[serde(default)]
+    pub base_url: String,
+
+    /// 外部系统的 Admin Token。
+    #[serde(default)]
+    pub token: String,
+
+    /// 传 token 用的请求头名（默认 `X-API-Key`）。
+    ///
+    /// 4code.us 实测认证走 `X-API-Key`：同一个 token 用 `Authorization: Bearer` 会被
+    /// 回 401 `INVALID_TOKEN`。做成可配是为了对方换认证方式时不用改代码——填
+    /// `Authorization` 时需自行在 token 里带上 `Bearer ` 前缀。
+    #[serde(default = "default_health_gate_auth_header")]
+    pub auth_header: String,
+
+    /// 要联动开关的外部账号 ID 列表。空列表等于没启用。
+    #[serde(default)]
+    pub account_ids: Vec<u64>,
+
+    /// 不稳定判定阈值：近 1 分钟报错数 **>=** 此值即视为不稳定（默认 10）。
+    #[serde(default = "default_health_gate_error_threshold")]
+    pub error_threshold: u64,
+
+    /// 轮询间隔（秒，默认 30）。判据窗口固定 60 秒，间隔取其一半，
+    /// 保证任何一分钟的异常至少被看到一次。
+    #[serde(default = "default_health_gate_interval_secs")]
+    pub check_interval_secs: u64,
+
+    /// 连续多少次判定一致才真正切换开关（默认 2）。
+    ///
+    /// 防抖用。报错数在阈值上下抖动时，单次读数就切会导致反复推开关，既刷对方
+    /// 审计日志也让调度状态来回跳。要求连续几个周期口径一致再动。
+    #[serde(default = "default_health_gate_confirmations")]
+    pub confirmations: u32,
+
+    /// 状态没变时也按当前判定重推一次的间隔（秒，默认 300 = 5 分钟）。
+    ///
+    /// 为什么需要：本地只记「上次推成功的值」，不去读对方当前状态。若有人在对方
+    /// 后台手动改了开关，本地记录就与实际脱节，且因为状态"没变"而永远不再推，
+    /// 一直错到下次健康度翻转。定期重推让这种漂移自愈。开关接口幂等，重推同值无副作用。
+    ///
+    /// `0` 表示只在翻转时推、不做定期兜底。
+    #[serde(default = "default_health_gate_reaffirm_interval_secs")]
+    pub reaffirm_interval_secs: u64,
+
+    /// 单次推送失败后的重试次数（默认 3，含首发共 3 次尝试）。
+    ///
+    /// 只对网络错误与对方 5xx 重试。4xx（token 失效 / 账号不存在）重试无意义，
+    /// 直接放弃并留给下个周期——那类问题得改配置，不是等一等就好。
+    #[serde(default = "default_health_gate_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for HealthGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            token: String::new(),
+            auth_header: default_health_gate_auth_header(),
+            account_ids: Vec::new(),
+            error_threshold: default_health_gate_error_threshold(),
+            check_interval_secs: default_health_gate_interval_secs(),
+            confirmations: default_health_gate_confirmations(),
+            reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
+            max_attempts: default_health_gate_max_attempts(),
+        }
+    }
+}
+
+impl HealthGateConfig {
+    /// 配置是否完整可用：开关开着，且基址 / token / 账号列表都给全了。
+    /// 缺任一项都当没启用处理 —— 半配状态下静默不跑比每周期报错刷屏好。
+    pub fn is_usable(&self) -> bool {
+        self.enabled
+            && !self.base_url.trim().is_empty()
+            && !self.token.trim().is_empty()
+            && !self.account_ids.is_empty()
+    }
+
+    /// 去掉末尾斜杠的基址，供拼接路径使用。
+    pub fn normalized_base_url(&self) -> &str {
+        self.base_url.trim().trim_end_matches('/')
+    }
+
+    /// 认证头名，空配置时回落到默认值（空头名会让 reqwest 直接 panic）。
+    pub fn auth_header(&self) -> &str {
+        let h = self.auth_header.trim();
+        if h.is_empty() { "X-API-Key" } else { h }
+    }
+}
+
+fn default_health_gate_auth_header() -> String {
+    "X-API-Key".to_string()
+}
+
+fn default_health_gate_error_threshold() -> u64 {
+    10
+}
+
+fn default_health_gate_interval_secs() -> u64 {
+    30
+}
+
+fn default_health_gate_confirmations() -> u32 {
+    2
+}
+
+fn default_health_gate_reaffirm_interval_secs() -> u64 {
+    300
+}
+
+fn default_health_gate_max_attempts() -> u32 {
+    3
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -465,6 +597,11 @@ pub struct Config {
     /// 请求用量日志（usage_log.*.jsonl + 聚合桶）保留天数（默认 31）。
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
+
+    /// 健康联动：按本地近 1 分钟报错数反向控制外部系统的账号调度开关。
+    /// 详见 [`HealthGateConfig`]。默认关闭。
+    #[serde(default)]
+    pub health_gate: HealthGateConfig,
 
     /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
     /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
@@ -654,6 +791,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            health_gate: HealthGateConfig::default(),
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,

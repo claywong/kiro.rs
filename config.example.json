@@ -12,6 +12,16 @@
   "traceEnabled": true,
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
+  "healthGate": {
+    "enabled": false,
+    "baseUrl": "https://4code.us",
+    "token": "替换为 4code.us 的 Admin Token",
+    "authHeader": "X-API-Key",
+    "accountIds": [],
+    "errorThreshold": 10,
+    "checkIntervalSecs": 30,
+    "confirmations": 2
+  },
   "vendors": [
     {
       "id": "kiroapp-io",
@@ -25,7 +35,11 @@
       "autoPurchase": false,
       "autoPurchaseMaxCount": 1,
       "autoPurchaseSchedule": [
-        { "from": "14:00", "to": "23:59", "maxCount": 2 }
+        {
+          "from": "14:00",
+          "to": "23:59",
+          "maxCount": 2
+        }
       ]
     },
     {
