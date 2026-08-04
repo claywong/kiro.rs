@@ -78,7 +78,9 @@ impl VendorFlavor {
     pub fn capabilities(self) -> VendorCapabilities {
         match self {
             Self::Legacy => VendorCapabilities {
-                system_status: true,
+                // `/api/status` 的存活 / 失效 / 存货数对本家没有可用数据，关掉这一位，
+                // 免得面板上白挂一张空卡（前端按 caps.systemStatus 决定是否渲染）
+                system_status: false,
                 gen_logs: true,
                 webhook_manage: true,
                 purchase_orders: true,
@@ -623,6 +625,17 @@ mod local_tests {
             VendorFlavor::Kiroapp.capabilities().zoned_purchase,
             "kiroapp.io 库存按 us / eu 分区，下单必须带 region"
         );
+    }
+
+    /// 首家的 `/api/status` 拿不到有用的存活 / 失效 / 存货数，这一位要关着，
+    /// 否则面板会渲染一张永远是 `—` 的「卖家存货 Key」卡。
+    ///
+    /// 注意这不影响库存：首家的库存走独立的 `PATH_STOCK`，与本能力无关。
+    #[test]
+    fn 首家不开系统状态() {
+        assert!(!VendorFlavor::Legacy.capabilities().system_status);
+        // Drop 家的 /api/status 是它唯一的库存兜底来源，那边必须保持开启
+        assert!(VendorFlavor::Drop.capabilities().system_status);
     }
 
     /// 只有确实分区的卖家才开这一位 —— 误开会让 `resolve_zone` 因 zones 为空
