@@ -105,7 +105,9 @@ impl VendorFlavor {
                 batch_scoped_purchase: true,
                 // 单价按母号累计产量分档，同一单里各 Key 可能不同价
                 tiered_pricing: true,
-                zoned_purchase: false,
+                // 库存按 us / eu 分区，各区单价独立、不跨区补货。下单必须带 region，
+                // 否则卖家只从默认区（us）取货，该区缺货时直接 404 而不会自动换区。
+                zoned_purchase: true,
             },
             Self::KiroappCc => VendorCapabilities {
                 system_status: false,
@@ -602,5 +604,32 @@ mod tests {
         let e = VendorApiError::unsupported("开号记录");
         assert!(e.status.is_none());
         assert!(e.message.contains("开号记录"));
+    }
+}
+
+/// 本地新增测试单独成块，避免插进上游 `mod tests` 中间引发合并冲突。
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    /// kiroapp.io 的分区能力必须开启。
+    ///
+    /// 这一位曾经是 false，而解析层（`stock_us` / `stock_eu` → zones）和发送层
+    /// （zone → `body["region"]`）都已就位，导致 `resolve_zone` 提前返回 None、
+    /// 下单不带 region，卖家只从默认区取货，us 缺货时直接 404 且不跨区补。
+    #[test]
+    fn kiroapp_具备分区提取能力() {
+        assert!(
+            VendorFlavor::Kiroapp.capabilities().zoned_purchase,
+            "kiroapp.io 库存按 us / eu 分区，下单必须带 region"
+        );
+    }
+
+    /// 只有确实分区的卖家才开这一位 —— 误开会让 `resolve_zone` 因 zones 为空
+    /// 而报 NoZoneInStock，把本来能提的单挡掉。
+    #[test]
+    fn 不分区的卖家不开该能力() {
+        assert!(!VendorFlavor::KiroappCc.capabilities().zoned_purchase);
+        assert!(!VendorFlavor::Drop.capabilities().zoned_purchase);
     }
 }
