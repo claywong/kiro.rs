@@ -11,8 +11,10 @@
 //!
 //! 1. **金额是字符串**（`"remaining": "884.400000"`），首家给的是数字。legacy 的
 //!    DTO 用 `f64`，直接复用会整份解析失败，因此本模块自带 DTO，用 [`Decimalish`]
-//!    同时接字符串与数字。另外本家现在**按美元计价**（早期是人民币），系统其余
-//!    部分都是人民币口径，故在 DTO 边界统一乘 [`USD_TO_CNY`]，见 [`amount_cny`]。
+//!    同时接字符串与数字。另外本家的**单价按美元计价**（早期是人民币），系统其余
+//!    部分都是人民币口径，故单价在 DTO 边界乘 [`USD_TO_CNY`]，见 [`amount_cny`]。
+//!    **余额类字段（`remaining` / `quota` / `used_quota` / stock 的 `balance`）本身
+//!    就是人民币**，不换汇，见 [`amount`]。
 //! 2. **库存走 `/api/me/stock`**（注意是 `me` 不是 `my`）。它一次给出库存、单价与
 //!    余额；`/api/status` 的 `keys_stock` 只有数量，作为兜底保留。本家的
 //!    `/api/my/stock` 实测 404 —— 只有这一个端点落在 `/api/me` 下。
@@ -59,26 +61,38 @@ impl Decimalish {
 
 /// 把可选的金额字段转成 f64（**原样，未换汇**）。
 ///
-/// 只在需要看卖家原始报价时用；接进 [`ProfileInfo`] / [`StockInfo`] /
-/// [`PurchaseResult`] 的一律走 [`amount_cny`]，见那里的说明。
+/// **余额类字段用这个**：本家的 `remaining` / `quota` / `used_quota` /
+/// stock 的 `balance` 本身就是人民币，换汇会把余额虚增 7 倍。
+/// 只有**单价**是美元，走 [`amount_cny`]。
 pub fn amount(v: &Option<Decimalish>) -> Option<f64> {
     v.as_ref().and_then(Decimalish::to_f64)
 }
 
-/// 本家的**美元 → 人民币**换汇率。
+/// 本家**单价**的美元 → 人民币换汇率。
 ///
-/// 本家早期按人民币计价，现已改为**美元**，而系统其余部分（面板展示、单价上限、
-/// 余额阈值、扣费统计）全按人民币口径。若把美元数直接接进去，2.2 USD 会被当成
-/// 2.2 CNY —— 单价上限、余额告警全部失真。故在 DTO 边界一次性换算，之后不再区分。
+/// 本家单价早期按人民币计价，现已改为**美元**，而系统其余部分（面板展示、单价
+/// 上限、扣费统计）全按人民币口径。若把美元单价直接接进去，2.2 USD 会被当成
+/// 2.2 CNY —— 单价上限判断失真。故在 DTO 边界一次性换算。
+///
+/// **只对单价生效**：余额类字段（`remaining` / `quota` / `used_quota` / stock 的
+/// `balance`）卖家给的就是人民币，走 [`amount`] 原样接入。
 pub const USD_TO_CNY: f64 = 7.0;
 
-/// 把卖家的美元金额换算成人民币。
+/// 把卖家的美元**单价**换算成人民币，**保留两位小数**。
 ///
-/// 所有落到共享结构体（`ProfileInfo` / `StockInfo` / `PurchaseResult`）的金额都
-/// 必须过这里 —— 漏一个就是一个口径不一致的字段，而金额口径错了不会报错，只会
-/// 静默算错钱。
+/// 仅用于 `price` 字段。余额类字段用 [`amount`] —— 口径错了不会报错，只会静默
+/// 算错钱。
+///
+/// 换汇后必须收敛到两位：卖家单价本就是两位小数（`"2.20"`），但 `2.2 * 7.0` 在
+/// 二进制浮点下是 `15.400000000000002`，而面板直接渲染这个数字（不做格式化），
+/// 会显示成一长串尾数。金额只保留到分，与卖家的报价精度一致。
 pub fn amount_cny(v: &Option<Decimalish>) -> Option<f64> {
-    amount(v).map(|v| v * USD_TO_CNY)
+    amount(v).map(|v| round2(v * USD_TO_CNY))
+}
+
+/// 四舍五入到两位小数（金额精度到分）。
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 /// 计数字段的兼容层。理由与 [`Decimalish`] 相同但后果重得多：本家已知会把
@@ -137,13 +151,13 @@ impl KeyEntry {
 pub struct ProfileResponse {
     #[serde(default)]
     pub name: Option<String>,
-    /// 累计充值总额（**USD**，接出去时折成 CNY）
+    /// 累计充值总额（**CNY**，原样接出）
     #[serde(default)]
     pub quota: Option<Decimalish>,
-    /// 当前可用余额（**USD**，接出去时折成 CNY）
+    /// 当前可用余额（**CNY**，原样接出）
     #[serde(default)]
     pub remaining: Option<Decimalish>,
-    /// 累计消费总额（**USD**，接出去时折成 CNY）
+    /// 累计消费总额（**CNY**，原样接出）
     #[serde(default)]
     pub used_quota: Option<Decimalish>,
     /// 已配置的 webhook 地址，未配置时是空串
@@ -157,10 +171,10 @@ impl From<ProfileResponse> for ProfileInfo {
             name: r.name,
             email: None,
             // 与首家一致：「可用余额」叫 remaining，不是 quota
-            // 三个数都是美元，按 USD_TO_CNY 折成人民币口径
-            balance: amount_cny(&r.remaining),
-            quota: amount_cny(&r.quota),
-            used_quota: amount_cny(&r.used_quota),
+            // 三个数都是人民币，不换汇（只有单价是美元）
+            balance: amount(&r.remaining),
+            quota: amount(&r.quota),
+            used_quota: amount(&r.used_quota),
             // 文档未给限购字段
             min_purchase: None,
             max_purchase: None,
@@ -207,7 +221,8 @@ impl From<StatusResponse> for StockInfo {
 /// 账号维度接口都在 `/api/my` 下，只有这一个在 `/api/me`，别顺手改成 my。
 ///
 /// 金额沿用 [`Decimalish`]：本家 `price` 与 `balance` 都是字符串
-/// （`"2.20"` / `"340.500000"`），单位是**美元**，见 [`USD_TO_CNY`]。
+/// （`"2.20"` / `"340.500000"`）。**单位不同**：`price` 是美元（折 CNY，见
+/// [`USD_TO_CNY`]），`balance` 本身就是人民币（原样）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct StockResponse {
     /// 当前可提取库存数
@@ -216,7 +231,7 @@ pub struct StockResponse {
     /// 单价（**USD**）。本家单一定价，故 min 与 max 同值。
     #[serde(default)]
     pub price: Option<Decimalish>,
-    /// 可用余额（**USD**），与 `/api/my/profile` 的 `remaining` 同一个数，
+    /// 可用余额（**CNY**，不换汇），与 `/api/my/profile` 的 `remaining` 同一个数，
     /// 接上后面板不必再为余额单独发一次 profile 请求。
     #[serde(default)]
     pub balance: Option<Decimalish>,
@@ -224,14 +239,14 @@ pub struct StockResponse {
 
 impl From<StockResponse> for StockInfo {
     fn from(r: StockResponse) -> Self {
-        // 本家报价是美元，折成人民币再往下走
+        // 本家报价是美元，折成人民币再往下走；余额本身是人民币，不折
         let price = amount_cny(&r.price);
         Self {
             available: r.stock.unwrap_or(0),
             // 单一定价：区间的两端都是同一个价，面板会因此显示单值而非范围
             price_min: price,
             price_max: price,
-            balance: amount_cny(&r.balance),
+            balance: amount(&r.balance),
             // 该卖家不分区
             zones: Vec::new(),
         }
@@ -249,7 +264,7 @@ pub struct PurchaseResponse {
     pub client_order_id: Option<String>,
     #[serde(default)]
     pub purchased: Countish,
-    /// 购买后的剩余余额（**USD**，字符串）
+    /// 购买后的剩余余额（**CNY**，字符串，不换汇）
     #[serde(default)]
     pub remaining: Option<Decimalish>,
     #[serde(default)]
@@ -277,8 +292,8 @@ impl From<PurchaseResponse> for PurchaseResult {
         Self {
             purchased,
             requested: None,
-            // 本家的「剩余」是账户余额，原始单位是美元，折成人民币
-            remaining: amount_cny(&r.remaining),
+            // 本家的「剩余」是账户余额，本身就是人民币，不换汇
+            remaining: amount(&r.remaining),
             // 文档未给单价与扣费明细
             unit_price: None,
             total_debit: None,
@@ -342,10 +357,10 @@ mod tests {
             "remaining":"884.400000","used_quota":"1115.600000",
             "webhook_url":"https://your-server.example/hook"}"#;
         let p: ProfileInfo = serde_json::from_str::<ProfileResponse>(raw).unwrap().into();
-        // 卖家给的是美元，接出来一律是人民币（× USD_TO_CNY）
-        assert_eq!(p.balance, Some(884.4 * USD_TO_CNY), "可用余额取 remaining 而非 quota");
-        assert_eq!(p.quota, Some(2000.0 * USD_TO_CNY));
-        assert_eq!(p.used_quota, Some(1115.6 * USD_TO_CNY));
+        // 余额类字段卖家给的就是人民币，不换汇
+        assert_eq!(p.balance, Some(884.4), "可用余额取 remaining 而非 quota");
+        assert_eq!(p.quota, Some(2000.0));
+        assert_eq!(p.used_quota, Some(1115.6));
         assert_eq!(p.webhook_url.as_deref(), Some("https://your-server.example/hook"));
         assert_eq!(p.name.as_deref(), Some("someone@example.com"));
     }
@@ -372,12 +387,34 @@ mod tests {
     fn 美元金额按汇率折成人民币() {
         let r: StockResponse = serde_json::from_str(r#"{"price":"2.20"}"#).unwrap();
         assert_eq!(amount(&r.price), Some(2.2), "amount 给原始美元数");
-        assert_eq!(amount_cny(&r.price), Some(15.400000000000002), "2.20 USD → 15.40 CNY");
+        // 恰好 15.40 而非 15.400000000000002 —— 换汇后收敛到两位，面板直接渲染
+        // 这个数字，不收敛就会显示成一长串尾数
+        assert_eq!(amount_cny(&r.price), Some(15.4), "2.20 USD → 15.40 CNY");
 
         // 缺失与不可解析仍是 None，换汇不该把它变成 0
         assert_eq!(amount_cny(&None), None);
         let bad: StockResponse = serde_json::from_str(r#"{"price":"暂无"}"#).unwrap();
         assert_eq!(amount_cny(&bad.price), None);
+    }
+
+    /// 换汇结果必须是两位小数的「干净」数字。
+    ///
+    /// 卖家报价本身两位（`"2.20"`），乘 7 后二进制浮点会带尾数。面板不做格式化，
+    /// 直接把这个 f64 渲染出来，故收敛必须发生在后端。
+    #[test]
+    fn 换汇后收敛到两位小数() {
+        let cases = [
+            ("2.20", 15.4),   // 2.2 * 7 = 15.400000000000002
+            ("30.00", 210.0), // 精确值，不该被动到
+            ("0.07", 0.49),   // 0.07 * 7 = 0.48999999999999994
+            ("1.23", 8.61),   // 1.23 * 7 = 8.610000000000001
+        ];
+        for (raw, want) in cases {
+            let r: StockResponse =
+                serde_json::from_str(&format!(r#"{{"price":"{raw}"}}"#)).unwrap();
+            let got = amount_cny(&r.price).unwrap();
+            assert_eq!(got, want, "{raw} USD 折人民币应为 {want}，实得 {got}");
+        }
     }
 
     /// 未配置 webhook 时返回空串，不能当成「已配置一个空地址」
@@ -411,14 +448,31 @@ mod tests {
         let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
         assert_eq!(s.available, 0);
         // 单一定价：区间两端同值，面板据此显示单值而非范围。
-        // 2.20 USD → 15.40 CNY
-        assert_eq!(s.price_min, Some(2.2 * USD_TO_CNY));
-        assert_eq!(s.price_max, Some(2.2 * USD_TO_CNY));
-        // 余额顺带给出，省一次 profile 请求
-        assert_eq!(s.balance, Some(340.5 * USD_TO_CNY));
+        // 2.20 USD → 15.40 CNY（字面量而非 2.2 * USD_TO_CNY：换汇后已收敛到两位）
+        assert_eq!(s.price_min, Some(15.4));
+        assert_eq!(s.price_max, Some(15.4));
+        // 余额顺带给出，省一次 profile 请求；它本身是人民币，不换汇
+        assert_eq!(s.balance, Some(340.5));
         // 该家不分区
         assert!(s.zones.is_empty());
         assert!(s.pick_zone().is_none());
+    }
+
+    /// 混合口径的回归锚：文档明写 `price` 是 **USD**、`balance` 是 **CNY**。
+    ///
+    /// 这两个字段在同一份响应里、同为字符串、同为金额，唯一区别是单位 ——
+    /// 一律换汇或一律不换汇都不会报错，只会静默算错钱。故用文档原样的数值钉住：
+    /// 余额若被误折成 14420，单价上限与余额告警会同时失真。
+    #[test]
+    fn 库存报价_单价美元而余额人民币() {
+        let raw = r#"{"stock":120,"price":"30.00","balance":"2060.00"}"#;
+        let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
+        assert_eq!(s.available, 120);
+        // 单价是美元，折人民币：30 USD → 210 CNY
+        assert_eq!(s.price_min, Some(210.0));
+        assert_eq!(s.price_max, Some(210.0));
+        // 余额本身就是人民币，原样接出，绝不是 2060 × 7
+        assert_eq!(s.balance, Some(2060.0), "余额是 CNY，换汇会虚增 7 倍");
     }
 
     #[test]
@@ -427,8 +481,8 @@ mod tests {
         let raw = r#"{"stock":7,"price":2.2,"balance":340.5}"#;
         let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
         assert_eq!(s.available, 7);
-        assert_eq!(s.price_min, Some(2.2 * USD_TO_CNY));
-        assert_eq!(s.balance, Some(340.5 * USD_TO_CNY));
+        assert_eq!(s.price_min, Some(15.4));
+        assert_eq!(s.balance, Some(340.5));
     }
 
     #[test]
@@ -446,7 +500,7 @@ mod tests {
         let s: StockInfo = serde_json::from_str::<StockResponse>(raw).unwrap().into();
         assert_eq!(s.available, 3);
         assert!(s.price_min.is_none());
-        assert_eq!(s.balance, Some(340.5 * USD_TO_CNY));
+        assert_eq!(s.balance, Some(340.5));
     }
 
     /// 跨模块契约：`/api/status` 的完整响应由 legacy 的 `VendorSystemStatus`
@@ -481,7 +535,7 @@ mod tests {
         let r: PurchaseResult = serde_json::from_str::<PurchaseResponse>(raw).unwrap().into();
         assert_eq!(r.purchased, 2);
         assert_eq!(r.keys.len(), 2);
-        assert_eq!(r.remaining, Some(884.4 * USD_TO_CNY), "剩余即账户余额，已折人民币");
+        assert_eq!(r.remaining, Some(884.4), "剩余即账户余额，本就是人民币，不换汇");
         assert_eq!(
             r.order_id.as_deref(),
             Some("0123456789abcdef0123456789abcdef")
@@ -517,7 +571,7 @@ mod tests {
             .into();
         assert_eq!(r.purchased, 2);
         assert_eq!(r.keys.len(), 2);
-        assert_eq!(r.remaining, Some(884.4 * USD_TO_CNY));
+        assert_eq!(r.remaining, Some(884.4));
 
         // 带小数的字符串按截断取整
         let raw = r#"{"purchased":"2.0","keys":[]}"#;
