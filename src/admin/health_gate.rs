@@ -34,6 +34,10 @@ use reqwest::Client;
 use crate::model::config::HealthGateConfig;
 
 use super::trace_db::SharedTraceStore;
+// 本地新增判据依赖单独成行，避免与上游对 use 块的重排相撞。
+use crate::kiro::token_manager::MultiTokenManager;
+
+use super::health_probe::SharedProbeState;
 
 /// 判据窗口：固定 60 秒，对齐概览页「报错 · 近 1 分钟」那张卡。
 const WINDOW_SECS: i64 = 60;
@@ -69,11 +73,105 @@ impl Health {
     }
 }
 
+/// 一轮判定的输入读数。
+///
+/// 抽成结构体是为了让判定逻辑能脱离运行中的 token manager / 探测器单独测试——
+/// 判定规则是这个特性的核心，必须能被测试锁住。
+#[derive(Debug, Clone, Copy)]
+struct Readings {
+    /// 近 60 秒报错条数。**依赖流量**：零流量时恒为 0。
+    errors: u64,
+    /// 可用凭据数 / 总凭据数。存量指标，不依赖流量。
+    available: usize,
+    total: usize,
+    /// 探测侧是否已连续失败到阈值。不依赖流量。
+    probe_failing: bool,
+}
+
+/// 判定为不稳定的具体原因，用于日志归因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnstableReason {
+    /// 凭据池可用比例过低（含全部不可用）
+    CredentialsExhausted,
+    /// 主动探测连续失败：凭据看着好，但链路出不了货
+    ProbeFailing,
+    /// 报错数达阈值
+    ErrorsOverThreshold,
+}
+
+impl UnstableReason {
+    fn label(self) -> &'static str {
+        match self {
+            UnstableReason::CredentialsExhausted => "凭据池可用比例过低",
+            UnstableReason::ProbeFailing => "主动探测连续失败",
+            UnstableReason::ErrorsOverThreshold => "报错数达阈值",
+        }
+    }
+}
+
+/// 三路判据合一。返回不稳定的原因，`None` 表示稳定。
+///
+/// # 为什么必须是「或」而不是投票
+///
+/// 三路各覆盖一类互不重叠的故障，任一路报警都是真故障：
+///
+/// | 判据 | 覆盖的故障 | 零流量下有效 |
+/// |---|---|---|
+/// | 可用凭据比例 | 凭据耗尽、token 失效 | 有效 |
+/// | 主动探测 | 凭据都好但推理接口坏了 | 有效 |
+/// | 报错数 | 兜底，抓前两者漏的 | **无效** |
+///
+/// 关键在于：**报错数这一路只能用来判不稳定，绝不能单独用来判稳定**。它是绝对条数
+/// （= 错误率 × 流量），兜底池一开、流量被分走，读数必然掉到阈值以下，那时「没量」
+/// 与「健康」无法区分。前两路不从请求派生，所以「兜底开了导致本地没量」不会让它们
+/// 的读数变好——这才是打破震荡环的地方。
+///
+/// 判定为稳定要求三路同时无异常，其中前两路是实打实的正面证据。
+fn judge(r: Readings, config: &HealthGateConfig) -> Option<UnstableReason> {
+    // 底线：一张可用的都没有 → 请求必然失败或排队，无可争辩的不可用。
+    // `total == 0` 是「一张凭据都没配」，同样不叫健康。
+    // 这条不受 min_available_ratio 影响，永远生效。
+    if r.total == 0 || r.available == 0 {
+        return Some(UnstableReason::CredentialsExhausted);
+    }
+
+    // 可选的余量判据，**默认关闭**。
+    //
+    // 为什么默认关：`available_count()` 把限流冷却中（`throttled_until` 未到期）的
+    // 凭据也算作不可用，而账号级 429 冷却是正常运行中的预期行为，不是故障。
+    // 流量一大就有大批凭据在冷却里轮转，比例天然很低——此时系统完全健康。
+    // 而且方向是反的：流量越大 → 冷却的越多 → 比例越低 → 越倾向判不稳定，
+    // 会在系统最正常忙碌的时候误报。
+    //
+    // 10 张里只有 1 张可用也可能完全正常：这 1 张能不能扛住取决于当前流量和它的
+    // 剩余配额，与「另外 9 张在冷却」没有直接关系。
+    //
+    // 保留配置项是给「想要余量预警」的运维口味用的，默认 0 表示不参与判定。
+    if config.min_available_ratio > 0.0 {
+        let ratio = r.available as f64 / r.total as f64;
+        if ratio < config.min_available_ratio {
+            return Some(UnstableReason::CredentialsExhausted);
+        }
+    }
+
+    if r.probe_failing {
+        return Some(UnstableReason::ProbeFailing);
+    }
+
+    if r.errors >= config.error_threshold {
+        return Some(UnstableReason::ErrorsOverThreshold);
+    }
+
+    None
+}
+
 /// 启动看门狗后台任务。配置不完整时直接返回，不起任务。
 pub fn spawn(
     config: HealthGateConfig,
     trace_store: SharedTraceStore,
     client: Client,
+    token_manager: Arc<MultiTokenManager>,
+    probe_state: Option<SharedProbeState>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.is_usable() {
         if config.enabled {
@@ -92,13 +190,28 @@ pub fn spawn(
         confirmations = config.confirmations,
         reaffirm_secs = config.reaffirm_interval_secs,
         max_attempts = config.max_attempts,
+        min_available_ratio = config.min_available_ratio,
+        probe = probe_state.is_some(),
+        probe_failures = config.probe_failures,
         "健康联动看门狗已启动：本地稳则关闭外部调度，不稳则打开"
     );
 
-    Some(tokio::spawn(run(Arc::new(config), trace_store, client)))
+    Some(tokio::spawn(run(
+        Arc::new(config),
+        trace_store,
+        client,
+        token_manager,
+        probe_state,
+    )))
 }
 
-async fn run(config: Arc<HealthGateConfig>, trace_store: SharedTraceStore, client: Client) {
+async fn run(
+    config: Arc<HealthGateConfig>,
+    trace_store: SharedTraceStore,
+    client: Client,
+    token_manager: Arc<MultiTokenManager>,
+    probe_state: Option<SharedProbeState>,
+) {
     let interval = Duration::from_secs(config.check_interval_secs.max(5));
     // 防抖计数：候选态 + 已连续观察到几次。
     let mut candidate = Health::Unknown;
@@ -113,23 +226,40 @@ async fn run(config: Arc<HealthGateConfig>, trace_store: SharedTraceStore, clien
     loop {
         tokio::time::sleep(interval).await;
 
-        if !trace_store.is_enabled() {
-            if !warned_trace_off {
-                tracing::warn!("健康联动：trace 已关闭，近 1 分钟报错数不再更新，联动暂停");
-                warned_trace_off = true;
-            }
-            continue;
+        // trace 关闭时只失去「报错数」这一路判据，凭据池存量与主动探测都不依赖它，
+        // 所以整体联动继续跑，不再像早期版本那样整个暂停。报错数按 0 计入，
+        // 也就是这一路不再指控——但它本来就只有指控权、没有放行权（见 judge 的说明），
+        // 所以按 0 处理不会造成「因为读不到数据而误判为健康」。
+        let trace_on = trace_store.is_enabled();
+        if !trace_on && !warned_trace_off {
+            tracing::warn!(
+                "健康联动：trace 已关闭，报错数判据失效，改由凭据池存量与主动探测判定"
+            );
+            warned_trace_off = true;
         }
-        if warned_trace_off {
-            tracing::info!("健康联动：trace 已恢复，联动继续");
+        if trace_on && warned_trace_off {
+            tracing::info!("健康联动：trace 已恢复，报错数判据重新生效");
             warned_trace_off = false;
         }
 
-        let errors = trace_store.recent_counters(WINDOW_SECS).errors;
-        let observed = if errors >= config.error_threshold {
-            Health::Unstable
-        } else {
-            Health::Stable
+        let readings = Readings {
+            errors: if trace_on {
+                trace_store.recent_counters(WINDOW_SECS).errors
+            } else {
+                0
+            },
+            available: token_manager.available_count(),
+            total: token_manager.total_count_in_group(None),
+            probe_failing: probe_state
+                .as_ref()
+                .map(|s| s.is_failing(config.probe_failures))
+                .unwrap_or(false),
+        };
+
+        let reason = judge(readings, &config);
+        let observed = match reason {
+            Some(_) => Health::Unstable,
+            None => Health::Stable,
         };
 
         // 防抖：候选态变了就重新计数。
@@ -158,16 +288,34 @@ async fn run(config: Arc<HealthGateConfig>, trace_store: SharedTraceStore, clien
         };
         if flipped {
             tracing::info!(
-                errors_1m = errors,
+                errors_1m = readings.errors,
                 threshold = config.error_threshold,
+                available = readings.available,
+                total = readings.total,
+                probe_failing = readings.probe_failing,
+                reason = reason.map(|r| r.label()).unwrap_or("三路判据均正常"),
                 from = applied.label(),
                 to = observed.label(),
                 schedulable,
                 "健康联动：本地状态翻转，推送外部调度开关"
             );
         } else {
+            // 重推是低频动作（默认 5 分钟一次），在这里带上探测器的累计计数，
+            // 用来观测「有成功就跳过」实际省下了多少次付费调用。
+            let (probes, skipped) = probe_state
+                .as_ref()
+                .map(|s| s.counters())
+                .unwrap_or((0, 0));
             tracing::debug!(
-                errors_1m = errors,
+                errors_1m = readings.errors,
+                available = readings.available,
+                total = readings.total,
+                probe_failing = readings.probe_failing,
+                probes_sent = probes,
+                probes_skipped = skipped,
+                probe_last_success_secs = probe_state
+                    .as_ref()
+                    .and_then(|s| s.secs_since_success()),
                 state = observed.label(),
                 schedulable,
                 "健康联动：定期重推当前判定"
@@ -396,6 +544,181 @@ mod tests {
         let c = HealthGateConfig::default();
         assert_eq!(c.reaffirm_interval_secs, 300);
         assert_eq!(c.max_attempts, 3);
+    }
+
+    // ── 三路判据的测试。这是本特性的核心规则，必须被锁住 ──────────────────
+    // 尤其是「报错数只有指控权、没有放行权」那条：它是打破震荡环的关键，
+    // 一旦被改成可以单独判稳定，环就回来了。
+
+    /// 默认判据配置：比例维度关闭（与线上默认一致），只有 available==0 是底线。
+    fn 判据配置() -> HealthGateConfig {
+        HealthGateConfig {
+            error_threshold: 10,
+            probe_failures: 2,
+            ..Default::default()
+        }
+    }
+
+    /// 健康基线：凭据充足、探测正常、无报错。
+    fn 健康读数() -> Readings {
+        Readings {
+            errors: 0,
+            available: 10,
+            total: 10,
+            probe_failing: false,
+        }
+    }
+
+    #[test]
+    fn 三路均正常才判稳定() {
+        assert_eq!(judge(健康读数(), &判据配置()), None);
+    }
+
+    #[test]
+    fn 零流量不能推出稳定_这是震荡环的根源() {
+        // 场景复现：兜底池已打开，本地流量被分走 → 报错数为 0。
+        // 若只看报错数会判"稳定"→ 关兜底 → 流量涌回 → 全报错 → 再开，循环往复。
+        // 凭据池存量与探测都不依赖流量，因此仍能正确判为不稳定。
+        let c = 判据配置();
+
+        // 凭据耗尽，但因为没量所以报错数是 0
+        let 凭据耗尽 = Readings {
+            errors: 0,
+            available: 0,
+            total: 10,
+            probe_failing: false,
+        };
+        assert_eq!(
+            judge(凭据耗尽, &c),
+            Some(UnstableReason::CredentialsExhausted),
+            "零流量下报错数为 0，但凭据耗尽仍须判为不稳定"
+        );
+
+        // 凭据全好、推理接口坏了：这是存量信号的盲区，只有探测能发现
+        let 探测失败 = Readings {
+            errors: 0,
+            available: 10,
+            total: 10,
+            probe_failing: true,
+        };
+        assert_eq!(
+            judge(探测失败, &c),
+            Some(UnstableReason::ProbeFailing),
+            "凭据看着全好，但链路出不了货，须由探测判为不稳定"
+        );
+    }
+
+    #[test]
+    fn 报错数达阈值单独也能判不稳定() {
+        // 报错数有指控权：前两路漏掉的故障靠它兜底
+        let r = Readings {
+            errors: 10,
+            ..健康读数()
+        };
+        assert_eq!(
+            judge(r, &判据配置()),
+            Some(UnstableReason::ErrorsOverThreshold)
+        );
+    }
+
+    #[test]
+    fn 默认不按比例判定_少量可用凭据算正常() {
+        // 关键：10 张里只剩 1 张可用是正常状态，不该判不稳定。
+        // available_count() 把限流冷却中的凭据算作不可用，而账号级 429 冷却是
+        // 正常运行中的预期行为。流量一大就有大批凭据在冷却里轮转，若按比例判，
+        // 会在系统最正常忙碌的时候误报——方向恰好是反的。
+        let c = 判据配置();
+        for available in 1..=10 {
+            let r = Readings {
+                available,
+                total: 10,
+                ..健康读数()
+            };
+            assert_eq!(
+                judge(r, &c),
+                None,
+                "10 张里有 {} 张可用，应判稳定",
+                available
+            );
+        }
+    }
+
+    #[test]
+    fn 一张可用的都没有是底线_不受比例配置影响() {
+        let 全不可用 = Readings {
+            available: 0,
+            total: 10,
+            ..健康读数()
+        };
+        // 比例判据关着（默认）也要拦
+        assert_eq!(
+            judge(全不可用, &判据配置()),
+            Some(UnstableReason::CredentialsExhausted)
+        );
+        // 比例判据开着当然也拦
+        let 开比例 = HealthGateConfig {
+            min_available_ratio: 0.2,
+            ..判据配置()
+        };
+        assert_eq!(
+            judge(全不可用, &开比例),
+            Some(UnstableReason::CredentialsExhausted)
+        );
+    }
+
+    #[test]
+    fn 一张凭据都没配不算健康() {
+        // total=0 时 available/total 无意义，不能当"比例达标"放行
+        let r = Readings {
+            available: 0,
+            total: 0,
+            ..健康读数()
+        };
+        assert_eq!(
+            judge(r, &判据配置()),
+            Some(UnstableReason::CredentialsExhausted)
+        );
+    }
+
+    #[test]
+    fn 显式开启比例判据后按阈值生效() {
+        // 保留该配置项是给「想要余量预警」的口味用，默认关闭。
+        let c = HealthGateConfig {
+            min_available_ratio: 0.2,
+            ..判据配置()
+        };
+        let 比例达标 = Readings {
+            available: 2,
+            total: 10,
+            ..健康读数()
+        };
+        assert_eq!(judge(比例达标, &c), None, "0.2 不低于 0.2，达标");
+
+        let 比例不足 = Readings {
+            available: 1,
+            total: 10,
+            ..健康读数()
+        };
+        assert_eq!(
+            judge(比例不足, &c),
+            Some(UnstableReason::CredentialsExhausted),
+            "0.1 低于 0.2"
+        );
+    }
+
+    #[test]
+    fn 判据优先级_凭据耗尽先于探测与报错() {
+        // 三路同时异常时按归因价值排序：凭据耗尽是最根本的原因
+        let 全异常 = Readings {
+            errors: 100,
+            available: 0,
+            total: 10,
+            probe_failing: true,
+        };
+        assert_eq!(
+            judge(全异常, &判据配置()),
+            Some(UnstableReason::CredentialsExhausted)
+        );
     }
 
     #[test]

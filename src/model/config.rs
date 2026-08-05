@@ -354,6 +354,51 @@ pub struct HealthGateConfig {
     /// 直接放弃并留给下个周期——那类问题得改配置，不是等一等就好。
     #[serde(default = "default_health_gate_max_attempts")]
     pub max_attempts: u32,
+
+    // ── 以下为「不依赖流量的判据」相关配置 ────────────────────────────────
+    // 报错绝对条数在闭环里会失效（兜底一开、流量被分走，分子塌了，「没量」和
+    // 「健康」读数一样），所以补两类零流量下依然有效的判据：凭据池存量、主动探测。
+    /// 可用凭据比例低于此值即判不稳定。**默认 0，即不启用该维度。**
+    ///
+    /// 注意这个判据容易误报，默认关闭是刻意的：`available_count()` 把限流冷却中
+    /// （`throttled_until` 未到期）的凭据也算作不可用，而账号级 429 冷却是正常
+    /// 运行中的预期行为、不是故障。流量一大就有大批凭据在冷却里轮转，比例天然
+    /// 很低，此时系统完全健康。方向还是反的：流量越大 → 冷却越多 → 比例越低
+    /// → 越倾向判不稳定，会在系统最正常忙碌的时候误报。
+    ///
+    /// 10 张里只有 1 张可用也可能完全正常——能不能扛住取决于当前流量和这张的
+    /// 剩余配额，与另外 9 张在冷却无关。
+    ///
+    /// 无论此项如何配置，「`available == 0`（一张可用的都没有）」始终判不稳定，
+    /// 那条是底线，不受这里影响。
+    #[serde(default = "default_health_gate_min_available_ratio")]
+    pub min_available_ratio: f64,
+
+    /// 是否开启主动探测（默认关闭）。
+    ///
+    /// 探测发的是**真实推理请求、会计费**，所以默认不开。它覆盖的是存量信号的
+    /// 盲区：凭据全好但推理接口坏了的时候 available 是满的，只能真出一次货才知道。
+    #[serde(default)]
+    pub probe_enabled: bool,
+
+    /// 探测间隔（秒，默认 30）。同时是「窗口内有成功请求则跳过本轮」的窗口长度。
+    ///
+    /// 因为有成功就跳过，探测频率天然与流量成反比：忙时一次不发，闲时才发，
+    /// 而闲时正是存量信号覆盖不到、真正需要探测的时刻。
+    #[serde(default = "default_health_gate_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+
+    /// 探测用的模型 ID（默认 `claude-opus-5`）。
+    ///
+    /// 用用户真实在用的模型探测，测出来的健康度才有意义，不会出现「便宜模型通了
+    /// 但主力模型挂了」的假阳性。代价是这是最贵的档，且可能有独立额度——
+    /// 配置前请确认高频探测不会啃掉用户真正要用的配额。
+    #[serde(default = "default_health_gate_probe_model")]
+    pub probe_model: String,
+
+    /// 连续多少次探测失败才判不稳定（默认 2）。单次网络抖动不下结论。
+    #[serde(default = "default_health_gate_probe_failures")]
+    pub probe_failures: u32,
 }
 
 impl Default for HealthGateConfig {
@@ -369,6 +414,11 @@ impl Default for HealthGateConfig {
             confirmations: default_health_gate_confirmations(),
             reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
             max_attempts: default_health_gate_max_attempts(),
+            min_available_ratio: default_health_gate_min_available_ratio(),
+            probe_enabled: false,
+            probe_interval_secs: default_health_gate_probe_interval_secs(),
+            probe_model: default_health_gate_probe_model(),
+            probe_failures: default_health_gate_probe_failures(),
         }
     }
 }
@@ -417,6 +467,24 @@ fn default_health_gate_reaffirm_interval_secs() -> u64 {
 
 fn default_health_gate_max_attempts() -> u32 {
     3
+}
+
+fn default_health_gate_min_available_ratio() -> f64 {
+    // 0 = 不启用比例判据，只保留 available == 0 那条底线。
+    // 理由见 `min_available_ratio` 字段注释：限流冷却会让比例在系统健康时也很低。
+    0.0
+}
+
+fn default_health_gate_probe_interval_secs() -> u64 {
+    30
+}
+
+fn default_health_gate_probe_model() -> String {
+    "claude-opus-5".to_string()
+}
+
+fn default_health_gate_probe_failures() -> u32 {
+    2
 }
 
 /// KNA 应用配置

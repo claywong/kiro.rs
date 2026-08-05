@@ -273,8 +273,29 @@ async fn main() {
         )
     });
 
-    // 健康联动看门狗：按近 1 分钟报错数反向推外部系统的账号调度开关
+    // 健康探测器：周期发真实推理请求，判断本地链路还能不能出货。
+    // 只在 healthGate 整体可用且显式开了 probeEnabled 时才起——它是要花钱的。
+    // 必须先于看门狗构建，因为看门狗要读它的状态。
+    let health_probe_state = if config.health_gate.is_usable() && config.health_gate.probe_enabled {
+        Some(admin::health_probe::spawn(
+            admin::health_probe::ProbeOptions {
+                interval_secs: config.health_gate.probe_interval_secs,
+                model_id: config.health_gate.probe_model.clone(),
+            },
+            kiro_provider.clone(),
+            admin_trace_store.clone(),
+        ))
+    } else {
+        None
+    };
+
+    // 健康联动看门狗：把本地健康度反向推成外部系统的账号调度开关
     // （本地稳 → 关掉外部调度；本地不稳 → 打开）。配置不完整时内部直接跳过。
+    //
+    // 判据三路合一：凭据池存量 + 主动探测 + 报错数。前两路不依赖流量，
+    // 这很关键——只用报错绝对条数会震荡：兜底一开、流量被分走，报错数必然掉到
+    // 阈值下，于是判为健康又关掉兜底，流量涌回来再全报错，如此往复。
+    //
     // 用独立 Client：对方是普通 JSON 接口，不需要流式那套读超时。
     match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
         Ok(client) => {
@@ -282,6 +303,8 @@ async fn main() {
                 config.health_gate.clone(),
                 admin_trace_store.clone(),
                 client,
+                token_manager.clone(),
+                health_probe_state.clone(),
             );
         }
         Err(e) => {

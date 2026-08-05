@@ -695,6 +695,37 @@ impl TraceStore {
     }
 }
 
+// 本地新增：健康联动看门狗用的成功数查询。单独成 impl 块，避免与上游对
+// `recent_counters` / `RecentCounters` 的改动相撞（那个结构体带 Serialize，
+// 是概览接口响应体的一部分，往里加字段会牵动上游的前后端契约）。
+impl TraceStore {
+    /// 最近若干秒内**成功**的请求条数（`final_status = 'success'`）。
+    ///
+    /// 供健康探测判断「是否还需要发探测请求」：窗口内有成功记录，说明真实流量
+    /// 已经证明链路能出货，探测就没必要发，省一次真实推理调用。
+    ///
+    /// 刻意只数 `success`，不含 `interrupted`：客户端主动断开既不能证明系统正常
+    /// 出货，也不能算服务端故障，拿它跳过探测会漏判。
+    ///
+    /// 失败仅 warn 并返回 0。返回 0 会让调用方倾向于「照常探测」，这是安全的
+    /// 降级方向——查询挂了宁可多发一次探测，也不要因为读不到数据而误判为健康。
+    pub fn recent_success_count(&self, window_secs: i64) -> u64 {
+        let cutoff = Utc::now().timestamp() - window_secs;
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT COUNT(*) FROM traces WHERE ts_epoch >= ?1 AND final_status = 'success'",
+            [cutoff],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => v as u64,
+            Err(e) => {
+                tracing::warn!("trace recent_success_count 查询失败: {}", e);
+                0
+            }
+        }
+    }
+}
+
 /// 某个时间窗口内的报错数与重试数
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -20,7 +20,12 @@
     "accountIds": [],
     "errorThreshold": 10,
     "checkIntervalSecs": 30,
-    "confirmations": 2
+    "confirmations": 2,
+    "minAvailableRatio": 0.0,
+    "probeEnabled": false,
+    "probeIntervalSecs": 30,
+    "probeModel": "claude-opus-5",
+    "probeFailures": 2
   },
   "vendors": [
     {
