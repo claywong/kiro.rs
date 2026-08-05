@@ -244,6 +244,8 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
                 "capabilities": s.capabilities(),
                 "inboundEnabled": s.config().inbound_enabled(),
                 "autoPurchase": s.auto_purchase(),
+                // 逐家独立：开着的只看自己，关着的按全局阈值判
+                "perChannel": s.per_channel(),
                 "unacked": unacked,
             })
         })
@@ -255,8 +257,6 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
         // 全局提取限制。放在这里而不是按家查的 /status —— 它跨供应商，
         // 塞进单家状态会让「切换标签页后这个值变不变」变成一个需要解释的问题。
         "poolTarget": state.registry.pool_gate().target(),
-        // 逐渠道补货。同上，跨供应商的全局设置。为 true 时 poolTarget 不参与判断
-        "perChannel": state.registry.pool_gate().per_channel(),
     }))
     .into_response()
 }
@@ -326,6 +326,9 @@ pub async fn get_status(State(state): State<VendorState>, Query(sel): Query<Vend
         // 未命中任何时段时的兜底值，用于在面板上区分「按时段」还是「按默认」
         "autoPurchaseBaseMaxCount": cfg.auto_purchase_max_count,
         "autoPurchaseWindow": service.auto_active_window(),
+        // 逐渠道补货（运行时值）。开着则本家只看自己有没有存活 Key，
+        // 不看全局池量；关着则按 autoPurchasePoolTarget 判总量
+        "autoPurchasePerChannel": service.per_channel(),
     });
 
     // 库存与档案两家都有；其余按能力集选择性发起
@@ -670,21 +673,25 @@ pub struct SetPerChannelRequest {
     pub per_channel: bool,
 }
 
-/// `PUT /api/admin/vendor/per-channel` —— 设置逐渠道补货模式
+/// `PUT /api/admin/vendor/per-channel?vendorId=xxx` —— 设置**某一家**的逐渠道补货
 ///
-/// 与 `set_pool_target` 相同，这是全局设置，不接受 `vendorId`。
+/// 与 `set_pool_target` 不同，这是**逐家**设置，要认 `vendorId` —— 每家可以各自
+/// 决定是「只看自己」还是「按全局总量」，混合配置是本特性的用法而非误配。
 pub async fn set_per_channel(
     State(state): State<VendorState>,
+    Query(sel): Query<VendorSelector>,
     Json(req): Json<SetPerChannelRequest>,
 ) -> Response {
-    let Some(service) = state.registry.default_service() else {
-        return err_response(VendorServiceError::NotConfigured);
+    let service = match pick(&state, &sel) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     let result = service.set_per_channel(req.per_channel);
     tracing::info!(
+        vendor_id = %service.vendor_id(),
         per_channel = result.per_channel,
         persisted = result.persisted,
-        "逐渠道补货模式已更新"
+        "逐渠道补货已更新"
     );
     Json(result).into_response()
 }

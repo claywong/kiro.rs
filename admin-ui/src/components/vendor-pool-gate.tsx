@@ -4,13 +4,8 @@ import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { vendorErrorMessage } from '@/api/vendor'
-import {
-  useVendorList,
-  useSetVendorPoolTarget,
-  useSetVendorPerChannel,
-} from '@/hooks/use-vendor'
+import { useVendorList, useSetVendorPoolTarget } from '@/hooks/use-vendor'
 
 /**
  * 全局提取限制。跨所有卖家共享，故摆在供应商标签页之外。
@@ -23,17 +18,18 @@ import {
  * 组合，语义上等于永久禁止自动补货，几乎肯定是误填。用单一数字 + 0 表示不启用，
  * 与后端 `autoPurchaseSchedule` 的 `maxCount: 0` 是同一套约定。
  *
- * 「逐渠道补货」是另一套判据，不是这个阈值的修饰项：打开后判据换成「本家有没有
- * 存活 Key」，阈值**完全不参与**。故它打开时把阈值一栏整体置灰 —— 若只是加一行
- * 说明而让输入框看着照常可用，会让人以为两者叠加生效。
+ * 「逐渠道补货」不在这里 —— 它是**逐家**配置，在各家标签页的状态条上
+ * （见 `vendor-status-bar.tsx`）。本阈值只管那些没开逐渠道的家，但统计的池量
+ * **包含**开了的那些家买来的号。
  */
 export function VendorPoolGate() {
   const { data: vendorList } = useVendorList()
   const setPoolTarget = useSetVendorPoolTarget()
-  const setPerChannel = useSetVendorPerChannel()
 
   const saved = vendorList?.poolTarget ?? 0
-  const perChannel = vendorList?.perChannel ?? false
+  // 开了逐渠道的家数：混合配置时阈值要大于它，否则那些家的常驻号会占满总量
+  const perChannelCount =
+    vendorList?.vendors?.filter((v) => v.perChannel).length ?? 0
   const [input, setInput] = useState(String(saved))
 
   // 服务端值变化时同步到输入框（首次加载完成、或保存后拉回实际值）。
@@ -72,102 +68,54 @@ export function VendorPoolGate() {
     }
   }
 
-  const handleToggle = async (next: boolean) => {
-    try {
-      const r = await setPerChannel.mutateAsync(next)
-      const what = r.perChannel
-        ? '已开启逐渠道补货'
-        : '已关闭逐渠道补货，恢复按全局阈值判断'
-      if (r.persisted) {
-        toast.success(what)
-      } else {
-        toast.warning(`${what}，但未能写入配置文件`, {
-          description: r.warning
-            ? `${r.warning}。重启后会回退到文件里的值。`
-            : '重启后会回退到文件里的值。',
-        })
-      }
-    } catch (e) {
-      toast.error(vendorErrorMessage(e, '设置逐渠道补货失败'))
-    }
-  }
-
   return (
     <Card>
-      <CardContent className="flex flex-col gap-3 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="text-sm font-medium">逐渠道补货</div>
-          <Switch
-            checked={perChannel}
-            onCheckedChange={handleToggle}
-            disabled={setPerChannel.isPending}
-            aria-label="只看本渠道有没有存活 Key，没有就补货"
+      <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
+        <div className="text-sm font-medium">全局提取限制</div>
+
+        <div className="flex items-center gap-2">
+          <Input
+            type="number"
+            min={0}
+            step={1}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && dirty) handleSave()
+            }}
+            className="h-8 w-20 tabular-nums"
+            aria-label="池中存活卖家 Key 的上限，0 表示不限制"
           />
-          <div className="min-w-0 flex-1 text-xs text-muted-foreground">
-            {perChannel ? (
-              <>
-                判据为「<strong>本渠道</strong>无存活 Key 即补货」，各家互不影响。
-                每家会各自维持库存，故账号消耗约为渠道数倍 —— 买到的号若很快被封，
-                本渠道又回到无存活，会再补一张。
-              </>
-            ) : (
-              <>
-                关闭时按下方全局阈值判断：只看池子总量，不区分渠道。
-                开启后改为每家各自维持库存，可用性更高但账号消耗更大。
-              </>
-            )}
-          </div>
+          <Button
+            size="sm"
+            onClick={handleSave}
+            disabled={!dirty || setPoolTarget.isPending}
+          >
+            {setPoolTarget.isPending ? '保存中…' : '保存'}
+          </Button>
         </div>
 
-        <div
-          className={`flex flex-wrap items-center gap-x-4 gap-y-2 border-t pt-3 ${
-            perChannel ? 'opacity-50' : ''
-          }`}
-        >
-          <div className="text-sm font-medium">全局提取限制</div>
-
-          <div className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={0}
-              step={1}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && dirty) handleSave()
-              }}
-              disabled={perChannel}
-              className="h-8 w-20 tabular-nums"
-              aria-label="池中存活卖家 Key 的上限，0 表示不限制"
-            />
-            <Button
-              size="sm"
-              onClick={handleSave}
-              disabled={perChannel || !dirty || setPoolTarget.isPending}
-            >
-              {setPoolTarget.isPending ? '保存中…' : '保存'}
-            </Button>
-          </div>
-
-          <div className="min-w-0 flex-1 text-xs text-muted-foreground">
-            {perChannel ? (
-              <>
-                逐渠道补货已开启，<strong>本项不参与判断</strong>
-                （保留的值会在关闭逐渠道后重新生效）。
-              </>
-            ) : (
-              <>
-                {saved === 0 ? (
-                  <>当前不限制。多家卖家的 Key 同期失效时，每家会各自补一次货。</>
-                ) : (
-                  <>池中存活的卖家 Key 达到 {saved} 个时，各家都不再自动补货。</>
-                )}
-                <span className="ml-1">
-                  填 0 表示不限制。此项与各家自己的「单次提取上限」是两层限制：后者管一笔提多少，此项管池子总量。
-                </span>
-              </>
-            )}
-          </div>
+        <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+          {saved === 0 ? (
+            <>
+              当前不限制。多家卖家的 Key 同期失效时，每家会各自补一次货。
+            </>
+          ) : (
+            <>
+              池中存活的卖家 Key 达到 {saved} 个时，各家都不再自动补货。
+            </>
+          )}
+          <span className="ml-1">
+            填 0 表示不限制。此项与各家自己的「单次提取上限」是两层限制：后者管一笔提多少，此项管池子总量。
+          </span>
+          {/* 混合配置的坑：开了逐渠道的家常驻的号会占满这个阈值，
+              把没开的家挤死。数字对不上时这里直接点出来。 */}
+          {perChannelCount > 0 && saved > 0 && saved <= perChannelCount && (
+            <span className="ml-1 text-amber-600 dark:text-amber-500">
+              有 {perChannelCount} 家开了「逐渠道补货」，它们常驻的 Key 会占满这个
+              上限，其余家将无法自动补货 —— 需把本值设为大于 {perChannelCount}。
+            </span>
+          )}
         </div>
       </CardContent>
     </Card>

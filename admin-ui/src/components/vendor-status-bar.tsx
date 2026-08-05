@@ -17,7 +17,7 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 import { Switch } from '@/components/ui/switch'
 import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
-  useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode,
+  useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode, useSetVendorPerChannel,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 // 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
@@ -198,6 +198,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   const setWebhookUrl = useSetVendorWebhookUrl(vendorId)
   const purchaseAdHoc = usePurchaseAdHoc(vendorId)
   const setMode = useSetVendorMode(vendorId)
+  const setPerChannel = useSetVendorPerChannel(vendorId)
   const confirm = useConfirm()
 
   const [redeemOpen, setRedeemOpen] = useState(false)
@@ -311,6 +312,40 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   }
 
   /**
+   * 切逐渠道补货。开启要确认 —— 它会让本家独立维持库存，账号消耗上升。
+   *
+   * 关闭不确认：从"各自保底"退回"按总量控"，只会少买不会多买。
+   */
+  const handleTogglePerChannel = async (next: boolean) => {
+    if (next) {
+      const ok = await confirm({
+        title: '开启逐渠道补货？',
+        description:
+          '开启后本家只看自己有没有存活 Key，没有就补货，不再受全局提取限制约束。' +
+          '本家会独立维持库存，账号消耗会上升；买来的号若很快被封，本家又回到无存活，' +
+          '会再补一张。' +
+          '注意：本家常驻的 Key 仍会计入全局池量，可能把其他未开本项的家挤到无法补货。',
+        confirmText: '开启',
+        destructive: true,
+      })
+      if (!ok) return
+    }
+    try {
+      const r = await setPerChannel.mutateAsync(next)
+      const what = r.perChannel ? '本家已改为独立补货' : '本家已改回按全局总量'
+      if (!r.persisted) {
+        toast.warning(`${what}（仅本次运行）`, {
+          description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
+        })
+        return
+      }
+      toast.success(what)
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换逐渠道补货失败'))
+    }
+  }
+
+  /**
    * 直接提取：不依赖 webhook 事件，服务端自行生成订单号。
    * 会真实扣费，故强制二次确认并把数量、预计扣费、余额变化列清楚。
    */
@@ -408,6 +443,29 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
             aria-label="切换自动 / 手动提取模式"
           />
         </div>
+
+        {/* 逐渠道补货：只在自动模式下有意义，手动模式下整块隐藏 ——
+            手动提取不过任何闸门，摆在那里只会让人以为它有作用。 */}
+        {status?.autoPurchase && (
+          <div className="flex items-center gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-1.5">
+            <div className="text-xs">
+              <span className="font-medium">
+                {status.autoPurchasePerChannel ? '本家独立补货' : '按全局总量'}
+              </span>
+              <span className="ml-1.5 text-muted-foreground">
+                {status.autoPurchasePerChannel
+                  ? '只看本家有没有存活 Key，不受别家影响'
+                  : '按「全局提取限制」判池子总量，含别家的 Key'}
+              </span>
+            </div>
+            <Switch
+              checked={status.autoPurchasePerChannel ?? false}
+              onCheckedChange={handleTogglePerChannel}
+              disabled={setPerChannel.isPending}
+              aria-label="切换逐渠道补货"
+            />
+          </div>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
         {/* 测试推送与写入地址都走卖家的 webhook 管理 API，没这能力的家一律隐藏 */}

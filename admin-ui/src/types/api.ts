@@ -654,6 +654,8 @@ export interface VendorListItem {
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
+  /** 逐渠道补货（逐家独立）：true = 只看本家存活，false = 按全局阈值判总量 */
+  perChannel: boolean
   unacked: number
 }
 
@@ -667,13 +669,6 @@ export interface VendorListResponse {
    * 跨供应商共享，故随清单一起返回而不在按家查的 `/status` 里。
    */
   poolTarget?: number
-  /**
-   * 逐渠道补货：判据换成「本家有没有存活 Key」，本家没有就补。
-   *
-   * 为 true 时 `poolTarget` **不参与判断** —— 两个判据同时生效会让
-   * `poolTarget=1` 把第二家挡死，那正是本模式要解掉的约束。
-   */
-  perChannel?: boolean
 }
 
 /** 卖家账号档案（已统一为 camelCase） */
@@ -720,6 +715,16 @@ export interface VendorStatus {
   autoPurchaseBaseMaxCount?: number
   /** 当前命中的时段描述，如 `14:00–23:00`；未配时段表或未命中为 null */
   autoPurchaseWindow?: string | null
+  /**
+   * 逐渠道补货（运行时值，逐家独立）。
+   *
+   * - `true`：本家只看**自己**有没有存活 Key，没有就补，不看全局池量
+   * - `false`：按 `poolTarget` 判池子总量，而该总量**包含**开着本项的那些家
+   *
+   * 不对称是刻意的。混合配置时 `poolTarget` 要大于「开着本项的家数」，
+   * 否则那些家常驻的号会占满总量，关着的家永远轮不到补货。
+   */
+  autoPurchasePerChannel?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string

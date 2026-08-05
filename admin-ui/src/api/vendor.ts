@@ -189,14 +189,18 @@ export async function setVendorPoolTarget(
 }
 
 /**
- * 设置逐渠道补货模式。与 `setVendorPoolTarget` 同为全局设置，不带 vendorId。
+ * 设置**某一家**的逐渠道补货。与 `setVendorPoolTarget` 不同，这是逐家设置，
+ * 必须带 vendorId —— 每家可以各自决定判据，混合配置是本特性的用法。
  */
 export async function setVendorPerChannel(
-  perChannel: boolean
+  perChannel: boolean,
+  vendorId?: string
 ): Promise<VendorPerChannelChange> {
-  const { data } = await api.put<VendorPerChannelChange>('/per-channel', {
-    perChannel,
-  })
+  const { data } = await api.put<VendorPerChannelChange>(
+    '/per-channel',
+    { perChannel },
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }
 

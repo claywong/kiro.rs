@@ -234,6 +234,8 @@ pub struct VendorService {
     /// 提取模式的运行时值。`config.auto_purchase` 只是启动快照，面板切换后
     /// 以本字段为准 —— 读它而不是读 config。
     auto_purchase: AtomicBool,
+    /// 逐渠道补货的运行时值。同上，面板切换后以本字段为准。
+    per_channel: AtomicBool,
     /// 跨供应商共享的全局提取闸门。各家持有同一个 Arc。
     pool_gate: Arc<PoolGate>,
 }
@@ -248,6 +250,7 @@ impl VendorService {
         pool_gate: Arc<PoolGate>,
     ) -> Self {
         let auto_purchase = config.auto_purchase;
+        let per_channel = config.auto_purchase_per_channel;
         Self {
             config,
             proxy,
@@ -255,6 +258,7 @@ impl VendorService {
             store,
             admin,
             auto_purchase: AtomicBool::new(auto_purchase),
+            per_channel: AtomicBool::new(per_channel),
             pool_gate,
         }
     }
@@ -366,11 +370,17 @@ impl VendorService {
         Ok(())
     }
 
-    /// 设置逐渠道补货模式：先改运行时值，再尽力写回 config.json。
+    /// 本家当前是否开着逐渠道补货
+    pub fn per_channel(&self) -> bool {
+        self.per_channel.load(Ordering::Relaxed)
+    }
+
+    /// 切本家的逐渠道补货：先改运行时值，再尽力写回 config.json。
     ///
-    /// 与 `set_pool_target` 同理，改的是所有家共享的那一个闸门。
+    /// 逐家独立，改这一家不影响别家。与 `set_auto_purchase` 同样的取舍 ——
+    /// 持久化失败不算切换失败，由返回的 `persisted` 告知面板。
     pub fn set_per_channel(&self, per_channel: bool) -> PerChannelChange {
-        self.pool_gate.set_per_channel(per_channel);
+        self.per_channel.store(per_channel, Ordering::Relaxed);
         match self.persist_per_channel(per_channel) {
             Ok(()) => PerChannelChange {
                 per_channel,
@@ -378,7 +388,7 @@ impl VendorService {
                 warning: None,
             },
             Err(e) => {
-                tracing::warn!("持久化逐渠道补货模式失败（运行时已生效）: {}", e);
+                tracing::warn!("持久化逐渠道补货失败（运行时已生效）: {}", e);
                 PerChannelChange {
                     per_channel,
                     persisted: false,
@@ -386,27 +396,6 @@ impl VendorService {
                 }
             }
         }
-    }
-
-    fn persist_per_channel(&self, per_channel: bool) -> anyhow::Result<()> {
-        use anyhow::Context;
-        let config_path = self
-            .admin
-            .token_manager()
-            .config()
-            .config_path()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                anyhow::anyhow!("配置文件路径未知，逐渠道补货模式仅在当前进程生效")
-            })?;
-
-        let mut config = crate::model::config::Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.auto_purchase_per_channel = per_channel;
-        config
-            .save()
-            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
-        Ok(())
     }
 
     /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
@@ -448,6 +437,50 @@ impl VendorService {
         }
         if !hit {
             anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化提取模式");
+        }
+
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 写回 config.json 里**本供应商那一项**的 `autoPurchasePerChannel`。
+    ///
+    /// 与 [`Self::persist_auto_purchase`] 同一套查找方式：单例 `vendor` 与列表
+    /// `vendors` 都找一遍，同一个 id 只会命中一处（`resolved_vendors` 已去重）。
+    fn persist_per_channel(&self, per_channel: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，逐渠道补货仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+
+        let target = self.vendor_id();
+        let mut hit = false;
+        if let Some(v) = config.vendor.as_mut()
+            && v.vendor_id() == target
+        {
+            v.auto_purchase_per_channel = per_channel;
+            hit = true;
+        }
+        if !hit {
+            for v in config.vendors.iter_mut() {
+                if v.vendor_id() == target {
+                    v.auto_purchase_per_channel = per_channel;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化逐渠道补货");
         }
 
         config
@@ -898,7 +931,10 @@ impl VendorService {
         });
 
         let census = auto::census(&self.vendor_key_states(), vid);
-        match auto::decide_authorization(verdict.as_ref(), self.pool_gate.gating_active(), census) {
+        // 兜底路径的刹车：本家开了逐渠道就靠本家盘点，否则靠全局阈值。
+        // 两者皆无时不放行兜底（见 `decide_authorization` 的联锁说明）。
+        let gating_active = self.per_channel() || self.pool_gate.enabled();
+        match auto::decide_authorization(verdict.as_ref(), gating_active, census) {
             auto::AuthDecision::DeadEvent => Ok(PurchaseAuthorization::DeadEvent {
                 // 走到这个分支必然有记录，否则判定函数不会给出 DeadEvent
                 event_id: dead
@@ -921,20 +957,26 @@ impl VendorService {
 
         // 2. 全局提取锁。必须在盘点之前拿到，并持有到下单+导入结束 ——
         //    否则三家并发时会同时读到「池里 0 个存活」再同时下单，闸门形同虚设。
-        //    两种模式都要串行化：逐渠道模式跳过的是阈值判断，不是并发保护 ——
+        //    开了逐渠道的家**也要**取锁：它跳过的是阈值判断，不是并发保护 ——
         //    同一家的两条推送并发到达时，若不串行化会各下一单、两张都记在本家。
         //    两种刹车皆无时不必付串行化的代价（此时兜底路径也已被拒），跳过取锁。
-        let _gate = if self.pool_gate.gating_active() {
+        let per_channel = self.per_channel();
+        let _gate = if per_channel || self.pool_gate.enabled() {
             Some(self.pool_gate.acquire().await?)
         } else {
             None
         };
 
-        // 3. 全局池量闸。零成本本地读，故排在出站查库存之前。
-        //    这里重新盘点而非复用步骤 1 的结论：等锁期间别家可能已经补过货了，
-        //    锁前的池量视图已经过期。
-        self.pool_gate
-            .check(auto::pool_alive(&self.vendor_key_states()))?;
+        // 3. 全局池量闸，**仅对没开逐渠道的家生效**。零成本本地读，故排在出站
+        //    查库存之前。这里重新盘点而非复用步骤 1 的结论：等锁期间别家可能
+        //    已经补过货了，锁前的池量视图已经过期。
+        //
+        //    开了逐渠道的家跳过这一步：判据已由步骤 1 的本家盘点给出。注意它买来
+        //    的号**仍会计入**别家的 `pool_alive` —— 刻意的不对称，见配置项文档。
+        if !per_channel {
+            self.pool_gate
+                .check(auto::pool_alive(&self.vendor_key_states()))?;
+        }
 
         // 4. 数量：三者取最小，为 0 则无可提
         let stock = self
