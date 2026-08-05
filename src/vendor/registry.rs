@@ -35,9 +35,17 @@ impl VendorRegistry {
         store: SharedVendorStore,
         admin: Arc<AdminService>,
         pool_target: u32,
+        per_channel: bool,
     ) -> Self {
-        let pool_gate = PoolGate::new(pool_target);
-        if pool_target > 0 {
+        let pool_gate = PoolGate::with_mode(pool_target, per_channel);
+        if per_channel {
+            // 两者同时配置时阈值不生效，明确告知 —— 否则面板上看到 target 还写着
+            // 数字，会以为它仍在拦。
+            tracing::info!(
+                pool_target,
+                "逐渠道补货已启用：判据为「本家无存活即补」，全局提取限制不再参与判断"
+            );
+        } else if pool_target > 0 {
             tracing::info!(pool_target, "全局提取限制已启用");
         }
         let services = vendors
@@ -82,6 +90,7 @@ impl VendorRegistry {
             store,
             admin,
             config.auto_purchase_pool_target,
+            config.auto_purchase_per_channel,
         )
     }
 

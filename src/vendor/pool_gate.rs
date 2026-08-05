@@ -19,7 +19,7 @@
 //! @author wangzhong
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
@@ -35,14 +35,24 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct PoolGate {
     /// 运行时阈值。0 = 不启用。面板改后立即生效，故用原子量而非读 config 快照。
     target: AtomicU32,
+    /// 逐渠道模式：判据换成「本家有没有存活」，全局阈值不再参与。
+    /// 见 [`Config::auto_purchase_per_channel`](crate::model::config::Config::auto_purchase_per_channel)。
+    per_channel: AtomicBool,
     /// 提取串行锁。守护「盘点 → 下单 → 导入」这段临界区。
     lock: Mutex<()>,
 }
 
 impl PoolGate {
+    /// 仅全局阈值模式。生产路径走 [`Self::with_mode`]，本构造留给测试。
+    #[cfg(test)]
     pub fn new(target: u32) -> Arc<Self> {
+        Self::with_mode(target, false)
+    }
+
+    pub fn with_mode(target: u32, per_channel: bool) -> Arc<Self> {
         Arc::new(Self {
             target: AtomicU32::new(target),
+            per_channel: AtomicBool::new(per_channel),
             lock: Mutex::new(()),
         })
     }
@@ -56,9 +66,26 @@ impl PoolGate {
         self.target.store(target, Ordering::Relaxed);
     }
 
-    /// 是否启用了池闸
+    pub fn per_channel(&self) -> bool {
+        self.per_channel.load(Ordering::Relaxed)
+    }
+
+    pub fn set_per_channel(&self, on: bool) {
+        self.per_channel.store(on, Ordering::Relaxed);
+    }
+
+    /// 是否启用了全局阈值闸
     pub fn enabled(&self) -> bool {
         self.target() > 0
+    }
+
+    /// 是否放行「就地盘点」兜底路径，以及是否需要串行化。
+    ///
+    /// 两种模式各自提供了刹车，都算有刹车：全局阈值靠池量上限，逐渠道靠本家
+    /// 盘点（买到即 `alive == 1`，下一条推送被 `StillAlive` 拒）。两者皆关时
+    /// 兜底无上限，必须维持原行为（只认卖家额度）。
+    pub fn gating_active(&self) -> bool {
+        self.enabled() || self.per_channel()
     }
 
     /// 取提取锁。`Err` 表示等待超时，调用方应记跳过而非继续下单。
@@ -76,7 +103,14 @@ impl PoolGate {
     /// 按阈值判断当前池量是否已够用。`Err(原因)` 表示本轮不该补货。
     ///
     /// 未启用（阈值 0）时一律放行，保持升级前后行为一致。
+    ///
+    /// 逐渠道模式下**一律放行**：该模式的判据是「本家有没有存活」，已由调用方
+    /// 的 `census` 判完。此处若还按池量拦，`target=1` 会把第二家挡死 —— 那正是
+    /// 本模式要解掉的约束，两个判据同时生效等于开关无效。
     pub fn check(&self, pool_alive: u32) -> Result<(), String> {
+        if self.per_channel() {
+            return Ok(());
+        }
         let target = self.target();
         if target == 0 {
             return Ok(());
@@ -132,6 +166,21 @@ mod tests {
         let msg = PoolGate::new(2).check(5).unwrap_err();
         assert!(msg.contains('5'), "要说明当前池量: {msg}");
         assert!(msg.contains('2'), "要说明阈值: {msg}");
+    }
+
+    #[test]
+    fn 逐渠道模式一律放行() {
+        let g = PoolGate::with_mode(1, true);
+        assert!(g.per_channel());
+        assert!(g.gating_active(), "per_channel 也算有刹车");
+        // 池量超阈值也放行 —— per_channel 开启时阈值不参与判断
+        assert!(g.check(99).is_ok());
+    }
+
+    #[test]
+    fn 两种刹车皆无时兜底不放行() {
+        let g = PoolGate::with_mode(0, false);
+        assert!(!g.gating_active(), "两种刹车皆无");
     }
 
     /// 固定 `service.rs` 里的实际用法：`let _gate = if enabled { Some(acquire) } else { None }`。

@@ -255,6 +255,8 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
         // 全局提取限制。放在这里而不是按家查的 /status —— 它跨供应商，
         // 塞进单家状态会让「切换标签页后这个值变不变」变成一个需要解释的问题。
         "poolTarget": state.registry.pool_gate().target(),
+        // 逐渠道补货。同上，跨供应商的全局设置。为 true 时 poolTarget 不参与判断
+        "perChannel": state.registry.pool_gate().per_channel(),
     }))
     .into_response()
 }
@@ -657,6 +659,32 @@ pub async fn set_pool_target(
         pool_target = result.pool_target,
         persisted = result.persisted,
         "全局提取限制已更新"
+    );
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPerChannelRequest {
+    /// true = 逐渠道补货（本家无存活即补），false = 全局阈值
+    pub per_channel: bool,
+}
+
+/// `PUT /api/admin/vendor/per-channel` —— 设置逐渠道补货模式
+///
+/// 与 `set_pool_target` 相同，这是全局设置，不接受 `vendorId`。
+pub async fn set_per_channel(
+    State(state): State<VendorState>,
+    Json(req): Json<SetPerChannelRequest>,
+) -> Response {
+    let Some(service) = state.registry.default_service() else {
+        return err_response(VendorServiceError::NotConfigured);
+    };
+    let result = service.set_per_channel(req.per_channel);
+    tracing::info!(
+        per_channel = result.per_channel,
+        persisted = result.persisted,
+        "逐渠道补货模式已更新"
     );
     Json(result).into_response()
 }

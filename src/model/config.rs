@@ -698,6 +698,31 @@ pub struct Config {
     #[serde(default)]
     pub auto_purchase_pool_target: u32,
 
+    /// 逐渠道补货：只看**本家**有没有存活 Key，没有就买，不看池子总量。
+    ///
+    /// 与 `auto_purchase_pool_target` 是互斥的两种判据，打开本开关时**全局阈值
+    /// 不再参与判断**（否则 target=1 会把第二家挡死，正是本开关要解掉的约束）：
+    ///
+    /// | | 判据 | 常驻总量 |
+    /// |---|---|---|
+    /// | `poolTarget = N` | 池中存活 < N | N 张，来源不定 |
+    /// | `perChannel = true` | 本家存活 == 0 | 家数 × 各家 `autoPurchaseMaxCount` |
+    ///
+    /// 为什么它仍然是有界的：兜底路径（就地盘点）不消费卖家额度、会反复成立，
+    /// 原本唯一的刹车是全局阈值。本模式换了另一个刹车 —— **本家自己的盘点**：
+    /// 买到一张后本家 `alive == 1`，下一条推送即被 `StillAlive` 拒掉。故上限是
+    /// 「每家各常驻 `maxCount` 张」，不会无限扣费。
+    ///
+    /// 代价要清楚：本模式下每家都会各自维持库存，账号消耗量约等于家数倍。
+    /// 且买来的号若立刻被封（`Suspended`），本家又回到 `alive == 0`，会再买一张 ——
+    /// 这是本开关的**预期语义**（渠道无可用即补），封号率高时消耗会明显上升。
+    ///
+    /// 与全局锁的关系：本模式仍然取锁串行化「盘点 → 下单 → 导入」。跳过的只是
+    /// 阈值判断，不是并发保护 —— 同一家的两条推送并发到达时，若不串行化会各下
+    /// 一单，两张都记在本家名下。
+    #[serde(default)]
+    pub auto_purchase_per_channel: bool,
+
     /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
     ///
     /// 注意键名 `kiroapp` 指的是 kiroapp**.cc**，而非 `flavor: "kiroapp"` 对应的
@@ -863,6 +888,7 @@ impl Default for Config {
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,
+            auto_purchase_per_channel: false,
             legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),

@@ -238,13 +238,18 @@ pub enum AuthDecision {
 /// 此后 60+ 次新货通知期间再没推过），只认卖家事件会让这些家的自动提取在
 /// 消费掉第一张额度后**永久死锁**：额度作废了，而补发额度的事件永远不来。
 ///
-/// `pool_gate_enabled` 是兜底路径的**前置条件**，这是有意的联锁：就地盘点不
-/// 消费额度，只要本家无存活 Key 就会反复成立，唯一的上限是池闸。若池闸没开还
-/// 放行，等于每条新货通知都下一单且没有任何刹车。故池闸未启用时维持原行为 ——
-/// 只认卖家事件，宁可不自动提取，也不留一条无上限的扣费路径。
+/// `gating_active` 是兜底路径的**前置条件**，这是有意的联锁：就地盘点不消费
+/// 额度，只要本家无存活 Key 就会反复成立，必须有一个刹车兜住上限。若无刹车还
+/// 放行，等于每条新货通知都下一单。故两种刹车皆无时维持原行为 —— 只认卖家事件，
+/// 宁可不自动提取，也不留一条无上限的扣费路径。
+///
+/// 两种刹车都算：
+/// - 全局阈值（`autoPurchasePoolTarget > 0`）—— 上限是池中存活总量
+/// - 逐渠道（`autoPurchasePerChannel`）—— 上限是本家买到即 `alive == 1`，
+///   下一条推送被 `StillAlive` 拒掉，故每家常驻 `maxCount` 张
 pub fn decide_authorization(
     dead: Option<&DeadEventVerdict>,
-    pool_gate_enabled: bool,
+    gating_active: bool,
     census: VendorKeyCensus,
 ) -> AuthDecision {
     // 卖家给了可用额度就直接用。其余情形都记下原因转入兜底 ——
@@ -268,11 +273,12 @@ pub fn decide_authorization(
         },
     };
 
-    if !pool_gate_enabled {
+    if !gating_active {
         return AuthDecision::Denied {
             reason: format!(
-                "{vendor_verdict}，且未启用全局提取限制（autoPurchasePoolTarget=0），\
-                 不做就地盘点 —— 该兜底不消费额度，需池闸兜住上限"
+                "{vendor_verdict}，且未启用任何提取限制（autoPurchasePoolTarget=0 \
+                 且 autoPurchasePerChannel=false），不做就地盘点 —— \
+                 该兜底不消费额度，需其中一个兜住上限"
             ),
         };
     }

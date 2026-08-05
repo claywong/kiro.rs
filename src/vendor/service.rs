@@ -128,6 +128,19 @@ pub struct PoolTargetChange {
     pub warning: Option<String>,
 }
 
+/// 设置逐渠道补货模式的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerChannelChange {
+    /// 设置后的模式（运行时已生效）
+    pub per_channel: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
@@ -347,6 +360,49 @@ impl VendorService {
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.auto_purchase_pool_target = target;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 设置逐渠道补货模式：先改运行时值，再尽力写回 config.json。
+    ///
+    /// 与 `set_pool_target` 同理，改的是所有家共享的那一个闸门。
+    pub fn set_per_channel(&self, per_channel: bool) -> PerChannelChange {
+        self.pool_gate.set_per_channel(per_channel);
+        match self.persist_per_channel(per_channel) {
+            Ok(()) => PerChannelChange {
+                per_channel,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化逐渠道补货模式失败（运行时已生效）: {}", e);
+                PerChannelChange {
+                    per_channel,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    fn persist_per_channel(&self, per_channel: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                anyhow::anyhow!("配置文件路径未知，逐渠道补货模式仅在当前进程生效")
+            })?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_purchase_per_channel = per_channel;
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
@@ -842,7 +898,7 @@ impl VendorService {
         });
 
         let census = auto::census(&self.vendor_key_states(), vid);
-        match auto::decide_authorization(verdict.as_ref(), self.pool_gate.enabled(), census) {
+        match auto::decide_authorization(verdict.as_ref(), self.pool_gate.gating_active(), census) {
             auto::AuthDecision::DeadEvent => Ok(PurchaseAuthorization::DeadEvent {
                 // 走到这个分支必然有记录，否则判定函数不会给出 DeadEvent
                 event_id: dead
@@ -865,8 +921,10 @@ impl VendorService {
 
         // 2. 全局提取锁。必须在盘点之前拿到，并持有到下单+导入结束 ——
         //    否则三家并发时会同时读到「池里 0 个存活」再同时下单，闸门形同虚设。
-        //    未启用池闸时不必付串行化的代价，直接跳过取锁。
-        let _gate = if self.pool_gate.enabled() {
+        //    两种模式都要串行化：逐渠道模式跳过的是阈值判断，不是并发保护 ——
+        //    同一家的两条推送并发到达时，若不串行化会各下一单、两张都记在本家。
+        //    两种刹车皆无时不必付串行化的代价（此时兜底路径也已被拒），跳过取锁。
+        let _gate = if self.pool_gate.gating_active() {
             Some(self.pool_gate.acquire().await?)
         } else {
             None

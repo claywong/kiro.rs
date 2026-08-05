@@ -8,6 +8,7 @@ import type {
   VendorPurchaseResult,
   VendorRedeemResult,
   VendorListResponse,
+  VendorPerChannelChange,
   VendorPoolTargetChange,
 } from '@/types/api'
 
@@ -183,6 +184,18 @@ export async function setVendorPoolTarget(
 ): Promise<VendorPoolTargetChange> {
   const { data } = await api.put<VendorPoolTargetChange>('/pool-target', {
     poolTarget,
+  })
+  return data
+}
+
+/**
+ * 设置逐渠道补货模式。与 `setVendorPoolTarget` 同为全局设置，不带 vendorId。
+ */
+export async function setVendorPerChannel(
+  perChannel: boolean
+): Promise<VendorPerChannelChange> {
+  const { data } = await api.put<VendorPerChannelChange>('/per-channel', {
+    perChannel,
   })
   return data
 }

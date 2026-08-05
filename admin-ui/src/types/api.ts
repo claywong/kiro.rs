@@ -667,6 +667,13 @@ export interface VendorListResponse {
    * 跨供应商共享，故随清单一起返回而不在按家查的 `/status` 里。
    */
   poolTarget?: number
+  /**
+   * 逐渠道补货：判据换成「本家有没有存活 Key」，本家没有就补。
+   *
+   * 为 true 时 `poolTarget` **不参与判断** —— 两个判据同时生效会让
+   * `poolTarget=1` 把第二家挡死，那正是本模式要解掉的约束。
+   */
+  perChannel?: boolean
 }
 
 /** 卖家账号档案（已统一为 camelCase） */
@@ -756,6 +763,16 @@ export interface VendorModeChange {
 export interface VendorPoolTargetChange {
   /** 设置后的阈值（运行时已生效）。0 = 不启用 */
   poolTarget: number
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 设置逐渠道补货模式的结果 */
+export interface VendorPerChannelChange {
+  /** 设置后的模式（运行时已生效） */
+  perChannel: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */
