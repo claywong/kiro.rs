@@ -297,20 +297,21 @@ async fn main() {
     // 阈值下，于是判为健康又关掉兜底，流量涌回来再全报错，如此往复。
     //
     // 用独立 Client：对方是普通 JSON 接口，不需要流式那套读超时。
-    match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
-        Ok(client) => {
-            admin::health_gate::spawn(
+    // 返回的状态句柄交给 AdminService，面板据此读写总开关。
+    let health_gate_state =
+        match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
+            Ok(client) => admin::health_gate::spawn(
                 config.health_gate.clone(),
                 admin_trace_store.clone(),
                 client,
                 token_manager.clone(),
                 health_probe_state.clone(),
-            );
-        }
-        Err(e) => {
-            tracing::warn!("健康联动：HTTP 客户端构建失败，联动不启动: {}", e);
-        }
-    }
+            ),
+            Err(e) => {
+                tracing::warn!("健康联动：HTTP 客户端构建失败，联动不启动: {}", e);
+                None
+            }
+        };
 
     // AdminService 在此统一构建（而非仅在 Admin API 分支内）：卖家 webhook 提取 Key 后
     // 要复用它的 import_one_credential 入库，而入站 webhook 不该依赖 adminApiKey 是否配置。
@@ -318,7 +319,8 @@ async fn main() {
     let admin_service = std::sync::Arc::new(
         admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
             .with_kiro_provider(kiro_provider.clone())
-            .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone())),
+            .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone()))
+            .with_health_gate(health_gate_state.clone()),
     );
 
     // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。

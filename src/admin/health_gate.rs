@@ -27,6 +27,7 @@
 //! - 全流程失败只 warn，绝不影响主服务。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -165,15 +166,111 @@ fn judge(r: Readings, config: &HealthGateConfig) -> Option<UnstableReason> {
     None
 }
 
+/// 看门狗的运行时状态，面板读写走这里。
+///
+/// 为什么需要它：`enabled` 原本只在 spawn 时读一次，改配置要重启才生效。面板要
+/// 能随时停掉自动联动（例如手工接管期间），故把它提成原子位，循环每轮重新读。
+///
+/// 同时暴露 `applied`（已推给对方的值）。这一项是刻意加的：关掉开关时我们**不动
+/// 对方状态**（单向推送、不读对方），于是对方残留的是上次推过去的值。不显示的话
+/// 你关掉之后无从知道现在停在哪一档 —— 兜底池永久开着（计费）和永久关着（无兜底）
+/// 是两个后果完全不同的残留。把它显示出来，不确定性至少是可见的。
+/// 用原子量而非 `Mutex`：与 [`super::health_probe::ProbeState`] 同理，读侧（面板
+/// 按需查）与写侧（每轮一次）都是低频单值，没有需要保持一致的字段组合。
+///
+/// 两个三态字段编码成 `u8`：0 = 未知 / 尚无，1 / 2 见各自常量。
+pub struct GateState {
+    /// 运行时总开关。false = 停止周期判定与推送，不改对方状态。
+    enabled: AtomicBool,
+    /// 最近一次**成功推给对方**的 `schedulable`。
+    /// [`APPLIED_NONE`] = 本进程还没推过。
+    applied: AtomicU8,
+    /// 最近一轮判定结论。[`VERDICT_UNKNOWN`] = 还没判过。
+    verdict: AtomicU8,
+}
+
+/// 本进程尚未成功推送过
+const APPLIED_NONE: u8 = 0;
+const APPLIED_FALSE: u8 = 1;
+const APPLIED_TRUE: u8 = 2;
+
+/// 尚无判定（刚启动，或开关关着没在判）
+const VERDICT_UNKNOWN: u8 = 0;
+const VERDICT_STABLE: u8 = 1;
+const VERDICT_UNSTABLE: u8 = 2;
+
+impl GateState {
+    fn new(enabled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            enabled: AtomicBool::new(enabled),
+            applied: AtomicU8::new(APPLIED_NONE),
+            verdict: AtomicU8::new(VERDICT_UNKNOWN),
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// 已推给对方的 `schedulable`。`None` = 本进程还没推过 —— 此时对方可能残留
+    /// 上次运行留下的值，面板要照实说「未知」而不是猜一个。
+    pub fn applied(&self) -> Option<bool> {
+        match self.applied.load(Ordering::Relaxed) {
+            APPLIED_FALSE => Some(false),
+            APPLIED_TRUE => Some(true),
+            _ => None,
+        }
+    }
+
+    fn set_applied(&self, schedulable: bool) {
+        self.applied.store(
+            if schedulable { APPLIED_TRUE } else { APPLIED_FALSE },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 最近一轮判定。`None` = 还没判过（刚启动或开关关着）
+    pub fn verdict(&self) -> Option<&'static str> {
+        match self.verdict.load(Ordering::Relaxed) {
+            VERDICT_STABLE => Some("稳定"),
+            VERDICT_UNSTABLE => Some("不稳定"),
+            _ => None,
+        }
+    }
+
+    fn set_verdict(&self, health: Health) {
+        self.verdict.store(
+            match health {
+                Health::Stable => VERDICT_STABLE,
+                Health::Unstable => VERDICT_UNSTABLE,
+                Health::Unknown => VERDICT_UNKNOWN,
+            },
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// 共享句柄
+pub type SharedGateState = Arc<GateState>;
+
 /// 启动看门狗后台任务。配置不完整时直接返回，不起任务。
+/// 返回运行时状态句柄供面板读写；`None` 表示配置不全、没起任务。
+///
+/// 判据是 [`HealthGateConfig::is_configured`] 而非 `is_usable` —— 只要地址、token、
+/// 账号列表填全了就把循环起起来，`enabled` 交给循环每轮读。若按 `is_usable` 起，
+/// 启动时开关是关的就没有任何循环在跑，面板打开后要等重启才生效。
 pub fn spawn(
     config: HealthGateConfig,
     trace_store: SharedTraceStore,
     client: Client,
     token_manager: Arc<MultiTokenManager>,
     probe_state: Option<SharedProbeState>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !config.is_usable() {
+) -> Option<SharedGateState> {
+    if !config.is_configured() {
         if config.enabled {
             tracing::warn!(
                 "健康联动已开启但配置不完整（baseUrl / token / accountIds 需全部填写），本次不启动"
@@ -181,6 +278,8 @@ pub fn spawn(
         }
         return None;
     }
+
+    let state = GateState::new(config.enabled);
 
     tracing::info!(
         base_url = %config.normalized_base_url(),
@@ -193,16 +292,19 @@ pub fn spawn(
         min_available_ratio = config.min_available_ratio,
         probe = probe_state.is_some(),
         probe_failures = config.probe_failures,
-        "健康联动看门狗已启动：本地稳则关闭外部调度，不稳则打开"
+        enabled = config.enabled,
+        "健康联动看门狗已就绪：本地稳则关闭外部调度，不稳则打开（总开关可在面板切换）"
     );
 
-    Some(tokio::spawn(run(
+    tokio::spawn(run(
         Arc::new(config),
         trace_store,
         client,
         token_manager,
         probe_state,
-    )))
+        Arc::clone(&state),
+    ));
+    Some(state)
 }
 
 async fn run(
@@ -211,6 +313,7 @@ async fn run(
     client: Client,
     token_manager: Arc<MultiTokenManager>,
     probe_state: Option<SharedProbeState>,
+    state: SharedGateState,
 ) {
     let interval = Duration::from_secs(config.check_interval_secs.max(5));
     // 防抖计数：候选态 + 已连续观察到几次。
@@ -222,9 +325,36 @@ async fn run(
     let mut last_push = std::time::Instant::now();
     // trace 关闭的告警只打一次，避免每周期刷屏。
     let mut warned_trace_off = false;
+    // 总开关的上一轮状态，用于只在切换时打日志。
+    let mut was_enabled = state.enabled();
 
     loop {
         tokio::time::sleep(interval).await;
+
+        // 总开关：关着就什么都不做 —— 不判定、不推送，**也不改对方状态**。
+        // 对方会保持上次推过去的值，这是有意的（面板会把该值显示出来）：
+        // 关开关的动机通常是「我要手工接管」，此时替用户决定对方该开还是该关，
+        // 比留在原处更容易出错。
+        //
+        // 防抖计数一并清掉：关掉期间本地状态可能已经变了，重新打开时应从头
+        // 观察 confirmations 轮再推，而不是拿关闭前的半截 streak 直接翻转。
+        if !state.enabled() {
+            if was_enabled {
+                tracing::info!(
+                    applied = ?state.applied(),
+                    "健康联动：总开关已关闭，停止判定与推送（外部调度保持当前值不变）"
+                );
+                was_enabled = false;
+            }
+            candidate = Health::Unknown;
+            streak = 0;
+            state.set_verdict(Health::Unknown);
+            continue;
+        }
+        if !was_enabled {
+            tracing::info!("健康联动：总开关已开启，恢复周期判定");
+            was_enabled = true;
+        }
 
         // trace 关闭时只失去「报错数」这一路判据，凭据池存量与主动探测都不依赖它，
         // 所以整体联动继续跑，不再像早期版本那样整个暂停。报错数按 0 计入，
@@ -261,6 +391,9 @@ async fn run(
             Some(_) => Health::Unstable,
             None => Health::Stable,
         };
+        // 判定结论每轮都记，与推不推送无关 —— 面板要显示「它现在认为本地稳不稳」，
+        // 而防抖期间（streak 未满）是不推送的，那时也该有结论可看。
+        state.set_verdict(observed);
 
         // 防抖：候选态变了就重新计数。
         if observed == candidate {
@@ -325,6 +458,7 @@ async fn run(
         if push_all(&config, &client, schedulable).await {
             applied = observed;
             last_push = std::time::Instant::now();
+            state.set_applied(schedulable);
         }
         // 推送失败时 applied / last_push 都不变，下个周期会再试。
     }
@@ -489,6 +623,63 @@ mod tests {
         c.token = "t".into();
         c.account_ids.clear();
         assert!(!c.is_usable());
+    }
+
+    /// `is_configured` 不看 `enabled` —— 看门狗靠它决定要不要起循环，
+    /// 若跟着 `enabled` 走，启动时关着就没循环在跑，面板打开后要等重启才生效。
+    #[test]
+    fn 配置齐全与当前启用是两件事() {
+        let mut c = HealthGateConfig {
+            enabled: false,
+            base_url: "https://4code.us".into(),
+            token: "t".into(),
+            account_ids: vec![1],
+            ..Default::default()
+        };
+        assert!(c.is_configured(), "填全了就算已配置，与开关无关");
+        assert!(!c.is_usable(), "但当前没启用");
+
+        c.enabled = true;
+        assert!(c.is_usable());
+
+        // 缺任一项都不算已配置
+        c.account_ids.clear();
+        assert!(!c.is_configured());
+    }
+
+    #[test]
+    fn 总开关可运行时切换() {
+        let s = GateState::new(false);
+        assert!(!s.enabled());
+        s.set_enabled(true);
+        assert!(s.enabled());
+        s.set_enabled(false);
+        assert!(!s.enabled());
+    }
+
+    /// 未推送过要照实返回 None：此时对方可能残留上次运行留下的值，
+    /// 面板得显示「未知」而不是猜一个，否则会让人以为对方停在某个确定档位。
+    #[test]
+    fn 未推送过的已应用值为未知() {
+        let s = GateState::new(true);
+        assert_eq!(s.applied(), None);
+        s.set_applied(false);
+        assert_eq!(s.applied(), Some(false));
+        s.set_applied(true);
+        assert_eq!(s.applied(), Some(true));
+    }
+
+    #[test]
+    fn 判定结论可读回且未知态为空() {
+        let s = GateState::new(true);
+        assert_eq!(s.verdict(), None);
+        s.set_verdict(Health::Stable);
+        assert_eq!(s.verdict(), Some("稳定"));
+        s.set_verdict(Health::Unstable);
+        assert_eq!(s.verdict(), Some("不稳定"));
+        // 关掉开关时循环会写回 Unknown，面板据此显示「未判定」
+        s.set_verdict(Health::Unknown);
+        assert_eq!(s.verdict(), None);
     }
 
     #[test]

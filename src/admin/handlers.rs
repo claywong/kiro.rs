@@ -25,7 +25,7 @@ use super::{
         CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
+        SetHealthGateRequest, SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -580,6 +580,24 @@ pub async fn set_self_heal_config(
     Json(payload): Json<SetSelfHealConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_self_heal_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/health-gate
+/// 读健康联动总开关状态（含当前判定与已推给外部的值）
+pub async fn get_health_gate_state(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_health_gate_state())
+}
+
+/// PUT /api/admin/config/health-gate
+/// 切健康联动总开关（运行时生效 + 持久化）。关闭时不改外部系统当前状态
+pub async fn set_health_gate_state(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetHealthGateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_health_gate_enabled(payload.enabled) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -427,8 +427,17 @@ impl HealthGateConfig {
     /// 配置是否完整可用：开关开着，且基址 / token / 账号列表都给全了。
     /// 缺任一项都当没启用处理 —— 半配状态下静默不跑比每周期报错刷屏好。
     pub fn is_usable(&self) -> bool {
-        self.enabled
-            && !self.base_url.trim().is_empty()
+        self.enabled && self.is_configured()
+    }
+
+    /// 配置是否齐全（不看 `enabled`）。
+    ///
+    /// 与 [`Self::is_usable`] 的分工：本方法答「填全了吗」，`is_usable` 答
+    /// 「填全了且现在开着吗」。看门狗按本方法决定要不要**起任务** —— 起了之后
+    /// `enabled` 由面板运行时切换，若按 `is_usable` 起任务，启动时是关的就压根
+    /// 没有循环在跑，面板打开开关后要等到重启才生效。
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
             && !self.token.trim().is_empty()
             && !self.account_ids.is_empty()
     }

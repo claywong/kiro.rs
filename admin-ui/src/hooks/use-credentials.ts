@@ -18,7 +18,9 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getHealthGateState,
   getSelfHealConfig,
+  setHealthGateEnabled,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
@@ -278,6 +280,29 @@ export function useSetSelfHealConfig() {
     mutationFn: setSelfHealConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['selfHealConfig'] })
+    },
+  })
+}
+
+/**
+ * 健康联动总开关状态。30s 刷新以便观测判定与已推送值的变化
+ * （看门狗默认 30s 一轮，对齐它的节奏）。
+ */
+export function useHealthGateState() {
+  return useQuery({
+    queryKey: ['healthGateState'],
+    queryFn: getHealthGateState,
+    refetchInterval: 30_000,
+  })
+}
+
+// 切健康联动总开关
+export function useSetHealthGateEnabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setHealthGateEnabled,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['healthGateState'] })
     },
   })
 }
