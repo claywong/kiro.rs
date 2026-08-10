@@ -19,7 +19,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::registry::VendorRegistry;
-use super::service::{VendorService, VendorServiceError};
+use super::service::{AutoPurchaseSource, VendorService, VendorServiceError};
 use super::store::{
     DEFAULT_QUERY_LIMIT, IncomingEvent, PurchaseTrigger, RecordOutcome, VendorEventKind,
 };
@@ -198,7 +198,13 @@ fn dispatch_event(service: &std::sync::Arc<VendorService>, event: &IncomingEvent
                 );
                 return;
             }
-            service.spawn_auto_purchase(event.event_id.clone(), event.new_keys);
+            // Webhook 触发：**总闸对它永远有效**。绕过总闸只给库存轮询那条路，
+            // 见 AutoPurchaseSource 的说明。
+            service.spawn_auto_purchase(
+                event.event_id.clone(),
+                event.new_keys,
+                AutoPurchaseSource::Webhook,
+            );
         }
         // 滥用回收要人工介入（换号、排查调用方），程序不自动补货
         VendorEventKind::KeyRevokedAbuse => {

@@ -369,15 +369,29 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   /**
    * 切换轮询是否遵循全局总闸。
    *
-   * 关掉（总闸关着也继续轮询）会让轮询产生更多请求，但不会自动下单，
-   * 仅增加发现频率，故不需二次确认。
+   * **关掉要二次确认**：它让总闸对本家这条轮询链路整体失效，包括下单 ——
+   * 而总闸是能一键停掉全部自动扣费的急停，且会被健康联动自动翻转。
+   * 开回来不确认：从「越过急停」退回「受急停管」，只会少买不会多买。
    */
   const handleToggleStockPollRespectGate = async (next: boolean) => {
+    if (!next) {
+      const ok = await confirm({
+        title: '让轮询越过总闸？',
+        description:
+          '关闭后，即便全局总闸处于关闭状态，本家仍会继续轮询、发现新车并自动下单。' +
+          '也就是说总闸对本家不再是急停 —— 而总闸会被健康联动自动翻转。' +
+          '要停掉本家的自动扣费，得关本家的「自动提取」开关，或把轮询间隔改为 0。' +
+          '池闸、失效授权判定仍然生效，不会无上限扣费。',
+        confirmText: '确认越过',
+        destructive: true,
+      })
+      if (!ok) return
+    }
     try {
       const r = await setStockPollRespectGate.mutateAsync(next)
       const what = next
         ? '轮询已改为遵循总闸（总闸关闭时停止轮询）'
-        : '轮询已改为不受总闸影响（总闸关闭时仍继续发现新车）'
+        : '轮询已越过总闸（总闸关闭时本家仍会自动下单）'
       if (!r.persisted) {
         toast.warning(`${what}（仅本次运行）`, {
           description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
@@ -513,19 +527,25 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         )}
 
         {/* 库存轮询：只在开了轮询（stockPollIntervalSecs > 0）的家显示。
-            这个开关控制的只有「发现」这一步，下单仍由 autoPurchase 与各级闸门决定。 */}
+            关掉「遵循总闸」后总闸对本家整条轮询链路失效（含下单），故用告警色标出。 */}
         {status?.stockPollIntervalSecs && status.stockPollIntervalSecs > 0 && (
-          <div className="flex items-center gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-1.5">
+          <div
+            className={`flex items-center gap-2.5 rounded-md border px-3 py-1.5 ${
+              status.stockPollRespectGlobalGate
+                ? 'border-border bg-muted/30'
+                : 'border-amber-500/40 bg-amber-500/5'
+            }`}
+          >
             <div className="text-xs">
               <span className="font-medium">
                 {status.stockPollRespectGlobalGate
                   ? '轮询遵循总闸'
-                  : '轮询不受总闸影响'}
+                  : '轮询已越过总闸'}
               </span>
               <span className="ml-1.5 text-muted-foreground">
                 {status.stockPollRespectGlobalGate
                   ? '总闸关闭时停止轮询（连库存都不查）'
-                  : '总闸关闭时仍继续发现新车（但不会自动下单）'}
+                  : '总闸关闭时本家仍会发现新车并自动下单，总闸对本家不再是急停'}
               </span>
             </div>
             <Switch

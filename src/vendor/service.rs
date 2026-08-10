@@ -155,6 +155,19 @@ pub struct PerChannelChange {
     pub warning: Option<String>,
 }
 
+/// 自动提取是被谁触发的。**决定总闸能不能被绕过**，故必须显式传，不给默认值。
+///
+/// 存在的唯一理由：`stockPollRespectGlobalGate=false` 的绕过**只对轮询这条路生效**。
+/// 若改成在 `try_auto_purchase` 里直接读那个开关，webhook 触发的自动提取会一并
+/// 绕过总闸 —— 那比该开关承诺的范围宽得多，且用户从开关名上完全看不出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPurchaseSource {
+    /// 卖家 webhook 推来的新货通知。**总闸对它永远有效**，无论本家怎么配。
+    Webhook,
+    /// 本地库存轮询发现的新车。本家关了 `stockPollRespectGlobalGate` 时可绕过总闸。
+    StockPoll,
+}
+
 /// 轮询总闸遵循开关的切换结果。
 ///
 /// 单独成一个类型而不复用 [`PerChannelChange`]：那个结构的字段叫 `per_channel`，
@@ -1169,11 +1182,14 @@ impl VendorService {
     async fn poll_stock_once(self: &Arc<Self>) -> Result<(), VendorServiceError> {
         let vid = self.vendor_id();
 
-        // 全局总闸。是否在这里让路由配置决定（`stockPollRespectGlobalGate`）：
+        // 全局总闸，由本家的 `stockPollRespectGlobalGate` 决定要不要认：
         //
         // - 遵循（默认）→ 总闸关着就连库存都不查，最省
-        // - 不遵循 → 继续发现并落库，但**下单那一步照样会被总闸挡住**
-        //   （`try_auto_purchase` 第 0 步就查它），故这不是一条绕过总闸的扣费路径
+        // - 不遵循 → 总闸对本家这条轮询链路**整体失效**：继续发现，且发现后
+        //   `try_auto_purchase` 也会绕过总闸真下单（见那里的步骤 0）
+        //
+        // 后者是一条越过全局急停的扣费路径，只在用户显式配了才成立。想停掉本家
+        // 得关它自己的 autoPurchase，或把 stockPollIntervalSecs 改成 0。
         //
         // 注意这里**不**因 `!auto_purchase()` 就跳过：只开轮询不开自动提取是一种
         // 有意的用法（先观察轮询能否发现新车，不冒扣费风险），此时仍要查并落库。
@@ -1281,8 +1297,10 @@ impl VendorService {
         }
 
         // 交回既有管线。授权、池闸、并发锁、数量绑定全在里面，轮询不重复判定。
-        // 总闸即便被本家配置放行到这里，那一步仍会拦下 —— 见本函数开头的说明。
-        self.spawn_auto_purchase(event_id, None);
+        //
+        // 传 StockPoll：本家关了 stockPollRespectGlobalGate 时，那一步会绕过总闸
+        // 继续下单（该开关的字面语义）。池闸、授权判定、并发锁**都不绕**。
+        self.spawn_auto_purchase(event_id, None, AutoPurchaseSource::StockPoll);
         Ok(())
     }
 
@@ -1293,10 +1311,15 @@ impl VendorService {
     /// 一步，之前任何一环给出否定结论都只记跳过，订单号仍留给手动提取。
     ///
     /// 多家并发时还要过 [`super::pool_gate`] 的总量闸，见 `try_auto_purchase`。
-    pub fn spawn_auto_purchase(self: &Arc<Self>, event_id: String, new_keys: Option<u32>) {
+    pub fn spawn_auto_purchase(
+        self: &Arc<Self>,
+        event_id: String,
+        new_keys: Option<u32>,
+        source: AutoPurchaseSource,
+    ) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys).await {
+            if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys, source).await {
                 tracing::info!(
                     vendor_id = %svc.vendor_id(),
                     event_id = %event_id,
@@ -1360,7 +1383,14 @@ impl VendorService {
     }
 
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
-    async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
+    ///
+    /// `source` 决定总闸能否被绕过，见 [`AutoPurchaseSource`] 与步骤 0。
+    async fn try_auto_purchase(
+        &self,
+        event_id: &str,
+        new_keys: Option<u32>,
+        source: AutoPurchaseSource,
+    ) -> Result<(), String> {
         let vid = self.vendor_id();
 
         // 0. 自动提取总闸。排在授权判定之前 —— 它是最便宜的检查，且全局关闭时
@@ -1370,7 +1400,30 @@ impl VendorService {
         //    会被 `spawn_auto_purchase` 写进事件行（`record_skip`），面板上看得到
         //    「总闸关着」这条跳过原因；提前返回则是静默丢弃，排障时分不清是关了
         //    还是 webhook 链路断了。
-        self.pool_gate.check_auto_enabled()?;
+        //
+        //    **唯一的例外**：本家关了 `stockPollRespectGlobalGate` 且本次由库存轮询
+        //    触发。此时总闸对这条路失效 —— 这是该开关的字面语义（「轮询不受总闸
+        //    影响」），用户显式配了才生效，缺省 true 不会走到这里。
+        //
+        //    代价必须写明：**总闸不再是能一键停掉全部扣费的急停**。而总闸会被健康
+        //    联动自动翻转，等于把「这家花钱」从那套自动逻辑里摘了出来 —— 想真正停掉
+        //    本家，得关它自己的 autoPurchase 或把 stockPollIntervalSecs 改成 0。
+        //    绕过时打 warn 而非 info：这是一条越过全局急停的扣费路径，日志里要显眼。
+        let bypass_gate =
+            source == AutoPurchaseSource::StockPoll && !self.stock_poll_respect_gate();
+        if bypass_gate {
+            if let Err(reason) = self.pool_gate.check_auto_enabled() {
+                tracing::warn!(
+                    vendor_id = %vid,
+                    event_id = %event_id,
+                    gate_says = %reason,
+                    "本家已配 stockPollRespectGlobalGate=false，轮询触发的自动提取\
+                     绕过总闸继续 —— 总闸对本家不再是急停"
+                );
+            }
+        } else {
+            self.pool_gate.check_auto_enabled()?;
+        }
 
         // 1. 授权：卖家的失效确认，或就地盘点的兜底结论
         let auth = self.resolve_authorization()?;
@@ -2186,6 +2239,39 @@ mod local_tests {
             !cfg_json(r#","stockPollRespectGlobalGate":false"#).stock_poll_respect_global_gate,
             "显式关闭要生效"
         );
+    }
+
+    // ============ 总闸绕过的适用范围 ============
+
+    /// 绕过条件的真值表。**这是一条越过全局急停的扣费路径，范围必须锁死。**
+    ///
+    /// 判据取自 `try_auto_purchase` 步骤 0：
+    /// `source == StockPoll && !respect_gate`
+    ///
+    /// 关键是 webhook 那一行 —— 若把判据写成「只看 `!respect_gate`」，卖家推送
+    /// 触发的自动提取会一并绕过总闸，比开关名承诺的范围宽得多，而用户从
+    /// 「轮询不受总闸影响」这个名字上完全看不出 webhook 也被放开了。
+    #[test]
+    fn 绕过总闸只适用于轮询触发() {
+        let bypass = |source: AutoPurchaseSource, respect_gate: bool| {
+            source == AutoPurchaseSource::StockPoll && !respect_gate
+        };
+
+        // 唯一该绕过的组合：轮询触发 + 显式关了遵循
+        assert!(
+            bypass(AutoPurchaseSource::StockPoll, false),
+            "这正是 stockPollRespectGlobalGate=false 的字面语义"
+        );
+
+        // 轮询触发但仍遵循（缺省）→ 不绕
+        assert!(!bypass(AutoPurchaseSource::StockPoll, true));
+
+        // webhook 触发，无论本家怎么配，总闸一律有效
+        assert!(
+            !bypass(AutoPurchaseSource::Webhook, false),
+            "webhook 绝不能被这个开关放开 —— 那超出了开关承诺的范围"
+        );
+        assert!(!bypass(AutoPurchaseSource::Webhook, true));
     }
 
     /// 面板与轮询循环都必须读**运行时值**，不能读 `config` 的启动快照。
