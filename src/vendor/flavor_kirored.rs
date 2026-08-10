@@ -345,6 +345,25 @@ struct CreateOrderData {
     order_no: Option<String>,
 }
 
+/// 历史订单列表信封 `{list, total, page, page_size}`。
+///
+/// 只在下单响应缺数字 `id` 时用来按 `order_no` 反查 —— 详情接口只认数字 `id`。
+#[derive(Debug, Deserialize, Default)]
+struct OrderIndexData {
+    #[serde(default)]
+    list: Vec<OrderIndexItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OrderIndexItem {
+    /// 数字自增 id（字符串形态，如 `"593"`）—— 详情接口要的就是它
+    #[serde(default)]
+    id: Option<String>,
+    /// 24 位业务单号，如 `202608101612130000967407`
+    #[serde(default)]
+    order_no: Option<String>,
+}
+
 /// 订单详情信封 `{item, items, ...}`
 #[derive(Debug, Deserialize, Default)]
 struct OrderDetailData {
@@ -680,19 +699,42 @@ impl KiroredClient {
         let env: Envelope<CreateOrderData> =
             self.authed_post(PATH_ORDER_CREATE, &create_body).await?;
         let order = env.into_data("下单")?;
-        let order_id = order
+        // 详情接口**只认数字自增 id**，传 24 位 order_no 会得到「订单不存在」。
+        // 下单响应有时只给 order_no，此时按单号去历史列表反查数字 id。
+        let numeric_id = order
             .id
             .as_ref()
             .map(value_to_string)
-            .filter(|s| !s.is_empty())
-            .or_else(|| order.order_no.clone())
-            .ok_or_else(|| VendorApiError {
-                status: None,
-                message: "下单成功但未返回订单号，无法拉取卡密".to_string(),
-            })?;
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && s.len() < 12);
+        let order_no = order.order_no.clone().filter(|s| !s.trim().is_empty());
+        let detail_id = match (numeric_id, &order_no) {
+            (Some(id), _) => id,
+            (None, Some(no)) => self.resolve_order_id(no).await?,
+            (None, None) => {
+                return Err(VendorApiError {
+                    status: None,
+                    message: "下单成功但未返回订单号，无法拉取卡密".to_string(),
+                })
+            }
+        };
 
         // 3. 查订单详情拿卡密（不依赖下单响应体结构）
-        let keys = self.fetch_order_keys(&order_id).await?;
+        //    到这一步积分已经扣掉、订单已成立，取卡密失败**不代表下单失败**。
+        //    错误里必须点明这一点，否则运维看到「订单不存在」会以为没买成而重复下单。
+        let keys = self
+            .fetch_order_keys(&detail_id)
+            .await
+            .map_err(|e| VendorApiError {
+                status: e.status,
+                message: format!(
+                    "下单已成功（订单 {}，积分已扣），但取卡密失败：{}；请到卖家后台查看卡密，不要重复下单",
+                    order_no.as_deref().unwrap_or(&detail_id),
+                    e.message
+                ),
+            })?;
+        // 对外展示优先用业务单号，便于与卖家后台核对
+        let order_id = order_no.unwrap_or(detail_id);
         Ok(PurchaseResult {
             purchased: keys.len() as u32,
             requested: Some(quantity),
@@ -709,9 +751,34 @@ impl KiroredClient {
         })
     }
 
-    /// 按订单号拉卡密（订单详情的 `items[].cards[]`）。
+    /// 按 24 位业务单号反查详情接口要的数字自增 id。
+    ///
+    /// 详情接口只接受数字 `id`（传 `order_no` 返回 code=1「订单不存在」，传
+    /// `{order_no:...}` 返回「请求参数异常」），而下单响应有时只给 `order_no`，
+    /// 故这里翻第一页历史订单按单号匹配。刚下的单必然在首页。
+    async fn resolve_order_id(&self, order_no: &str) -> Result<String, VendorApiError> {
+        let body = serde_json::json!({ "page": 1, "page_size": 20 });
+        let env: Envelope<OrderIndexData> = self.authed_post(PATH_ORDER_INDEX, &body).await?;
+        let list = env.into_data("查询历史订单")?.list;
+        list.iter()
+            .find(|o| o.order_no.as_deref().map(str::trim) == Some(order_no.trim()))
+            .and_then(|o| o.id.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| VendorApiError {
+                status: None,
+                message: format!(
+                    "下单成功（单号 {order_no}）但在历史订单首页未找到该单，无法定位卡密；\
+                     请到卖家后台核对，不要重复下单"
+                ),
+            })
+    }
+
+    /// 按数字自增 id 拉卡密（订单详情的 `items[].cards[]`）。
+    ///
+    /// `order_id` 必须是数字自增 id，不能是业务单号 —— 见 [`Self::resolve_order_id`]。
     async fn fetch_order_keys(&self, order_id: &str) -> Result<Vec<PurchasedKey>, VendorApiError> {
-        // detail 接口按数字 id 查；order_id 可能是纯数字字符串
+        // 详情接口的 id 可传数字或数字字符串，两者都接受
         let id_value: serde_json::Value = order_id
             .parse::<i64>()
             .map(serde_json::Value::from)
