@@ -276,6 +276,12 @@ pub struct Product {
     pub purchasable: Option<bool>,
     #[serde(default)]
     pub in_stock: Option<bool>,
+    /// SKU 库存数
+    #[serde(default)]
+    pub sku_stock: Option<u32>,
+    /// 当前可提取数（综合库存、余额等的结果）
+    #[serde(default)]
+    pub available: Option<u32>,
     /// 最新批次，健康度看这里
     #[serde(default)]
     pub latest_batch: Option<LatestBatch>,
@@ -308,6 +314,18 @@ impl Product {
             .as_ref()
             .map(|b| b.health.eq_ignore_ascii_case("good"))
             .unwrap_or(false)
+    }
+
+    /// 本商品是否有实际库存可下单。
+    ///
+    /// 综合多个字段判断：`purchasable` 为 true，或 `available` / `sku_stock` 大于 0。
+    /// 早期实现因抓包时看到活车的 `purchasable` 为 false（疑似库存快照滞后）而故意
+    /// 忽略此标志，但实测该标志**与实际库存一致**（都为 0 时下单会失败），
+    /// 故现在恢复为必要条件。
+    pub fn has_stock(&self) -> bool {
+        self.purchasable.unwrap_or(false)
+            || self.available.unwrap_or(0) > 0
+            || self.sku_stock.unwrap_or(0) > 0
     }
 
     /// 选品排序用的积分价：优先 point_price，回退 min_point_price。
@@ -398,19 +416,16 @@ fn looks_like_region(s: &str) -> bool {
 
 // ============ 选品 ============
 
-/// 从商品列表选一个可下单的：**健康（health=good）且积分最低**者。
+/// 从商品列表选一个可下单的：**健康且有库存、积分最低**者。
 ///
-/// - 只考虑 `latest_batch.health == good` 的商品 —— 其余（dead / none / 预定制）
-///   要么买到即失效，要么无现货。
-/// - 同为健康时取积分价最低者，价同则按 id 字典序保证结果稳定（重试幂等）。
-/// - 无任何健康商品时返回 None，调用方据此报「当前无健康车可提」而不是瞎买。
-///
-/// 注意不校验 `purchasable`：抓包发现即便有活车，列表里的 `purchasable` 也可能
-/// 因库存快照滞后而为 false，真正能不能买以下单结果为准。健康度是更强的信号。
+/// - 必须同时满足 `health == good` 和有实际库存（`purchasable` 或 `available > 0`）。
+///   只有批次活着但库存已耗尽的商品会被过滤掉。
+/// - 同为可订购时取积分价最低者，价同则按 id 字典序保证结果稳定（重试幂等）。
+/// - 无任何可订购商品时返回 None，调用方据此报「当前无车可提」。
 pub fn pick_product(products: &[Product]) -> Option<&Product> {
     products
         .iter()
-        .filter(|p| p.is_healthy() && p.sku_id.is_some())
+        .filter(|p| p.is_healthy() && p.has_stock() && p.sku_id.is_some())
         .min_by(|a, b| {
             a.price()
                 .total_cmp(&b.price())
@@ -560,9 +575,10 @@ impl KiroredClient {
 
     /// 库存与报价：把商品列表折叠成中立 [`StockInfo`]。
     ///
-    /// kiro.red 是商品制，没有「可提取张数」的概念。这里把**健康商品数**当作
-    /// `available`（>0 表示当前有活车可买），并把每个健康商品作为一个 `zone`
-    /// 透出（zone=商品 id、label=名称、unit_price=积分价），供面板展示挑车。
+    /// kiro.red 是商品制，没有「可提取张数」的概念。这里把**可订购商品数**
+    /// （健康且有库存）当作 `available`（>0 表示当前有车可买），并把每个健康商品
+    /// 作为一个 `zone` 透出（zone=商品 id、label=名称、unit_price=积分价），
+    /// 供面板展示车次。缺货商品的 `zone.available` 为 0，面板会显示但标灰。
     pub async fn stock(&self) -> Result<StockInfo, VendorApiError> {
         let products = self.fetch_products().await?;
         let healthy: Vec<&Product> = products.iter().filter(|p| p.is_healthy()).collect();
@@ -570,11 +586,14 @@ impl KiroredClient {
             .iter()
             .map(|p| {
                 let batch = p.latest_batch.as_ref();
+                let has_stock = p.has_stock();
                 ZoneStock {
                     zone: p.id.clone(),
                     label: Some(p.name.clone()),
-                    available: 1,
-                    stock: None,
+                    // 有库存时为 1（可下单），否则为 0（面板显示但标灰）
+                    available: if has_stock { 1 } else { 0 },
+                    // 透出卖家的实际库存数
+                    stock: p.sku_stock.or(p.available),
                     unit_price: p.point_price.or(p.min_point_price),
                     enabled: true,
                     // 0 是卖家表示「无」的写法，别让前端显示 1970 年
@@ -584,14 +603,17 @@ impl KiroredClient {
                 }
             })
             .collect();
-        let price_min = healthy
+        // price_min 只从有库存的商品里算
+        let orderable: Vec<&Product> = products.iter().filter(|p| p.is_healthy() && p.has_stock()).collect();
+        let price_min = orderable
             .iter()
             .filter_map(|p| p.point_price.or(p.min_point_price))
             .fold(None, |acc: Option<f64>, v| {
                 Some(acc.map_or(v, |a| a.min(v)))
             });
         Ok(StockInfo {
-            available: healthy.len() as u32,
+            // available 是有库存可下单的商品数
+            available: orderable.len() as u32,
             price_min,
             price_max: None,
             balance: None,
@@ -634,7 +656,7 @@ impl KiroredClient {
         let products = self.fetch_products().await?;
         let chosen = pick_product(&products).ok_or_else(|| VendorApiError {
             status: None,
-            message: "当前无健康车可提（所有商品最新批次均非 good）".to_string(),
+            message: "当前无车可提（所有商品均已缺货或批次已失效）".to_string(),
         })?;
         let sku_id = chosen.sku_id.ok_or_else(|| VendorApiError {
             status: None,
