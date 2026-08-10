@@ -219,10 +219,11 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 
 | 端点 | 用途 |
 |---|---|
-| `GET /api/my/stock` | 可提数量 + 单价 + **余额（`credits`）** |
+| `GET /api/my/stock` | 扁平库存（**只是退路**，给不出分区）+ **余额（`credits`）** |
+| `GET /api/my/stock/regions` | **双区货架，选区的真相来源** + 余额 |
 | `GET /api/my/profile` | 账号名与 webhook 地址（**不含余额**） |
 | `GET /api/my/credits` | 余额 + 积分流水（`ledger[]`） |
-| `POST /api/my/keys/claim` | 提货，参数 `count` + `client_order_id` |
+| `POST /api/my/keys/claim` | 提货，参数 `count` + `client_order_id` + **`region`** |
 | `GET /api/status` | 系统状态，**免鉴权** |
 | `GET /api/my/keys` | 名下密钥，`?history=true` 含已失效，**给密钥正文** |
 | `GET /api/my/keys/created-at` | 最早密钥时刻 + 累计个数 |
@@ -233,8 +234,8 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 - ✅ 积分流水、名下密钥（**带正文，可与本地凭据池逐张对账**）、最早密钥时间
 - ✅ Webhook 远程管理（`PUT` 写地址 + 测试推送）
 - ✅ 阶梯定价（`/api/my/key-price-tiers` 按母号累计产量分档）
+- ✅ 分区库存（`us-east-1` / `eu-central-1`，**2026-08-10 起**，见下）
 - ❌ 无开号记录（`/api/my/gen-logs` 实测 404）
-- ❌ 不分区（见下）
 
 **协议名可写** `"kiro-ooo"` / `"kiro.ooo"` / `"kiroooo"`。域名里 o 的个数容易数错，
 故 `"kirooo"`（两个 o）与 `"kirooooo"`（四个 o）也都认 —— 拼错会直接报错拒启动，
@@ -254,16 +255,51 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 只读 `claimable` 会报出一个提不到的数：实测 `claimable=2` 而 `afford=1`（45 积分、
 单价 45）。故取给了值的那几个的最小值，`can_buy` 为 false 时直接归 0。
 
-**区域是逐 Key 的，提货不能选区。** 本家 `keys[]` 每张自带 `region`
-（`us-east-1` / `eu-central-1`），而 claim **不接受 `zone` 参数** —— 区域由卖家决定，
-一单可能混区。这与其余六家（整单一个区）形态不同，故：
+**分区在独立端点，参数名是 `region` 而非 `zone`。** 2026-08-10 起本家上了双区货架，
+早期版本确实不分区。三个坑：
 
-- **全单同区**（常态）→ 该区写进凭据的 `apiRegion`，请求正确打到 `q.{region}.amazonaws.com`
-- **混区** → 整单按全局默认区入库，并在日志里 `WARN` 记下混了哪些区
+1. **扁平 `/api/my/stock` 给不出分区**，它只报一份数字（实测是「当前开放那个区」的）。
+   选区必须查 `/api/my/stock/regions`，每区一张卡
+   `{region, label, open, claimable, stock, afford, unit_price, can_buy}`。
+2. **区代码是完整 AWS 标识**（`us-east-1` / `eu-central-1`），不是 `legacy` / `kiromarket`
+   那种 `us` / `eu` 短码，原样回传给 claim。
+3. **claim 不传 `region` 时卖家默认 `us-east-1`**，而美区经常正是关停 0 库存的那个。
+   实测同一时刻：美区 `open=false` / `stock=0` / 单价 80，欧区开放 13 个 / 单价 50，
+   扁平端点报的是欧区那一份。所以「不带区下单」的症状是**面板显示有货、下单永远失败**，
+   而且面板上的单价也是另一个区的。
 
-后者是**已知的能力缺口**：混区单里非默认区的那几张，请求会打到错误的区域端点而失败，
-需人工在凭据里改 `apiRegion`。修它要给中立结构加逐张区域并改入库函数签名
-（波及全部七家的构造点），属于独立的一件事。**看到那条 WARN 就去核对凭据区域。**
+各区**严格隔离不跨区补货**，故 `zoned_purchase` 能力必须开，由 `resolve_zone` +
+`StockInfo::pick_zone` 选「开放有货中最便宜」的区。`afford` 逐区不同（按本区单价算），
+两区差价 60%，算可提量时必须带上它。
+
+**发车时间与存活时长靠 `fleet_now` 算，不要硬编码时区。** 货架里每区带
+`dispatches[]`（历史车次：`time` 发车时刻、`dead_at` 整车报废时刻、空串表示还活着）
+与 `batches[]`（此刻还能提的批次）。所有时刻串**都不带时区**，但顶层 `fleet_now`
+是卖家自己的当前时刻，于是：
+
+```
+存活时长 =（dead_at 或 fleet_now）− time      // 两端同源，差值与时区无关
+发车时刻 = 本机此刻 −（fleet_now − time）     // 换成前端要的 Unix 秒，同样只用差值
+```
+
+实测卖家时钟是 UTC+8，**但代码一点都不依赖这个事实** —— 硬编码 8 小时的话卖家
+换机房就错，而症状是存活时长整体偏移 8 小时（看着像「刚发车」或「跑了半天」，
+不会报错）。缺 `fleet_now` 时两个字段一律留空，宁可不显示也不显示错数。
+
+取哪趟车：**优先 `batches[]` 里最新那批对应的车**（那是此刻真能提到的货，
+「这车跑了多久」问的就是它）；本区无货时退回 `dispatches[]` 最新那趟，回答
+「上一趟什么时候发的」。车已死用 `dead_at` 封顶，否则死掉的车存活时长还会一直涨。
+面板上显示为「存活 9分12秒 · 9分钟前发车」，前端 `describeZoneBatch` 已有渲染。
+
+货架端点不可用或返回空 `regions` 时退回扁平库存，此时 `zones` 为空、提取会被
+`NoZoneInStock` 挡下 —— **这是故意的**：不知道哪个区有货时宁可不下单，也不赌默认区。
+退回时日志有 `WARN`。
+
+响应逐 Key 仍带 `region`，以它为准；**响应给不出区域时（字符串形态的 `keys[]`、
+或降级按 `ksk_` 前缀捞出的那条路径）用本单下过的 `region` 兜底** —— 欧区 Key 若按
+全局默认区入库，请求会打到 `q.us-east-1.amazonaws.com` 而全部失败，症状只是
+「刚提的 Key 莫名不可用」。真回了混区（带 region 下单后不应再发生）则整单按全局
+默认区入库并 `WARN` 记下混了哪些区，**看到那条 WARN 就去核对凭据的 `apiRegion`**。
 
 #### 未经实测的两处
 
@@ -314,7 +350,8 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 ## Webhook 配置
 
 `legacy`、`kiroapp`（.io）、`drop`、`kiromarket` 与 `kiro-ooo` 支持推送；
-`kiroapp-cc` 与 `kirored` 没有 webhook。
+`kiroapp-cc` 与 `kirored` 没有 webhook —— 这两家的自动提取要靠
+[库存轮询](#库存轮询没有-webhook-的家怎么自动提取)，光开 `autoPurchase` 不会有任何动作。
 
 每家供应商需要独立配置 webhook 入站地址：
 
@@ -332,6 +369,72 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 注意路径是 `/webhook/vendor/...`，**不在 `/api` 下**，也不需要 `adminApiKey`
 认证 —— 对方推送端不带签名，那个不可猜测的路径段本身就是唯一凭证，比对不上
 直接 404。入站只负责落库与告警，不触发任何扣费。
+
+## 库存轮询（没有 webhook 的家怎么自动提取）
+
+自动提取全代码库只有一个触发点：入站 webhook 收到 `new_keys_available`。
+所以 `kirored` / `kiroapp-cc` 单独开 `autoPurchase` 是**静默无效**的 —— 面板显示
+「自动提取」，却一次都不会动，且因为流程从未启动，连跳过原因都不会留，现象与
+「webhook 链路断了」完全一样。
+
+`stockPollIntervalSecs` 补上缺失的那一环：定时查库存，发现新车就**合成**一条
+`new_keys_available` 事件塞进同一条管线。
+
+```json
+{
+  "id": "kirored",
+  "flavor": "kirored",
+  "autoPurchase": true,
+  "stockPollIntervalSecs": 60,
+  "stockPollRespectGlobalGate": true
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `stockPollIntervalSecs` | 轮询间隔秒数，**0 = 关闭（默认）**。下限 60，配小了抬到 60 并告警 |
+| `stockPollRespectGlobalGate` | 是否遵循全局总闸 `autoPurchaseEnabled`，默认 `true` |
+
+**与 `autoPurchase` 是 AND 关系。** 轮询非 0 只让轮询器跑起来，下不下单仍由
+`autoPurchase` 与各级闸门决定。分开是有意的：**单独开轮询、不开 autoPurchase**，
+可以先只观察「轮询能否发现新车」—— 合成事件照样落库、面板上看得到，可人工提取，
+不冒扣费风险。确认节奏对了再开 `autoPurchase`。
+
+**判定与扣费全部复用既有管线**，轮询自己一步判定都不做（多一条判定就多一条绕过
+闸门的路径）。真正放行要同时满足：新批次出现 **且** 授权通过（本家盘点无存活 Key，
+即 `LocalCensus`）**且** 过池闸。所以不是「有新车就买」，而是「我手上没号了、
+且正好有新车」才买。
+
+### event_id 取批次身份，这是成败所在
+
+合成事件按 `(vendorId, eventId)` 去重，取错粒度必出事故：
+
+| 取法 | 后果 |
+|---|---|
+| 固定串 | 第一次之后永远算重投，一次都不会再提 |
+| 时间戳 / UUID | 每个轮询周期都是新事件，等于每分钟撞一次授权判定 |
+| **卖家侧批次身份**（正解） | 一趟车 = 一条事件 = 一笔订单，重启也不重复提 |
+
+批次身份取 `ZoneStock::departed_at`（kiro.red 是 `latest_batch.import_time`，
+kiro.ooo 是 `dispatches[].time`），`eventId = poll:{zone}:{发车 Unix 秒}`。
+`poll:` 前缀让面板能一眼分出「卖家推来的」与「我们轮询发现的」。
+
+**卖家给不出发车时刻就不提** —— 没有稳定 id 就会退化成「每轮下一单」，宁可不提。
+`zones` 恒空的家（`kiroapp-cc`）因此轮询无效。注意日志里那条「未给出任何分区」
+有两种成因：结构上不分区，或**此刻没有健康车次**（kiro.red 只把 `health=good` 的
+商品折进 `zones`，车一不健康就空了）—— 实测后者更常见，别当成接口变形去排查。
+
+### 其它约束
+
+- **遵循总闸关掉也不会绕过扣费**：下单走 `try_auto_purchase`，它第 0 步照样查总闸。
+  关掉本项的效果只是「总闸关着时也保持发现」，适合总闸常态关闭（如健康联动自动
+  开关）但仍想知道卖家何时发车的场景。
+- 失败按 2 的幂次退避，**封顶 16 倍**（60 秒间隔 → 最长 16 分钟）。无上限的退避会
+  退到几小时，卖家恢复后半天发现不了新车。
+- 已处理过的车不重试，**不看当初是提成了还是跳过了**。下单失败的原因通常不是重试
+  能解决的（余额不足 / 卖家拒单），要重试就在面板上按那条事件手动提取。
+- 入站可用的家配了轮询会告警：卖家推送更及时也更省，通常不必两者并存。并存不会
+  重复下单（`poll:` 前缀与卖家事件天然不同名，真撞上同一趟车由池闸与本家盘点挡住）。
 
 ## 前端界面
 
