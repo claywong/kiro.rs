@@ -22,7 +22,7 @@ import {
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 // 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
 import { formatVendorRegion } from '@/lib/vendor-region'
-import type { VendorStatus } from '@/types/api'
+import type { VendorStatus, VendorZoneStock } from '@/types/api'
 
 /** 四格状态卡片中的一格 */
 function StatCard({
@@ -102,6 +102,25 @@ function describeUptime(system?: VendorStatus['system']): string | null {
   if (seconds == null) return startedRaw ? `启动于 ${startedRaw}` : null
   const ran = `已运行 ${formatDuration(seconds)}`
   return startedRaw ? `${ran} — 启动于 ${startedRaw}` : ran
+}
+
+/**
+ * 车次的发车时间与存活时长，如「56 分钟 · 3小时前发车」。
+ *
+ * 存活时长优先用卖家给的 aliveText —— 与站点显示口径一致，免得我们自己换算出
+ * 一个跟卖家不一样的数字。发车时间是 Unix 秒，转成「多久前」比绝对时刻更好读。
+ *
+ * 注意 aliveSecs 在活车上是「已存活多久」、会随时间增长，不是「还能活多久」，
+ * 所以这里只叙述事实（存活 N），不写成「剩余 N」。
+ */
+function describeZoneBatch(zone: VendorZoneStock): string | null {
+  const parts: string[] = []
+  const alive = zone.aliveText?.trim() || (zone.aliveSecs != null ? formatDuration(zone.aliveSecs) : null)
+  if (alive) parts.push(`存活 ${alive}`)
+  if (zone.departedAt != null && zone.departedAt > 0) {
+    parts.push(`${formatDuration(Date.now() / 1000 - zone.departedAt)}前发车`)
+  }
+  return parts.length ? parts.join(' · ') : null
 }
 
 /** 距今多久。用于开号记录里标出「刚开的」还是「很久没开了」。 */
@@ -561,6 +580,14 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
                 : status?.stock?.available ?? status?.stockMax ?? '—'
           }
           hint={status?.stockError ?? '已综合余额、库存与每母号上限'}
+          sub={
+            status?.stockError
+              ? undefined
+              : status?.stock?.zones
+                  ?.filter((z) => z.enabled && describeZoneBatch(z))
+                  .map((z) => `${z.label ?? z.zone}：${describeZoneBatch(z)}`)
+                  .join('　') || undefined
+          }
           tone={status?.stockError ? 'warn' : 'normal'}
         />
         <StatCard

@@ -240,6 +240,16 @@ struct UserData {
     total_points_used: Option<f64>,
 }
 
+/// `/api/user/user/info` 的 `data` —— 档案嵌在 `user` 键下，与登录响应同构。
+///
+/// 少这一层会让 `UserData` 的字段全部落空成 `None`，症状是面板余额空白而
+/// 接口不报错（`code=0`，只是解不出字段），故单独建型而非直接解 [`UserData`]。
+#[derive(Debug, Deserialize, Default)]
+struct UserInfoData {
+    #[serde(default)]
+    user: Option<UserData>,
+}
+
 /// 商品列表信封 `{list:[...], total}`
 #[derive(Debug, Deserialize, Default)]
 struct ProductList {
@@ -276,6 +286,19 @@ pub struct LatestBatch {
     /// `good` / `dead` / `none`
     #[serde(default)]
     pub health: String,
+    /// 发车时间（Unix 秒）—— 本批次入库的时刻
+    #[serde(default)]
+    pub import_time: Option<i64>,
+    /// 存活秒数。**活车是「已存活多久」、死车是最终存活时长**，见
+    /// [`ZoneStock::alive_secs`](super::protocol::ZoneStock::alive_secs)。
+    #[serde(default)]
+    pub max_alive_seconds: Option<i64>,
+    /// 卖家给的存活时长文案，如「26 分钟 46 秒」
+    #[serde(default)]
+    pub max_alive_text: Option<String>,
+    /// 死亡时间（Unix 秒）。活车为 `0`，故取用前需判非零。
+    #[serde(default)]
+    pub dead_time: Option<i64>,
 }
 
 impl Product {
@@ -545,13 +568,20 @@ impl KiroredClient {
         let healthy: Vec<&Product> = products.iter().filter(|p| p.is_healthy()).collect();
         let zones: Vec<ZoneStock> = healthy
             .iter()
-            .map(|p| ZoneStock {
-                zone: p.id.clone(),
-                label: Some(p.name.clone()),
-                available: 1,
-                stock: None,
-                unit_price: p.point_price.or(p.min_point_price),
-                enabled: true,
+            .map(|p| {
+                let batch = p.latest_batch.as_ref();
+                ZoneStock {
+                    zone: p.id.clone(),
+                    label: Some(p.name.clone()),
+                    available: 1,
+                    stock: None,
+                    unit_price: p.point_price.or(p.min_point_price),
+                    enabled: true,
+                    // 0 是卖家表示「无」的写法，别让前端显示 1970 年
+                    departed_at: batch.and_then(|b| b.import_time).filter(|t| *t > 0),
+                    alive_secs: batch.and_then(|b| b.max_alive_seconds),
+                    alive_text: batch.and_then(|b| b.max_alive_text.clone()),
+                }
             })
             .collect();
         let price_min = healthy
@@ -571,10 +601,13 @@ impl KiroredClient {
 
     /// 账户档案：余额（积分）、已用积分。
     pub async fn profile(&self) -> Result<ProfileInfo, VendorApiError> {
-        let env: Envelope<UserData> = self
+        let env: Envelope<UserInfoData> = self
             .authed_post(PATH_USER_INFO, &serde_json::json!({}))
             .await?;
-        let user = env.into_data("获取账户信息")?;
+        let user = env
+            .into_data("获取账户信息")?
+            .user
+            .unwrap_or_default();
         Ok(ProfileInfo {
             name: user.username,
             email: user.email,
@@ -734,6 +767,7 @@ mod tests {
             in_stock: Some(false),
             latest_batch: Some(LatestBatch {
                 health: health.to_string(),
+                ..Default::default()
             }),
         }
     }
@@ -806,5 +840,50 @@ mod tests {
             account: None,
         };
         assert!(parse_card(&card).is_none());
+    }
+
+    /// 账户信息的 `data` 外面还套一层 `user`。样例取自卖家真实返回，少这层会让
+    /// 余额静默变 `None`（接口 `code=0` 不报错，只是面板空白）。
+    #[test]
+    fn 账户信息解出嵌套user里的余额() {
+        let raw = r#"{"code":0,"data":{"user":{"id":"96",
+            "username":"kiro_6e202b50","email":"c@example.com","points":66,
+            "total_points_used":34,"order_count":3,"status":1}},"message":"成功"}"#;
+        let env: Envelope<UserInfoData> = serde_json::from_str(raw).unwrap();
+        let user = env.into_data("获取账户信息").unwrap().user.unwrap();
+        assert_eq!(user.points, Some(66.0));
+        assert_eq!(user.total_points_used, Some(34.0));
+        assert_eq!(user.username.as_deref(), Some("kiro_6e202b50"));
+    }
+
+    /// 车次的发车时间与存活时长要透到 zone 上。样例取自卖家真实返回。
+    #[test]
+    fn 商品解出发车时间与存活时长() {
+        let raw = r#"{"id":"55","name":"纯APIKEY 双区混发","sku_id":58,
+            "point_price":12,"latest_batch":{"health":"good","import_time":1786337683,
+            "max_alive_seconds":1606,"max_alive_text":"26 分钟 46 秒","dead_time":0}}"#;
+        let p: Product = serde_json::from_str(raw).unwrap();
+        let b = p.latest_batch.as_ref().unwrap();
+        assert_eq!(b.import_time, Some(1786337683));
+        assert_eq!(b.max_alive_seconds, Some(1606));
+        assert_eq!(b.max_alive_text.as_deref(), Some("26 分钟 46 秒"));
+        assert!(p.is_healthy());
+    }
+
+    /// `latest_batch` 整个缺失时，时间字段退化为 `None` 而非 panic。
+    #[test]
+    fn 商品缺批次时时间字段为空() {
+        let p: Product = serde_json::from_str(r#"{"id":"9","name":"x"}"#).unwrap();
+        assert!(p.latest_batch.is_none());
+        assert!(!p.is_healthy());
+    }
+
+    /// `data` 里没有 `user` 键时不 panic，退化为全 `None`。
+    #[test]
+    fn 账户信息缺user键时退化为空() {
+        let env: Envelope<UserInfoData> =
+            serde_json::from_str(r#"{"code":0,"data":{},"message":"成功"}"#).unwrap();
+        let user = env.into_data("获取账户信息").unwrap().user.unwrap_or_default();
+        assert_eq!(user.points, None);
     }
 }

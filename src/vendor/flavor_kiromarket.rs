@@ -97,6 +97,10 @@ impl From<StockResponse> for StockInfo {
                 unit_price: z.unit_price,
                 // 本家没有这个字段，一律按开放处理
                 enabled: true,
+                // 该家无车次概念
+                departed_at: None,
+                alive_secs: None,
+                alive_text: None,
             })
             .collect();
         // 报价区间只算「开放且有货」的区：把 0 库存区的价算进来，

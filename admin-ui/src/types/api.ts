@@ -643,6 +643,15 @@ export interface VendorZoneStock {
   unitPrice?: number
   /** 本区是否开放。关闭的区即使有存货也提不出来。 */
   enabled: boolean
+  /** 发车时间（Unix 秒）。车次制卖家（kiro.red）才有。 */
+  departedAt?: number
+  /**
+   * 存活时长（秒）。**语义随车次状态而变**：车还活着时是「已存活多久」、
+   * 会随时间增长；车已死时是「总共活了多久」的终值。不是「预计还能活多久」。
+   */
+  aliveSecs?: number
+  /** 卖家给的存活时长文案，如「26 分钟 46 秒」。优先用它以与卖家口径一致。 */
+  aliveText?: string
 }
 
 /** 卖家清单项 */
