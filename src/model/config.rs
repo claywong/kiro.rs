@@ -131,6 +131,14 @@ pub struct VendorConfig {
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 
+    /// 提取入库时写入凭据的调度优先级。**数值越小越优先**（选号取 priority 最小者）。
+    ///
+    /// 不配时按 flavor 取缺省：车次制的 kiro.red 给 10（拼车号存活短，排在自有号
+    /// 之后当兜底），其余家给 0（与本配置项引入前的行为一致）。取值见
+    /// [`Self::effective_default_priority`]。
+    #[serde(default)]
+    pub default_priority: Option<u32>,
+
     /// 提取入库时写入凭据的 API Region（默认不写）。
     ///
     /// 卖家 Key 是 API Key 凭据，`effective_api_region` 只看凭据的 `apiRegion`
@@ -217,6 +225,9 @@ fn default_vendor_rpm_limit() -> u32 {
     300
 }
 
+/// kiro.red 入库凭据的缺省优先级。数值越小越优先，10 表示排在自有号（0）之后。
+pub const DEFAULT_KIRORED_PRIORITY: u32 = 10;
+
 /// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
 pub const DEFAULT_VENDOR_ID: &str = "default";
 
@@ -285,6 +296,8 @@ impl LegacyKiroappCcConfig {
             webhook_path_token: String::new(),
             default_groups: self.default_groups.clone(),
             default_rpm_limit: self.default_rpm_limit,
+            // 该家非车次制，按 flavor 缺省取 0
+            default_priority: None,
             default_api_region: String::new(),
             default_auth_region: String::new(),
             auto_purchase: false,
@@ -299,6 +312,21 @@ impl LegacyKiroappCcConfig {
 }
 
 impl VendorConfig {
+    /// 入库凭据的调度优先级。显式配了就用配的，否则按 flavor 取缺省。
+    ///
+    /// kiro.red 缺省 10 而非 0：那家是拼车车次，号的存活时长以分钟计（实测多为
+    /// 半小时到一小时），排在自有号之后当兜底更合适。缺省值放在代码里而不是要求
+    /// 写进配置文件，是为了让「不配也对」—— 新加这家的人不必知道要补这一项。
+    pub fn effective_default_priority(&self) -> u32 {
+        if let Some(p) = self.default_priority {
+            return p;
+        }
+        match self.flavor {
+            crate::vendor::protocol::VendorFlavor::Kirored => DEFAULT_KIRORED_PRIORITY,
+            _ => 0,
+        }
+    }
+
     /// 规整后的 base URL（去掉末尾斜杠）
     pub fn normalized_base_url(&self) -> &str {
         self.base_url.trim_end_matches('/')
@@ -1429,5 +1457,49 @@ mod vendor_config_compat_tests {
             Some(VendorFlavor::KiroappCc)
         );
         assert_ne!(VendorFlavor::Kiroapp, VendorFlavor::KiroappCc);
+    }
+
+    /// kiro.red 不配 priority 时缺省 10 —— 车次号存活短，排在自有号（0）之后兜底。
+    #[test]
+    fn kirored不配优先级时缺省10() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://kiro.red","apiKey":"a@b.c","flavor":"kirored"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_priority, None, "配置里确实没这一项");
+        assert_eq!(cfg.effective_default_priority(), 10);
+    }
+
+    /// 其余家缺省 0，与本配置项引入前的行为一致（原先硬编码 0）。
+    #[test]
+    fn 其余家不配优先级时缺省0() {
+        for flavor in ["legacy", "kiroapp", "kiroapp-cc", "drop", "kiromarket"] {
+            let cfg: VendorConfig = serde_json::from_str(&format!(
+                r#"{{"baseUrl":"https://x","apiKey":"k","flavor":"{flavor}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                cfg.effective_default_priority(),
+                0,
+                "flavor={flavor} 应保持原有的 0"
+            );
+        }
+    }
+
+    /// 显式配了就以配置为准，包括把这家改回 0。
+    #[test]
+    fn 显式配置覆盖缺省优先级() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://kiro.red","apiKey":"a@b.c","flavor":"kirored",
+                "defaultPriority":0}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_default_priority(), 0);
+
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k","flavor":"legacy","defaultPriority":7}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_default_priority(), 7);
     }
 }

@@ -778,6 +778,7 @@ impl VendorService {
         let cfg = &self.config;
         let groups = cfg.default_groups.clone();
         let rpm_limit = cfg.default_rpm_limit;
+        let priority = cfg.effective_default_priority();
         // 来源渠道带上供应商 id，便于按家盘点与对账
         let source_channel = format!("{}{}:{}", auto::VENDOR_CHANNEL_PREFIX, self.vendor_id(), order_id);
 
@@ -802,6 +803,7 @@ impl VendorService {
             groups,
             rpm_limit,
             api_region,
+            priority,
         ).await
     }
 
