@@ -47,6 +47,13 @@ pub enum VendorFlavor {
     /// - 发货：**无 webhook**，下单即发货，卡密在订单详情 `cards[].content` 里
     /// - 下单：商品（SKU + 积分）模型，需先拉 products 选品再 `POST /user/order/create`
     Kirored,
+    /// kiro.ooo：`/api/my/*` + `X-API-Key: usr-xxx`。与 [`Self::Legacy`] 同前缀同鉴权，
+    /// 但**余额语义不同**：本家 `profile.remaining` 是剩余配额且恒为 0，真实余额在
+    /// `credits`（照首家映射会让面板显示余额 0、自动提取恒算出 0 个可提）。
+    /// 其余差异：提货走 `/my/keys/claim`、库存不分区、无开号记录、`/status` 有真实
+    /// 数据但字段名是 `uptime_secs`。独有：`/my/credits` 流水、`/my/keys` **给密钥正文**。
+    /// 详见 [`super::flavor_kiroooo`]。
+    KiroOoo,
 }
 
 impl VendorFlavor {
@@ -58,6 +65,7 @@ impl VendorFlavor {
             Self::Drop => "drop",
             Self::Kiromarket => "kiromarket",
             Self::Kirored => "kirored",
+            Self::KiroOoo => "kiro-ooo",
         }
     }
 
@@ -89,13 +97,18 @@ impl VendorFlavor {
             // 归一化去掉非字母数字，故 `kiro.red` / `kiro-red` 等写法都落到这里。
             // 注意不能只用 `kiro` 之类过宽的别名，会与前几家的 `kiroapp` 混淆。
             "kirored" | "kiroredcom" | "red" => Some(Self::Kirored),
+            // 归一化去掉非字母数字，故 `kiro.ooo` / `kiro-ooo` 都落到 `kiroooo`。
+            // **刻意容忍数错 o 的个数**（`kirooo` / `kirooooo`）与裸 `ooo`：这个域名
+            // 极易写错，而拼错会直接报错拒启动，容忍几个近似写法比让人排查
+            // 「为什么 flavor 不认」划算。注意不能宽到 `kiro` —— 那会与 kiroapp 混淆。
+            "kiroooo" | "kirooo" | "kirooooo" | "ooo" => Some(Self::KiroOoo),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored"
+        "legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored, kiro-ooo"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -211,6 +224,32 @@ impl VendorFlavor {
                 tiered_pricing: false,
                 // 区编码在卡密 content 里（如 ----us-east-1），不是下单参数；
                 // 选区靠运行时挑 health=good 的商品，故不开分区能力
+                zoned_purchase: false,
+            },
+            Self::KiroOoo => VendorCapabilities {
+                // `/status` 免鉴权且有真实数据（存活 / 失效 / 存货 / 累计）
+                system_status: true,
+                // `/api/my/gen-logs` 实测 404，本家没有开号记录
+                gen_logs: false,
+                // PUT /my/webhook 与 POST /my/webhook/test 都有（GET 返 405 allow PUT）
+                webhook_manage: true,
+                purchase_orders: true,
+                // 文档的端点表里没列，但 GET /my/redeem 返 405 allow POST，路由实存
+                redeem: true,
+                // `/my/credits` 的 ledger[] 就是积分流水
+                ledger: true,
+                // `/my/keys` 且**给密钥正文**，可与本地凭据池逐张对账
+                my_keys: true,
+                // `/my/keys/created-at` 给最早时刻 + 累计个数
+                earliest_key: true,
+                // 推送里给的是提货幂等键，不是可定向拉取的批次 id
+                batch_scoped_purchase: false,
+                // `/my/key-price-tiers` 按母号累计产量分档（bands），同一单可能混价，
+                // 总额只能以卖家返回为准
+                tiered_pricing: true,
+                // 库存接口无 zones，claim 也不接受 zone —— 区域是逐 Key 由卖家定的，
+                // 不是下单参数。误开会让 resolve_zone 因 zones 为空而报 NoZoneInStock，
+                // 把本来能提的单全挡掉。
                 zoned_purchase: false,
             },
         }
@@ -840,5 +879,81 @@ mod local_tests {
         assert!(!c.earliest_key);
         assert!(!c.batch_scoped_purchase);
         assert!(!c.ledger);
+    }
+
+    // ============ 第七家 kiro.ooo ============
+
+    /// 各种写法都要落到同一个变体。**含数错 o 个数的写法** —— 这个域名极易写错，
+    /// 而拼错的 flavor 会直接报错拒启动。
+    #[test]
+    fn kiroooo_宽松解析() {
+        for raw in [
+            "kiro-ooo",
+            "kiro.ooo",
+            "kiroooo",
+            "KiroOoo",
+            "KIRO-OOO",
+            // 数错 o 的个数
+            "kirooo",
+            "kirooooo",
+            "ooo",
+        ] {
+            assert_eq!(
+                VendorFlavor::parse(raw),
+                Some(VendorFlavor::KiroOoo),
+                "解析失败: {raw}"
+            );
+        }
+    }
+
+    /// 不能与既有六家撞名。`kiro` 前缀相近的有四家，必须都区分开。
+    #[test]
+    fn kiroooo_不与既有家撞名() {
+        assert_ne!(VendorFlavor::parse("kiroapp"), Some(VendorFlavor::KiroOoo));
+        assert_ne!(VendorFlavor::parse("kiroapp-cc"), Some(VendorFlavor::KiroOoo));
+        assert_ne!(VendorFlavor::parse("kiromarket"), Some(VendorFlavor::KiroOoo));
+        assert_ne!(VendorFlavor::parse("kirored"), Some(VendorFlavor::KiroOoo));
+        assert_ne!(VendorFlavor::parse("drop"), Some(VendorFlavor::KiroOoo));
+        assert_ne!(VendorFlavor::parse("legacy"), Some(VendorFlavor::KiroOoo));
+        // 反向：本家的写法不能被解析成别家
+        assert_eq!(VendorFlavor::parse("kiro.ooo"), Some(VendorFlavor::KiroOoo));
+    }
+
+    /// 序列化形态必须与 as_str / 报错提示一致，否则面板写回 config 会改拼法
+    #[test]
+    fn kiroooo_序列化形态稳定() {
+        assert_eq!(
+            serde_json::to_string(&VendorFlavor::KiroOoo).unwrap(),
+            r#""kiro-ooo""#
+        );
+        assert_eq!(VendorFlavor::KiroOoo.as_str(), "kiro-ooo");
+        assert!(VendorFlavor::all_names().contains("kiro-ooo"));
+        // 往返：序列化出去的名字必须能读回来
+        let json = serde_json::to_string(&VendorFlavor::KiroOoo).unwrap();
+        assert_eq!(
+            serde_json::from_str::<VendorFlavor>(&json).unwrap(),
+            VendorFlavor::KiroOoo
+        );
+    }
+
+    /// 能力集。`zoned_purchase` 必须关 —— 本家库存接口无 zones，误开会让
+    /// `resolve_zone` 报 NoZoneInStock 把所有单挡掉。
+    #[test]
+    fn kiroooo_能力集() {
+        let c = VendorFlavor::KiroOoo.capabilities();
+        assert!(
+            !c.zoned_purchase,
+            "区域是逐 Key 由卖家定的，不是下单参数；误开会挡掉全部提取"
+        );
+        assert!(c.system_status, "/status 免鉴权且有真实数据");
+        assert!(!c.gen_logs, "/api/my/gen-logs 实测 404");
+        assert!(c.webhook_manage, "PUT /my/webhook 与测试推送都有");
+        assert!(c.purchase_orders);
+        assert!(c.redeem, "文档表未列，但 GET 返 405 allow POST，路由实存");
+        assert!(c.ledger, "/my/credits 的 ledger[]");
+        assert!(c.my_keys, "/my/keys 且给密钥正文");
+        assert!(c.earliest_key, "/my/keys/created-at");
+        assert!(c.tiered_pricing, "/my/key-price-tiers 按累计产量分档");
+        assert!(!c.batch_scoped_purchase);
     }
 }

@@ -15,6 +15,12 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 > 写成 `"flavor": "kiroapp"` 却填 kiroapp.cc 的地址，会对着不存在的 `/api/me/*`
 > 发请求，症状是一片 404。
 
+> **`kiro-ooo` 与 `legacy` 最容易混，且配错最难查**：两家同样是 `/api/my/*` +
+> `X-API-Key: usr-xxx`，路径与鉴权头几乎一样。但 kiro.ooo 的**余额在 `credits`**，
+> 它的 `profile.remaining` 恒为 0。把 kiro.ooo 配成 `legacy` 不会 401 也不会 404，
+> 而是余额显示 0、自动提取算出的可提数量恒为 0 —— **整家静默不可用且不报错**。
+> 另外它的提货路径是 `/api/my/keys/claim` 而非 `/api/my/purchase`。
+
 > **`drop` 与 `legacy` 也容易混**：两家都用 `/api/my/*` + `X-API-Key: usr-xxx`，
 > 路径和鉴权头几乎一样。区别在于 Drop 的金额是**字符串**、库存来自 `/api/status`
 > 而非 `/api/my/stock`。把 Drop 配成 `legacy` 不会 401，而是余额与下单结果解析
@@ -114,7 +120,7 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 
 ## 协议类型（flavor）
 
-Kiro 支持三种供应商协议。能力差异由代码里的能力集决定，前端据此隐藏不支持的卡片。
+Kiro 支持七种供应商协议。能力差异由代码里的能力集决定，前端据此隐藏不支持的卡片。
 
 ### `legacy` - 首家卖家协议
 
@@ -206,6 +212,81 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 > [文档](https://drop.kiro.ss/docs) 而不是猜** —— 上一轮就是照着旧文档实现完，
 > 才发现接口已经换掉了。
 
+### `kiro-ooo` - kiro.ooo 自助台协议
+
+`/api/my/*` + `X-API-Key: usr-xxx`。**与 `legacy` 同前缀同鉴权，但不能配成 `legacy`** ——
+差异不在路径而在字段语义，配错不会 401/404，而是余额显示 0、自动提取永远提不出东西。
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/my/stock` | 可提数量 + 单价 + **余额（`credits`）** |
+| `GET /api/my/profile` | 账号名与 webhook 地址（**不含余额**） |
+| `GET /api/my/credits` | 余额 + 积分流水（`ledger[]`） |
+| `POST /api/my/keys/claim` | 提货，参数 `count` + `client_order_id` |
+| `GET /api/status` | 系统状态，**免鉴权** |
+| `GET /api/my/keys` | 名下密钥，`?history=true` 含已失效，**给密钥正文** |
+| `GET /api/my/keys/created-at` | 最早密钥时刻 + 累计个数 |
+| `GET /api/my/purchase-orders` | 订单列表（裸数组，最近 50 条） |
+| `PUT /api/my/webhook`、`POST /api/my/webhook/test` | webhook 地址读写与测试推送 |
+
+- ✅ 余额、库存、按订单提取、系统状态、订单列表
+- ✅ 积分流水、名下密钥（**带正文，可与本地凭据池逐张对账**）、最早密钥时间
+- ✅ Webhook 远程管理（`PUT` 写地址 + 测试推送）
+- ✅ 阶梯定价（`/api/my/key-price-tiers` 按母号累计产量分档）
+- ❌ 无开号记录（`/api/my/gen-logs` 实测 404）
+- ❌ 不分区（见下）
+
+**协议名可写** `"kiro-ooo"` / `"kiro.ooo"` / `"kiroooo"`。域名里 o 的个数容易数错，
+故 `"kirooo"`（两个 o）与 `"kirooooo"`（四个 o）也都认 —— 拼错会直接报错拒启动，
+容忍几个近似写法比让人排查「为什么 flavor 不认」划算。
+
+#### 三处必须知道的差异
+
+**余额在 `credits`，不在 `remaining`。** 本家 `/api/my/profile` 返回的
+`quota` / `remaining` / `used_quota` **恒为 0**（该家不用这套配额模型），真实余额是
+`credits`，且只出现在 `/api/my/stock` 与 `/api/my/credits`。照 `legacy` 映射
+`balance ← remaining` 的后果是：面板余额显示 0、自动提取算出的可提数量恒为 0 ——
+**整家静默不可用且不报任何错**。这是本家必须独立 flavor 的首要理由。
+档案接口没有余额时，后端会补一次 `/api/my/credits?limit=1` 取那个数。
+
+**可提数量按四个字段取小。** `/api/my/stock` 给 `claimable`（可领上限）、`stock`
+（可取库存）、`afford`（**按现有积分买得起几个**）、`max`（聚合上限），语义各不相同。
+只读 `claimable` 会报出一个提不到的数：实测 `claimable=2` 而 `afford=1`（45 积分、
+单价 45）。故取给了值的那几个的最小值，`can_buy` 为 false 时直接归 0。
+
+**区域是逐 Key 的，提货不能选区。** 本家 `keys[]` 每张自带 `region`
+（`us-east-1` / `eu-central-1`），而 claim **不接受 `zone` 参数** —— 区域由卖家决定，
+一单可能混区。这与其余六家（整单一个区）形态不同，故：
+
+- **全单同区**（常态）→ 该区写进凭据的 `apiRegion`，请求正确打到 `q.{region}.amazonaws.com`
+- **混区** → 整单按全局默认区入库，并在日志里 `WARN` 记下混了哪些区
+
+后者是**已知的能力缺口**：混区单里非默认区的那几张，请求会打到错误的区域端点而失败，
+需人工在凭据里改 `apiRegion`。修它要给中立结构加逐张区域并改入库函数签名
+（波及全部七家的构造点），属于独立的一件事。**看到那条 WARN 就去核对凭据区域。**
+
+#### 未经实测的两处
+
+**Webhook 载荷形态未验证。** 要在卖家侧配好地址才能收到推送，接入时没有改动
+账号的 webhook 配置。已知的只有文档一句「每次发车我方都会给所有配好 Webhook 的
+用户推一条到货通知」，以及推送里带 `client_order_id`。故事件名走宽松归一化，把
+`key_new` / `on_key_new` / `keys_available` / `dispatch` / `on_dispatch` 等都映射到
+`new_keys_available`，`key_dead` / `all_dead` → `all_keys_dead`；`key_suspect`
+（疑似失效）**刻意不映射成全失效** —— 那会在旧 Key 可能还活着时触发补货扣费，
+只当告警处理。事件名候选取自本家 `/api/my/notify/prefs` 的开关名，是卖家自己的
+通知语汇，大概率同源。**首次收到真实推送后请核对日志里的事件名**，若落成 `unknown`
+就要往 `normalize_event_type` 里补一个别名。因此配置默认 `autoPurchase: false`。
+
+**claim 响应形态未验证**（会扣积分，接入时未触发）。文档示例脚本用
+`jq -r ".keys[]"` 暗示字符串数组，而 `/api/my/keys` 返回对象数组，两处不一致。
+故 DTO 用 untagged 枚举同时接住两种元素形态，外层结构完全不认识时再按 `ksk_`
+前缀降级扫描 —— 与 `kiroapp-cc` / `drop` 同一道理：拿到 2xx 积分就已经扣了，
+按结构硬解失败等于把付过费的 Key 扔掉。一个都没捞到时告警并提示人工核对扣费。
+
+**`/api/my/redeem` 文档没列但路由存在**（`GET` 返 405 `allow: POST`），故开放了
+兑换能力，请求体沿用通用的 `{"code":...}`，响应字段给足别名。形态猜错只会让面板
+少显示一个到账数字，兑换本身（同账号同码幂等）不受影响。
+
 ## 时段表配置
 
 通过 `autoPurchaseSchedule` 限制自动提取仅在特定时段生效，可设置不同时段的不同上限：
@@ -232,7 +313,8 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 
 ## Webhook 配置
 
-`legacy`、`kiroapp`（.io）与 `drop` 支持推送，`kiroapp-cc` 没有 webhook。
+`legacy`、`kiroapp`（.io）、`drop`、`kiromarket` 与 `kiro-ooo` 支持推送；
+`kiroapp-cc` 与 `kirored` 没有 webhook。
 
 每家供应商需要独立配置 webhook 入站地址：
 
@@ -288,8 +370,8 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 
 以下两个仅部分协议支持，不支持时返回「该卖家不支持…」：
 
-- `GET /api/admin/vendor/ledger?vendorId=xxx` - 积分流水（仅 `kiroapp`）
-- `GET /api/admin/vendor/keys?vendorId=xxx` - 我的密钥列表（仅 `kiroapp`）
+- `GET /api/admin/vendor/ledger?vendorId=xxx` - 积分流水（`kiroapp` / `kiromarket` / `kiro-ooo`）
+- `GET /api/admin/vendor/keys?vendorId=xxx` - 我的密钥列表（`kiroapp` / `kiromarket` / `kiro-ooo`）
 
 Webhook 远程管理仅 `legacy` 支持：
 
@@ -340,7 +422,7 @@ flavor 为 `kiroapp-cc` 的普通供应商。新配置请直接写进 `vendors`�
 A: 启动时会报错并提示可选值，**不会静默回退**：
 
 ```
-无法识别的卖家协议风味 "unknown"，可选值: legacy, kiroapp, kiroapp-cc
+无法识别的卖家协议风味 "unknown"，可选值: legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored, kiro-ooo
 ```
 
 刻意不回退默认值 —— 拼错的 flavor 若被当成 `legacy`，会对着错误的路径和鉴权头
@@ -352,9 +434,13 @@ A: 不能。每家的 token 必须唯一，否则无法正确路由 webhook。
 
 ### Q: 如何测试 webhook 是否配置正确？
 
-A: 仅 `legacy` 协议可以：前端供应商页面有「测试推送」按钮，点击后让供应商推一条
-测试消息到已保存的 webhook URL。`kiroapp`（.io）没有这个 API，只能在卖家网页里
-配好地址后等真实推送；`kiroapp-cc` 根本没有 webhook。
+A: `legacy`、`drop`、`kiromarket` 与 `kiro-ooo` 可以：前端供应商页面有「测试推送」
+按钮，点击后让供应商推一条测试消息到已保存的 webhook URL。`kiroapp`（.io）没有这个
+API，只能在卖家网页里配好地址后等真实推送；`kiroapp-cc` 与 `kirored` 根本没有 webhook。
+
+注意 `kiro-ooo` 的测试推送能验证「地址能收到」，但**验不出事件名对不对** ——
+测试消息的 `event` 通常是 `test`，而真实到货通知的事件名本次未经实测
+（见该协议章节）。首次真实推送后要核对日志。
 
 ## 完整配置示例
 

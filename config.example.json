@@ -91,6 +91,18 @@
       "defaultRpmLimit": 300,
       "autoPurchase": false,
       "autoPurchaseMaxCount": 1
+    },
+    {
+      "id": "kiro-ooo",
+      "name": "kiro.ooo",
+      "flavor": "kiro-ooo",
+      "baseUrl": "https://kiro.ooo",
+      "apiKey": "usr-替换为 kiro.ooo 自助台的 API Key",
+      "webhookPathToken": "whk_替换为自己生成的随机串_4",
+      "defaultGroups": [],
+      "defaultRpmLimit": 300,
+      "autoPurchase": false,
+      "autoPurchaseMaxCount": 1
     }
   ]
 }

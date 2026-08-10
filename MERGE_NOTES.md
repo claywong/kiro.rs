@@ -152,6 +152,64 @@
 **上游关系**：同样是本地独有。若上游日后做卖家对接，几乎不可能撞上这套签名/解密逻辑，合并时整体保留。
 唯一的融合点是 `protocol.rs` 的 `VendorFlavor` 枚举与 `config.rs` 的 `VendorConfig`（见第三节的约定）。
 
+### 2026-08-10 接入第七家 kiro.ooo（flavor = `kiro-ooo`）
+
+**背景**：与 `legacy` 同前缀（`/api/my/*`）同鉴权（`X-API-Key: usr-xxx`），但**字段语义不同**。
+接入前用真实 Key 探过全部只读端点，差异是实测的而非照文档推断：
+
+| 维度 | legacy | kiro.ooo |
+|---|---|---|
+| 余额 | `profile.remaining` | **`credits`**（且 `remaining` 恒为 0） |
+| 提货路径 | `/api/my/purchase` | `/api/my/keys/claim` |
+| 分区 | 下单传 `zone` | 不能选区，区域**逐 Key** 由卖家定 |
+| 开号记录 | `/api/my/gen-logs` | 404 |
+| `/api/status` | 无有用数据 | 有真实数据，但字段是 `uptime_secs` |
+
+**做的决策**：
+
+1. **必须独立 flavor，不能复用 `legacy`**。配成 `legacy` 不会 401/404（路径鉴权都一样），
+   而是 `balance ← remaining` 取到 0 → 面板余额 0 → `decide_count` 恒算出 0 → **整家静默不可用**。
+   这类「配错了但不报错」的坑是本次最该记住的一条。
+2. **逐 Key 区域：只做全单同区，混区不管**（用户显式决定）。本家 `keys[]` 每张带 `region`
+   （`us-east-1` / `eu-central-1`），而中立结构 `PurchaseResult` 只有一个 `zone`。
+   **没有**给 `PurchasedKey` 加逐张区域 —— 那要改 `import_keys` 签名并动全部七家的构造点。
+   改为复用既存的 `zone` 通道：全单同区就填进去（`import_purchased` 已有的 zone→`api_region`
+   映射会写对），混区则留空退回默认区并 `WARN`。
+   **已知代价**：混区单里非默认区的 Key 会打到错误的区域端点而失败，需人工改凭据 `apiRegion`。
+   日后要修就是「给 `PurchasedKey` 加 `region` + `import_keys` 收 `Vec<KeyToImport>`」，别重新推导。
+3. **`import_purchased` 的区域映射扩了一个分支**（含连字符视为完整 AWS 区域标识直接用）。
+   这是唯一动到的共用代码。其余家只发 `us` / `eu` 两字母简码，走原分支，行为不变。
+4. **`/api/status` 单独建 DTO 再映射进 `legacy::VendorSystemStatus`**，没给后者加
+   `alias = "uptime_secs"`。那是上游文件，把本家形态混进去等于让同一个 DTO 有两个真相来源。
+   本家独有的 `keys_alive` / `keys_suspect` / `auto_mode` 走它的 `extra` 透传字段。
+5. **claim 走宽松解析**（与 `kiroapp-cc` / `drop` 同一道理，第三次用这个模式了）：
+   2xx 即已扣积分，按结构硬解失败等于把付过费的 Key 扔掉。本家不确定性更大 ——
+   文档示例脚本 `jq -r ".keys[]"` 暗示字符串数组，而 `/api/my/keys` 是对象数组，
+   故 DTO 用 untagged 枚举吃下两种元素形态，外层再兜一层 `ksk_` 前缀降级扫描。
+6. **`redeem` 开了，尽管文档端点表没列**。依据是 `GET /api/my/redeem` 返回 405 `allow: POST`，
+   路由确实存在。响应形态未知处给足别名 —— 猜错只少显示一个到账数字，兑换本身幂等不受影响。
+7. **flavor 别名容忍数错 o 的个数**（`kirooo` / `kirooooo` / `ooo` 都认）。这个域名极易写错，
+   而拼错的 flavor 会直接报错拒启动。不能宽到 `kiro` —— 那会与 `kiroapp` 系混淆。
+
+**未经实测、日后要补的两处**（已写进 `VENDOR.md`）：
+
+- **webhook 载荷与事件名**。要在卖家侧配好地址才能收到，本次没动用户的 webhook 配置。
+  事件名走 `flavor_kiroooo::normalize_event_type` 宽松归一化，候选取自本家
+  `/api/my/notify/prefs` 的开关名（`on_key_new` / `on_key_dead` / `on_dispatch`）。
+  **首次真实推送后核对日志**，落成 `unknown` 就补别名。故默认 `autoPurchase: false`。
+  注意 `key_suspect`（疑似失效）**刻意不映射成 `all_keys_dead`** —— 那会在旧 Key 可能还活着时
+  触发补货扣费，只当告警。
+- **claim 响应确切形态**（会扣 45 积分，未触发）。宽松解析兜住。
+
+**验证**：`cargo build` + `cargo test`（958 passed）+ `npx tsc --noEmit` 全过。
+另外起了一个临时实例、用真实 Key 走完整代码路径验过只读接口：余额 45（取自 `credits`
+而非 0 值的 `remaining`）、可提 1（受 `afford` 收敛，不是 `claimable` 的 2）、
+`uptime_seconds` 1278（从 `uptime_secs` 映射）、流水的 `ref_id` 已并入备注、
+密钥列表带正文。**未触发 claim**。
+
+**上游关系**：本地独有。融合点同前六家：`VendorFlavor` 枚举、`VendorConfig`、
+`client.rs` 的各个 `match self.flavor`。
+
 ## 三、需要「融合」而非取舍的点
 
 `token_manager.rs` 的 `select_next_credential_excluding` / `acquire_context_impl` 是双方改动的

@@ -19,6 +19,7 @@ use super::flavor_kiroapp as kiroapp;
 use super::flavor_kiroapp_cc as kiroapp_cc;
 use super::flavor_kiromarket as kiromarket;
 // 本地新增导入单独成行，避免与上游按序排列的 use 块冲突。
+use super::flavor_kiroooo as kiroooo;
 use super::flavor_kirored as kirored;
 use super::flavor_legacy as legacy;
 use super::protocol::{
@@ -93,9 +94,12 @@ impl VendorClient {
             // Drop 与首家同用 X-API-Key（都是 usr-xxx 形态的 Key）
             // kiro-market 同样是 usr-xxx 形态、同样走 X-API-Key。
             // 它也接受 Authorization: Bearer，但文档给的首选是这个头。
-            VendorFlavor::Legacy | VendorFlavor::Drop | VendorFlavor::Kiromarket => {
-                req.header("X-API-Key", &self.api_key)
-            }
+            // kiro.ooo 同样是 usr-xxx 形态、同样走 X-API-Key（也接受
+            // Authorization: Bearer，但文档给的首选是这个头）。
+            VendorFlavor::Legacy
+            | VendorFlavor::Drop
+            | VendorFlavor::Kiromarket
+            | VendorFlavor::KiroOoo => req.header("X-API-Key", &self.api_key),
             VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
             // kiro.red 不走这条通用鉴权 —— 它有自己的签名 + JWT 管线
             // （见 flavor_kirored）。此分支不应被走到，原样返回不加头。
@@ -372,6 +376,97 @@ impl VendorClient {
         })
     }
 
+    /// kiro.ooo 的提货：`POST /api/my/keys/claim`，**成功响应宽松解析**。
+    ///
+    /// 与 [`Self::claim_kiroapp_cc`] / [`Self::purchase_drop`] 同一道理：拿到 2xx
+    /// 就说明积分已经扣了，若因为响应结构不认识就报错，等于把付过费的 Key 扔掉。
+    /// 本家的不确定性尤其大 —— 文档只保证有 `keys[]`（示例脚本 `jq -r ".keys[]"`），
+    /// 其余字段名一概未给，而 `keys[]` 的元素是字符串还是对象在文档里自相矛盾
+    /// （示例脚本按字符串取，`/my/keys` 却返回对象）。
+    ///
+    /// 故：DTO 已用 untagged 枚举吃下两种元素形态，这里再兜一层「整个结构完全
+    /// 不认识」的情况 —— 按 `ksk_` 前缀扫，连裸文本响应也能捞出。
+    ///
+    /// 与那两家不同的一点：本家 claim **有幂等键**（`client_order_id`），故降级捞出
+    /// 时把订单号填进 `order_id`，人工核对时能按它到卖家侧查这一单。
+    async fn claim_kiroooo(
+        &self,
+        body: &serde_json::Value,
+        client_order_id: &str,
+    ) -> Result<PurchaseResult, VendorApiError> {
+        let resp = self
+            .auth(self.http.post(self.url(kiroooo::PATH_CLAIM)).json(body))
+            .send()
+            .await
+            .map_err(|e| VendorApiError {
+                status: None,
+                message: e.to_string(),
+            })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| VendorApiError {
+            status: Some(status.as_u16()),
+            message: format!("读取响应体失败: {e}"),
+        })?;
+
+        if !status.is_success() {
+            // 本家错误体是扁平的 `{"code":404,"message":"..."}`（实测 404/405 皆如此），
+            // 与 Self::parse 认的 `{"error":"..."}` 不同名，故单独取一次
+            let message = kiroooo_error_message(&text).unwrap_or_else(|| truncate(&text, 300));
+            return Err(VendorApiError {
+                status: Some(status.as_u16()),
+                message,
+            });
+        }
+
+        // 先按文档形态解析（DTO 已容忍字符串 / 对象两种 keys 元素）
+        if let Ok(r) = serde_json::from_str::<kiroooo::ClaimResponse>(&text) {
+            let result: PurchaseResult = r.into();
+            if !result.keys.is_empty() {
+                return Ok(result);
+            }
+            // 解析成功但一个 Key 都没有：可能真的成交 0 个（合法，如库存被抢空），
+            // 也可能 keys 字段改了名。降级扫一遍，捞到就用捞到的。
+            let scanned = scan_keys(&text);
+            if scanned.is_empty() {
+                return Ok(result);
+            }
+            tracing::warn!(
+                order_id = %client_order_id,
+                found = scanned.len(),
+                "kiro.ooo claim 响应的 keys 为空但正文里有 ksk_ Key，已按前缀降级捞出"
+            );
+            return Ok(PurchaseResult {
+                purchased: result.purchased.max(scanned.len() as u32),
+                keys: scanned,
+                ..result
+            });
+        }
+
+        // 结构完全不认识。积分已经扣了，捞不到也返回 Ok(空) 而不是 Err ——
+        // 上层据此提示人工按订单号核对，报错会让人误以为没花钱。
+        let scanned = scan_keys(&text);
+        if scanned.is_empty() {
+            tracing::warn!(
+                order_id = %client_order_id,
+                "kiro.ooo claim 返回 2xx 但结构无法识别且未捞到 ksk_ Key，可能已扣积分: {}",
+                truncate(&text, 300)
+            );
+        } else {
+            tracing::warn!(
+                order_id = %client_order_id,
+                found = scanned.len(),
+                "kiro.ooo claim 响应结构不符合文档，已按前缀降级捞出 Key"
+            );
+        }
+        Ok(PurchaseResult {
+            purchased: scanned.len() as u32,
+            order_id: Some(client_order_id.to_string()),
+            keys: scanned,
+            ..Default::default()
+        })
+    }
+
     // ============ 提取（消费侧）============
 
     /// 下单提取 Key。
@@ -446,6 +541,10 @@ impl VendorClient {
             VendorFlavor::Kirored => {
                 self.kirored_client().purchase(count, client_order_id).await
             }
+            // kiro.ooo：路径是 /my/keys/claim（不是 /my/purchase），参数与首家同名
+            // （count + client_order_id）。**不带 zone** —— 本家不接受该参数，
+            // 区域由卖家逐 Key 决定。走宽松解析，见 claim_kiroooo 的说明。
+            VendorFlavor::KiroOoo => self.claim_kiroooo(&body, client_order_id).await,
         }
     }
 
@@ -492,6 +591,12 @@ impl VendorClient {
             }
             // kiro.red 无库存端点，把商品列表里的健康商品折叠成中立库存
             VendorFlavor::Kirored => self.kirored_client().stock().await,
+            VendorFlavor::KiroOoo => {
+                // 本家的库存接口一次给出可提数量 + 单价 + **余额（credits）**，
+                // 故面板的余额可以只靠这一次请求
+                let r: kiroooo::StockResponse = self.get(kiroooo::PATH_STOCK).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -533,6 +638,33 @@ impl VendorClient {
             }
             // kiro.red 走 /user/user/info，余额是积分
             VendorFlavor::Kirored => self.kirored_client().profile().await,
+            // 本家档案里**没有余额** —— `remaining` 是剩余配额且实测恒为 0，真实余额
+            // 在 `credits`，而该字段只出现在 /my/stock 与 /my/credits。故补一次
+            // /my/credits?limit=1（limit 压到 1 是为了别把整份流水拉回来，
+            // 这里只要那个余额数）。
+            VendorFlavor::KiroOoo => {
+                let r: kiroooo::ProfileResponse = self.get(kiroooo::PATH_PROFILE).await?;
+                let mut info: ProfileInfo = r.into();
+                if info.balance.is_none() {
+                    match self
+                        .get_with::<kiroooo::CreditsResponse>(
+                            kiroooo::PATH_CREDITS,
+                            &[("limit", "1".to_string())],
+                        )
+                        .await
+                    {
+                        Ok(c) => info.balance = c.credits,
+                        // 补余额失败不算档案查询失败：名字与 webhook 地址已经拿到了，
+                        // 报错会让整张卡片空掉。余额留空，面板显示「—」。
+                        Err(e) => tracing::warn!(
+                            "kiro.ooo 取 {} 失败（档案其余字段已获得，余额留空）: {}",
+                            kiroooo::PATH_CREDITS,
+                            e
+                        ),
+                    }
+                }
+                Ok(info)
+            }
         }
     }
 
@@ -559,6 +691,12 @@ impl VendorClient {
                     .get_with(kiromarket::PATH_ORDERS, &limit_offset(page, page_size))
                     .await?;
                 Ok(env.map_into())
+            }
+            VendorFlavor::KiroOoo => {
+                // 与首家同样返回裸数组、无分页参数，固定最近 50 条
+                let orders: Vec<kiroooo::PurchaseOrderRow> =
+                    self.get(kiroooo::PATH_ORDERS).await?;
+                Ok(kiroooo::orders_to_paged(orders))
             }
             // 这几家没有可对账的列表接口，返回空分页。
             // kiro.red 虽有 /user/order/index，但本次对接只做手动提取，不做订单对账。
@@ -590,6 +728,14 @@ impl VendorClient {
                     self.post_json(kiromarket::PATH_REDEEM, &body).await?;
                 Ok(r.into())
             }
+            // 文档的端点表里没有这个接口，但 GET /my/redeem 实测返回 405
+            // `allow: POST`，说明路由存在。请求体沿用各家通用的 `{"code":...}`，
+            // 响应形态未知处已在 DTO 里给足别名。
+            VendorFlavor::KiroOoo => {
+                let r: kiroooo::RedeemResponse =
+                    self.post_json(kiroooo::PATH_REDEEM, &body).await?;
+                Ok(r.into())
+            }
             VendorFlavor::KiroappCc | VendorFlavor::Drop | VendorFlavor::Kirored => {
                 Err(VendorApiError::unsupported("兑换码充值"))
             }
@@ -606,6 +752,13 @@ impl VendorClient {
         // 首家与 Drop 的路径恰好同名，但分开取：Drop 的 stock() 走
         // drop_flavor::PATH_STATUS，若只改那一处、这里继续用 legacy 的常量，
         // 同一端点就有了两个真相来源，且没有测试会失败。同 webhook_path()。
+        // kiro.ooo 的 /api/status 虽同路径，但字段名不同（`uptime_secs` 而非
+        // `uptime_seconds`）且多几个维度，故走本家 DTO 再映射进首家结构。
+        // 不给首家 DTO 加别名 —— 那是上游文件，把本家形态混进去等于让它有两个真相。
+        if self.flavor == VendorFlavor::KiroOoo {
+            let r: kiroooo::SystemStatusResponse = self.get(kiroooo::PATH_STATUS).await?;
+            return Ok(r.into());
+        }
         let path = match self.flavor {
             VendorFlavor::Drop => drop_flavor::PATH_STATUS,
             _ => legacy::PATH_STATUS,
@@ -672,6 +825,7 @@ impl VendorClient {
         match self.flavor {
             VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK,
             VendorFlavor::Kiromarket => kiromarket::PATH_WEBHOOK,
+            VendorFlavor::KiroOoo => kiroooo::PATH_WEBHOOK,
             _ => legacy::PATH_WEBHOOK,
         }
     }
@@ -680,6 +834,7 @@ impl VendorClient {
         match self.flavor {
             VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK_TEST,
             VendorFlavor::Kiromarket => kiromarket::PATH_WEBHOOK_TEST,
+            VendorFlavor::KiroOoo => kiroooo::PATH_WEBHOOK_TEST,
             _ => legacy::PATH_WEBHOOK_TEST,
         }
     }
@@ -693,6 +848,19 @@ impl VendorClient {
     ) -> Result<Paged<LedgerEntry>, VendorApiError> {
         if !self.capabilities().ledger {
             return Err(VendorApiError::unsupported("积分流水查询"));
+        }
+        // kiro.ooo 的流水挂在余额接口下（`/my/credits` 的 ledger[]），只认 `limit`
+        // 一个参数、无类型筛选，故单独一条路
+        if self.flavor == VendorFlavor::KiroOoo {
+            if entry_type.is_some_and(|t| !t.trim().is_empty()) {
+                // 不静默忽略：调用方以为筛过了、看到的却是全量，比报错更难发现
+                return Err(VendorApiError::unsupported("按类型筛选积分流水"));
+            }
+            let limit = page_size.unwrap_or(50).clamp(1, 500);
+            let r: kiroooo::CreditsResponse = self
+                .get_with(kiroooo::PATH_CREDITS, &[("limit", limit.to_string())])
+                .await?;
+            return Ok(kiroooo::ledger_to_paged(r.ledger));
         }
         // 本家分页与筛选参数名都与 kiroapp 不同，分开构造
         if self.flavor == VendorFlavor::Kiromarket {
@@ -736,6 +904,17 @@ impl VendorClient {
                 .await?;
             return Ok(env.map_into());
         }
+        if self.flavor == VendorFlavor::KiroOoo {
+            // `?history=1` 含已失效，缺省则只给存活。本家无分页参数，按单页处理。
+            let mut q = Vec::new();
+            if history {
+                q.push(("history", "1".to_string()));
+            }
+            let r = self
+                .get_with::<kiroooo::MyKeysResponse>(kiroooo::PATH_KEYS, &q)
+                .await?;
+            return Ok(r.into_paged());
+        }
         let mut query = paging(page, page_size);
         if history {
             query.push(("history", "1".to_string()));
@@ -750,8 +929,19 @@ impl VendorClient {
         if !self.capabilities().earliest_key {
             return Err(VendorApiError::unsupported("最早密钥时间查询"));
         }
-        let r: kiroapp::CreatedAtResponse = self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
-        Ok(r.into())
+        match self.flavor {
+            VendorFlavor::Kiroapp => {
+                let r: kiroapp::CreatedAtResponse =
+                    self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::KiroOoo => {
+                let r: kiroooo::CreatedAtResponse =
+                    self.get(kiroooo::PATH_KEYS_CREATED_AT).await?;
+                Ok(r.into())
+            }
+            _ => Err(VendorApiError::unsupported("最早密钥时间查询")),
+        }
     }
 }
 
@@ -815,6 +1005,18 @@ fn paging(page: Option<u32>, page_size: Option<u32>) -> Vec<(&'static str, Strin
         ));
     }
     q
+}
+
+/// kiro.ooo 的错误响应体：`{"code":404,"message":"接口不存在: /api/my/xxx"}`
+fn kiroooo_error_message(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct E {
+        message: Option<String>,
+    }
+    serde_json::from_str::<E>(text)
+        .ok()
+        .and_then(|e| e.message)
+        .filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]

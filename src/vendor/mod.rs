@@ -15,6 +15,9 @@
 //! [`flavor_kirored`] 是第六家 kiro.red，与前五家协议**根本不同**：email + 密码
 //! 登录换 JWT、每个请求带签名、响应体 AES 加密、无 webhook、商品（SKU + 积分）
 //! 下单。整套管线自成一体，不走 [`client`] 的通用请求路径。
+//! [`flavor_kiroooo`] 是第七家 kiro.ooo，又与首家同前缀同鉴权，但**余额语义不同**：
+//! 本家 `profile.remaining` 恒为 0，真实余额在 `credits` —— 照首家映射会让整家
+//! 静默不可用（面板余额 0、自动提取恒算出 0 个可提）。提货走 `/my/keys/claim`。
 //!
 //! @author wangzhong
 
@@ -33,6 +36,7 @@ pub mod flavor_drop;
 pub mod flavor_kiroapp;
 pub mod flavor_kiroapp_cc;
 pub mod flavor_kiromarket;
+pub mod flavor_kiroooo;
 pub mod flavor_kirored;
 pub mod flavor_legacy;
 pub mod protocol;

@@ -566,6 +566,26 @@ impl VendorService {
             ),
             // kiro.red 无 webhook，不会走到这里（入站未启用），加兜底分支防 match 不穷尽
             VendorFlavor::Kirored => (str_field("purchase_order_id"), None),
+            // 本家文档明确 claim 用 client_order_id 做幂等（与首家同字段名），
+            // webhook 推送里也带它。优先取它，回退到 purchase_order_id（以防日后
+            // 卖家给订单号起个独立字段）。校验 hex32（实测订单号确是 32 位十六进制）。
+            VendorFlavor::KiroOoo => {
+                let oid = str_field("client_order_id").or_else(|| str_field("purchase_order_id"));
+                let oid = oid.filter(|s| is_hex32(s)).or_else(|| {
+                    Some(derive_client_order_id(vendor_id, &event_id))
+                });
+                (oid, None)
+            }
+        };
+
+        // 本家 webhook 载荷未经实测（要在卖家侧配好地址才能收到，本次未动用户配置）。
+        // 事件名已知的只有文档一句「推一条到货通知」，已见的通知开关名是
+        // `on_key_new` / `on_key_dead` / `on_dispatch`。宽松归一化，见 normalize_event_type。
+        let event_type = if flavor == VendorFlavor::KiroOoo {
+            super::flavor_kiroooo::normalize_event_type(event_type)
+                .unwrap_or(event_type)
+        } else {
+            event_type
         };
 
         Some(IncomingEvent {
@@ -786,9 +806,15 @@ impl VendorService {
             .map(|k| k.key.clone())
             .collect();
 
-        // 根据实际成交区域设置 api_region：eu 需要 eu-central-1，us 或不分区用默认
+        // 根据实际成交区域设置 api_region：eu 需要 eu-central-1，us 或不分区用默认。
+        // kiro.ooo 扩展：该家的区域是完整 AWS 标识符（如 eu-central-1、us-east-1），
+        // 而非两字母简码，故映射扩成也认含连字符的完整 ID —— 直接用。
         let api_region = resp.zone.as_deref().and_then(|z| {
-            if z == "eu" {
+            if z.contains('-') {
+                // 含连字符的视为完整 AWS 区域标识，直接用（kiro.ooo 走此分支）
+                Some(z.to_string())
+            } else if z == "eu" {
+                // 两字母简码的首家 / Drop / kiromarket 走这里
                 Some("eu-central-1".to_string())
             } else {
                 None
@@ -1617,5 +1643,115 @@ mod tests {
         let b = VendorService::parse_event("b", VendorFlavor::Legacy, raw).unwrap();
         assert_eq!(a.event_id, b.event_id);
         assert_ne!(a.vendor_id, b.vendor_id);
+    }
+}
+
+/// 本地新增测试单独成块，避免插进上游 `mod tests` 中间引发合并冲突。
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    // ============ 第七家 kiro.ooo 的入站事件解析 ============
+
+    /// 本家 claim 的幂等键就叫 `client_order_id`，推送里也带它，要优先取
+    #[test]
+    fn kiroooo_取client_order_id做幂等键() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e1",
+            "client_order_id":"21a68cccb15074980ffa96dc3a050b3d","new_keys":2}"#;
+        let e = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, raw).unwrap();
+        assert_eq!(
+            e.purchase_order_id.as_deref(),
+            Some("21a68cccb15074980ffa96dc3a050b3d"),
+            "必须原样沿用推送里的订单号，改写会错过卖家侧的幂等重放"
+        );
+        assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
+        assert_eq!(e.new_keys, Some(2));
+        // 本家没有可定向拉取的批次 id
+        assert!(e.batch_order_id.is_none());
+    }
+
+    /// 订单号形态不合法（或缺失）时派生一个，且**对同一条推送稳定** ——
+    /// 否则重投会被当成第二笔单再扣一次积分
+    #[test]
+    fn kiroooo_订单号不合法时派生且稳定() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e2",
+            "client_order_id":"batch_not_hex"}"#;
+        let a = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, raw).unwrap();
+        let b = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, raw).unwrap();
+        let oid = a.purchase_order_id.as_deref().unwrap();
+        assert!(is_hex32(oid), "派生值必须是 32 位十六进制，实际: {oid}");
+        assert_eq!(
+            a.purchase_order_id, b.purchase_order_id,
+            "同一条推送必须派生出同一个订单号，否则重投会重复扣费"
+        );
+    }
+
+    /// 缺订单号也要派生 —— 有订单号才可能走自动提取（见 `dispatch_event`）
+    #[test]
+    fn kiroooo_缺订单号也派生() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e3"}"#;
+        let e = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, raw).unwrap();
+        assert!(e.purchase_order_id.is_some_and(|s| is_hex32(&s)));
+    }
+
+    /// **本家 webhook 事件名未经实测**，故走宽松归一化。这条锁住归一化确实接在
+    /// 解析链路上 —— 只测 `normalize_event_type` 本身不能证明它被调用了。
+    #[test]
+    fn kiroooo_事件名归一化接在解析链路上() {
+        // 本家通知开关叫 on_key_new，webhook 事件名大概率同源
+        let raw = br#"{"event":"key_new","event_id":"e4",
+            "client_order_id":"21a68cccb15074980ffa96dc3a050b3d"}"#;
+        let e = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, raw).unwrap();
+        assert_eq!(
+            e.kind,
+            VendorEventKind::NewKeysAvailable,
+            "key_new 必须归一成新货事件，落成 unknown 会让自动补货完全不工作"
+        );
+
+        // 疑似失效不能当成全失效 —— 那会在旧 Key 可能还活着时触发补货扣费
+        let suspect = br#"{"event":"key_suspect","event_id":"e5"}"#;
+        let s = VendorService::parse_event("kiro-ooo", VendorFlavor::KiroOoo, suspect).unwrap();
+        assert_ne!(
+            s.kind,
+            VendorEventKind::AllKeysDead,
+            "疑似失效只该告警，映射成全失效会误触发扣费"
+        );
+    }
+
+    /// 归一化只对本家生效，不能影响别家的事件名解析
+    #[test]
+    fn kiroooo_的归一化不影响别家() {
+        let raw = br#"{"event":"key_new","event_id":"e6"}"#;
+        let legacy = VendorService::parse_event("other", VendorFlavor::Legacy, raw).unwrap();
+        assert_eq!(
+            legacy.kind,
+            VendorEventKind::Unknown,
+            "首家没有 key_new 这个事件名，不该被本家的归一化带偏"
+        );
+    }
+
+    // ============ 逐 Key 区域 → api_region 的映射 ============
+
+    /// 本家的区域是完整 AWS 标识（`eu-central-1`），要能直接用；
+    /// 其余家的两字母简码（`eu`）仍走原分支。这条锁住那个扩展没有回归。
+    #[test]
+    fn 区域映射同时认完整标识与两字母简码() {
+        // 与 import_purchased 里的映射保持同一份逻辑
+        let map = |z: &str| -> Option<String> {
+            if z.contains('-') {
+                Some(z.to_string())
+            } else if z == "eu" {
+                Some("eu-central-1".to_string())
+            } else {
+                None
+            }
+        };
+        // kiro.ooo：完整标识直接用
+        assert_eq!(map("eu-central-1").as_deref(), Some("eu-central-1"));
+        assert_eq!(map("us-east-1").as_deref(), Some("us-east-1"));
+        // 其余家：两字母简码仍按原样映射
+        assert_eq!(map("eu").as_deref(), Some("eu-central-1"));
+        // us 用全局默认，不显式写
+        assert!(map("us").is_none());
     }
 }

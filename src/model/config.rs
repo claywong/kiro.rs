@@ -100,6 +100,8 @@ pub struct VendorConfig {
     /// | `kiroapp-cc` | kiroapp**.cc** | `/openapi/*` + `Authorization: Bearer` |
     /// | `drop` | drop.kiro.ss | `/api/my/*` + `X-API-Key`，人民币计价 |
     /// | `kiromarket` | api.91kiro.com | `/api/my/*` + `X-API-Key`，逐张实付 |
+    /// | `kirored` | kiro.red | email + 密码登录，请求签名，响应 AES 加密 |
+    /// | `kiro-ooo` | kiro.ooo | `/api/my/*` + `X-API-Key`，**余额在 `credits`** |
     ///
     /// 拼错时**直接报错而非静默回退** —— 被当成默认值会对着错误的路径和鉴权头
     /// 发请求，症状是一片 401/404。可选值见
