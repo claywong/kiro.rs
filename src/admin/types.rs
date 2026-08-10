@@ -164,6 +164,10 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_rpm_limit")]
     pub rpm_limit: u32,
 
+    /// Credit 使用上限（美元）。None 表示不限制。
+    #[serde(default)]
+    pub credit_limit: Option<f64>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,

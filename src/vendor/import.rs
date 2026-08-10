@@ -23,6 +23,7 @@ use super::store::PurchaseOutcome;
 /// 各张卡分属不同区，用订单级区域会让一半凭证连错端点、报凭证失效。
 /// `priority` 是调度优先级，**数值越小越优先**；由调用方按家给，见
 /// [`VendorConfig::effective_default_priority`](crate::model::config::VendorConfig::effective_default_priority)。
+/// `credit_limit` 是 credit 使用上限（美元），None 表示不限制。
 pub async fn import_keys(
     admin: &Arc<AdminService>,
     keys: Vec<PurchasedKey>,
@@ -31,6 +32,7 @@ pub async fn import_keys(
     rpm_limit: u32,
     api_region: Option<String>,
     priority: u32,
+    credit_limit: Option<f64>,
 ) -> PurchaseOutcome {
     let mut outcome = PurchaseOutcome::default();
     for pk in keys {
@@ -61,6 +63,7 @@ pub async fn import_keys(
             scopes: None,
             priority,
             rpm_limit,
+            credit_limit,
             region: None,
             auth_region: None,
             api_region: region_for_key,

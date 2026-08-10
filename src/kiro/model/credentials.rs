@@ -88,6 +88,11 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub rpm_limit: u32,
 
+    /// Credit 使用上限（美元）。None 表示不限制。
+    /// 实际已用额度从 traces.db 请求记录统计，达到此上限后该凭据不再被调度。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_limit: Option<f64>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +256,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("scopes", &self.scopes)
             .field("priority", &self.priority)
             .field("rpm_limit", &self.rpm_limit)
+            .field("credit_limit", &self.credit_limit)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
             .field("api_region", &self.api_region)

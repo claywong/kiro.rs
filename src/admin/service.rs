@@ -1300,6 +1300,7 @@ impl AdminService {
             scopes: req.scopes,
             priority: req.priority,
             rpm_limit: req.rpm_limit,
+            credit_limit: req.credit_limit,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,

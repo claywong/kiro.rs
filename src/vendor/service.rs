@@ -1005,6 +1005,13 @@ impl VendorService {
             (!d.is_empty()).then(|| d.to_ascii_lowercase())
         });
 
+        // kiro.red 的 key 自动设置 4k credit 限额
+        let credit_limit = if self.config.flavor == super::protocol::VendorFlavor::Kirored {
+            Some(4000.0)
+        } else {
+            None
+        };
+
         super::import::import_keys(
             &self.admin,
             keys,
@@ -1013,6 +1020,7 @@ impl VendorService {
             rpm_limit,
             api_region,
             priority,
+            credit_limit,
         ).await
     }
 

@@ -724,6 +724,27 @@ impl TraceStore {
             }
         }
     }
+
+    /// 查询指定凭证的累计已用 credit（从 traces 表的 credits 列求和）。
+    ///
+    /// 用于 credit_limit 过滤：token_manager 每分钟调用此方法更新缓存，
+    /// 调度时过滤掉已用 >= limit 的凭证。
+    ///
+    /// 失败时返回 None（调用方据此保持旧缓存或跳过该凭证）。
+    pub fn get_credit_usage_for_credential(&self, credential_id: u64) -> Option<f64> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT COALESCE(SUM(credits), 0.0) FROM traces WHERE final_credential_id = ?1",
+            [credential_id],
+            |row| row.get::<_, f64>(0),
+        ) {
+            Ok(sum) => Some(sum),
+            Err(e) => {
+                tracing::warn!("查询凭证 #{} 的 credit usage 失败: {}", credential_id, e);
+                None
+            }
+        }
+    }
 }
 
 /// 某个时间窗口内的报错数与重试数

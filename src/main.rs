@@ -251,6 +251,21 @@ async fn main() {
         });
     }
 
+    // 定期更新凭证 credit usage 缓存（每分钟），用于 credit_limit 过滤
+    if let Some(ts) = trace_store.as_ref() {
+        let token_mgr = token_manager.clone();
+        let trace_st = ts.clone();
+        tokio::spawn(async move {
+            let minute = std::time::Duration::from_secs(60);
+            // 启动后立即更新一次，避免首分钟内 credit_limit 过滤失效
+            token_mgr.update_credit_usage_cache(&trace_st);
+            loop {
+                tokio::time::sleep(minute).await;
+                token_mgr.update_credit_usage_cache(&trace_st);
+            }
+        });
+    }
+
     if let Some(initial_key) = configured_api_key.as_ref() {
         client_key_manager.sync_system_key(
             "默认密钥".to_string(),

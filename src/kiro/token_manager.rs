@@ -1210,6 +1210,9 @@ pub struct MultiTokenManager {
     model_cache_generations: Mutex<HashMap<u64, u64>>,
     /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
     model_cache_epoch: AtomicU64,
+    /// 每个凭证的累计已用 credit（从 traces.db 统计），每分钟更新一次。
+    /// 用于 credit_limit 过滤：已用 >= limit 的凭证不再调度。
+    credit_usage_cache: Mutex<HashMap<u64, f64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1570,6 +1573,7 @@ impl MultiTokenManager {
             model_refresh_semaphore: Semaphore::new(4),
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
+            credit_usage_cache: Mutex::new(HashMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1923,13 +1927,31 @@ impl MultiTokenManager {
         group: Option<&str>,
         now: Instant,
     ) -> bool {
-        !entry.disabled
-            && !entry
+        // 基础检查：禁用、限流、分组匹配、模型支持
+        if entry.disabled
+            || entry
                 .throttled_until
                 .map(|until| until > now)
                 .unwrap_or(false)
-            && credential_matches_request(&entry.credentials, model, group)
-            && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+            || !credential_matches_request(&entry.credentials, model, group)
+            || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
+        {
+            return false;
+        }
+
+        // credit_limit 检查：如果设置了限额且已用 >= 限额，则不可用
+        if let Some(limit) = entry.credentials.credit_limit {
+            if limit > 0.0 {
+                let usage_cache = self.credit_usage_cache.lock();
+                if let Some(&used) = usage_cache.get(&entry.id) {
+                    if used >= limit {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
     }
 
     fn has_available_for_request(
@@ -4788,6 +4810,30 @@ impl MultiTokenManager {
             config.self_heal_min_interval_secs = self_heal_min_interval_secs;
             config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
         })
+    }
+
+    /// 更新 credit usage 缓存（从 traces.db 统计每个凭证的累计已用 credit）。
+    ///
+    /// 只统计**未禁用**的凭证，避免已删除账号的历史数据干扰。
+    /// 调用方应每分钟调用一次此方法（如 main.rs 的后台任务）。
+    pub fn update_credit_usage_cache(&self, trace_store: &crate::admin::TraceStore) {
+        let entries = self.entries.lock();
+        let active_ids: Vec<u64> = entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect();
+        drop(entries);
+
+        let mut usage_map = HashMap::new();
+        for &id in &active_ids {
+            if let Some(usage) = trace_store.get_credit_usage_for_credential(id) {
+                usage_map.insert(id, usage);
+            }
+        }
+
+        let mut cache = self.credit_usage_cache.lock();
+        *cache = usage_map;
     }
 }
 

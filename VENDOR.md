@@ -104,6 +104,32 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 | `defaultApiRegion` | 凭据的 `apiRegion`（空串=沿用全局） | `""` |
 | `defaultAuthRegion` | 凭据的 `authRegion`（空串=沿用全局） | `""` |
 
+## Credit 限额（自动限制单个 Key 的用量）
+
+从 **kiro.red** 供应商购买的 Key 会**自动设置 4000 美元的 credit 限额**，达到限额后该 Key 自动停止被调度使用。
+
+### 工作原理
+
+1. **自动设置**：从 kiro.red 提取的 Key 入库时自动添加 `"creditLimit": 4000.0`
+2. **每分钟统计**：后台任务每分钟从 `traces.db` 统计每个凭证的累计已用 credit
+3. **自动过滤**：调度时如果某个 Key 的已用 >= 限额，则不再被选中使用
+4. **只统计有效凭证**：已禁用的凭证不计入统计
+
+### 手动设置限额
+
+其他供应商的 Key 默认不限制，如需添加限额可手动编辑 `credentials.json`：
+
+```json
+{
+  "kiroApiKey": "ksk_xxx",
+  "authMethod": "api_key",
+  "creditLimit": 3000.0,
+  "rpmLimit": 10
+}
+```
+
+设置 `creditLimit` 后，该凭证的已用 credit 达到限额时会自动停止调度。
+
 ### 已废弃的旧字段名
 
 早期文档用过下面这组名字，为兼容存量配置仍可识别，**新配置请用正名**：
