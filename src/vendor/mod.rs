@@ -12,6 +12,9 @@
 //! [`flavor_drop`] 是第四家 drop.kiro.ss（`/api/v1/*`，人民币计价、下单可能异步）。
 //! [`flavor_kiromarket`] 是第五家 kiro-market（api.91kiro.com，`/api/my/*`，
 //! 与首家同路径同鉴权，但 `keys` 是带逐张实付的对象数组、余额不在库存接口里）。
+//! [`flavor_kirored`] 是第六家 kiro.red，与前五家协议**根本不同**：email + 密码
+//! 登录换 JWT、每个请求带签名、响应体 AES 加密、无 webhook、商品（SKU + 积分）
+//! 下单。整套管线自成一体，不走 [`client`] 的通用请求路径。
 //!
 //! @author wangzhong
 
@@ -30,6 +33,7 @@ pub mod flavor_drop;
 pub mod flavor_kiroapp;
 pub mod flavor_kiroapp_cc;
 pub mod flavor_kiromarket;
+pub mod flavor_kirored;
 pub mod flavor_legacy;
 pub mod protocol;
 pub mod registry;

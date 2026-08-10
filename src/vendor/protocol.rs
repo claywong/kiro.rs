@@ -38,6 +38,15 @@ pub enum VendorFlavor {
     /// 逐张 `paid` 的对象数组（阶梯定价，提货跨车次会混价）、档案套在 `profile`
     /// 键下、余额不在库存接口里。另有质保期内自动退款机制（无需我方动作）。
     Kiromarket,
+    /// kiro.red（kiro.red）：与前五家协议**根本不同**，逻辑物理隔离在
+    /// [`super::flavor_kirored`]，不共用 [`super::client::VendorClient`] 的
+    /// 请求管线。差异：
+    /// - 鉴权：email + 密码登录换 JWT（7 天过期，进程级缓存），非静态 Key
+    /// - 请求：每个请求带 `X-Signature`（url+method+ts 双重 MD5）与时间戳头
+    /// - 响应：`X-Signature-Status: 1` 时 body 是 AES-128-CBC 密文，key/iv 由请求签名派生
+    /// - 发货：**无 webhook**，下单即发货，卡密在订单详情 `cards[].content` 里
+    /// - 下单：商品（SKU + 积分）模型，需先拉 products 选品再 `POST /user/order/create`
+    Kirored,
 }
 
 impl VendorFlavor {
@@ -48,6 +57,7 @@ impl VendorFlavor {
             Self::KiroappCc => "kiroapp-cc",
             Self::Drop => "drop",
             Self::Kiromarket => "kiromarket",
+            Self::Kirored => "kirored",
         }
     }
 
@@ -76,13 +86,16 @@ impl VendorFlavor {
             "kiromarket" | "91kiro" | "kiro91" | "api91kirocom" | "market" => {
                 Some(Self::Kiromarket)
             }
+            // 归一化去掉非字母数字，故 `kiro.red` / `kiro-red` 等写法都落到这里。
+            // 注意不能只用 `kiro` 之类过宽的别名，会与前几家的 `kiroapp` 混淆。
+            "kirored" | "kiroredcom" | "red" => Some(Self::Kirored),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc, drop, kiromarket"
+        "legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -174,6 +187,31 @@ impl VendorFlavor {
                 // us / eu 严格隔离，不跨区补货。不显式传 zone 时卖家只从美区取，
                 // 美区缺货就直接返回缺货
                 zoned_purchase: true,
+            },
+            Self::Kirored => VendorCapabilities {
+                // 无 /api/status 之类端点
+                system_status: false,
+                // 有车次批次概念，但那是商品维度的库存快照，不是「开号记录 + 平均间隔」
+                gen_logs: false,
+                // 无 webhook —— 发货靠下单后主动查订单详情
+                webhook_manage: false,
+                // 有 /user/order/index 历史订单
+                purchase_orders: true,
+                // 站点有兑换码充值，但本次对接只做手动提取，兑换接口暂不实现，
+                // 故关掉以与 client 层的 unsupported 保持一致（避免面板给出点了报错的按钮）
+                redeem: false,
+                // 有积分流水（订单本身即消费流水）——但无独立 ledger 端点，关掉
+                ledger: false,
+                // 站点有 /user/order/index，但本次对接只做手动提取，
+                // 且该端点 DTO 与 kiroapp/kiromarket 不同，未实现映射，关掉
+                my_keys: false,
+                earliest_key: false,
+                batch_scoped_purchase: false,
+                // 积分定价，单件商品固定积分价，不是同单混价的阶梯
+                tiered_pricing: false,
+                // 区编码在卡密 content 里（如 ----us-east-1），不是下单参数；
+                // 选区靠运行时挑 health=good 的商品，故不开分区能力
+                zoned_purchase: false,
             },
         }
     }
@@ -749,5 +787,58 @@ mod local_tests {
         assert!(!c.earliest_key);
         // 补货推送给的是提货幂等键，不是可定向拉取的批次 id
         assert!(!c.batch_scoped_purchase);
+    }
+
+    // ============ 第六家 kiro.red ============
+
+    /// 各种写法都要能落到同一个变体上。归一化去掉非字母数字，
+    /// 故连字符、点号、大小写都容忍。
+    #[test]
+    fn kirored_宽松解析() {
+        for raw in ["kirored", "kiro-red", "kiro.red", "KiroRed", "KIRORED"] {
+            assert_eq!(
+                VendorFlavor::parse(raw),
+                Some(VendorFlavor::Kirored),
+                "解析失败: {raw}"
+            );
+        }
+    }
+
+    /// 不能与既有五家撞名。尤其 `kiroapp` 前缀相近，必须区分。
+    #[test]
+    fn kirored_不与既有家撞名() {
+        assert_ne!(VendorFlavor::parse("kiroapp"), Some(VendorFlavor::Kirored));
+        assert_ne!(VendorFlavor::parse("kiroappcc"), Some(VendorFlavor::Kirored));
+        assert_ne!(VendorFlavor::parse("kiromarket"), Some(VendorFlavor::Kirored));
+        assert_ne!(VendorFlavor::parse("drop"), Some(VendorFlavor::Kirored));
+    }
+
+    /// 序列化形态必须与 as_str / 报错提示一致，否则面板写回 config 会改拼法。
+    #[test]
+    fn kirored_序列化形态稳定() {
+        assert_eq!(
+            serde_json::to_string(&VendorFlavor::Kirored).unwrap(),
+            r#""kirored""#
+        );
+        assert_eq!(VendorFlavor::Kirored.as_str(), "kirored");
+        assert!(VendorFlavor::all_names().contains("kirored"));
+    }
+
+    /// 能力集：无 webhook（靠下单即发货），不分区（区编码在卡密里）。
+    #[test]
+    fn kirored_能力集() {
+        let c = VendorFlavor::Kirored.capabilities();
+        assert!(!c.webhook_manage, "kiro.red 无 webhook");
+        assert!(!c.zoned_purchase, "区编码在卡密 content 里，不是下单参数");
+        assert!(!c.tiered_pricing, "积分定价，单件固定价");
+        assert!(!c.redeem, "本次对接不做兑换，与 client 层 unsupported 保持一致");
+        assert!(c.purchase_orders, "有历史订单");
+        assert!(!c.my_keys, "本次未实现密钥列表映射");
+        // 以下几项本家没有对应端点
+        assert!(!c.system_status);
+        assert!(!c.gen_logs);
+        assert!(!c.earliest_key);
+        assert!(!c.batch_scoped_purchase);
+        assert!(!c.ledger);
     }
 }

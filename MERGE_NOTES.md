@@ -113,6 +113,45 @@
 **上游关系**：`src/vendor/` 整个模块是本地独有，上游没有对应实现，这次改动无融合风险。
 但注意第 2 条移植的宽松解析是本地特有的保命逻辑，若上游日后自己做卖家对接，合并时不要被取代。
 
+### 2026-08-10 接入第六家 kiro.red（flavor = `kirored`）
+
+**背景**：kiro.red 与前五家协议**根本不同**，是首个不用静态 Key 的卖家。三个底层假设它全不满足：
+
+| 维度 | 前五家 | kiro.red |
+|---|---|---|
+| 鉴权 | 静态 `X-API-Key` / `Bearer km_xxx` | email + 密码登录换 JWT，7 天过期，需缓存 |
+| 请求 | 裸 JSON | 每个请求带 `X-Signature`（url+method+ts 双重 MD5）+ 时间戳头 |
+| 响应 | 明文 JSON | `X-Signature-Status: 1` 时 body 是 AES-128-CBC 密文，key/iv 由请求签名派生 |
+| 发货 | webhook 推 `new_keys_available` | **无 webhook**，下单即发货，卡密在订单详情 `cards[].content` |
+| 下单 | 「提取 N 个 key」 | 商品（SKU + 积分）模型，先拉 products 选品再 `POST /user/order/create` |
+
+**做的决策**：
+
+1. **整套请求管线物理隔离在 `flavor_kirored.rs`（810 行），不复用 `client.rs` 的 `auth`/`parse`/`post_json`**。
+   签名、AES 解密、登录换 token、进程级 token 缓存、选品、下单、查卡密全在这一个文件里。
+   `client.rs` 只在 `purchase`/`stock`/`profile` 的 match 加一行 `Kirored => self.kirored_client().xxx()` 委托，
+   底层方法一律不动。这是 CLAUDE.md 第二条（物理隔离）的直接应用 —— 严禁把签名/解密塞进 `client.rs` 的通用管线。
+2. **token 缓存做成模块内进程级** `OnceLock<Mutex<HashMap>>`（按 `base_url\nemail` 做 key），
+   **不侵入 `VendorService` 结构**。原因：service 层每次调用都 `self.client()` 新建无状态 client，
+   若把 token 放 client 会每次重登。放模块级静态既避免改 service 结构，也天然跨调用共享。
+3. **凭据复用 `api_key` 存 email，新增 `vendor_password` 字段**（单独成行、`#[serde(default)]`、放结构体末尾），
+   `outbound_enabled()` 对 kirored 额外要求 password 非空。新增字段破坏了三处手工构造 `VendorConfig` 的地方
+   （`to_vendor_config`、`client.rs`/`registry.rs` 测试的 `cfg`），已一并补 `vendor_password: String::new()`。
+4. **能力集保守**：只开 `purchase_orders`（实际未做对账，走空分页），其余 `webhook_manage`/`redeem`/
+   `my_keys`/`ledger`/`zoned_purchase`/`tiered_pricing` 全关。redeem/my_keys 站点其实有，但本次范围只做手动提取，
+   未实现映射就关掉，与 client 层的 `unsupported`/空分页保持一致（避免面板给出点了报错的按钮）。
+   改能力位时**同步改了 `local_tests` 里的断言**（本地特性的断言可改，上游测试不可改）。
+5. **签名/解密用离线复算的确定性向量做单测**（`签名双重md5与前端一致` 等 10 个），锁死算法不跑偏。
+   关键坑：签名的 `url` 必须是**完整路径 `/api/xxx`**（含前缀），用相对路径会被判「签名校验异常」。
+6. **下单不依赖 create 响应体结构**：create 只取订单号，卡密统一走 `order/detail` 的 `cards[].content` 再拉。
+   因为 create 的响应结构是从前端 JS 推断的、不确定，而 detail 已抓包验证。
+
+**选品**：运行时拉 products，选 `latest_batch.health == good` 且积分最低者；无健康车报错不瞎买。
+故意不校验 `purchasable`（库存快照滞后常为 false，健康度是更强信号）。
+
+**上游关系**：同样是本地独有。若上游日后做卖家对接，几乎不可能撞上这套签名/解密逻辑，合并时整体保留。
+唯一的融合点是 `protocol.rs` 的 `VendorFlavor` 枚举与 `config.rs` 的 `VendorConfig`（见第三节的约定）。
+
 ## 三、需要「融合」而非取舍的点
 
 `token_manager.rs` 的 `select_next_credential_excluding` / `acquire_context_impl` 是双方改动的

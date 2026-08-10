@@ -199,6 +199,14 @@ pub struct VendorConfig {
     /// 这是本项的**预期语义**（渠道无可用即补），封号率高时消耗会明显上升。
     #[serde(default)]
     pub auto_purchase_per_channel: bool,
+
+    /// 登录密码，仅 `kirored`（kiro.red）用。该家不用静态 Key，而是用
+    /// email + 密码登录换 JWT —— email 复用 `api_key` 字段，密码放这里。
+    ///
+    /// 单独成行、放在结构体末尾且带 `#[serde(default)]`：既不打扰上游按序排列的
+    /// 字段块，其余家不配也不受影响（缺省空串）。
+    #[serde(default)]
+    pub vendor_password: String,
 }
 
 fn default_vendor_auto_max_count() -> u32 {
@@ -284,6 +292,8 @@ impl LegacyKiroappCcConfig {
             auto_purchase_schedule: Vec::new(),
             // 不开自动提取的家谈不上逐渠道补货，与上面 auto_purchase 保持一致
             auto_purchase_per_channel: false,
+            // kiroapp.cc 走静态 Key，不用登录密码
+            vendor_password: String::new(),
         }
     }
 }
@@ -314,9 +324,18 @@ impl VendorConfig {
         }
     }
 
-    /// 出站接口是否可用（base_url 与 api_key 均非空）
+    /// 出站接口是否可用（base_url 与 api_key 均非空）。
+    ///
+    /// kirored（kiro.red）额外要求 `vendor_password` 非空 —— 该家用
+    /// email（存在 `api_key`）+ 密码登录，缺密码则登录必失败，提前判为不可用。
     pub fn outbound_enabled(&self) -> bool {
-        !self.normalized_base_url().is_empty() && !self.api_key.trim().is_empty()
+        if self.normalized_base_url().is_empty() || self.api_key.trim().is_empty() {
+            return false;
+        }
+        if self.flavor == crate::vendor::protocol::VendorFlavor::Kirored {
+            return !self.vendor_password.trim().is_empty();
+        }
+        true
     }
 
     /// 入站 webhook 是否可用（出站可用且路径 token 非空）

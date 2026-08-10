@@ -18,6 +18,8 @@ use super::flavor_drop as drop_flavor;
 use super::flavor_kiroapp as kiroapp;
 use super::flavor_kiroapp_cc as kiroapp_cc;
 use super::flavor_kiromarket as kiromarket;
+// 本地新增导入单独成行，避免与上游按序排列的 use 块冲突。
+use super::flavor_kirored as kirored;
 use super::flavor_legacy as legacy;
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
@@ -40,6 +42,9 @@ pub struct VendorClient {
     base_url: String,
     api_key: String,
     flavor: VendorFlavor,
+    // kirored（kiro.red）专用：该家用 email（存在 api_key）+ 密码登录，
+    // 单独成行避免与上游字段块冲突。其余家为空串。
+    vendor_password: String,
 }
 
 impl VendorClient {
@@ -59,7 +64,19 @@ impl VendorClient {
             base_url: vendor.normalized_base_url().to_string(),
             api_key: vendor.api_key.trim().to_string(),
             flavor: vendor.flavor,
+            vendor_password: vendor.vendor_password.trim().to_string(),
         })
+    }
+
+    /// 构建 kiro.red 专用客户端（复用同一个 reqwest::Client）。
+    /// 仅在 flavor == Kirored 的委托分支里调用。
+    fn kirored_client(&self) -> kirored::KiroredClient {
+        kirored::KiroredClient::new(
+            self.http.clone(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+            self.vendor_password.clone(),
+        )
     }
 
     pub fn capabilities(&self) -> VendorCapabilities {
@@ -80,6 +97,9 @@ impl VendorClient {
                 req.header("X-API-Key", &self.api_key)
             }
             VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
+            // kiro.red 不走这条通用鉴权 —— 它有自己的签名 + JWT 管线
+            // （见 flavor_kirored）。此分支不应被走到，原样返回不加头。
+            VendorFlavor::Kirored => req,
         }
     }
 
@@ -421,6 +441,11 @@ impl VendorClient {
                     self.post_json(kiromarket::PATH_PURCHASE, &body).await?;
                 Ok(r.into())
             }
+            // kiro.red 走独立管线：内部完成登录 → 选品 → 下单 → 查卡密。
+            // batch_order_id / zone 对本家无意义（选品在运行时按 health 自动做）。
+            VendorFlavor::Kirored => {
+                self.kirored_client().purchase(count, client_order_id).await
+            }
         }
     }
 
@@ -465,6 +490,8 @@ impl VendorClient {
                 let r: kiromarket::StockResponse = self.get(kiromarket::PATH_STOCK).await?;
                 Ok(r.into())
             }
+            // kiro.red 无库存端点，把商品列表里的健康商品折叠成中立库存
+            VendorFlavor::Kirored => self.kirored_client().stock().await,
         }
     }
 
@@ -504,6 +531,8 @@ impl VendorClient {
                 let r: kiromarket::ProfileResponse = self.get(kiromarket::PATH_PROFILE).await?;
                 Ok(r.into())
             }
+            // kiro.red 走 /user/user/info，余额是积分
+            VendorFlavor::Kirored => self.kirored_client().profile().await,
         }
     }
 
@@ -531,8 +560,9 @@ impl VendorClient {
                     .await?;
                 Ok(env.map_into())
             }
-            // 这两家都只能按 id 查单条，没有列表接口，返回空分页
-            VendorFlavor::KiroappCc | VendorFlavor::Drop => Ok(Paged {
+            // 这几家没有可对账的列表接口，返回空分页。
+            // kiro.red 虽有 /user/order/index，但本次对接只做手动提取，不做订单对账。
+            VendorFlavor::KiroappCc | VendorFlavor::Drop | VendorFlavor::Kirored => Ok(Paged {
                 items: vec![],
                 total: Some(0),
                 page: Some(page.unwrap_or(1)),
@@ -560,7 +590,7 @@ impl VendorClient {
                     self.post_json(kiromarket::PATH_REDEEM, &body).await?;
                 Ok(r.into())
             }
-            VendorFlavor::KiroappCc | VendorFlavor::Drop => {
+            VendorFlavor::KiroappCc | VendorFlavor::Drop | VendorFlavor::Kirored => {
                 Err(VendorApiError::unsupported("兑换码充值"))
             }
         }
@@ -807,6 +837,7 @@ mod tests {
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
+            vendor_password: String::new(),
         }
     }
 

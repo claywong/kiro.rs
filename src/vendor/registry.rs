@@ -155,6 +155,7 @@ mod tests {
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
+            vendor_password: String::new(),
         }
     }
 

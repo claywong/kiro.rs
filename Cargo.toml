@@ -47,6 +47,11 @@ flate2 = "1"        # tar.gz 解压（在线更新）
 tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）
+# 第六家卖家 kiro.red 专用：请求签名走 MD5、响应体走 AES-128-CBC。
+# 与既有 sha2 同属 RustCrypto 生态。单独成行、放在依赖块末尾，避免与上游排序冲突。
+aes = "0.8"        # kiro.red 响应解密（AES-128-CBC）
+cbc = "0.1"        # CBC 分组模式 + PKCS7 填充
+md-5 = "0.10"      # kiro.red 请求签名（双重 MD5）与解密密钥派生
 
 [profile.fast]
 inherits = "release"

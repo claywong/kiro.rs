@@ -79,6 +79,18 @@
       "defaultRpmLimit": 300,
       "autoPurchase": false,
       "autoPurchaseMaxCount": 1
+    },
+    {
+      "id": "kirored",
+      "name": "kiro.red",
+      "flavor": "kirored",
+      "baseUrl": "https://kiro.red",
+      "apiKey": "替换为 kiro.red 的登录邮箱（该家用邮箱+密码登录，非 API Key）",
+      "vendorPassword": "替换为 kiro.red 的登录密码",
+      "defaultGroups": [],
+      "defaultRpmLimit": 300,
+      "autoPurchase": false,
+      "autoPurchaseMaxCount": 1
     }
   ]
 }

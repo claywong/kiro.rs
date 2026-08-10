@@ -564,6 +564,8 @@ impl VendorService {
                 // 本家无「可定向拉取的批次 id」：round_id 是车次，下单不接受它
                 None,
             ),
+            // kiro.red 无 webhook，不会走到这里（入站未启用），加兜底分支防 match 不穷尽
+            VendorFlavor::Kirored => (str_field("purchase_order_id"), None),
         };
 
         Some(IncomingEvent {
