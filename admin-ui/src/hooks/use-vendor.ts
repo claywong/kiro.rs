@@ -11,6 +11,7 @@ import {
   setVendorAutoPurchaseEnabled,
   setVendorMode,
   setVendorPerChannel,
+  setStockPollRespectGate,
   setVendorPoolTarget,
   testVendorWebhook,
   setVendorWebhookUrl,
@@ -157,6 +158,17 @@ export function useSetVendorPerChannel(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (perChannel: boolean) => setVendorPerChannel(perChannel, vendorId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
+      qc.invalidateQueries({ queryKey: ['vendor-list'] })
+    },
+  })
+}
+
+export function useSetStockPollRespectGate(vendorId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (respect: boolean) => setStockPollRespectGate(respect, vendorId),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
       qc.invalidateQueries({ queryKey: ['vendor-list'] })

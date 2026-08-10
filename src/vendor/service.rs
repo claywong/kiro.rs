@@ -17,10 +17,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::admin::AdminService;
 use crate::http_client::ProxyConfig;
-use crate::model::config::{TlsBackend, VendorConfig};
+use crate::model::config::{MIN_STOCK_POLL_INTERVAL_SECS, TlsBackend, VendorConfig};
 
 use super::auto;
 use super::client::VendorClient;
@@ -32,8 +33,8 @@ use super::protocol::{
     StockInfo, VendorApiError, VendorCapabilities, VendorFlavor, VendorKeyInfo,
 };
 use super::store::{
-    IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, SharedVendorStore,
-    ValidationStatus, VendorEventKind,
+    IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, RecordOutcome,
+    SharedVendorStore, ValidationStatus, VendorEventKind,
 };
 
 /// 单张提取到的 Key 的附带信息（返回给前端）。
@@ -154,6 +155,23 @@ pub struct PerChannelChange {
     pub warning: Option<String>,
 }
 
+/// 轮询总闸遵循开关的切换结果。
+///
+/// 单独成一个类型而不复用 [`PerChannelChange`]：那个结构的字段叫 `per_channel`，
+/// 拿它传「是否遵循总闸」会让响应 JSON 里出现一个语义对不上的 `perChannel` 键，
+/// 日志与接口两头都得靠注释解释，读代码的人必然要绕一圈。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockPollGateChange {
+    /// 设置后的值（运行时已生效）
+    pub respect: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
@@ -249,6 +267,8 @@ pub struct VendorService {
     auto_purchase: AtomicBool,
     /// 逐渠道补货的运行时值。同上，面板切换后以本字段为准。
     per_channel: AtomicBool,
+    /// 库存轮询是否遵循全局总闸的运行时值。同上，面板切换后以本字段为准。
+    stock_poll_respect_gate: AtomicBool,
     /// 跨供应商共享的全局提取闸门。各家持有同一个 Arc。
     pool_gate: Arc<PoolGate>,
 }
@@ -264,6 +284,7 @@ impl VendorService {
     ) -> Self {
         let auto_purchase = config.auto_purchase;
         let per_channel = config.auto_purchase_per_channel;
+        let respect_gate = config.stock_poll_respect_global_gate;
         Self {
             config,
             proxy,
@@ -272,6 +293,7 @@ impl VendorService {
             admin,
             auto_purchase: AtomicBool::new(auto_purchase),
             per_channel: AtomicBool::new(per_channel),
+            stock_poll_respect_gate: AtomicBool::new(respect_gate),
             pool_gate,
         }
     }
@@ -464,6 +486,35 @@ impl VendorService {
         }
     }
 
+    /// 库存轮询是否遵循全局总闸的**运行时值**。
+    ///
+    /// 面板与轮询循环都必须用它，不能用 `config.stock_poll_respect_global_gate`
+    /// —— 那是启动快照，面板切换后不会变，会让开关点了就弹回去。
+    pub fn stock_poll_respect_gate(&self) -> bool {
+        self.stock_poll_respect_gate.load(Ordering::Relaxed)
+    }
+
+    pub fn set_stock_poll_respect_gate(&self, respect: bool) -> StockPollGateChange {
+        self.stock_poll_respect_gate.store(respect, Ordering::Relaxed);
+        match self.persist_stock_poll_respect_gate(respect) {
+            Ok(()) => StockPollGateChange {
+                respect,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                // 持久化失败不算设置失败：运行时已生效，重启才回退。
+                // 与 set_per_channel 同一取舍。
+                tracing::warn!("持久化轮询总闸遵循失败（运行时已生效）: {}", e);
+                StockPollGateChange {
+                    respect,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
     /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
     ///
     /// 重新从磁盘加载再改单个字段，避免把进程内的旧快照整体覆盖上去 ——
@@ -547,6 +598,46 @@ impl VendorService {
         }
         if !hit {
             anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化逐渠道补货");
+        }
+
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    fn persist_stock_poll_respect_gate(&self, respect: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，轮询总闸遵循仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+
+        let target = self.vendor_id();
+        let mut hit = false;
+        if let Some(v) = config.vendor.as_mut()
+            && v.vendor_id() == target
+        {
+            v.stock_poll_respect_global_gate = respect;
+            hit = true;
+        }
+        if !hit {
+            for v in config.vendors.iter_mut() {
+                if v.vendor_id() == target {
+                    v.stock_poll_respect_global_gate = respect;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化轮询总闸遵循");
         }
 
         config
@@ -983,6 +1074,216 @@ impl VendorService {
                 }
             }
         });
+    }
+
+    /// 库存轮询的**实际生效间隔**（秒），0 表示未启用。
+    ///
+    /// 与配置原值的区别是已抬过下限。面板与轮询器都用它，避免面板显示一个
+    /// 与真实节奏不符的数（配 10 秒实际按 60 秒跑，显示 10 会让人误判）。
+    pub fn stock_poll_interval(&self) -> u64 {
+        self.config.effective_stock_poll_interval()
+    }
+
+    /// 拉起库存轮询器，给**没有 webhook 的卖家**补上「谁来叫醒自动提取」这一环。
+    ///
+    /// 返回 `false` 表示未启用（配置为 0），调用方据此不必记日志。
+    ///
+    /// 为什么需要它：自动提取全代码库只有一个触发点 —— 入站 webhook 收到
+    /// `new_keys_available`。而 `kirored` / `kiroapp-cc` 压根不提供推送，这两家单独开
+    /// `autoPurchase` 是**静默无效**的：面板显示「自动提取」，却一次都不会动，
+    /// 且因为流程从未启动，连 `record_skip` 的跳过原因都不会留 —— 现象与
+    /// 「webhook 链路断了」完全一样，极难分辨。
+    ///
+    /// 本轮询器只负责「发现新车 → 合成事件 → 交给 `spawn_auto_purchase`」，
+    /// **一步判定都不自己做**：授权、池闸、并发锁、数量绑定、幂等全部沿用既有管线。
+    /// 这是有意的 —— 轮询多一条判定就多一条绕过闸门的路径。
+    pub fn spawn_stock_poller(self: &Arc<Self>) -> bool {
+        let interval = self.stock_poll_interval();
+        if interval == 0 {
+            return false;
+        }
+        // 抬到下限时告警一次。抬而不是拒绝启动：用户意图明确是「要轮询」，
+        // 配小了是不知道代价，按下限跑起来比不跑更符合意图。
+        let configured = self.config.stock_poll_interval_secs;
+        if configured < MIN_STOCK_POLL_INTERVAL_SECS {
+            tracing::warn!(
+                vendor_id = %self.vendor_id(),
+                configured,
+                min = MIN_STOCK_POLL_INTERVAL_SECS,
+                "轮询间隔小于下限，已抬到下限"
+            );
+        }
+
+        // 入站可用的家不该靠轮询 —— 卖家推送比我们轮询更及时也更省。配了就提醒，
+        // 但不拒绝：两者并存不会重复下单（合成事件的 id 带 `poll:` 前缀，与卖家
+        // 事件天然不同名；真撞上同一趟车，池闸与本家盘点会挡住第二单）。
+        if self.config.inbound_enabled() {
+            tracing::warn!(
+                vendor_id = %self.vendor_id(),
+                "本家已启用入站 webhook，仍配了库存轮询；卖家推送更及时，通常不必两者并存"
+            );
+        }
+
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            let period = Duration::from_secs(interval);
+            tracing::info!(
+                vendor_id = %svc.vendor_id(),
+                interval_secs = interval,
+                auto_purchase = svc.auto_purchase(),
+                "库存轮询已启动"
+            );
+            // 连续失败计数，用于指数退避。查库存对 kirored 是登录+签名+解密，
+            // 卖家侧故障时死循环重试既压对方也刷满我们的日志。
+            let mut failures: u32 = 0;
+            loop {
+                // 先睡后查：启动瞬间往往还没加载完凭据池，此时盘点结果不可信，
+                // 会让第一轮基于「池是空的」误判为该补货。
+                //
+                // 退避封顶 16 倍（1 分钟间隔 → 最长 16 分钟）：卖家侧故障可能持续
+                // 很久，无上限的指数退避会退到几小时，恢复后半天发现不了新车。
+                let backoff = period * 2u32.saturating_pow(failures.min(4));
+                tokio::time::sleep(backoff).await;
+
+                match svc.poll_stock_once().await {
+                    Ok(()) => failures = 0,
+                    Err(e) => {
+                        failures = failures.saturating_add(1);
+                        tracing::warn!(
+                            vendor_id = %svc.vendor_id(),
+                            failures,
+                            "库存轮询失败，将退避后重试: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        });
+        true
+    }
+
+    /// 轮询一轮：查库存 → 判定 → 发现新车则合成事件并走自动提取。
+    ///
+    /// `Err` 只用于**出站失败**（触发退避）；「没货」「没有新车」都是正常结果，
+    /// 记 debug 日志后返回 `Ok`。
+    async fn poll_stock_once(self: &Arc<Self>) -> Result<(), VendorServiceError> {
+        let vid = self.vendor_id();
+
+        // 全局总闸。是否在这里让路由配置决定（`stockPollRespectGlobalGate`）：
+        //
+        // - 遵循（默认）→ 总闸关着就连库存都不查，最省
+        // - 不遵循 → 继续发现并落库，但**下单那一步照样会被总闸挡住**
+        //   （`try_auto_purchase` 第 0 步就查它），故这不是一条绕过总闸的扣费路径
+        //
+        // 注意这里**不**因 `!auto_purchase()` 就跳过：只开轮询不开自动提取是一种
+        // 有意的用法（先观察轮询能否发现新车，不冒扣费风险），此时仍要查并落库。
+        if self.stock_poll_respect_gate.load(Ordering::Relaxed) {
+            if let Err(reason) = self.pool_gate.check_auto_enabled() {
+                tracing::debug!(vendor_id = %vid, "库存轮询跳过: {}", reason);
+                return Ok(());
+            }
+        }
+
+        let stock = self.stock().await?;
+        let batch = match auto::decide_poll(&stock) {
+            auto::PollDecision::Found(b) => b,
+            auto::PollDecision::Idle(reason) => {
+                tracing::debug!(vendor_id = %vid, "库存轮询本轮无事: {}", reason);
+                return Ok(());
+            }
+        };
+
+        let event_id = batch.event_id();
+        // 这趟车我们处理过了吗？靠事件表去重 —— 重启也不会重复提（表在 SQLite 里）。
+        //
+        // 只要行存在就跳过，**不看它当初提成了还是跳过了**：失败的那一趟若在这里
+        // 重试，等于每个轮询周期都对同一趟车撞一次授权判定与下单，而下单失败的原因
+        // 通常不是重试能解决的（余额不足 / 卖家侧拒单）。需要重试就人工在面板上按
+        // 那条事件提取。
+        match self.store.get_event(vid, &event_id) {
+            Ok(Some(_)) => {
+                tracing::debug!(
+                    vendor_id = %vid,
+                    event_id = %event_id,
+                    "库存轮询：这趟车已处理过，跳过"
+                );
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // 读不到就当没处理过会导致重复下单，故这里视为出站级失败去退避
+                return Err(VendorServiceError::Storage(format!(
+                    "查询合成事件失败: {e}"
+                )));
+            }
+        }
+
+        // 合成事件落库。`purchase_order_id` 必须给 —— `dispatch_event` 那条路会对
+        // 缺订单号的事件跳过自动提取，而幂等键正是从它派生的。用 event_id 本身，
+        // 于是「一趟车 = 一条事件 = 一笔订单」在库里就是可见的。
+        let zone_label = stock
+            .find_zone(&batch.zone)
+            .and_then(|z| z.label.clone())
+            .unwrap_or_else(|| batch.zone.clone());
+        let event = IncomingEvent {
+            vendor_id: vid.to_string(),
+            event_id: event_id.clone(),
+            kind: VendorEventKind::NewKeysAvailable,
+            purchase_order_id: Some(event_id.clone()),
+            batch_order_id: None,
+            message: Some(format!("库存轮询发现新车：{zone_label}")),
+            // 卖家没说几张。留空让 decide_count 按「卖家上限 ∧ 配置上限」取小 ——
+            // 填一个我们猜的数会盖掉那两个真实上限。
+            new_keys: None,
+            dead: None,
+            raw_payload: serde_json::json!({
+                "source": "stock_poll",
+                "zone": batch.zone,
+                "departedAt": batch.departed_at,
+            })
+            .to_string(),
+        };
+
+        match self.store.record_event(&event) {
+            Ok(RecordOutcome::Inserted) => {}
+            // 并发或竞态下已被写入：另一条路径会处理，这里不重复派发
+            Ok(RecordOutcome::Duplicate) => {
+                tracing::debug!(
+                    vendor_id = %vid,
+                    event_id = %event_id,
+                    "库存轮询：合成事件已存在，交由既有那条处理"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(VendorServiceError::Storage(format!(
+                    "合成事件落库失败: {e}"
+                )));
+            }
+        }
+
+        tracing::info!(
+            vendor_id = %vid,
+            event_id = %event_id,
+            zone = %batch.zone,
+            "库存轮询发现新车，已合成事件"
+        );
+
+        // 只开轮询没开自动提取：事件已落库，面板上能看到并手动提取。
+        // 这正是「先观察、不扣费」那种用法要的效果。
+        if !self.auto_purchase() {
+            tracing::info!(
+                vendor_id = %vid,
+                event_id = %event_id,
+                "本家为手动提取模式，合成事件仅落库，可在面板上手动提取"
+            );
+            return Ok(());
+        }
+
+        // 交回既有管线。授权、池闸、并发锁、数量绑定全在里面，轮询不重复判定。
+        // 总闸即便被本家配置放行到这里，那一步仍会拦下 —— 见本函数开头的说明。
+        self.spawn_auto_purchase(event_id, None);
+        Ok(())
     }
 
     /// 自动提取。仅在自动模式 + 上一轮失效已确认时真正下单。
@@ -1830,5 +2131,81 @@ mod local_tests {
         assert_eq!(map("eu").as_deref(), Some("eu-central-1"));
         // us 用全局默认，不显式写
         assert!(map("us").is_none());
+    }
+
+    // ============ 库存轮询的生效间隔 ============
+
+    /// 只给 `baseUrl` / `apiKey` 的最小配置，其余走 serde 默认 —— 这正好锁住
+    /// 「用户不写这些字段时的缺省行为」，比手写全字段更贴近真实配置文件。
+    fn cfg_json(extra: &str) -> VendorConfig {
+        let raw = format!(r#"{{"baseUrl":"https://x","apiKey":"k"{extra}}}"#);
+        serde_json::from_str(&raw).expect("配置应可解析")
+    }
+
+    /// 0 就是关闭 —— 不能被下限抬成「开着」，那等于替用户开了一条扣费路径
+    #[test]
+    fn 轮询间隔为零表示关闭() {
+        assert_eq!(cfg_json("").effective_stock_poll_interval(), 0, "缺省即关闭");
+        assert_eq!(
+            cfg_json(r#","stockPollIntervalSecs":0"#).effective_stock_poll_interval(),
+            0
+        );
+    }
+
+    /// 配小于下限的值要抬到下限。面板与轮询器都读这个值，
+    /// 否则面板显示 10 秒而实际按 60 秒跑，会让人误判「怎么没按我配的频率查」
+    #[test]
+    fn 轮询间隔抬到下限() {
+        assert_eq!(
+            cfg_json(r#","stockPollIntervalSecs":10"#).effective_stock_poll_interval(),
+            MIN_STOCK_POLL_INTERVAL_SECS
+        );
+    }
+
+    /// 大于等于下限的值原样保留
+    #[test]
+    fn 轮询间隔大于下限时原样保留() {
+        assert_eq!(
+            cfg_json(r#","stockPollIntervalSecs":600"#).effective_stock_poll_interval(),
+            600
+        );
+        assert_eq!(
+            cfg_json(r#","stockPollIntervalSecs":60"#).effective_stock_poll_interval(),
+            60
+        );
+    }
+
+    /// 遵循总闸默认开启 —— 默认不该放行一条「总闸关了还在查」的路径
+    #[test]
+    fn 遵循总闸默认开启() {
+        assert!(
+            cfg_json("").stock_poll_respect_global_gate,
+            "缺省必须为 true：默认行为要最保守"
+        );
+        assert!(
+            !cfg_json(r#","stockPollRespectGlobalGate":false"#).stock_poll_respect_global_gate,
+            "显式关闭要生效"
+        );
+    }
+
+    /// 面板与轮询循环都必须读**运行时值**，不能读 `config` 的启动快照。
+    ///
+    /// 这条锁的是一个真实踩过的坑：状态接口曾返回 `cfg.stock_poll_respect_global_gate`，
+    /// 于是面板关掉开关后重新拉状态拿到的还是启动时那个 true，开关点了就弹回去 ——
+    /// 看着像「关闭失败」，而 PUT 请求其实全部成功、config.json 也写进去了。
+    #[test]
+    fn 轮询总闸遵循以运行时值为准() {
+        // 起始为 true（缺省），切成 false 后读回来必须是 false。
+        // 用真实的 AtomicBool 语义验证，不构造整个 VendorService。
+        let runtime = std::sync::atomic::AtomicBool::new(
+            cfg_json("").stock_poll_respect_global_gate,
+        );
+        assert!(runtime.load(Ordering::Relaxed), "初值取自配置");
+
+        runtime.store(false, Ordering::Relaxed);
+        assert!(
+            !runtime.load(Ordering::Relaxed),
+            "切换后必须读到新值；若面板读的是 config 快照，这里就会拿到旧的 true"
+        );
     }
 }

@@ -742,6 +742,14 @@ export interface VendorStatus {
    * 否则那些家常驻的号会占满总量，关着的家永远轮不到补货。
    */
   autoPurchasePerChannel?: boolean
+  /**
+   * 库存轮询的生效间隔（秒），0 = 未启用。给没有 webhook 的家
+   * （kirored / kiroapp-cc）补上自动提取的触发源：定时查库存，发现新车就合成
+   * 事件走同一条管线。已抬过下限，与 config.json 的原值不一定相同。
+   */
+  stockPollIntervalSecs?: number
+  /** 轮询是否遵循全局总闸。关着时总闸停了也继续发现新车（但仍不会自动下单） */
+  stockPollRespectGlobalGate?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
@@ -805,6 +813,16 @@ export interface VendorAutoEnabledChange {
 export interface VendorPerChannelChange {
   /** 设置后的模式（运行时已生效） */
   perChannel: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 设置「轮询是否遵循全局总闸」的结果 */
+export interface VendorStockPollGateChange {
+  /** 设置后的值（运行时已生效） */
+  respect: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */

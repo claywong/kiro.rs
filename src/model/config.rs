@@ -217,7 +217,70 @@ pub struct VendorConfig {
     /// 字段块，其余家不配也不受影响（缺省空串）。
     #[serde(default)]
     pub vendor_password: String,
+
+    /// 轮询发现新车并自动提取的间隔（秒）。**0 = 关闭（默认）**。
+    ///
+    /// 给**没有 webhook 的卖家**（`kirored` / `kiroapp-cc`）用。这些家的
+    /// `autoPurchase` 单独开是无效的：自动提取只由入站事件触发，而它们压根不推 ——
+    /// 开关能开、面板显示「自动提取」，却一次都不会动，且不留任何跳过记录。
+    /// 本项补上缺失的那一环：定时查库存，发现新车就**合成**一条
+    /// `new_keys_available` 事件塞进同一条管线，下游判定与幂等完全复用。
+    ///
+    /// 与 `autoPurchase` 是 **AND** 关系：本项非 0 只是让轮询器跑起来，真正下不下单
+    /// 仍由 `autoPurchase` 与各级闸门决定。两个开关分开是有意的 —— 单独开本项可以
+    /// 先只观察「轮询能否发现新车」（日志里看得到），不冒扣费风险。
+    ///
+    /// **有下限**：小于 [`MIN_STOCK_POLL_INTERVAL_SECS`] 的非 0 值会被抬到该值并
+    /// 告警。kiro.red 查一次库存要登录 + 签名 + 解密，间隔太密等于持续压卖家接口，
+    /// 且我方每一轮都要走一遍授权判定。
+    #[serde(default)]
+    pub stock_poll_interval_secs: u64,
+
+    /// 轮询是否遵循**全局自动提取总闸**（顶层 `autoPurchaseEnabled`）。默认 `true`。
+    ///
+    /// 这个开关能控制的**只有「发现」这一步**，不是扣费开关：
+    ///
+    /// | 本项 | 总闸关闭时的行为 |
+    /// |---|---|
+    /// | `true`（默认） | 轮询直接跳过，连库存都不查 |
+    /// | `false` | 继续查库存、继续把发现的新车落成事件，但**仍然不会自动下单** |
+    ///
+    /// 后者仍不下单的原因：真正的下单走 `try_auto_purchase`，它第 0 步就查总闸，
+    /// 不受本项影响。所以关掉本项**不会**产生一条绕过总闸的扣费路径 —— 效果是
+    /// 「总闸关着时也保持发现」，合成事件落库、面板上看得到，可人工决定要不要提。
+    ///
+    /// 什么时候该关：总闸常态关闭（例如靠健康联动自动开关）、但你仍想知道卖家
+    /// 什么时候发车、发的哪个区。开着总闸时本项没有区别。
+    #[serde(default = "default_true")]
+    pub stock_poll_respect_global_gate: bool,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+impl VendorConfig {
+    /// 库存轮询的**实际生效间隔**（秒），0 表示未启用。
+    ///
+    /// 与配置原值的区别是已抬过下限（见 [`MIN_STOCK_POLL_INTERVAL_SECS`]）。
+    /// 轮询器与面板都必须用这个值，否则面板显示 10 秒而实际按 60 秒跑，
+    /// 会让人误判「怎么没按我配的频率查」。
+    ///
+    /// **0 不受下限影响** —— 0 是「关闭」，被抬成 60 等于替用户开了一条扣费路径。
+    pub fn effective_stock_poll_interval(&self) -> u64 {
+        match self.stock_poll_interval_secs {
+            0 => 0,
+            v => v.max(MIN_STOCK_POLL_INTERVAL_SECS),
+        }
+    }
+}
+
+/// 轮询间隔下限（秒）。见 [`VendorConfig::stock_poll_interval_secs`]。
+///
+/// 定在 1 分钟。车次存活时间以十分钟计（kiro.red 实测「16 分钟 47 秒」这个量级），
+/// 1 分钟的分辨率足够抢到刚发的车。再密就没有意义了 —— kiro.red 查一次库存要
+/// 登录换 JWT + 请求签名 + 响应解密，秒级轮询等于持续压卖家接口。
+pub const MIN_STOCK_POLL_INTERVAL_SECS: u64 = 60;
 
 fn default_vendor_auto_max_count() -> u32 {
     1
@@ -309,6 +372,9 @@ impl LegacyKiroappCcConfig {
             auto_purchase_per_channel: false,
             // kiroapp.cc 走静态 Key，不用登录密码
             vendor_password: String::new(),
+            // 存量配置不擅自开轮询：那会带来扣费行为，必须用户显式配
+            stock_poll_interval_secs: 0,
+            stock_poll_respect_global_gate: true,
         }
     }
 }

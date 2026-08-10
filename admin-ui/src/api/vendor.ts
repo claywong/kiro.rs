@@ -10,6 +10,7 @@ import type {
   VendorListResponse,
   VendorAutoEnabledChange,
   VendorPerChannelChange,
+  VendorStockPollGateChange,
   VendorPoolTargetChange,
 } from '@/types/api'
 
@@ -216,6 +217,18 @@ export async function setVendorPerChannel(
   const { data } = await api.put<VendorPerChannelChange>(
     '/per-channel',
     { perChannel },
+    { params: vendorId ? { vendorId } : {} }
+  )
+  return data
+}
+
+export async function setStockPollRespectGate(
+  respect: boolean,
+  vendorId?: string
+): Promise<VendorStockPollGateChange> {
+  const { data } = await api.put<VendorStockPollGateChange>(
+    '/stock-poll-respect-gate',
+    { respect },
     { params: vendorId ? { vendorId } : {} }
   )
   return data

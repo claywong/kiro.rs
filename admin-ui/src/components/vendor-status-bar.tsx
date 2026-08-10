@@ -18,6 +18,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
   useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode, useSetVendorPerChannel,
+  useSetStockPollRespectGate,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 // 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
@@ -218,6 +219,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   const purchaseAdHoc = usePurchaseAdHoc(vendorId)
   const setMode = useSetVendorMode(vendorId)
   const setPerChannel = useSetVendorPerChannel(vendorId)
+  const setStockPollRespectGate = useSetStockPollRespectGate(vendorId)
   const confirm = useConfirm()
 
   const [redeemOpen, setRedeemOpen] = useState(false)
@@ -365,6 +367,30 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   }
 
   /**
+   * 切换轮询是否遵循全局总闸。
+   *
+   * 关掉（总闸关着也继续轮询）会让轮询产生更多请求，但不会自动下单，
+   * 仅增加发现频率，故不需二次确认。
+   */
+  const handleToggleStockPollRespectGate = async (next: boolean) => {
+    try {
+      const r = await setStockPollRespectGate.mutateAsync(next)
+      const what = next
+        ? '轮询已改为遵循总闸（总闸关闭时停止轮询）'
+        : '轮询已改为不受总闸影响（总闸关闭时仍继续发现新车）'
+      if (!r.persisted) {
+        toast.warning(`${what}（仅本次运行）`, {
+          description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
+        })
+        return
+      }
+      toast.success(what)
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换轮询总闸遵循失败'))
+    }
+  }
+
+  /**
    * 直接提取：不依赖 webhook 事件，服务端自行生成订单号。
    * 会真实扣费，故强制二次确认并把数量、预计扣费、余额变化列清楚。
    */
@@ -482,6 +508,31 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
               onCheckedChange={handleTogglePerChannel}
               disabled={setPerChannel.isPending}
               aria-label="切换逐渠道补货"
+            />
+          </div>
+        )}
+
+        {/* 库存轮询：只在开了轮询（stockPollIntervalSecs > 0）的家显示。
+            这个开关控制的只有「发现」这一步，下单仍由 autoPurchase 与各级闸门决定。 */}
+        {status?.stockPollIntervalSecs && status.stockPollIntervalSecs > 0 && (
+          <div className="flex items-center gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-1.5">
+            <div className="text-xs">
+              <span className="font-medium">
+                {status.stockPollRespectGlobalGate
+                  ? '轮询遵循总闸'
+                  : '轮询不受总闸影响'}
+              </span>
+              <span className="ml-1.5 text-muted-foreground">
+                {status.stockPollRespectGlobalGate
+                  ? '总闸关闭时停止轮询（连库存都不查）'
+                  : '总闸关闭时仍继续发现新车（但不会自动下单）'}
+              </span>
+            </div>
+            <Switch
+              checked={status.stockPollRespectGlobalGate ?? true}
+              onCheckedChange={handleToggleStockPollRespectGate}
+              disabled={setStockPollRespectGate.isPending}
+              aria-label="切换轮询是否遵循全局总闸"
             />
           </div>
         )}

@@ -342,6 +342,9 @@ async fn main() {
         tracing::info!("未配置卖家对接，vendor 相关接口将返回未配置");
     } else {
         tracing::info!("卖家对接已启用，共 {} 家", vendor_registry.len());
+        // 库存轮询：给没有 webhook 的家（kirored / kiroapp-cc）补上自动提取的触发源。
+        // 只对配了 stockPollIntervalSecs 的家生效，未配的家不起任何任务。
+        vendor_registry.spawn_stock_pollers();
     }
     // 端点提示在下方路由清单里打印，注册表随后被 VendorState 接管，先取出所需计数。
     let vendor_count = vendor_registry.len();

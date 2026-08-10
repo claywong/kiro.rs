@@ -74,6 +74,22 @@ impl VendorRegistry {
         }
     }
 
+    /// 拉起各家的库存轮询器。**必须在 tokio 运行时内调用**（内部 `tokio::spawn`）。
+    ///
+    /// 单独成一个方法而不放进 [`Self::new`]：构造在测试里也会跑，而测试不该起后台
+    /// 任务去打卖家接口。由 `main` 在运行时就绪后显式调一次。
+    pub fn spawn_stock_pollers(&self) {
+        let started: Vec<&str> = self
+            .services
+            .iter()
+            .filter(|s| s.spawn_stock_poller())
+            .map(|s| s.vendor_id())
+            .collect();
+        if !started.is_empty() {
+            tracing::info!(vendors = ?started, "库存轮询已为这些卖家启动");
+        }
+    }
+
     /// 从完整配置构建（合并 `vendor` 单例与 `vendors` 列表）
     pub fn from_config(
         config: &Config,
@@ -164,6 +180,8 @@ mod tests {
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
             vendor_password: String::new(),
+            stock_poll_interval_secs: 0,
+            stock_poll_respect_global_gate: true,
         }
     }
 

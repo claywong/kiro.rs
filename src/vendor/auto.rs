@@ -307,6 +307,94 @@ pub fn decide_count(new_keys: Option<u32>, stock_max: u32, configured_max: u32) 
     new_keys.unwrap_or(stock_max).min(stock_max).min(configured_max)
 }
 
+// ============ 轮询发现新车 ============
+
+/// 一趟车的身份，用来给合成事件取 id。
+///
+/// 没有 webhook 的卖家（`kirored` / `kiroapp-cc`）不会推「有新货了」，只能靠轮询
+/// 库存自己发现。而合成事件要塞进 `vendor_events` 表，那张表按
+/// `(vendor_id, event_id)` 唯一去重，于是 **event_id 取什么直接决定成败**：
+///
+/// - 取固定串 → 第一次之后永远算重投，一次都不会再提
+/// - 取时间戳 / UUID → 每个轮询周期都是新事件，等于每轮撞一次授权判定
+///
+/// 正解是取**卖家侧的批次身份**：一趟车一个 id，同一趟车反复看到也只算一条事件。
+/// 两家都有现成的可用：
+///
+/// - kiro.red：`latest_batch.import_time`（发车 Unix 秒），落在 `ZoneStock::departed_at`
+/// - kiro.ooo：`dispatches[].time`（发车时刻），同样落在 `departed_at`
+///
+/// 故这里统一从 [`super::protocol::ZoneStock`] 取，不必逐家写规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchIdentity {
+    /// 区 / 商品 id。kiro.red 是商品 id，kiro.ooo 是 AWS 区域代码。
+    pub zone: String,
+    /// 发车时刻（Unix 秒）
+    pub departed_at: i64,
+}
+
+impl BatchIdentity {
+    /// 合成事件的 id。
+    ///
+    /// `poll:` 前缀是刻意的：面板的事件列表里一眼能分出「卖家推来的」和「我们
+    /// 轮询发现的」，排障时不必去猜某条事件的来源。
+    pub fn event_id(&self) -> String {
+        format!("poll:{}:{}", self.zone, self.departed_at)
+    }
+}
+
+/// 轮询一轮的结论
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollDecision {
+    /// 发现一趟可提的新车，应合成事件并走自动提取
+    Found(BatchIdentity),
+    /// 本轮无事可做，附原因（仅记 debug 日志，不写库 —— 轮询每几分钟一轮，
+    /// 每轮都落库会把事件表刷满，而「没货」不是需要留痕的事件）
+    Idle(String),
+}
+
+/// 从库存里挑出「本轮该不该提、提哪趟车」。**纯函数，判定规则的全部。**
+///
+/// 规则按保守优先排列，与 `try_auto_purchase` 现有的检查顺序同一取向
+/// （代价从小到大、可逆到不可逆）：
+///
+/// 1. 必须有**开放且有货**的区 —— 没货谈不上提
+/// 2. 该区必须给得出**发车时刻** —— 给不出就没有批次身份，合成事件无法去重，
+///    宁可不提也不能拿时间戳当 id（那会每轮下一单）
+/// 3. 多区有货时取 [`super::protocol::StockInfo::pick_zone`] 选中的那个 ——
+///    与手动提取、webhook 触发用的是同一个选区函数，三条路径口径一致
+///
+/// 注意**这里不判「本地有没有存活 Key」**：那是授权判定
+/// （[`decide_authorization`]）的职责，在 `try_auto_purchase` 里由本家盘点或池闸
+/// 给结论。两处分工不能混 —— 混了就会出现「轮询自己放行、绕过池闸」的路径。
+pub fn decide_poll(stock: &super::protocol::StockInfo) -> PollDecision {
+    let Some(zone) = stock.pick_zone() else {
+        return PollDecision::Idle(if stock.zones.is_empty() {
+            // 空 zones 有两种成因，而从 StockInfo 分不出是哪一种，故**不断言**：
+            //
+            // - 结构上不分区（kiroapp-cc）→ 永久如此，轮询对其无效
+            // - 此刻没有可列出的车次（kiro.red 只把 health=good 的商品折进 zones，
+            //   车一不健康 zones 就空了）→ 下一轮可能就有
+            //
+            // 早先这里写的是「库存未按区给出」，读起来像卖家接口变形了，会把人
+            // 引到错误的排查方向 —— 实测最常见的其实是第二种。
+            "库存未给出任何分区（本家可能不分区，或当前无健康车次）".to_string()
+        } else {
+            "各区均无可提库存".to_string()
+        });
+    };
+    let Some(departed_at) = zone.departed_at.filter(|t| *t > 0) else {
+        return PollDecision::Idle(format!(
+            "{} 有货但卖家未给发车时刻，无法为合成事件取稳定 id",
+            zone.label.as_deref().unwrap_or(&zone.zone)
+        ));
+    };
+    PollDecision::Found(BatchIdentity {
+        zone: zone.zone.clone(),
+        departed_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +741,157 @@ mod tests {
     #[test]
     fn 空池全局盘点为零() {
         assert_eq!(pool_alive(&[]), 0);
+    }
+
+    // ============ 轮询发现新车 ============
+
+    use super::super::protocol::{StockInfo, ZoneStock};
+
+    fn zone(zone: &str, available: u32, departed_at: Option<i64>, price: f64) -> ZoneStock {
+        ZoneStock {
+            zone: zone.to_string(),
+            label: Some(format!("{zone}区")),
+            available,
+            stock: Some(available),
+            unit_price: Some(price),
+            enabled: true,
+            departed_at,
+            alive_secs: None,
+            alive_text: None,
+        }
+    }
+
+    fn stock_with(zones: Vec<ZoneStock>) -> StockInfo {
+        StockInfo {
+            available: zones.iter().map(|z| z.available).sum(),
+            price_min: None,
+            price_max: None,
+            balance: None,
+            zones,
+        }
+    }
+
+    /// 合成事件的 id 必须**只由批次身份决定** —— 这是整个轮询方案的成败所在。
+    ///
+    /// 取时间戳或 UUID 会让每个轮询周期都产生一条新事件，等于每分钟撞一次授权
+    /// 判定；取固定串则第一次之后永远算重投，一次都不会再提。
+    #[test]
+    fn 合成事件id只由批次身份决定() {
+        let b = BatchIdentity {
+            zone: "55".into(),
+            departed_at: 1786337683,
+        };
+        assert_eq!(b.event_id(), "poll:55:1786337683");
+        // 同一趟车反复看到，id 必须一致（去重全靠这个）
+        assert_eq!(b.event_id(), b.clone().event_id());
+        // 不同车必须不同 id，否则新车会被当成重投而永不提取
+        let next = BatchIdentity {
+            zone: "55".into(),
+            departed_at: 1786338000,
+        };
+        assert_ne!(b.event_id(), next.event_id());
+        // 同一时刻的不同区是两趟车（kiro.ooo 双区同时发车）
+        let other_zone = BatchIdentity {
+            zone: "eu-central-1".into(),
+            departed_at: 1786337683,
+        };
+        assert_ne!(b.event_id(), other_zone.event_id());
+        // 前缀让面板能一眼区分「卖家推来的」与「我们轮询发现的」
+        assert!(b.event_id().starts_with("poll:"));
+    }
+
+    #[test]
+    fn 轮询发现有货的区() {
+        let s = stock_with(vec![
+            zone("us-east-1", 0, Some(1786337000), 80.0),
+            zone("eu-central-1", 3, Some(1786337683), 50.0),
+        ]);
+        match decide_poll(&s) {
+            PollDecision::Found(b) => {
+                assert_eq!(b.zone, "eu-central-1", "要挑有货的那个区");
+                assert_eq!(b.departed_at, 1786337683);
+            }
+            other => panic!("应发现新车，实际: {other:?}"),
+        }
+    }
+
+    /// 选区必须复用 `pick_zone` —— 与手动提取、webhook 触发同一口径。
+    /// 各自实现会导致「轮询挑贵的、手动挑便宜的」这种说不清的差异。
+    #[test]
+    fn 多区有货时与pick_zone同口径() {
+        let s = stock_with(vec![
+            zone("us-east-1", 5, Some(1786337000), 80.0),
+            zone("eu-central-1", 5, Some(1786337683), 50.0),
+        ]);
+        let picked = s.pick_zone().unwrap().zone.clone();
+        match decide_poll(&s) {
+            PollDecision::Found(b) => assert_eq!(b.zone, picked, "口径必须与 pick_zone 一致"),
+            other => panic!("应发现新车，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 无货时不发现() {
+        let s = stock_with(vec![
+            zone("us-east-1", 0, Some(1786337000), 80.0),
+            zone("eu-central-1", 0, Some(1786337683), 50.0),
+        ]);
+        assert!(matches!(decide_poll(&s), PollDecision::Idle(_)));
+    }
+
+    /// 关停的区即使有存货也提不出来，不该触发
+    #[test]
+    fn 关停的区不发现() {
+        let mut z = zone("eu-central-1", 5, Some(1786337683), 50.0);
+        z.enabled = false;
+        assert!(matches!(decide_poll(&stock_with(vec![z])), PollDecision::Idle(_)));
+    }
+
+    /// **没有发车时刻就不提** —— 没有批次身份就没有稳定的 event_id，
+    /// 硬提会退化成「每个轮询周期下一单」。宁可不提。
+    #[test]
+    fn 缺发车时刻时不发现() {
+        let s = stock_with(vec![zone("eu-central-1", 5, None, 50.0)]);
+        match decide_poll(&s) {
+            PollDecision::Idle(reason) => assert!(
+                reason.contains("发车时刻"),
+                "原因要说清是缺发车时刻，实际: {reason}"
+            ),
+            other => panic!("缺批次身份时必须不提，实际: {other:?}"),
+        }
+        // 0 是卖家表示「无」的写法，同样不算
+        let s0 = stock_with(vec![zone("eu-central-1", 5, Some(0), 50.0)]);
+        assert!(matches!(decide_poll(&s0), PollDecision::Idle(_)));
+    }
+
+    /// zones 恒空的家（kiroapp-cc）轮询无效；kiro.red 无健康车次时也会走到这里。
+    ///
+    /// 原因文案**不能断言成因** —— 两种情形从 StockInfo 分不出来，写成
+    /// 「卖家未按区给出」会把人引向「接口变形了」这个错误方向。
+    #[test]
+    fn 无分区时给出不断言成因的原因() {
+        let s = stock_with(vec![]);
+        match decide_poll(&s) {
+            PollDecision::Idle(reason) => {
+                assert!(reason.contains("不分区"), "要提到可能不分区，实际: {reason}");
+                assert!(
+                    reason.contains("无健康车次"),
+                    "也要提到可能只是当下没车 —— 这是实测最常见的成因，实际: {reason}"
+                );
+            }
+            other => panic!("实际: {other:?}"),
+        }
+    }
+
+    /// 轮询判定**不碰**「本地有没有存活 Key」—— 那是 decide_authorization 的职责。
+    /// 混在一起就会出现「轮询自己放行、绕过池闸」的路径。
+    #[test]
+    fn 轮询判定不涉及本地盘点() {
+        // 同一份库存，无论本地池什么状态，decide_poll 的结论都一样
+        let s = stock_with(vec![zone("eu-central-1", 3, Some(1786337683), 50.0)]);
+        let first = decide_poll(&s);
+        let second = decide_poll(&s);
+        assert_eq!(first, second);
+        assert!(matches!(first, PollDecision::Found(_)));
     }
 }

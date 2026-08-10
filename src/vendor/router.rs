@@ -14,7 +14,7 @@ use super::handlers::{
     set_webhook_url, test_webhook, list_orders,
 };
 // 本地新增的多卖家接口单独成行，避免与上游改动撞在同一批 use 上。
-use super::handlers::{list_ledger, list_my_keys, list_vendors};
+use super::handlers::{list_ledger, list_my_keys, list_vendors, set_stock_poll_respect_gate};
 
 /// 入站 webhook 请求体上限（64KB）。卖家 payload 只有几百字节，不需要给到
 /// Anthropic 路由那种 50MB。
@@ -47,6 +47,7 @@ pub fn create_vendor_admin_router(state: VendorState) -> Router {
         // 自动提取总闸。全局设置，与 /mode 的逐家切换是两回事。
         .route("/auto-purchase-enabled", put(set_auto_purchase_enabled))
         .route("/per-channel", put(set_per_channel))
+        .route("/stock-poll-respect-gate", put(set_stock_poll_respect_gate))
         .route("/redeem", post(redeem))
         .route("/webhook", put(set_webhook_url))
         .route("/webhook/test", post(test_webhook))

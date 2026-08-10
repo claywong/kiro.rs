@@ -331,6 +331,15 @@ pub async fn get_status(State(state): State<VendorState>, Query(sel): Query<Vend
         // 逐渠道补货（运行时值）。开着则本家只看自己有没有存活 Key，
         // 不看全局池量；关着则按 autoPurchasePoolTarget 判总量
         "autoPurchasePerChannel": service.per_channel(),
+        // 库存轮询：给没有 webhook 的家（kirored / kiroapp-cc）补上自动提取的触发源。
+        // 0 表示未启用。透出实际生效值（已抬到下限）而非配置原值 —— 面板显示一个
+        // 与真实节奏不符的间隔，会让人误判「怎么没按我配的频率查」。
+        "stockPollIntervalSecs": service.stock_poll_interval(),
+        // 轮询是否遵循全局总闸。关着时总闸停了也继续发现新车（但仍不会自动下单）
+        // 必须读**运行时值**而非 cfg 的启动快照：面板切换后 config.json 与 AtomicBool
+        // 都已更新，但 cfg 是进程启动时那份，永远返回旧值 —— 症状是开关点了就弹回去，
+        // 看着像「关闭失败」，而请求其实全成功了。同 autoPurchase / perChannel。
+        "stockPollRespectGlobalGate": service.stock_poll_respect_gate(),
     });
 
     // 库存与档案两家都有；其余按能力集选择性发起
@@ -706,6 +715,13 @@ pub struct SetPerChannelRequest {
     pub per_channel: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetStockPollRespectGateRequest {
+    /// true = 轮询遵循全局总闸，false = 总闸关着也继续轮询
+    pub respect: bool,
+}
+
 /// `PUT /api/admin/vendor/per-channel?vendorId=xxx` —— 设置**某一家**的逐渠道补货
 ///
 /// 与 `set_pool_target` 不同，这是**逐家**设置，要认 `vendorId` —— 每家可以各自
@@ -725,6 +741,28 @@ pub async fn set_per_channel(
         per_channel = result.per_channel,
         persisted = result.persisted,
         "逐渠道补货已更新"
+    );
+    Json(result).into_response()
+}
+
+/// `PUT /api/admin/vendor/stock-poll-respect-gate?vendorId=xxx` —— 设置库存轮询是否遵循全局总闸
+///
+/// 与 `set_per_channel` 一样是**逐家**设置 —— 每家可以各自决定遵不遵循总闸。
+pub async fn set_stock_poll_respect_gate(
+    State(state): State<VendorState>,
+    Query(sel): Query<VendorSelector>,
+    Json(req): Json<SetStockPollRespectGateRequest>,
+) -> Response {
+    let service = match pick(&state, &sel) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let result = service.set_stock_poll_respect_gate(req.respect);
+    tracing::info!(
+        vendor_id = %service.vendor_id(),
+        respect = result.respect,
+        persisted = result.persisted,
+        "库存轮询总闸遵循已更新"
     );
     Json(result).into_response()
 }
