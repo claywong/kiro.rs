@@ -10,9 +10,11 @@
 //!   `balance ← remaining` 会让面板显示余额 0，且自动提取算出的可提数量恒为 0 ——
 //!   整家静默不可用。这是本家必须独立成 flavor 的首要理由。
 //! - **提货路径是 `/my/keys/claim`** 而非 `/my/purchase`。
-//! - **库存不分区**：`/my/stock` 是扁平结构，没有 `zones[]`，claim 也不接受
-//!   `zone` 参数。区域（`us-east-1` / `eu-central-1`）由卖家逐 Key 决定，
-//!   见 [`ClaimResponse`] 对 `PurchaseResult::zone` 的处理。
+//! - **分区在独立端点**：`/my/stock` 是扁平结构、没有 `zones[]`，双区货架要另取
+//!   `/my/stock/regions`（见 [`RegionsResponse`]）；claim 的区域参数名是
+//!   **`region`**（不是首家的 `zone`），且**不传默认 `us-east-1`**。这一条是
+//!   2026-08-10 卖家改版后新增的，早期版本确实不分区。
+//!   参数名与默认值都要留意：默认区常常正是关停 0 库存的那个。
 //! - **无开号记录**：`/my/gen-logs` 实测 404。
 //! - **`/status` 有真实数据**（且免鉴权），但字段名是 `uptime_secs`，
 //!   legacy 的 DTO 叫 `uptime_seconds`，映射时要补。
@@ -21,15 +23,19 @@
 //!
 //! @author wangzhong
 
+use chrono::NaiveDateTime;
 use serde::Deserialize;
 
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, PurchasedKey,
-    RedeemResult, StockInfo, VendorKeyInfo,
+    RedeemResult, StockInfo, VendorKeyInfo, ZoneStock,
 };
 
 /// 路径前缀。账号维度接口都在 `/api/my` 下，系统状态在 `/api/status`（免鉴权）。
 pub const PATH_STOCK: &str = "/api/my/stock";
+/// 双区货架。`/my/stock` 只给一份扁平数字（实测是「当前开放那个区」的），
+/// 要判断哪个区有货必须查这里。
+pub const PATH_STOCK_REGIONS: &str = "/api/my/stock/regions";
 /// 提货。注意不是 `/api/my/purchase` —— 本家没有那个路由。
 pub const PATH_CLAIM: &str = "/api/my/keys/claim";
 pub const PATH_PROFILE: &str = "/api/my/profile";
@@ -128,8 +134,283 @@ impl From<StockResponse> for StockInfo {
             // 关键：余额取 credits。本家的 remaining 是剩余配额且恒 0，
             // 拿它当余额会让面板显示 0 且自动提取算不出可提数量。
             balance: r.credits,
-            // 本家不分区
+            // 分区在 /my/stock/regions，本端点给不出来。**留空是有意的**：
+            // 只有 client 层取到货架后才填（见 VendorClient::stock 的本家分支），
+            // 在这里凭空造一个「默认区」会让 pick_zone 选到一个未经核实的区。
             zones: Vec::new(),
+        }
+    }
+}
+
+// ============ 双区货架 ============
+
+/// claim 不传 `region` 时卖家采用的默认区（文档明写）。
+///
+/// 建这个常量不是为了拿它当下单参数用，而是为了在注释与测试里指名道姓：
+/// **默认区经常正是关停 0 库存的那个**，所以下单必须显式带区。
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// `GET /my/stock/regions` 的 `regions[]` 单项。
+///
+/// 实测样本（2026-08-10 18:00）：
+/// ```json
+/// {"region":"eu-central-1","label":"欧洲区","open":true,"claimable":13,
+///  "stock":13,"afford":2,"unit_price":50,"short_credits":0,
+///  "batches":[{"count":8,"time":"2026-08-10 17:41:00"}],
+///  "dispatches":[{"alive":8,"dead":0,"delivered":0,"running":true,"time":"..."}]}
+/// ```
+///
+/// 卖家侧的时刻格式：`2026-08-10 18:19:00`，**不带时区**。
+///
+/// 实测卖家时钟是 UTC+8（`fleet_now` 比本机 UTC 快 8 小时），但这个偏移
+/// **不能硬编码** —— 一律拿同一响应里的 [`RegionsResponse::fleet_now`] 做基准算差值，
+/// 差值是时区无关的。见 [`parse_naive`] 与 [`StockRegion::into_zone`]。
+const TIME_FMT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// 解析卖家的无时区时刻串。空串与畸形串都归 `None`（卖家用空串表示「无」）。
+fn parse_naive(raw: &str) -> Option<NaiveDateTime> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(s, TIME_FMT).ok()
+}
+
+/// 一趟车。`dispatches[]` 单项。
+///
+/// 实测样本（同一区的相邻两趟）：
+/// ```json
+/// {"alive":1,"dead":0,"dead_at":"","delivered":8,"running":true,"time":"2026-08-10 18:19:00"}
+/// {"alive":0,"dead":10,"dead_at":"2026-08-10 18:23:53","delivered":0,"running":false,
+///  "time":"2026-08-10 18:04:00"}
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Dispatch {
+    /// 发车时刻（无时区，见 [`TIME_FMT`]）
+    #[serde(default)]
+    pub time: String,
+    /// 整车报废时刻。**空串表示车还活着** —— 这是判断死活最可靠的信号。
+    #[serde(default)]
+    pub dead_at: String,
+    /// 卖家自己的「这车还在跑吗」结论
+    #[serde(default)]
+    pub running: bool,
+    /// 本车当前存活的 Key 数
+    #[serde(default)]
+    pub alive: Option<u32>,
+    /// 本车已死的 Key 数
+    #[serde(default)]
+    pub dead: Option<u32>,
+    /// 本车已发放（被人提走）的 Key 数
+    #[serde(default)]
+    pub delivered: Option<u32>,
+}
+
+/// 一批可提的货。`batches[]` 单项。
+///
+/// 与 `dispatches[]` 的区别：`batches` 只列**此刻还能提**的批次（提空即消失），
+/// `dispatches` 是历史车次流水。故「这批货是哪趟车的」要看 `batches`。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Batch {
+    /// 该批次所属车次的发车时刻，与 `dispatches[].time` 同值可对上
+    #[serde(default)]
+    pub time: String,
+    /// 本批可提数量
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StockRegion {
+    /// 区域代码。**取值是完整 AWS 区域标识**（`us-east-1` / `eu-central-1`），
+    /// 不是首家那种 `us` / `eu` 短码 —— claim 时原样回传。
+    #[serde(default)]
+    pub region: String,
+    /// 中文区名，如「美国区」
+    #[serde(default)]
+    pub label: Option<String>,
+    /// 本区是否开放。关停的区即使有存货也提不出来。
+    #[serde(default)]
+    pub open: bool,
+    /// 本区可领上限
+    #[serde(default)]
+    pub claimable: Option<u32>,
+    /// 本区仓库存货
+    #[serde(default)]
+    pub stock: Option<u32>,
+    /// 按现有积分在**本区单价**下买得起几个。各区单价不同，故这个数逐区不同。
+    #[serde(default)]
+    pub afford: Option<u32>,
+    /// 本区单价。实测美区 80、欧区 50，**差 60%，不能混用**。
+    #[serde(default)]
+    pub unit_price: Option<f64>,
+    /// 卖家自己的「本区能不能买」结论
+    #[serde(default = "default_true")]
+    pub can_buy: bool,
+    /// 历史车次流水，**最新的在前**（实测按 `time` 降序）
+    #[serde(default)]
+    pub dispatches: Vec<Dispatch>,
+    /// 此刻还能提的批次。空表示本区无货（此时 `dispatches` 仍有历史车次）。
+    #[serde(default)]
+    pub batches: Vec<Batch>,
+}
+
+impl StockRegion {
+    /// 本区实际可提数量。与 [`StockResponse::effective_available`] 同规则：
+    /// `claimable` / `stock` / `afford` 取小，`open` 或 `can_buy` 为假则归 0。
+    ///
+    /// 这里**必须带上 `afford`**：它按本区单价算，美区 80 / 欧区 50 的差价下，
+    /// 同样的积分在两区买得起的个数不同。漏掉它会让面板报一个买不起的数，
+    /// 自动提取也会按那个数下单。
+    pub fn effective_available(&self) -> u32 {
+        if !self.open || !self.can_buy {
+            return 0;
+        }
+        [self.claimable, self.stock, self.afford]
+            .into_iter()
+            .flatten()
+            .min()
+            // 一个数量字段都没给：无从判断，按 0 处理，不凭空造数触发扣费
+            .unwrap_or(0)
+    }
+}
+
+impl StockRegion {
+    /// 挑出「本区当前该展示哪趟车」。
+    ///
+    /// 规则：**优先 `batches[]` 里最新那批对应的车** —— 那是此刻真能提到的货，
+    /// 「这车跑了多久了」问的就是它。本区无货（`batches` 空）时退回 `dispatches[]`
+    /// 最新那趟，用来回答「上一趟什么时候发的」。
+    ///
+    /// 不假设卖家的数组顺序（实测降序，但那是卖家的实现细节，改了不会报错、
+    /// 只会让面板显示一趟老车），故一律按解析出的时刻取最大。
+    fn current_dispatch(&self) -> Option<&Dispatch> {
+        let latest_batch_time = self.batches.iter().filter_map(|b| parse_naive(&b.time)).max();
+        if let Some(t) = latest_batch_time {
+            // 能和车次对上就用那趟车 —— 它带 dead_at / running，批次没有
+            if let Some(d) = self
+                .dispatches
+                .iter()
+                .find(|d| parse_naive(&d.time) == Some(t))
+            {
+                return Some(d);
+            }
+        }
+        self.dispatches
+            .iter()
+            .filter(|d| parse_naive(&d.time).is_some())
+            .max_by_key(|d| parse_naive(&d.time))
+    }
+
+    /// 转中立结构。
+    ///
+    /// `fleet_now` 是**卖家自己的当前时刻**，用来把无时区的时刻串换成时区无关的
+    /// 差值；缺它时车次相关的两个字段一律留空 —— 宁可不显示，也不显示一个错数。
+    pub fn into_zone(self, fleet_now: Option<NaiveDateTime>) -> ZoneStock {
+        let available = self.effective_available();
+
+        // 存活时长 =（整车报废时刻 或 卖家当前时刻）− 发车时刻。
+        //
+        // 两端都取自卖家自己的时钟，**差值与时区无关** —— 这就是不必知道卖家在哪个
+        // 时区也能算对的原因（实测其时钟为 UTC+8，但一点都不依赖这个事实）。
+        // 语义随车况而变，与 ZoneStock::alive_secs 的约定一致：车活着是「已跑多久」
+        // 且会随时间增长，车已死是「总共跑了多久」的终值。
+        let (departed_at, alive_secs) = match self
+            .current_dispatch()
+            .and_then(|d| parse_naive(&d.time).map(|t| (t, parse_naive(&d.dead_at))))
+        {
+            Some((departed, dead_at)) => {
+                let alive = fleet_now
+                    // 车已死就用 dead_at 封顶，否则死了的车存活时长还会一直涨
+                    .map(|now| dead_at.unwrap_or(now).signed_duration_since(departed))
+                    .map(|d| d.num_seconds())
+                    // 负数说明卖家两个时刻自相矛盾（时钟回拨 / 字段错位），
+                    // 报一个负的存活时长不如不报
+                    .filter(|s| *s >= 0);
+                // 发车时刻前端要 Unix 秒，而我们只有卖家的无时区串。拿 fleet_now
+                // 当锚点换算成「本机此刻 − 已过去多久」，同样只用差值。
+                let departed_unix = fleet_now.and_then(|now| {
+                    let ago = now.signed_duration_since(departed).num_seconds();
+                    // 未来时刻（卖家预告下一趟车？）不当发车时间用：
+                    // 前端按 now - departedAt 算「多久前发车」，会显示成负数
+                    (ago >= 0).then(|| chrono::Utc::now().timestamp() - ago)
+                });
+                (departed_unix.filter(|t| *t > 0), alive)
+            }
+            None => (None, None),
+        };
+
+        ZoneStock {
+            zone: self.region,
+            label: self.label.filter(|s| !s.trim().is_empty()),
+            available,
+            stock: self.stock,
+            unit_price: self.unit_price,
+            // 卖家的 open 与 can_buy 都得为真才算开放
+            enabled: self.open && self.can_buy,
+            departed_at,
+            alive_secs,
+            // 本家不给存活时长文案（kiro.red 才给），留空让前端按 alive_secs 自己格式化
+            alive_text: None,
+        }
+    }
+}
+
+/// `GET /my/stock/regions` 响应。
+///
+/// 顶层还给 `fleet_active` / `fleet_now` / `fleet_started_at`（发车状态）、
+/// `ok` / `remaining`，中立结构没有位置，不建模。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RegionsResponse {
+    #[serde(default)]
+    pub regions: Vec<StockRegion>,
+    /// 账户积分余额。与 `/my/stock` 的 `credits` 同源，取到就不必再查一次。
+    #[serde(default)]
+    pub credits: Option<f64>,
+    /// **卖家自己的当前时刻**（无时区），如 `2026-08-10 18:28:12`。
+    ///
+    /// 这个字段是车次存活时长能算准的全部依据：卖家给的时刻串都不带时区，
+    /// 但只要拿同一响应里的它做基准，`now − 发车时刻` 就是时区无关的差值。
+    /// 实测其时钟为 UTC+8，**但不要硬编码这个偏移** —— 卖家换机房就错了，
+    /// 而症状是存活时长整体偏移 8 小时（看着像「刚发车」或「跑了半天」）。
+    #[serde(default)]
+    pub fleet_now: String,
+    /// 本轮发车是否正在进行
+    #[serde(default)]
+    pub fleet_active: bool,
+}
+
+impl From<RegionsResponse> for StockInfo {
+    fn from(r: RegionsResponse) -> Self {
+        let credits = r.credits;
+        // 卖家不给 fleet_now（老版本或字段改名）时，车次字段一律留空而非猜时区
+        let fleet_now = parse_naive(&r.fleet_now);
+        if fleet_now.is_none() && !r.regions.is_empty() {
+            tracing::debug!(
+                raw = %r.fleet_now,
+                "kiro.ooo 货架未给可解析的 fleet_now，本次不透出发车时间与存活时长"
+            );
+        }
+        let zones: Vec<ZoneStock> = r
+            .regions
+            .into_iter()
+            .map(|z| z.into_zone(fleet_now))
+            .collect();
+        // 报价只算「开放且有货」的区：把关停区的价算进来，面板就会显示一个
+        // 实际提不到的价位（实测美区 open=false 却仍标 80）
+        let prices: Vec<f64> = zones
+            .iter()
+            .filter(|z| z.enabled && z.available > 0)
+            .filter_map(|z| z.unit_price)
+            .collect();
+        Self {
+            // 各区之和。注意这个数**不代表任何单一区能提这么多** ——
+            // 各区严格隔离，下单必须按区走，见 StockInfo::pick_zone。
+            available: zones.iter().map(|z| z.available).sum(),
+            price_min: prices.iter().copied().reduce(f64::min),
+            price_max: prices.iter().copied().reduce(f64::max),
+            balance: credits,
+            zones,
         }
     }
 }
@@ -356,8 +637,11 @@ pub struct ClaimResponse {
 
 /// 一批 Key 的共同区域。**全部相同才返回 Some。**
 ///
-/// 本家的区域是逐 Key 的，而中立结构 [`PurchaseResult`] 只有一个 `zone`
+/// 卖家逐 Key 给区域，而中立结构 [`PurchaseResult`] 只有一个 `zone`
 /// （其余六家都是「整单一个区」）。取舍：
+///
+/// 自 2026-08-10 起 claim 带 `region` 下单，一单只会来自一个区，混区实际不再发生；
+/// 但这里的兜底**不删** —— 它是对「卖家真回了混区」的防线，删掉就变成静默错落区。
 ///
 /// - **全单同区**（单区提货是常态）→ 返回该区，`service::import_purchased` 会把它
 ///   写进凭据的 `api_region`，请求就会正确打到 `q.{region}.amazonaws.com`。
@@ -726,6 +1010,50 @@ mod tests {
     const STOCK_REAL: &str = r#"{"afford":1,"can_buy":true,"claimable":2,"credits":45,
         "max":2,"remaining":0,"short_credits":0,"stock":2,"unit_price":45}"#;
 
+    /// 线上 `GET /my/stock/regions` 的真实返回（2026-08-10 18:00 采样，
+    /// 车次明细已裁剪）。注意**美区关停 0 库存、单价 80；欧区开放 13 个、单价 50**
+    /// —— 而同一时刻扁平 `/my/stock` 报的是欧区那一份。
+    const REGIONS_REAL: &str = r#"{"credits":145,"fleet_active":false,
+        "fleet_now":"2026-08-10 18:00:14","fleet_started_at":"","ok":true,"remaining":145,
+        "regions":[
+          {"afford":1,"batches":[],"can_buy":false,"claimable":0,
+           "dispatches":[{"alive":0,"dead":0,"dead_at":"","delivered":9,"running":true,
+                          "time":"2026-08-10 17:41:00"}],
+           "label":"美国区","open":false,"region":"us-east-1","short_credits":0,
+           "stock":0,"unit_price":80},
+          {"afford":2,"batches":[{"count":8,"time":"2026-08-10 17:41:00"}],"can_buy":true,
+           "claimable":13,
+           "dispatches":[{"alive":8,"dead":0,"dead_at":"","delivered":0,"running":true,
+                          "time":"2026-08-10 17:41:00"}],
+           "label":"欧洲区","open":true,"region":"eu-central-1","short_credits":0,
+           "stock":13,"unit_price":50}]}"#;
+
+    /// 线上 `GET /my/stock/regions` 的**车次部分**真实返回（2026-08-10 18:28:12 采样）。
+    ///
+    /// 这份样本的价值在于同一区里既有活着的车（`dead_at` 空）也有死掉的车
+    /// （`dead_at` 有值、`running=false`），且 `batches[]` 指向的不是最新那趟历史车。
+    const REGIONS_FLEET_REAL: &str = r#"{"credits":145,"fleet_active":false,
+        "fleet_now":"2026-08-10 18:28:12","fleet_started_at":"","ok":true,
+        "regions":[
+          {"region":"us-east-1","label":"美国区","open":true,"can_buy":true,
+           "claimable":1,"stock":1,"afford":1,"unit_price":80,
+           "batches":[{"count":1,"time":"2026-08-10 18:19:00"}],
+           "dispatches":[
+             {"alive":1,"dead":0,"dead_at":"","delivered":8,"running":true,
+              "time":"2026-08-10 18:19:00"},
+             {"alive":0,"dead":10,"dead_at":"2026-08-10 18:23:53","delivered":0,
+              "running":false,"time":"2026-08-10 18:04:00"},
+             {"alive":0,"dead":0,"dead_at":"","delivered":9,"running":true,
+              "time":"2026-08-10 17:41:00"}]},
+          {"region":"eu-central-1","label":"欧洲区","open":true,"can_buy":true,
+           "claimable":5,"stock":5,"afford":2,"unit_price":50,
+           "batches":[{"count":5,"time":"2026-08-10 18:19:00"}],
+           "dispatches":[
+             {"alive":5,"dead":0,"dead_at":"","delivered":3,"running":true,
+              "time":"2026-08-10 18:19:00"},
+             {"alive":0,"dead":0,"dead_at":"","delivered":8,"running":true,
+              "time":"2026-08-10 17:41:00"}]}]}"#;
+
     /// 线上 `GET /my/profile` 的真实返回（注意 quota / remaining / used_quota 全 0）
     const PROFILE_REAL: &str = r#"{"auto_fleet":false,"claimable":1,"is_fleet_owner":false,
         "is_super":false,"min_reserve":1,"name":"claywong","needs_2fa":false,"quota":0,
@@ -801,7 +1129,273 @@ mod tests {
         assert_eq!(s.available, 1, "afford=1 时不能报 claimable 的 2");
         assert_eq!(s.price_min, Some(45.0));
         assert_eq!(s.price_max, Some(45.0));
-        assert!(s.zones.is_empty(), "本家不分区，不应凭空造出区");
+        // 分区在 /my/stock/regions，本端点给不出来，留空（见 扁平库存不伪造分区）
+        assert!(s.zones.is_empty());
+    }
+
+    // ============ 双区货架：2026-08-10 改版后新增 ============
+
+    /// **本次改版最关键的一条断言。**
+    ///
+    /// 改版前本家按「不分区」实现，下单不带 `region`。而卖家默认区是
+    /// `us-east-1`，实测该区 `open=false` / `stock=0`，同时扁平 `/my/stock` 报的
+    /// 是欧区的 13 个 / 单价 50 —— 症状是面板显示有货、下单永远失败。
+    #[test]
+    fn 货架选到开放有货的欧区而非默认美区() {
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(REGIONS_REAL)
+            .unwrap()
+            .into();
+        assert_eq!(s.zones.len(), 2, "双区都要给全，没货的区也要列出来");
+
+        let picked = s.pick_zone().expect("欧区开放且有货，必须能选出来");
+        assert_eq!(
+            picked.zone, "eu-central-1",
+            "必须选开放有货的欧区；选到默认的美区（open=false）会永远提不出货"
+        );
+        assert_ne!(
+            picked.zone, DEFAULT_REGION,
+            "不带 region 时卖家就用这个默认区，而它此刻是关停的"
+        );
+        // 区代码是完整 AWS 标识，不是首家的 us / eu 短码 —— 原样回传给 claim
+        assert!(picked.zone.contains('-'), "区代码要能直接当 region 参数用");
+    }
+
+    #[test]
+    fn 货架逐区映射数量与单价() {
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(REGIONS_REAL)
+            .unwrap()
+            .into();
+        let us = s.find_zone("us-east-1").expect("美区要列出");
+        let eu = s.find_zone("eu-central-1").expect("欧区要列出");
+
+        assert!(!us.enabled, "open=false 必须落成不可用");
+        assert_eq!(us.available, 0);
+        assert_eq!(us.label.as_deref(), Some("美国区"));
+        // 关停区的单价仍要读出来给面板展示，只是不参与报价区间
+        assert_eq!(us.unit_price, Some(80.0));
+
+        assert!(eu.enabled);
+        assert_eq!(eu.stock, Some(13), "仓库存货照实给");
+        assert_eq!(
+            eu.available, 2,
+            "claimable=13 但 afford=2（145 积分 / 单价 50），必须按 afford 收敛"
+        );
+        assert_eq!(eu.unit_price, Some(50.0));
+        assert_eq!(eu.label.as_deref(), Some("欧洲区"));
+
+        // 顶层：可提量是各区之和，余额取 credits（省一次 /my/credits）
+        assert_eq!(s.available, 2);
+        assert_eq!(s.balance, Some(145.0), "货架端点同时给余额");
+        // 报价只算开放有货的区：把关停美区的 80 算进来，面板会显示一个提不到的价
+        assert_eq!(s.price_min, Some(50.0));
+        assert_eq!(
+            s.price_max,
+            Some(50.0),
+            "关停区的 80 不能进报价区间，否则显示 50-80 会让人以为能按 80 提美区"
+        );
+    }
+
+    // ============ 发车时间与存活时长 ============
+
+    /// 存活时长要**只用卖家自己时钟内的差值**算，不能依赖本机时区。
+    ///
+    /// 样本：`fleet_now` 18:28:12，欧区当前车 18:19:00 发出且还活着
+    /// （`dead_at` 空）→ 存活 9 分 12 秒 = 552 秒。
+    #[test]
+    fn 存活时长按卖家时钟算差值() {
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(REGIONS_FLEET_REAL)
+            .unwrap()
+            .into();
+        let eu = s.find_zone("eu-central-1").unwrap();
+        assert_eq!(
+            eu.alive_secs,
+            Some(552),
+            "18:28:12 − 18:19:00 = 9分12秒；算错通常是拿本机时钟去减卖家时刻"
+        );
+        // 发车时刻要能换成 Unix 秒给前端，且落在「刚刚过去」的区间内
+        let departed = eu.departed_at.expect("发车时间要透出");
+        let ago = chrono::Utc::now().timestamp() - departed;
+        assert!(
+            (540..=600).contains(&ago),
+            "距今应约 552 秒（容忍测试耗时），实际 {ago}"
+        );
+        // 本家不给文案，前端按 alive_secs 自己格式化
+        assert!(eu.alive_text.is_none());
+    }
+
+    /// 已死的车用 `dead_at` 封顶 —— 否则死掉的车存活时长还会随时间一直涨。
+    ///
+    /// 构造：把美区的 `batches` 指向那趟 18:04 发车、18:23:53 报废的车，
+    /// 存活应是 19 分 53 秒 = 1193 秒的**终值**，与 `fleet_now` 无关。
+    #[test]
+    fn 已死的车存活时长取终值() {
+        let raw = r#"{"fleet_now":"2026-08-10 18:28:12","regions":[
+            {"region":"us-east-1","open":true,"claimable":1,"stock":1,"afford":1,
+             "batches":[{"count":1,"time":"2026-08-10 18:04:00"}],
+             "dispatches":[
+               {"alive":0,"dead":10,"dead_at":"2026-08-10 18:23:53","running":false,
+                "time":"2026-08-10 18:04:00"},
+               {"alive":1,"dead":0,"dead_at":"","running":true,
+                "time":"2026-08-10 18:19:00"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        let us = s.find_zone("us-east-1").unwrap();
+        assert_eq!(
+            us.alive_secs,
+            Some(1193),
+            "18:23:53 − 18:04:00 = 19分53秒，是终值；拿 fleet_now 去减会算成 24分12秒"
+        );
+    }
+
+    /// 展示的是**能提到的那批货**所属的车，不是历史上最新那趟。
+    ///
+    /// 构造：最新车次是 18:19 那趟，但 `batches` 指向 17:41 那趟（18:19 的已被提空）。
+    /// 问「这车跑了多久」问的是手上能提的货，故应取 17:41。
+    #[test]
+    fn 取可提批次对应的车而非最新历史车() {
+        let raw = r#"{"fleet_now":"2026-08-10 18:28:12","regions":[
+            {"region":"eu-central-1","open":true,"claimable":3,"stock":3,"afford":3,
+             "batches":[{"count":3,"time":"2026-08-10 17:41:00"}],
+             "dispatches":[
+               {"alive":0,"dead":0,"dead_at":"","running":true,"time":"2026-08-10 18:19:00"},
+               {"alive":3,"dead":0,"dead_at":"","running":true,"time":"2026-08-10 17:41:00"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        let eu = s.find_zone("eu-central-1").unwrap();
+        assert_eq!(
+            eu.alive_secs,
+            Some(2832),
+            "18:28:12 − 17:41:00 = 47分12秒；取成 18:19 那趟就答错了问题"
+        );
+    }
+
+    /// 无货的区（`batches` 空）退回最新历史车，用来回答「上一趟什么时候发的」
+    #[test]
+    fn 无货时退回最新历史车() {
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(REGIONS_REAL)
+            .unwrap()
+            .into();
+        let us = s.find_zone("us-east-1").unwrap();
+        // 美区 batches 空，只有 17:41 那一趟；fleet_now 18:00:14 → 19分14秒
+        assert_eq!(us.alive_secs, Some(1154));
+        assert!(
+            us.departed_at.is_some(),
+            "关停无货的区也该显示上一趟发车时间，那正是判断「下一趟大概何时」的依据"
+        );
+    }
+
+    /// 卖家数组顺序是实现细节，不能依赖。乱序时仍要取时刻最大的那趟。
+    #[test]
+    fn 车次乱序时仍取最新() {
+        let raw = r#"{"fleet_now":"2026-08-10 18:28:12","regions":[
+            {"region":"us-east-1","open":true,"claimable":1,"stock":1,"afford":1,
+             "batches":[],
+             "dispatches":[
+               {"dead_at":"","running":true,"time":"2026-08-10 17:41:00"},
+               {"dead_at":"","running":true,"time":"2026-08-10 18:19:00"},
+               {"dead_at":"","running":true,"time":"2026-08-10 18:04:00"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        // 18:28:12 − 18:19:00 = 552，说明取到了最新那趟而非数组第一个
+        assert_eq!(s.zones[0].alive_secs, Some(552));
+    }
+
+    /// 缺 `fleet_now` 时**不猜时区**：宁可不显示，也不显示一个偏 8 小时的数
+    #[test]
+    fn 缺卖家当前时刻时不猜时区() {
+        let raw = r#"{"regions":[{"region":"us-east-1","open":true,"claimable":1,
+            "stock":1,"afford":1,"batches":[{"count":1,"time":"2026-08-10 18:19:00"}],
+            "dispatches":[{"dead_at":"","running":true,"time":"2026-08-10 18:19:00"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        assert!(s.zones[0].alive_secs.is_none(), "没有基准时刻就不能算差值");
+        assert!(s.zones[0].departed_at.is_none());
+        // 其余字段照常
+        assert_eq!(s.zones[0].available, 1);
+    }
+
+    /// 畸形 / 空时刻串不能让整区解析失败或算出 1970 年
+    #[test]
+    fn 时刻串畸形时车次字段留空() {
+        let raw = r#"{"fleet_now":"2026-08-10 18:28:12","regions":[
+            {"region":"us-east-1","open":true,"claimable":1,"stock":1,"afford":1,
+             "batches":[{"count":1,"time":""}],
+             "dispatches":[{"dead_at":"","running":true,"time":"not-a-time"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        assert!(s.zones[0].alive_secs.is_none());
+        assert!(
+            s.zones[0].departed_at.is_none(),
+            "解析不出来要留空，落成 0 会让前端显示 1970 年"
+        );
+        assert_eq!(s.zones[0].available, 1, "车次解析失败不该影响可提数量");
+    }
+
+    /// 卖家时刻自相矛盾（发车时刻晚于当前时刻）时不报负数
+    #[test]
+    fn 发车时刻在未来时不报负存活() {
+        let raw = r#"{"fleet_now":"2026-08-10 18:00:00","regions":[
+            {"region":"us-east-1","open":true,"claimable":1,"stock":1,"afford":1,
+             "batches":[{"count":1,"time":"2026-08-10 19:00:00"}],
+             "dispatches":[{"dead_at":"","running":true,"time":"2026-08-10 19:00:00"}]}]}"#;
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(raw).unwrap().into();
+        assert!(s.zones[0].alive_secs.is_none(), "负的存活时长不如不报");
+        assert!(
+            s.zones[0].departed_at.is_none(),
+            "前端按 now − departedAt 算「多久前发车」，未来时刻会显示负数"
+        );
+    }
+
+    /// `can_buy=false` 与 `open=false` 任一为假都提不出来
+    #[test]
+    fn 货架的开放与可买缺一不可() {
+        let mk = |open, can_buy| StockRegion {
+            region: "eu-central-1".into(),
+            open,
+            can_buy,
+            claimable: Some(5),
+            stock: Some(5),
+            afford: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(mk(true, true).effective_available(), 5);
+        assert_eq!(mk(false, true).effective_available(), 0, "关停区提不出货");
+        assert_eq!(
+            mk(true, false).effective_available(),
+            0,
+            "卖家说不能买时比任何数量字段权威"
+        );
+    }
+
+    /// 数量字段全缺时不能凭空造数 —— 那会触发一笔提不到的扣费单
+    #[test]
+    fn 货架数量字段全缺时按零处理() {
+        let r: StockRegion =
+            serde_json::from_str(r#"{"region":"us-east-1","open":true}"#).unwrap();
+        assert_eq!(r.effective_available(), 0);
+        // can_buy 缺失按 true（老响应没这个字段）
+        assert!(r.can_buy);
+    }
+
+    /// 卖家回滚或改端点时 regions 为空：不能造出一个「默认区」
+    #[test]
+    fn 货架为空时不造区() {
+        let s: StockInfo = serde_json::from_str::<RegionsResponse>(r#"{"credits":10}"#)
+            .unwrap()
+            .into();
+        assert!(s.zones.is_empty(), "不知道哪个区有货时不能猜");
+        assert!(
+            s.pick_zone().is_none(),
+            "选不出区应让上层报 NoZoneInStock 挡住下单，而不是赌默认的美区"
+        );
+        assert_eq!(s.available, 0);
+        // 余额仍要读出来
+        assert_eq!(s.balance, Some(10.0));
+    }
+
+    /// 扁平 `/my/stock` 是退路，它给不出分区 —— 必须留空而非编一个
+    #[test]
+    fn 扁平库存不伪造分区() {
+        let s: StockInfo = serde_json::from_str::<StockResponse>(STOCK_REAL).unwrap().into();
+        assert!(
+            s.zones.is_empty(),
+            "扁平端点没有区域信息，凭空造区会让 pick_zone 选到未经核实的区"
+        );
     }
 
     #[test]

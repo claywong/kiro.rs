@@ -389,10 +389,18 @@ impl VendorClient {
     ///
     /// 与那两家不同的一点：本家 claim **有幂等键**（`client_order_id`），故降级捞出
     /// 时把订单号填进 `order_id`，人工核对时能按它到卖家侧查这一单。
+    /// `zone` 是本单下给卖家的 `region`，仅作**兜底**：响应逐 Key 给了区域就以
+    /// 响应为准（卖家才是真相），只在响应给不出时用它。
+    ///
+    /// 这个兜底不是可选的锦上添花：欧区 Key 若按全局默认区（美区）入库，
+    /// 请求会打到 `q.us-east-1.amazonaws.com` 而全部失败，而症状只是「刚提的
+    /// Key 莫名不可用」，极难定位。降级捞出路径（`scan_keys`）尤其需要它 ——
+    /// 那条路径从裸文本里按 `ksk_` 前缀捞，本来一点区域信息都没有。
     async fn claim_kiroooo(
         &self,
         body: &serde_json::Value,
         client_order_id: &str,
+        zone: Option<&str>,
     ) -> Result<PurchaseResult, VendorApiError> {
         let resp = self
             .auth(self.http.post(self.url(kiroooo::PATH_CLAIM)).json(body))
@@ -420,8 +428,14 @@ impl VendorClient {
         }
 
         // 先按文档形态解析（DTO 已容忍字符串 / 对象两种 keys 元素）
+        // 本单下过的区，供响应给不出区域时兜底
+        let fallback_zone = || zone.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
         if let Ok(r) = serde_json::from_str::<kiroooo::ClaimResponse>(&text) {
-            let result: PurchaseResult = r.into();
+            let mut result: PurchaseResult = r.into();
+            // 响应没给区域（字符串形态的 keys 就没有）时用本单下过的区。
+            // 反过来不覆盖：卖家真回了区域就以它为准。
+            result.zone = result.zone.or_else(fallback_zone);
             if !result.keys.is_empty() {
                 return Ok(result);
             }
@@ -463,6 +477,8 @@ impl VendorClient {
             purchased: scanned.len() as u32,
             order_id: Some(client_order_id.to_string()),
             keys: scanned,
+            // 裸文本捞出的 Key 没有任何区域信息，只能靠本单下过的区
+            zone: fallback_zone(),
             ..Default::default()
         })
     }
@@ -541,10 +557,17 @@ impl VendorClient {
             VendorFlavor::Kirored => {
                 self.kirored_client().purchase(count, client_order_id).await
             }
-            // kiro.ooo：路径是 /my/keys/claim（不是 /my/purchase），参数与首家同名
-            // （count + client_order_id）。**不带 zone** —— 本家不接受该参数，
-            // 区域由卖家逐 Key 决定。走宽松解析，见 claim_kiroooo 的说明。
-            VendorFlavor::KiroOoo => self.claim_kiroooo(&body, client_order_id).await,
+            // kiro.ooo：路径是 /my/keys/claim（不是 /my/purchase），数量参数与首家
+            // 同名（count + client_order_id），但**区域参数叫 `region` 而非 `zone``**，
+            // 且不传时卖家默认 us-east-1 —— 而美区常关停 0 库存，所以有区就必须带。
+            // 走宽松解析，见 claim_kiroooo 的说明。
+            VendorFlavor::KiroOoo => {
+                let z = zone.map(str::trim).filter(|s| !s.is_empty());
+                if let Some(z) = z {
+                    body["region"] = serde_json::json!(z);
+                }
+                self.claim_kiroooo(&body, client_order_id, z).await
+            }
         }
     }
 
@@ -592,10 +615,41 @@ impl VendorClient {
             // kiro.red 无库存端点，把商品列表里的健康商品折叠成中立库存
             VendorFlavor::Kirored => self.kirored_client().stock().await,
             VendorFlavor::KiroOoo => {
-                // 本家的库存接口一次给出可提数量 + 单价 + **余额（credits）**，
-                // 故面板的余额可以只靠这一次请求
-                let r: kiroooo::StockResponse = self.get(kiroooo::PATH_STOCK).await?;
-                Ok(r.into())
+                // 优先走双区货架：`/my/stock` 只给一份扁平数字（实测是当前开放那个区
+                // 的），拿它当全局库存会出现「面板显示欧区的 13 个 / 单价 50，下单却
+                // 默认落到关停的美区」。货架端点同时给 credits，仍是一次请求。
+                match self
+                    .get::<kiroooo::RegionsResponse>(kiroooo::PATH_STOCK_REGIONS)
+                    .await
+                {
+                    Ok(r) if !r.regions.is_empty() => Ok(r.into()),
+                    // 空 regions 与请求失败同样处理：退回扁平库存。
+                    // 该端点是 2026-08-10 才有的，卖家回滚或改名时不能整家不可用；
+                    // 但退回后 zones 为空，resolve_zone 会因 NoZoneInStock 挡住下单
+                    // —— 这是**故意的**：不知道哪个区有货时，宁可不下单，
+                    // 也不赌默认区（美区常关停）。故必须告警。
+                    Ok(_) => {
+                        tracing::warn!(
+                            "kiro.ooo {} 返回空 regions，退回 {} 取扁平库存；\
+                             此时无法选区，提取会被 NoZoneInStock 挡下",
+                            kiroooo::PATH_STOCK_REGIONS,
+                            kiroooo::PATH_STOCK
+                        );
+                        let r: kiroooo::StockResponse = self.get(kiroooo::PATH_STOCK).await?;
+                        Ok(r.into())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "kiro.ooo {} 不可用（{}），退回 {} 取扁平库存；\
+                             此时无法选区，提取会被 NoZoneInStock 挡下",
+                            kiroooo::PATH_STOCK_REGIONS,
+                            e,
+                            kiroooo::PATH_STOCK
+                        );
+                        let r: kiroooo::StockResponse = self.get(kiroooo::PATH_STOCK).await?;
+                        Ok(r.into())
+                    }
+                }
             }
         }
     }
@@ -1041,6 +1095,8 @@ mod tests {
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
             vendor_password: String::new(),
+            stock_poll_interval_secs: 0,
+            stock_poll_respect_global_gate: true,
         }
     }
 

@@ -247,10 +247,11 @@ impl VendorFlavor {
                 // `/my/key-price-tiers` 按母号累计产量分档（bands），同一单可能混价，
                 // 总额只能以卖家返回为准
                 tiered_pricing: true,
-                // 库存接口无 zones，claim 也不接受 zone —— 区域是逐 Key 由卖家定的，
-                // 不是下单参数。误开会让 resolve_zone 因 zones 为空而报 NoZoneInStock，
-                // 把本来能提的单全挡掉。
-                zoned_purchase: false,
+                // 双区严格隔离（`/my/stock/regions`），claim 的参数名是 `region`
+                // 且**不传默认 us-east-1**。必须开：关掉的话 resolve_zone 直接返回
+                // None，下单就落到默认的美区 —— 而实测美区常关停 0 库存，
+                // 面板显示的却是欧区的数量与单价，症状是「明明有货却提不出来」。
+                zoned_purchase: true,
             },
         }
     }
@@ -948,14 +949,14 @@ mod local_tests {
         );
     }
 
-    /// 能力集。`zoned_purchase` 必须关 —— 本家库存接口无 zones，误开会让
-    /// `resolve_zone` 报 NoZoneInStock 把所有单挡掉。
+    /// 能力集。`zoned_purchase` 必须**开** —— 2026-08-10 起本家上了双区货架
+    /// （`/my/stock/regions`），claim 不带 `region` 默认落到美区，而美区常关停。
     #[test]
     fn kiroooo_能力集() {
         let c = VendorFlavor::KiroOoo.capabilities();
         assert!(
-            !c.zoned_purchase,
-            "区域是逐 Key 由卖家定的，不是下单参数；误开会挡掉全部提取"
+            c.zoned_purchase,
+            "双区严格隔离，不带 region 会落到默认的美区（常关停 0 库存）"
         );
         assert!(c.system_status, "/status 免鉴权且有真实数据");
         assert!(!c.gen_logs, "/api/my/gen-logs 实测 404");
