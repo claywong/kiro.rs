@@ -11,18 +11,21 @@ use std::sync::Arc;
 use crate::admin::AdminService;
 use crate::admin::types::AddCredentialRequest;
 
+use super::protocol::PurchasedKey;
 use super::store::PurchaseOutcome;
 
 /// 把 `ksk_` Key 逐条入库。
 ///
 /// `source_channel` 写成 `vendor:<order_id>` 形式，用于事后追溯这批 Key 的来源；
 /// kiroapp 无订单号，由调用方传入自己的标识。
-/// `api_region` 传入实际成交区域（如 `eu-central-1`），用于设置凭证的 API 区域。
+/// `api_region` 是**订单级**成交区域（如 `eu-central-1`）。单张卡自带区域时
+/// （[`PurchasedKey::region`]）以卡上的为准 —— kiro.red 的双区混发商品同一单里
+/// 各张卡分属不同区，用订单级区域会让一半凭证连错端点、报凭证失效。
 /// `priority` 是调度优先级，**数值越小越优先**；由调用方按家给，见
 /// [`VendorConfig::effective_default_priority`](crate::model::config::VendorConfig::effective_default_priority)。
 pub async fn import_keys(
     admin: &Arc<AdminService>,
-    keys: Vec<String>,
+    keys: Vec<PurchasedKey>,
     source_channel: &str,
     groups: Vec<String>,
     rpm_limit: u32,
@@ -30,7 +33,19 @@ pub async fn import_keys(
     priority: u32,
 ) -> PurchaseOutcome {
     let mut outcome = PurchaseOutcome::default();
-    for key in keys {
+    for pk in keys {
+        let key = pk.key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        // 卡上带区就用卡上的，否则回落订单级
+        let region_for_key = pk
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| api_region.clone());
         let req = AddCredentialRequest {
             refresh_token: None,
             access_token: None,
@@ -48,7 +63,7 @@ pub async fn import_keys(
             rpm_limit,
             region: None,
             auth_region: None,
-            api_region: api_region.clone(),
+            api_region: region_for_key,
             machine_id: None,
             email: None,
             proxy_url: None,

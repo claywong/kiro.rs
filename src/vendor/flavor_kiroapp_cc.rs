@@ -104,6 +104,8 @@ impl ClaimResult {
                     password: None,
                     issuer_url: None,
                     price: None,
+                    // 本家的区域是订单级的（zone），逐张不带区
+                    region: None,
                 })
                 .collect(),
             replayed: false,

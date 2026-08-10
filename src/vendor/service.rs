@@ -52,6 +52,9 @@ pub struct PurchasedKeyBrief {
     /// 这一张实际扣了多少（同一单里各张可能不同）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<f64>,
+    /// 这一张自己的 AWS 区域（双区混发的家逐张不同），面板据此核对入库区域
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// 该账号是否附带了密码。密码本身不外传，只告知存在性 ——
     /// 需要时从日志或卖家面板取。
     pub has_password: bool,
@@ -972,24 +975,34 @@ impl VendorService {
         // 来源渠道带上供应商 id，便于按家盘点与对账
         let source_channel = format!("{}{}:{}", auto::VENDOR_CHANNEL_PREFIX, self.vendor_id(), order_id);
 
-        let keys: Vec<String> = resp.keys.iter()
+        // 整条带过去：单张卡自带区域时（kiro.red 双区混发）入库要以卡上的为准
+        let keys: Vec<_> = resp.keys.iter()
             .filter(|k| !k.key.trim().is_empty())
-            .map(|k| k.key.clone())
+            .cloned()
             .collect();
 
         // 根据实际成交区域设置 api_region：eu 需要 eu-central-1，us 或不分区用默认。
         // kiro.ooo 扩展：该家的区域是完整 AWS 标识符（如 eu-central-1、us-east-1），
         // 而非两字母简码，故映射扩成也认含连字符的完整 ID —— 直接用。
+        // 注意：kiro.red 的 zone 是**商品 id**（如 `55`）而非区域，不能只看
+        // 「含连字符」就当区域用 —— 那家的区在每张卡上，走 PurchasedKey::region。
         let api_region = resp.zone.as_deref().and_then(|z| {
-            if z.contains('-') {
-                // 含连字符的视为完整 AWS 区域标识，直接用（kiro.ooo 走此分支）
-                Some(z.to_string())
+            if looks_like_aws_region(z) {
+                // 完整 AWS 区域标识，直接用（kiro.ooo 走此分支）
+                Some(z.to_ascii_lowercase())
             } else if z == "eu" {
                 // 两字母简码的首家 / Drop / kiromarket 走这里
                 Some("eu-central-1".to_string())
             } else {
                 None
             }
+        })
+        // 都推不出来时用该家配置的 defaultApiRegion。此前这个配置项在入库路径上
+        // 完全没被读过，卡上无区、zone 又不是区域的家（kiro.red）只能拿到 None，
+        // 于是回落全局默认区、连错端点报凭证失效。
+        .or_else(|| {
+            let d = cfg.default_api_region.trim();
+            (!d.is_empty()).then(|| d.to_ascii_lowercase())
         });
 
         super::import::import_keys(
@@ -1669,6 +1682,7 @@ fn build_result(
                 account: k.account.clone(),
                 issuer_url: k.issuer_url.clone(),
                 price: k.price,
+                region: k.region.clone(),
                 // 只透出存在性，密码不出后端
                 has_password: k.password.as_deref().is_some_and(|p| !p.trim().is_empty()),
             })
@@ -1686,6 +1700,26 @@ fn fallback_event_id(raw: &[u8]) -> String {
 }
 
 /// 是否为卖家要求的 32 位十六进制订单号形态
+/// 判断一个字符串是否形如完整 AWS 区域标识（`us-east-1` / `eu-central-1`）。
+///
+/// 用来把「卖家回显的区域」和「卖家的商品 id」区分开：kiro.red 的 zone 是商品
+/// id，早期只判 `contains('-')` 会把它当成区域写进凭证的 api_region。
+/// 判据：`<字母簇>-<字母簇>+-<数字>`，段全小写字母 / 结尾为数字。
+fn looks_like_aws_region(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    // 首段是地理前缀（us / eu / ap / sa / ca / me / af / cn / il），中间段是字母
+    let (last, head) = parts.split_last().expect("已判长度 >= 3");
+    if !last.chars().all(|c| c.is_ascii_digit()) || last.is_empty() {
+        return false;
+    }
+    head.iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
 fn is_hex32(s: &str) -> bool {
     let t = s.trim();
     t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())
@@ -2014,6 +2048,7 @@ mod tests {
                     password: Some("secret".to_string()),
                     issuer_url: Some("https://i".to_string()),
                     price: Some(30.0),
+                    region: None,
                 },
                 PurchasedKey {
                     key: "sk-b".to_string(),
@@ -2021,6 +2056,7 @@ mod tests {
                     password: None,
                     issuer_url: None,
                     price: Some(40.0),
+                    region: None,
                 },
             ],
         };
@@ -2060,6 +2096,7 @@ mod tests {
                 password: Some("   ".to_string()),
                 issuer_url: None,
                 price: None,
+                region: None,
             }],
             ..Default::default()
         };
@@ -2169,8 +2206,8 @@ mod local_tests {
     fn 区域映射同时认完整标识与两字母简码() {
         // 与 import_purchased 里的映射保持同一份逻辑
         let map = |z: &str| -> Option<String> {
-            if z.contains('-') {
-                Some(z.to_string())
+            if looks_like_aws_region(z) {
+                Some(z.to_ascii_lowercase())
             } else if z == "eu" {
                 Some("eu-central-1".to_string())
             } else {
@@ -2184,6 +2221,18 @@ mod local_tests {
         assert_eq!(map("eu").as_deref(), Some("eu-central-1"));
         // us 用全局默认，不显式写
         assert!(map("us").is_none());
+    }
+
+    /// kiro.red 的 zone 是**商品 id**，绝不能被当成区域写进凭证 —— 那会让
+    /// api_region 变成 `55` / `55-a` 之类的垃圾值，凭证直接报失效。
+    #[test]
+    fn 商品id不被当成区域() {
+        assert!(!looks_like_aws_region("55"), "纯数字商品 id");
+        assert!(!looks_like_aws_region("sku-58"), "两段、末段是数字但缺地理段");
+        assert!(!looks_like_aws_region("纯APIKEY-双区-1"), "非 ASCII 字母");
+        assert!(!looks_like_aws_region("us-east-x"), "末段必须是数字");
+        assert!(looks_like_aws_region("ap-southeast-2"));
+        assert!(looks_like_aws_region("us-gov-west-1"), "四段区域也认");
     }
 
     // ============ 库存轮询的生效间隔 ============

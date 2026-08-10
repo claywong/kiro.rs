@@ -752,9 +752,12 @@ impl VendorClient {
                     self.get(kiroooo::PATH_ORDERS).await?;
                 Ok(kiroooo::orders_to_paged(orders))
             }
-            // 这几家没有可对账的列表接口，返回空分页。
-            // kiro.red 虽有 /user/order/index，但本次对接只做手动提取，不做订单对账。
-            VendorFlavor::KiroappCc | VendorFlavor::Drop | VendorFlavor::Kirored => Ok(Paged {
+            VendorFlavor::Kirored => {
+                // 这家的列表接口是 POST + 签名 + 可能加密，走它自己的管线
+                self.kirored_client().purchase_orders(page, page_size).await
+            }
+            // 这两家没有可对账的列表接口，返回空分页。
+            VendorFlavor::KiroappCc | VendorFlavor::Drop => Ok(Paged {
                 items: vec![],
                 total: Some(0),
                 page: Some(page.unwrap_or(1)),
@@ -1026,6 +1029,8 @@ fn scan_keys(text: &str) -> Vec<crate::vendor::protocol::PurchasedKey> {
             password: None,
             issuer_url: None,
             price: None,
+            // 本家的区域是订单级的（zone），逐张不带区
+            region: None,
         })
         .collect()
 }

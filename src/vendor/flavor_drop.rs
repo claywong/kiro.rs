@@ -284,6 +284,8 @@ impl From<PurchaseResponse> for PurchaseResult {
                 password: None,
                 issuer_url: None,
                 price: None,
+                // 本家的区域是订单级的（zone），逐张不带区
+                region: None,
             })
             .collect();
         // 回显数与实际条数不一致时取较大者：少算会漏入库，而入库本身按 Key

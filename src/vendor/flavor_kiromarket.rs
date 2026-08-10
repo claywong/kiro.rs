@@ -199,6 +199,8 @@ impl From<PurchaseResponse> for PurchaseResult {
                 issuer_url: None,
                 // 阶梯定价：优先用这一张自己的实付，缺失时退回本单单价
                 price: k.paid.or(unit_price),
+                // 本家的区域是订单级的（zone），逐张不带区
+                region: None,
             })
             .collect();
         // 卖家回显数与实际条数不一致时取较大者，避免漏入库

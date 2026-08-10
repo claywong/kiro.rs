@@ -28,7 +28,8 @@ use md5::{Digest, Md5};
 use serde::Deserialize;
 
 use super::protocol::{
-    ProfileInfo, PurchaseResult, PurchasedKey, StockInfo, VendorApiError, ZoneStock,
+    OrderInfo, Paged, ProfileInfo, PurchaseResult, PurchasedKey, StockInfo, VendorApiError,
+    ZoneStock,
 };
 
 /// AES-128-CBC 解密器类型别名（RustCrypto）。
@@ -345,23 +346,122 @@ struct CreateOrderData {
     order_no: Option<String>,
 }
 
-/// 历史订单列表信封 `{list, total, page, page_size}`。
+/// 历史订单列表信封 `{list, total, page, page_size, counters}`。
 ///
-/// 只在下单响应缺数字 `id` 时用来按 `order_no` 反查 —— 详情接口只认数字 `id`。
+/// 两处用它：下单响应缺数字 `id` 时按 `order_no` 反查（详情接口只认数字 `id`），
+/// 以及面板的历史订单对账（[`orders_to_paged`]）。
 #[derive(Debug, Deserialize, Default)]
-struct OrderIndexData {
+pub struct OrderIndexData {
     #[serde(default)]
-    list: Vec<OrderIndexItem>,
+    pub list: Vec<OrderIndexItem>,
+    #[serde(default)]
+    pub total: Option<u32>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct OrderIndexItem {
-    /// 数字自增 id（字符串形态，如 `"593"`）—— 详情接口要的就是它
+/// 历史订单一行。实测样本见 [`orders_to_paged`] 的单测。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OrderIndexItem {
+    /// 数字自增 id（字符串形态，如 `"612"`）—— 详情接口要的就是它
     #[serde(default)]
-    id: Option<String>,
-    /// 24 位业务单号，如 `202608101612130000967407`
+    pub id: Option<String>,
+    /// 24 位业务单号，如 `202608102107130000960141`
     #[serde(default)]
-    order_no: Option<String>,
+    pub order_no: Option<String>,
+    /// 下单方自带的幂等键。我们下单不传，故本家实测恒为 null。
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    /// 本单消耗积分（**未扣退款**，净支出要减 `refund_points`）
+    #[serde(default)]
+    pub point_cost: Option<f64>,
+    /// 已退还积分。整单退款时等于 `point_cost`。
+    #[serde(default)]
+    pub refund_points: Option<f64>,
+    /// 发货状态，1 已发货
+    #[serde(default)]
+    pub deliver_status: Option<i64>,
+    /// 下单时刻（unix 秒）
+    #[serde(default)]
+    pub create_time: Option<i64>,
+    /// 明细行。要的数量在这里，顶层 `item_count` 是**明细行数**而非件数。
+    #[serde(default)]
+    pub items: Vec<OrderIndexLine>,
+}
+
+/// 历史订单的明细行
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OrderIndexLine {
+    /// 本行件数
+    #[serde(default)]
+    pub quantity: Option<u32>,
+    /// 本行发货状态，1 已发货
+    #[serde(default)]
+    pub deliver_status: Option<i64>,
+}
+
+impl From<OrderIndexItem> for OrderInfo {
+    fn from(o: OrderIndexItem) -> Self {
+        // 件数在明细行里。顶层 `item_count` 是明细行数（单商品单行时恒为 1），
+        // 拿它当件数会把「一单提 3 张」记成 1 张。
+        let requested: u32 = o.items.iter().filter_map(|l| l.quantity).sum();
+        // 已发货件数：整单已发货时全算，否则只算发了货的行。
+        // 卖家对未发货单不会给卡密，此时算 0 才与本地入库数对得上。
+        let delivered_all = o.deliver_status == Some(1);
+        let purchased: u32 = o
+            .items
+            .iter()
+            .filter(|l| delivered_all || l.deliver_status == Some(1))
+            .filter_map(|l| l.quantity)
+            .sum();
+        // 净支出 = 消耗 − 已退。整单退款后这里是 0，不能只报 point_cost，
+        // 否则对账时把退掉的钱算成了花掉的。
+        let total_debit = o.point_cost.map(|c| {
+            let net = c - o.refund_points.unwrap_or(0.0);
+            if net < 0.0 { 0.0 } else { net }
+        });
+        Self {
+            // client_order_id 原样透出（API 下单时我们传的幂等键，网页下单时为 null）
+            client_order_id: o.client_order_id.clone().filter(|s| !s.trim().is_empty()),
+            // order_id 优先用卖家的业务单号，回退幂等键 —— API 下单时卖家不给
+            // order_no 只给 client_order_id，此时用后者才能与本地 purchase_events
+            // 表的 order_id 列对上（那里也是优先 order_no、回退 client_order_id）
+            order_id: o
+                .order_no
+                .or(o.client_order_id)
+                .filter(|s| !s.trim().is_empty()),
+            requested: Some(requested),
+            purchased: Some(purchased),
+            total_debit,
+            created_at: o.create_time.filter(|t| *t > 0).and_then(ts_to_rfc3339),
+        }
+    }
+}
+
+/// unix 秒转 RFC3339 字符串，与 kiroapp / kiromarket 给的字符串时间对齐。
+fn ts_to_rfc3339(ts: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0).map(|d| d.to_rfc3339())
+}
+
+/// 把历史订单信封折成中立分页。分页字段缺失时按卖家实际返回条数兜底。
+pub fn orders_to_paged(data: OrderIndexData) -> Paged<OrderInfo> {
+    let count = data.list.len() as u32;
+    let page_size = data.page_size.filter(|n| *n > 0);
+    let total = data.total;
+    // 总页数由 total / page_size 推；缺任一则不给（前端按 None 隐藏页码）
+    let pages = match (total, page_size) {
+        (Some(t), Some(ps)) => Some(t.div_ceil(ps)),
+        _ => None,
+    };
+    Paged {
+        items: data.list.into_iter().map(OrderInfo::from).collect(),
+        total: total.or(Some(count)),
+        page: data.page.or(Some(1)),
+        page_size: page_size.or(Some(count.max(1))),
+        pages,
+    }
 }
 
 /// 订单详情信封 `{item, items, ...}`
@@ -416,12 +516,21 @@ fn parse_card(card: &OrderCard) -> Option<PurchasedKey> {
             }
         })
     });
+    // 区域：任一段形如 AWS 区域标识即取之。这家「双区混发」商品同一单里
+    // 各张卡的区不同，必须逐张记下来 —— 订单级 zone（商品 id）表达不了。
+    let region = parts
+        .iter()
+        .skip(1)
+        .find(|p| looks_like_region(p))
+        .copied()
+        .map(|s| s.to_ascii_lowercase());
     Some(PurchasedKey {
         key,
         account,
         password: None,
         issuer_url,
         price: None,
+        region,
     })
 }
 
@@ -751,6 +860,23 @@ impl KiroredClient {
         })
     }
 
+    /// 历史提取订单，供面板与本地事件对账。
+    ///
+    /// 分页参数与卖家一致（`page` 从 1 起算）。这家的列表接口是 POST + 签名，
+    /// 不能复用 [`VendorClient::get_with`](super::client::VendorClient)。
+    pub async fn purchase_orders(
+        &self,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Paged<OrderInfo>, VendorApiError> {
+        let body = serde_json::json!({
+            "page": page.unwrap_or(1).max(1),
+            "page_size": page_size.unwrap_or(50).clamp(1, 100),
+        });
+        let env: Envelope<OrderIndexData> = self.authed_post(PATH_ORDER_INDEX, &body).await?;
+        Ok(orders_to_paged(env.into_data("查询历史订单")?))
+    }
+
     /// 按 24 位业务单号反查详情接口要的数字自增 id。
     ///
     /// 详情接口只接受数字 `id`（传 `order_no` 返回 code=1「订单不存在」，传
@@ -906,6 +1032,29 @@ mod tests {
         assert_eq!(pk.key, "ksk_abc123");
         assert!(pk.account.is_none(), "region 段不应被当成账号");
         assert!(pk.issuer_url.is_none());
+        assert_eq!(
+            pk.region.as_deref(),
+            Some("us-east-1"),
+            "region 段必须留下来，否则入库拿不到区、凭证会连错端点"
+        );
+    }
+
+    /// 双区混发：同一单里两张卡分属不同区，各自的区必须独立带出来。
+    /// 订单级 zone 是商品 id，表达不了这个差异 —— 这条锁住那个坑。
+    #[test]
+    fn 同单双区各自带区() {
+        let a = parse_card(&OrderCard {
+            content: "ksk_a----us-east-1".to_string(),
+            account: None,
+        })
+        .unwrap();
+        let b = parse_card(&OrderCard {
+            content: "ksk_b----eu-central-1".to_string(),
+            account: None,
+        })
+        .unwrap();
+        assert_eq!(a.region.as_deref(), Some("us-east-1"));
+        assert_eq!(b.region.as_deref(), Some("eu-central-1"));
     }
 
     /// 账密+key 卡密：`ksk_xxx----账号----密码----region----url`。
@@ -924,6 +1073,119 @@ mod tests {
             pk.issuer_url.as_deref(),
             Some("https://d-9.awsapps.com/start")
         );
+        assert_eq!(pk.region.as_deref(), Some("eu-central-1"));
+    }
+
+    // ============ 历史订单 ============
+
+    /// 卖家 `/api/user/order/index` 的真实返回（探针抓取，单号与 IP 已改）。
+    const ORDER_INDEX_SAMPLE: &str = r#"{"list":[{"id":"612",
+        "order_no":"202608102107130000960141","client_order_id":null,"source":"web",
+        "user_id":96,"type":1,"is_reserve":0,"point_cost":15,"pay_status":1,
+        "pay_time":1786367233,"deliver_status":1,"deliver_time":1786367233,
+        "item_count":1,"contact_email":"","refund_time":0,"refund_points":0,
+        "refund_reason":"","user_remark":"","remark":"","ip":"1.2.3.4",
+        "create_time":1786367233,"update_time":1786367233,
+        "items":[{"order_id":612,"product_id":55,"product_name":"Kiro 拼车 纯APIKEY 双区混发",
+        "sku_name":"标准版","quantity":1,"point_price":15,"point_subtotal":15,
+        "deliver_status":1}],"product_summary":"Kiro 拼车 纯APIKEY 双区混发",
+        "pay_status_text":"已完成","deliver_status_text":"已发货"}],
+        "total":7,"page":1,"page_size":5,
+        "counters":{"all":7,"unpaid":0,"paid":7,"refunded":0,"canceled":0}}"#;
+
+    /// 真实样本要能解析并映射到中立结构，分页信息按卖家给的走。
+    #[test]
+    fn 历史订单映射真实样本_网页下单() {
+        let data: OrderIndexData =
+            serde_json::from_str(ORDER_INDEX_SAMPLE).expect("真实返回应可解析");
+        let paged = orders_to_paged(data);
+        assert_eq!(paged.total, Some(7));
+        assert_eq!(paged.page, Some(1));
+        assert_eq!(paged.page_size, Some(5));
+        assert_eq!(paged.pages, Some(2), "7 条 / 每页 5 = 2 页");
+        let o = &paged.items[0];
+        assert_eq!(o.order_id.as_deref(), Some("202608102107130000960141"));
+        assert!(
+            o.client_order_id.is_none(),
+            "网页下单不带幂等键，该字段应为 null"
+        );
+        assert_eq!(o.requested, Some(1));
+        assert_eq!(o.purchased, Some(1));
+        assert_eq!(o.total_debit, Some(15.0));
+        assert_eq!(o.created_at.as_deref(), Some("2026-08-10T13:07:13+00:00"));
+    }
+
+    /// API 下单时卖家不给 order_no、只给 client_order_id（我们的幂等键）。
+    /// order_id 要回退到 client_order_id 才能与本地 purchase_events 表对上账。
+    #[test]
+    fn 历史订单映射_api下单回退幂等键() {
+        let raw = r#"{"list":[{"id":"700","order_no":null,
+            "client_order_id":"fd8a2e8860b690f0d17f279fde00a975","point_cost":15,
+            "deliver_status":1,"create_time":1786386553,
+            "items":[{"quantity":1,"deliver_status":1}]}],"total":1}"#;
+        let paged = orders_to_paged(serde_json::from_str(raw).unwrap());
+        let o = &paged.items[0];
+        assert_eq!(
+            o.client_order_id.as_deref(),
+            Some("fd8a2e8860b690f0d17f279fde00a975")
+        );
+        // order_id 回退到 client_order_id，否则对不上本地记录
+        assert_eq!(
+            o.order_id.as_deref(),
+            Some("fd8a2e8860b690f0d17f279fde00a975")
+        );
+    }
+
+    /// 件数取明细行的 quantity 之和，不能用顶层 item_count —— 后者是**行数**，
+    /// 一单提 3 张（单行 quantity=3）时它是 1，会把提取量记少。
+    #[test]
+    fn 件数取明细行数量之和而非行数() {
+        let raw = r#"{"list":[{"id":"1","order_no":"n1","point_cost":45,
+            "deliver_status":1,"item_count":1,"create_time":1786367233,
+            "items":[{"quantity":3,"deliver_status":1}]}],
+            "total":1,"page":1,"page_size":20}"#;
+        let paged = orders_to_paged(serde_json::from_str(raw).unwrap());
+        assert_eq!(paged.items[0].requested, Some(3));
+        assert_eq!(paged.items[0].purchased, Some(3));
+    }
+
+    /// 未发货的单不该报出货数 —— 卖家此时不给卡密，本地也没入库。
+    #[test]
+    fn 未发货单出货数为零() {
+        let raw = r#"{"list":[{"id":"2","order_no":"n2","point_cost":15,
+            "deliver_status":0,"create_time":1786367233,
+            "items":[{"quantity":2,"deliver_status":0}]}],"total":1}"#;
+        let paged = orders_to_paged(serde_json::from_str(raw).unwrap());
+        assert_eq!(paged.items[0].requested, Some(2), "要的还是 2 件");
+        assert_eq!(paged.items[0].purchased, Some(0), "但一件都没发");
+    }
+
+    /// 退款单的净支出要扣掉已退积分，否则对账时把退回的钱算成花掉的。
+    #[test]
+    fn 退款单净支出扣掉已退积分() {
+        let raw = r#"{"list":[{"id":"3","order_no":"n3","point_cost":15,
+            "refund_points":15,"deliver_status":1,"create_time":1786367233,
+            "items":[{"quantity":1,"deliver_status":1}]}],"total":1}"#;
+        let paged = orders_to_paged(serde_json::from_str(raw).unwrap());
+        assert_eq!(paged.items[0].total_debit, Some(0.0));
+    }
+
+    /// 分页字段缺失时按实际条数兜底，不能给出 0 页让前端以为没数据。
+    #[test]
+    fn 分页字段缺失时按条数兜底() {
+        let raw = r#"{"list":[{"id":"4","order_no":"n4","items":[{"quantity":1}]}]}"#;
+        let paged = orders_to_paged(serde_json::from_str(raw).unwrap());
+        assert_eq!(paged.total, Some(1));
+        assert_eq!(paged.page, Some(1));
+        assert!(paged.pages.is_none(), "推不出总页数时不瞎给");
+    }
+
+    /// 空列表是合法状态（新账号没下过单），不该报错。
+    #[test]
+    fn 历史订单空列表() {
+        let paged = orders_to_paged(serde_json::from_str(r#"{"list":[],"total":0}"#).unwrap());
+        assert!(paged.items.is_empty());
+        assert_eq!(paged.total, Some(0));
     }
 
     /// 空卡密返回 None。

@@ -67,6 +67,8 @@ impl From<PurchaseResponse> for PurchaseResult {
                 issuer_url: k.issuer_url,
                 // 该卖家单一定价，逐张单价就是本区单价
                 price: r.unit_price,
+                // 本家的区域是订单级的（zone），逐张不带区
+                region: None,
             })
             .collect();
         // 该卖家不回显 purchased 与实际条数的差异，取较大者兜底

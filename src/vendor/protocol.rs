@@ -208,15 +208,15 @@ impl VendorFlavor {
                 gen_logs: false,
                 // 无 webhook —— 发货靠下单后主动查订单详情
                 webhook_manage: false,
-                // 有 /user/order/index 历史订单
+                // POST /user/order/index，已映射为中立分页（见 kirored::orders_to_paged）
                 purchase_orders: true,
                 // 站点有兑换码充值，但本次对接只做手动提取，兑换接口暂不实现，
                 // 故关掉以与 client 层的 unsupported 保持一致（避免面板给出点了报错的按钮）
                 redeem: false,
                 // 有积分流水（订单本身即消费流水）——但无独立 ledger 端点，关掉
                 ledger: false,
-                // 站点有 /user/order/index，但本次对接只做手动提取，
-                // 且该端点 DTO 与 kiroapp/kiromarket 不同，未实现映射，关掉
+                // 无「我名下的密钥列表」端点 —— 卡密只在各自订单的详情里，
+                // 拿不到跨订单的密钥总览
                 my_keys: false,
                 earliest_key: false,
                 batch_scoped_purchase: false,
@@ -410,6 +410,12 @@ pub struct PurchasedKey {
     pub issuer_url: Option<String>,
     /// 这一张实际扣了多少（阶梯定价下同单各不相同）
     pub price: Option<f64>,
+    /// **这一张**的 AWS 区域（如 `eu-central-1`）。
+    ///
+    /// 只有卡密自带区域信息的家会填（kiro.red 的「双区混发」商品同一单里
+    /// 各张卡的区不同，订单级 [`PurchaseResult::zone`] 表达不了）。
+    /// 为 None 时入库回落到订单级 zone 推导出的区域。
+    pub region: Option<String>,
 }
 
 /// 下单结果（中立）

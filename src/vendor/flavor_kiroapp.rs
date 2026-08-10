@@ -185,6 +185,8 @@ impl From<PurchaseResponse> for PurchaseResult {
                 password: k.password,
                 issuer_url: k.issuer_url,
                 price: k.price,
+                // 本家的区域是订单级的（zone），逐张不带区
+                region: None,
             })
             .collect();
         let purchased = r.purchased.max(keys.len() as u32);
