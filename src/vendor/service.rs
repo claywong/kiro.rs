@@ -550,6 +550,20 @@ impl VendorService {
                 // 早先那版文档用 batch_id 标批次；现版没有，留着不影响
                 str_field("batch_id"),
             ),
+            // 本家的 purchase_order_id **不是订单号**，是替我们预生成的提货幂等键
+            // （文档明确：拿它调补拉接口会 404，因为此刻还没有订单）。直接当
+            // client_order_id 用即是文档推荐的用法，重投时天然幂等。
+            //
+            // 形态校验仍要做：文档说它是 32 位十六进制，但 Drop 家就出现过文档与
+            // 实际不符（示例值 batch_xxx 而下单要求 hex32）。不合法就从
+            // (vendor_id, event_id) 派生一个，对同一条推送稳定。
+            VendorFlavor::Kiromarket => (
+                str_field("purchase_order_id")
+                    .filter(|s| is_hex32(s))
+                    .or_else(|| Some(derive_client_order_id(vendor_id, &event_id))),
+                // 本家无「可定向拉取的批次 id」：round_id 是车次，下单不接受它
+                None,
+            ),
         };
 
         Some(IncomingEvent {
@@ -1249,6 +1263,104 @@ mod tests {
 
     fn parse_drop(raw: &[u8]) -> Option<IncomingEvent> {
         VendorService::parse_event("drop", VendorFlavor::Drop, raw)
+    }
+
+    fn parse_kiromarket(raw: &[u8]) -> Option<IncomingEvent> {
+        VendorService::parse_event("km", VendorFlavor::Kiromarket, raw)
+    }
+
+    // ============ 第五家 kiro-market（api.91kiro.com）============
+
+    /// 文档 §6 给的补货样本。本家的 `purchase_order_id` 是替我们预生成的
+    /// **提货幂等键**（32 位十六进制），直接当 client_order_id 用即是文档推荐用法。
+    #[test]
+    fn kiromarket_补货事件() {
+        let raw = r#"{"event":"new_keys_available",
+            "event_id":"evt-1","visibility":"public",
+            "message":"美国区新增 20 个 Key 已就绪，可提货","new_keys":20,"zone":"us",
+            "purchase_order_id":"0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+            "pool_id":"m1","timestamp":1785000000}"#;
+        let e = parse_kiromarket(raw.as_bytes()).unwrap();
+        assert_eq!(e.kind, VendorEventKind::NewKeysAvailable);
+        assert_eq!(e.new_keys, Some(20));
+        assert_eq!(
+            e.purchase_order_id.as_deref(),
+            Some("0a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            "合法的 hex32 应原样沿用，它就是提货幂等键"
+        );
+        // 本家无「可定向拉取的批次 id」：round_id 是车次，下单不接受它
+        assert!(e.batch_order_id.is_none());
+        assert!(e.message.as_deref().unwrap().contains("美国区"));
+    }
+
+    /// 文档说 `purchase_order_id` 是 32 位十六进制，但 Drop 家就出现过文档与实际
+    /// 不符（示例值 `batch_xxx` 而下单要求 hex32）。形态不合法必须换成派生值，
+    /// 否则下单被 400 `bad_order_id` 拒。
+    #[test]
+    fn kiromarket_非法形态的订单号被换成派生值() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e1",
+            "purchase_order_id":"batch_not_hex"}"#;
+        let order = parse_kiromarket(raw).unwrap().purchase_order_id.unwrap();
+        assert_ne!(order, "batch_not_hex");
+        assert!(is_hex32(&order), "派生值必须合法: {order}");
+    }
+
+    /// 缺订单号时也要派生一个 —— 否则 `dispatch_event` 会因缺号跳过自动提取
+    #[test]
+    fn kiromarket_缺订单号时派生() {
+        let raw = br#"{"event":"new_keys_available","event_id":"e2","new_keys":5}"#;
+        let e = parse_kiromarket(raw).unwrap();
+        assert!(is_hex32(e.purchase_order_id.as_deref().unwrap()));
+    }
+
+    /// 同一条推送重投得到同一订单号，卖家侧幂等重放生效、不会重复扣费
+    #[test]
+    fn kiromarket_派生值对同一推送稳定() {
+        let raw = br#"{"event":"new_keys_available","event_id":"same","purchase_order_id":"x"}"#;
+        let a = parse_kiromarket(raw).unwrap().purchase_order_id;
+        let b = parse_kiromarket(raw).unwrap().purchase_order_id;
+        assert_eq!(a, b);
+    }
+
+    /// 不同卖家的同名 event_id 不能撞成同一个订单号
+    #[test]
+    fn kiromarket_不同卖家的派生值不相同() {
+        let raw = br#"{"event":"new_keys_available","event_id":"dup","purchase_order_id":"x"}"#;
+        let a = VendorService::parse_event("km-a", VendorFlavor::Kiromarket, raw)
+            .unwrap()
+            .purchase_order_id;
+        let b = VendorService::parse_event("km-b", VendorFlavor::Kiromarket, raw)
+            .unwrap()
+            .purchase_order_id;
+        assert_ne!(a, b);
+    }
+
+    /// 全部失效事件：启动失效确认观察窗口的依据
+    #[test]
+    fn kiromarket_全部失效事件() {
+        let raw = br#"{"event":"all_keys_dead","event_id":"e3","round_id":"r1","dead":20}"#;
+        let e = parse_kiromarket(raw).unwrap();
+        assert_eq!(e.kind, VendorEventKind::AllKeysDead);
+        assert_eq!(e.dead, Some(20));
+    }
+
+    /// 本家独有的两类事件目前不建模，落成 Unknown 即可 —— 只落库不派发动作。
+    ///
+    /// `warranty_refund` 是质保期内车次判死的自动退款通知，无需我方动作。
+    /// `reserved_keys_delivered` 是包量预留已交付（钱已扣、号已是我们的，要拿
+    /// order_id 调补拉接口取正文），本轮刻意不接：它需要一条「不下单只取件」的
+    /// 新路径。**没签包量协议就不会收到这条**，故不接不影响常规补货。
+    #[test]
+    fn kiromarket_未建模事件落成unknown不派发() {
+        for name in ["warranty_refund", "reserved_keys_delivered", "webhook_test"] {
+            let raw = format!(r#"{{"event":"{name}","event_id":"x-{name}"}}"#);
+            let e = parse_kiromarket(raw.as_bytes()).unwrap();
+            assert_eq!(
+                e.kind,
+                VendorEventKind::Unknown,
+                "{name} 目前不建模，应落成 Unknown"
+            );
+        }
     }
 
     // ============ Drop 家（drop.kiro.ss）============

@@ -67,6 +67,18 @@
       "defaultRpmLimit": 300,
       "autoPurchase": false,
       "autoPurchaseMaxCount": 1
+    },
+    {
+      "id": "kiromarket",
+      "name": "kiro-market",
+      "flavor": "kiromarket",
+      "baseUrl": "https://api.91kiro.com",
+      "apiKey": "usr-替换为 91kiro 账号的 API Key（注册时一次性下发）",
+      "webhookPathToken": "whk_替换为自己生成的随机串_3",
+      "defaultGroups": [],
+      "defaultRpmLimit": 300,
+      "autoPurchase": false,
+      "autoPurchaseMaxCount": 1
     }
   ]
 }

@@ -10,6 +10,8 @@
 //! 功能完整），[`flavor_kiroapp_cc`] 是 kiroapp**.cc**（`/openapi/*`，只有库存 /
 //! 余额 / 提取三个接口，无 webhook）。两者是不同的卖家。
 //! [`flavor_drop`] 是第四家 drop.kiro.ss（`/api/v1/*`，人民币计价、下单可能异步）。
+//! [`flavor_kiromarket`] 是第五家 kiro-market（api.91kiro.com，`/api/my/*`，
+//! 与首家同路径同鉴权，但 `keys` 是带逐张实付的对象数组、余额不在库存接口里）。
 //!
 //! @author wangzhong
 
@@ -27,6 +29,7 @@ pub mod store;
 pub mod flavor_drop;
 pub mod flavor_kiroapp;
 pub mod flavor_kiroapp_cc;
+pub mod flavor_kiromarket;
 pub mod flavor_legacy;
 pub mod protocol;
 pub mod registry;

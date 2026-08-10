@@ -91,8 +91,19 @@ pub struct VendorConfig {
     #[serde(default)]
     pub name: String,
 
-    /// 协议风味：`legacy`（`/api/my/*` + `X-API-Key`）或
-    /// `kiroapp`（`/api/me/*` + `Authorization: Bearer`）。缺省 `legacy`。
+    /// 协议风味，决定路径前缀、鉴权头与响应字段映射。缺省 `legacy`。
+    ///
+    /// | 值 | 卖家 | 路径 + 鉴权 |
+    /// |---|---|---|
+    /// | `legacy` | 首家 | `/api/my/*` + `X-API-Key` |
+    /// | `kiroapp` | kiroapp**.io** | `/api/me/*` + `Authorization: Bearer` |
+    /// | `kiroapp-cc` | kiroapp**.cc** | `/openapi/*` + `Authorization: Bearer` |
+    /// | `drop` | drop.kiro.ss | `/api/my/*` + `X-API-Key`，人民币计价 |
+    /// | `kiromarket` | api.91kiro.com | `/api/my/*` + `X-API-Key`，逐张实付 |
+    ///
+    /// 拼错时**直接报错而非静默回退** —— 被当成默认值会对着错误的路径和鉴权头
+    /// 发请求，症状是一片 401/404。可选值见
+    /// [`crate::vendor::protocol::VendorFlavor::all_names`]。
     #[serde(default)]
     pub flavor: crate::vendor::protocol::VendorFlavor,
 

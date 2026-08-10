@@ -17,6 +17,7 @@ use crate::model::config::{TlsBackend, VendorConfig};
 use super::flavor_drop as drop_flavor;
 use super::flavor_kiroapp as kiroapp;
 use super::flavor_kiroapp_cc as kiroapp_cc;
+use super::flavor_kiromarket as kiromarket;
 use super::flavor_legacy as legacy;
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
@@ -73,7 +74,11 @@ impl VendorClient {
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.flavor {
             // Drop 与首家同用 X-API-Key（都是 usr-xxx 形态的 Key）
-            VendorFlavor::Legacy | VendorFlavor::Drop => req.header("X-API-Key", &self.api_key),
+            // kiro-market 同样是 usr-xxx 形态、同样走 X-API-Key。
+            // 它也接受 Authorization: Bearer，但文档给的首选是这个头。
+            VendorFlavor::Legacy | VendorFlavor::Drop | VendorFlavor::Kiromarket => {
+                req.header("X-API-Key", &self.api_key)
+            }
             VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
         }
     }
@@ -405,6 +410,17 @@ impl VendorClient {
                 Ok(result.into_purchase_result(client_order_id.to_string(), count))
             }
             VendorFlavor::Drop => self.purchase_drop(&body, client_order_id).await,
+            VendorFlavor::Kiromarket => {
+                // 与首家同名参数（zone）。不带 zone 时卖家**只从美区取货且不跨区
+                // 补**，美区缺货就直接返回缺货 —— 故有分区能力时必须显式指定。
+                // 传非 us / eu 的值会被 400 bad_zone 拒，不会静默按美区处理。
+                if let Some(z) = zone.filter(|s| !s.trim().is_empty()) {
+                    body["zone"] = serde_json::json!(z.trim());
+                }
+                let r: kiromarket::PurchaseResponse =
+                    self.post_json(kiromarket::PATH_PURCHASE, &body).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -445,6 +461,10 @@ impl VendorClient {
                     }
                 }
             }
+            VendorFlavor::Kiromarket => {
+                let r: kiromarket::StockResponse = self.get(kiromarket::PATH_STOCK).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -479,6 +499,11 @@ impl VendorClient {
                 let r: drop_flavor::ProfileResponse = self.get(drop_flavor::PATH_PROFILE).await?;
                 Ok(r.into())
             }
+            VendorFlavor::Kiromarket => {
+                // 与首家同路径，但档案套在 profile 键下，故用本家自己的 DTO
+                let r: kiromarket::ProfileResponse = self.get(kiromarket::PATH_PROFILE).await?;
+                Ok(r.into())
+            }
         }
     }
 
@@ -497,6 +522,12 @@ impl VendorClient {
             VendorFlavor::Kiroapp => {
                 let env: kiroapp::Envelope<kiroapp::KiroappOrder> = self
                     .get_with(kiroapp::PATH_ORDERS, &paging(page, page_size))
+                    .await?;
+                Ok(env.map_into())
+            }
+            VendorFlavor::Kiromarket => {
+                let env: kiromarket::Envelope<kiromarket::Order> = self
+                    .get_with(kiromarket::PATH_ORDERS, &limit_offset(page, page_size))
                     .await?;
                 Ok(env.map_into())
             }
@@ -522,6 +553,11 @@ impl VendorClient {
             VendorFlavor::Kiroapp => {
                 let r: kiroapp::RedeemResponse =
                     self.post_json(kiroapp::PATH_REDEEM, &body).await?;
+                Ok(r.into())
+            }
+            VendorFlavor::Kiromarket => {
+                let r: kiromarket::RedeemResponse =
+                    self.post_json(kiromarket::PATH_REDEEM, &body).await?;
                 Ok(r.into())
             }
             VendorFlavor::KiroappCc | VendorFlavor::Drop => {
@@ -563,12 +599,20 @@ impl VendorClient {
                 "通过 API 配置 webhook 地址（请在卖家网页的设置里填）",
             ));
         }
+        // 请求体形状按家分。kiro-market 是双通道（自己车 / 公共车各一个地址），
+        // 没有 webhook_url 这个字段 —— 发错字段名会得到一个 200 却什么都没改。
+        let body = match self.flavor {
+            VendorFlavor::Kiromarket => serde_json::json!({
+                // 两个都写同一个地址：我们只有一个入站端点，且事件里带
+                // visibility 可区分来源。只写 public 会让自己车的通知
+                // 回落到 public（文档如此），行为相同但语义不明确。
+                "private_url": webhook_url,
+                "public_url": webhook_url,
+            }),
+            _ => serde_json::json!({ "webhook_url": webhook_url }),
+        };
         let resp = self
-            .auth(
-                self.http
-                    .put(self.url(self.webhook_path()))
-                    .json(&serde_json::json!({ "webhook_url": webhook_url })),
-            )
+            .auth(self.http.put(self.url(self.webhook_path())).json(&body))
             .send()
             .await
             .map_err(|e| VendorApiError {
@@ -583,8 +627,13 @@ impl VendorClient {
         if !self.capabilities().webhook_manage {
             return Err(VendorApiError::unsupported("由 API 触发 webhook 测试推送"));
         }
-        self.post_json(self.webhook_test_path(), &serde_json::json!({}))
-            .await
+        // kiro-market 要指定通道（private / public），空体可能被 400 拒。
+        // 取 public：那是补货通知的通道，也就是我们真正依赖的那条。
+        let body = match self.flavor {
+            VendorFlavor::Kiromarket => serde_json::json!({ "channel": "public" }),
+            _ => serde_json::json!({}),
+        };
+        self.post_json(self.webhook_test_path(), &body).await
     }
 
     /// webhook 地址读写路径。首家与 Drop 恰好同名，但分开取以免日后一家改路径
@@ -592,6 +641,7 @@ impl VendorClient {
     fn webhook_path(&self) -> &'static str {
         match self.flavor {
             VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK,
+            VendorFlavor::Kiromarket => kiromarket::PATH_WEBHOOK,
             _ => legacy::PATH_WEBHOOK,
         }
     }
@@ -599,6 +649,7 @@ impl VendorClient {
     fn webhook_test_path(&self) -> &'static str {
         match self.flavor {
             VendorFlavor::Drop => drop_flavor::PATH_WEBHOOK_TEST,
+            VendorFlavor::Kiromarket => kiromarket::PATH_WEBHOOK_TEST,
             _ => legacy::PATH_WEBHOOK_TEST,
         }
     }
@@ -612,6 +663,18 @@ impl VendorClient {
     ) -> Result<Paged<LedgerEntry>, VendorApiError> {
         if !self.capabilities().ledger {
             return Err(VendorApiError::unsupported("积分流水查询"));
+        }
+        // 本家分页与筛选参数名都与 kiroapp 不同，分开构造
+        if self.flavor == VendorFlavor::Kiromarket {
+            let mut query = limit_offset(page, page_size);
+            if let Some(t) = entry_type.filter(|s| !s.trim().is_empty()) {
+                // 本家的变动类型字段叫 reason（取值 recharge / purchase / income /
+                // warranty / clawback / adjust / commit）
+                query.push(("reason", t.trim().to_string()));
+            }
+            let env: kiromarket::Envelope<kiromarket::Ledger> =
+                self.get_with(kiromarket::PATH_LEDGER, &query).await?;
+            return Ok(env.map_into());
         }
         let mut query = paging(page, page_size);
         if let Some(t) = entry_type.filter(|s| !s.trim().is_empty()) {
@@ -634,6 +697,14 @@ impl VendorClient {
     ) -> Result<Paged<VendorKeyInfo>, VendorApiError> {
         if !self.capabilities().my_keys {
             return Err(VendorApiError::unsupported("名下密钥列表查询"));
+        }
+        if self.flavor == VendorFlavor::Kiromarket {
+            // 本家没有 history 参数：列表本身就含已失效的（status 为 dead /
+            // revoked），存活与否看 status 而不是靠筛选参数
+            let env: kiromarket::Envelope<kiromarket::MyKey> = self
+                .get_with(kiromarket::PATH_KEYS, &limit_offset(page, page_size))
+                .await?;
+            return Ok(env.map_into());
         }
         let mut query = paging(page, page_size);
         if history {
@@ -683,6 +754,22 @@ fn scan_keys(text: &str) -> Vec<crate::vendor::protocol::PurchasedKey> {
             price: None,
         })
         .collect()
+}
+
+/// 构造 `limit` / `offset` 形态的分页参数（kiro-market 用这一套，不认 page）。
+///
+/// 上层接口统一用「页码 + 每页条数」，这里换算成偏移量。`page` 从 1 起算，
+/// 故 `offset = (page - 1) × limit`；`page` 为 0 或缺失都按第一页处理。
+/// `limit` 收敛到卖家上限（200），超了只会白拿一个 400。
+fn limit_offset(page: Option<u32>, page_size: Option<u32>) -> Vec<(&'static str, String)> {
+    let limit = page_size
+        .unwrap_or(50)
+        .clamp(1, kiromarket::MAX_LIMIT);
+    let offset = page.unwrap_or(1).saturating_sub(1) * limit;
+    vec![
+        ("limit", limit.to_string()),
+        ("offset", offset.to_string()),
+    ]
 }
 
 /// 构造分页查询参数。`page_size` 超过卖家上限时收敛，避免白拿一个 400。

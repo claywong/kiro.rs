@@ -33,6 +33,11 @@ pub enum VendorFlavor {
     /// 两处：金额是字符串、库存来自 `/api/status` 的 `keys_stock`。
     /// 实测无兑换码 / 开号记录 / 订单列表（均 404）。
     Drop,
+    /// kiro-market（api.91kiro.com）：`/api/my/*` + `X-API-Key: usr-xxx`。
+    /// 与 [`Self::Legacy`] 同路径同鉴权同下单参数，差异在响应形态：`keys` 是带
+    /// 逐张 `paid` 的对象数组（阶梯定价，提货跨车次会混价）、档案套在 `profile`
+    /// 键下、余额不在库存接口里。另有质保期内自动退款机制（无需我方动作）。
+    Kiromarket,
 }
 
 impl VendorFlavor {
@@ -42,6 +47,7 @@ impl VendorFlavor {
             Self::Kiroapp => "kiroapp",
             Self::KiroappCc => "kiroapp-cc",
             Self::Drop => "drop",
+            Self::Kiromarket => "kiromarket",
         }
     }
 
@@ -65,13 +71,18 @@ impl VendorFlavor {
             "kiroapp" | "kiroappio" | "me" => Some(Self::Kiroapp),
             "kiroappcc" | "openapi" => Some(Self::KiroappCc),
             "drop" | "dropkiross" | "kirodrop" => Some(Self::Drop),
+            // 归一化会去掉非字母数字，故 `kiro-market` / `api.91kiro.com` 等写法
+            // 都能落到这几个别名上
+            "kiromarket" | "91kiro" | "kiro91" | "api91kirocom" | "market" => {
+                Some(Self::Kiromarket)
+            }
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc, drop"
+        "legacy, kiroapp, kiroapp-cc, drop, kiromarket"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -139,6 +150,30 @@ impl VendorFlavor {
                 batch_scoped_purchase: false,
                 tiered_pricing: false,
                 zoned_purchase: false,
+            },
+            Self::Kiromarket => VendorCapabilities {
+                // 文档未给 /api/status 之类的系统状态端点
+                system_status: false,
+                // 有车次概念（GET /api/my/rounds），但那不是「开号批次记录 +
+                // 平均间隔」，面板那张卡对不上，不开
+                gen_logs: false,
+                // GET / PUT /api/my/webhook 与 POST /api/my/webhook/test 都有
+                webhook_manage: true,
+                purchase_orders: true,
+                redeem: true,
+                ledger: true,
+                my_keys: true,
+                // 无「最早密钥时间」接口
+                earliest_key: false,
+                // 补货推送给的是提货幂等键（purchase_order_id），不是可定向拉取的
+                // 批次 id —— 下单只能按区提，不能指定车次
+                batch_scoped_purchase: false,
+                // 单价按整车产出量查阶梯，且随车次存活时长逐档降价；提货按最早
+                // 入库先给、会跨车次，故同一单可能混价，总额只能以卖家返回为准
+                tiered_pricing: true,
+                // us / eu 严格隔离，不跨区补货。不显式传 zone 时卖家只从美区取，
+                // 美区缺货就直接返回缺货
+                zoned_purchase: true,
             },
         }
     }
@@ -644,5 +679,75 @@ mod local_tests {
     fn 不分区的卖家不开该能力() {
         assert!(!VendorFlavor::KiroappCc.capabilities().zoned_purchase);
         assert!(!VendorFlavor::Drop.capabilities().zoned_purchase);
+    }
+
+    // ============ 第五家 kiro-market ============
+
+    /// 各种写法都要能落到同一个变体上。归一化会去掉非字母数字，
+    /// 故连字符、点号、大小写都容忍。
+    #[test]
+    fn kiromarket_宽松解析() {
+        for raw in [
+            "kiromarket",
+            "kiro-market",
+            "kiroMarket",
+            "KIROMARKET",
+            "91kiro",
+            "api.91kiro.com",
+        ] {
+            assert_eq!(
+                VendorFlavor::parse(raw),
+                Some(VendorFlavor::Kiromarket),
+                "解析失败: {raw}"
+            );
+        }
+    }
+
+    /// 序列化形态必须与 `as_str()` / 报错提示一致。
+    ///
+    /// 面板切换提取模式时会把整个 config.json 写回，两者不一致会让用户手写的
+    /// `kiromarket` 被悄悄改成另一种拼法（`kiroapp-cc` 就踩过这个坑）。
+    #[test]
+    fn kiromarket_序列化形态稳定() {
+        assert_eq!(
+            serde_json::to_string(&VendorFlavor::Kiromarket).unwrap(),
+            r#""kiromarket""#
+        );
+        assert_eq!(VendorFlavor::Kiromarket.as_str(), "kiromarket");
+        // 报错提示里要能看到这个可选值
+        assert!(VendorFlavor::all_names().contains("kiromarket"));
+    }
+
+    /// 不能与既有四家撞名
+    #[test]
+    fn kiromarket_不与既有家撞名() {
+        assert_ne!(VendorFlavor::parse("kiroapp"), Some(VendorFlavor::Kiromarket));
+        assert_ne!(VendorFlavor::parse("drop"), Some(VendorFlavor::Kiromarket));
+        assert_ne!(
+            VendorFlavor::parse("kiroapp-cc"),
+            Some(VendorFlavor::Kiromarket)
+        );
+    }
+
+    /// 分区能力必须开启：本家 us / eu 严格隔离、不跨区补货，
+    /// 不带 zone 下单时卖家只从美区取，美区缺货就直接返回缺货。
+    /// 这一位若是 false，`resolve_zone` 会提前返回 None、下单不带 zone。
+    #[test]
+    fn kiromarket_能力集() {
+        let c = VendorFlavor::Kiromarket.capabilities();
+        assert!(c.zoned_purchase, "us / eu 严格隔离，下单必须带 zone");
+        // 单价按整车产出量查阶梯、且随存活时长降价，提货跨车次会混价
+        assert!(c.tiered_pricing, "同一单可能混价，总额只能以卖家返回为准");
+        assert!(c.webhook_manage, "有 GET / PUT /api/my/webhook");
+        assert!(c.purchase_orders);
+        assert!(c.redeem);
+        assert!(c.ledger);
+        assert!(c.my_keys);
+        // 以下三项本家没有对应端点，开了面板会挂空卡或给出点了报错的按钮
+        assert!(!c.system_status);
+        assert!(!c.gen_logs);
+        assert!(!c.earliest_key);
+        // 补货推送给的是提货幂等键，不是可定向拉取的批次 id
+        assert!(!c.batch_scoped_purchase);
     }
 }
