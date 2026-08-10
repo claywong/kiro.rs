@@ -792,6 +792,21 @@ pub struct Config {
     #[serde(default)]
     pub auto_purchase_pool_target: u32,
 
+    /// 自动提取总闸。`false` = 全局关闭，任何家都不再自动下单。默认 `true`。
+    ///
+    /// 与各家 `autoPurchase` 的分工：那个是**逐家**的模式选择（这一家走自动还是
+    /// 手动），本值是**跨家**的一刀切。想全停时逐家去关有两个毛病 —— 家数多要点
+    /// N 次，且新增一家时默认值取自它自己的配置块，很容易漏掉一家又悄悄开始下单。
+    /// 故单独留一个总闸，语义是「先问它，再问各家」。
+    ///
+    /// 关闭时**不改各家的 `autoPurchase`**：那是用户对每家的意图，总闸只是临时
+    /// 压住出站。重新打开后各家回到原来各自的模式，不需要再逐家恢复一遍。
+    ///
+    /// 默认 `true` 而非 `false`：存量 `config.json` 里没有这个键，反过来会让升级
+    /// 后自动提取集体静默停摆，且现场几乎无从发现。
+    #[serde(default = "default_auto_purchase_enabled")]
+    pub auto_purchase_enabled: bool,
+
     // 逐渠道补货是**逐家**配置，见 [`VendorConfig::auto_purchase_per_channel`]。
     // 早期版本曾在此处放过一个同名顶层开关，是设计错误：那样一开就是全家生效，
     // 无法「A 家各自保底、B 家仍按总量控」。已移除，不保留别名 —— 该版本没发布过。
@@ -917,6 +932,11 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+/// 自动提取总闸缺省开启，理由见 [`Config::auto_purchase_enabled`]
+fn default_auto_purchase_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -961,6 +981,7 @@ impl Default for Config {
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,
+            auto_purchase_enabled: default_auto_purchase_enabled(),
             legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
@@ -1501,5 +1522,31 @@ mod vendor_config_compat_tests {
         )
         .unwrap();
         assert_eq!(cfg.effective_default_priority(), 7);
+    }
+
+    /// 存量 config.json 没有 `autoPurchaseEnabled` 这个键。若默认成 false，
+    /// 升级后所有家的自动提取会集体静默停摆，且现场几乎无从发现。
+    #[test]
+    fn 自动提取总闸缺省开启() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.auto_purchase_enabled);
+        assert!(Config::default().auto_purchase_enabled);
+    }
+
+    /// 显式写 false 要能关掉 —— 总闸的整个用途就在这里
+    #[test]
+    fn 自动提取总闸可显式关闭() {
+        let config: Config = serde_json::from_str(r#"{"autoPurchaseEnabled":false}"#).unwrap();
+        assert!(!config.auto_purchase_enabled);
+    }
+
+    /// 总闸与阈值是两个独立的顶层字段，读一个不该带出另一个的默认值
+    #[test]
+    fn 总闸与池阈值互不干扰() {
+        let config: Config =
+            serde_json::from_str(r#"{"autoPurchaseEnabled":false,"autoPurchasePoolTarget":5}"#)
+                .unwrap();
+        assert!(!config.auto_purchase_enabled);
+        assert_eq!(config.auto_purchase_pool_target, 5);
     }
 }

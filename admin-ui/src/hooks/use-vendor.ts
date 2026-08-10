@@ -8,6 +8,7 @@ import {
   purchaseAdHoc,
   ackVendorEvents,
   redeemVendorCode,
+  setVendorAutoPurchaseEnabled,
   setVendorMode,
   setVendorPerChannel,
   setVendorPoolTarget,
@@ -18,8 +19,9 @@ import {
 /**
  * 卖家清单。首次进页面拉取，后续不主动刷新（卖家列表运行期不变）。
  *
- * 例外：响应里的 `poolTarget` 是可变的全局设置，改动后由
- * [`useSetVendorPoolTarget`] 显式 invalidate 本 key 拉新值。
+ * 例外：响应里的 `poolTarget` 与 `autoPurchaseEnabled` 是可变的全局设置，改动后由
+ * [`useSetVendorPoolTarget`] / [`useSetVendorAutoPurchaseEnabled`] 显式
+ * invalidate 本 key 拉新值。
  */
 export function useVendorList() {
   return useQuery({
@@ -127,6 +129,20 @@ export function useSetVendorPoolTarget() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (poolTarget: number) => setVendorPoolTarget(poolTarget),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-list'] }),
+  })
+}
+
+/**
+ * 切换自动提取总闸。与 [`useSetVendorPoolTarget`] 同样用 `onSettled` —— 持久化
+ * 失败时后端仍返回 200，失败分支也该把服务端实际值拉回来。
+ *
+ * 只刷 `vendor-list`：总闸不进各家的 `/status`，状态条上没有它。
+ */
+export function useSetVendorAutoPurchaseEnabled() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (enabled: boolean) => setVendorAutoPurchaseEnabled(enabled),
     onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-list'] }),
   })
 }

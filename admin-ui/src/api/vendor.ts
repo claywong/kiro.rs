@@ -8,6 +8,7 @@ import type {
   VendorPurchaseResult,
   VendorRedeemResult,
   VendorListResponse,
+  VendorAutoEnabledChange,
   VendorPerChannelChange,
   VendorPoolTargetChange,
 } from '@/types/api'
@@ -185,6 +186,22 @@ export async function setVendorPoolTarget(
   const { data } = await api.put<VendorPoolTargetChange>('/pool-target', {
     poolTarget,
   })
+  return data
+}
+
+/**
+ * 切换自动提取总闸。与 `setVendorPoolTarget` 一样不带 vendorId —— 总闸跨供应商。
+ *
+ * 与 `setVendorMode` 的区别：那个改某一家的模式，这个压住所有家，
+ * 且不会改动各家的 autoPurchase。
+ */
+export async function setVendorAutoPurchaseEnabled(
+  autoPurchaseEnabled: boolean
+): Promise<VendorAutoEnabledChange> {
+  const { data } = await api.put<VendorAutoEnabledChange>(
+    '/auto-purchase-enabled',
+    { autoPurchaseEnabled }
+  )
   return data
 }
 

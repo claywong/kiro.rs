@@ -10,8 +10,8 @@ use axum::{
 
 use super::handlers::{
     VendorState, ack_events, get_status, list_events, purchase_ad_hoc, purchase_for_event,
-    receive_webhook, redeem, set_mode, set_per_channel, set_pool_target, set_webhook_url,
-    test_webhook, list_orders,
+    receive_webhook, redeem, set_auto_purchase_enabled, set_mode, set_per_channel, set_pool_target,
+    set_webhook_url, test_webhook, list_orders,
 };
 // 本地新增的多卖家接口单独成行，避免与上游改动撞在同一批 use 上。
 use super::handlers::{list_ledger, list_my_keys, list_vendors};
@@ -44,6 +44,8 @@ pub fn create_vendor_admin_router(state: VendorState) -> Router {
         .route("/keys", get(list_my_keys))
         .route("/mode", put(set_mode))
         .route("/pool-target", put(set_pool_target))
+        // 自动提取总闸。全局设置，与 /mode 的逐家切换是两回事。
+        .route("/auto-purchase-enabled", put(set_auto_purchase_enabled))
         .route("/per-channel", put(set_per_channel))
         .route("/redeem", post(redeem))
         .route("/webhook", put(set_webhook_url))

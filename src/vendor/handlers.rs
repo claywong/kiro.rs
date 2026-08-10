@@ -257,6 +257,8 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
         // 全局提取限制。放在这里而不是按家查的 /status —— 它跨供应商，
         // 塞进单家状态会让「切换标签页后这个值变不变」变成一个需要解释的问题。
         "poolTarget": state.registry.pool_gate().target(),
+        // 自动提取总闸。同为全局量，故与 poolTarget 并列。
+        "autoPurchaseEnabled": state.registry.pool_gate().auto_enabled(),
     }))
     .into_response()
 }
@@ -662,6 +664,37 @@ pub async fn set_pool_target(
         pool_target = result.pool_target,
         persisted = result.persisted,
         "全局提取限制已更新"
+    );
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoEnabledRequest {
+    /// false = 全局关闭自动提取，任何家都不再自动下单
+    pub auto_purchase_enabled: bool,
+}
+
+/// `PUT /api/admin/vendor/auto-purchase-enabled` —— 切换自动提取总闸
+///
+/// 与 [`set_pool_target`] 同一套写法，理由相同（这是全局设置）：
+/// - 不接受 `vendorId`，也不 `pick()` 某一家 —— 总闸跨供应商。
+/// - 不校验 `outbound_enabled` —— 全局约束与某一家配没配对接无关。
+///
+/// 与 [`set_mode`] 的区别在于范围：那个改某一家的模式，这个压住所有家，
+/// 且**不修改**各家的 `autoPurchase`（重开后各家回到原模式）。
+pub async fn set_auto_purchase_enabled(
+    State(state): State<VendorState>,
+    Json(req): Json<SetAutoEnabledRequest>,
+) -> Response {
+    let Some(service) = state.registry.default_service() else {
+        return err_response(VendorServiceError::NotConfigured);
+    };
+    let result = service.set_auto_purchase_enabled(req.auto_purchase_enabled);
+    tracing::info!(
+        auto_purchase_enabled = result.auto_purchase_enabled,
+        persisted = result.persisted,
+        "自动提取总闸已切换"
     );
     Json(result).into_response()
 }

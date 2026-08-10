@@ -4,8 +4,13 @@ import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { vendorErrorMessage } from '@/api/vendor'
-import { useVendorList, useSetVendorPoolTarget } from '@/hooks/use-vendor'
+import {
+  useVendorList,
+  useSetVendorPoolTarget,
+  useSetVendorAutoPurchaseEnabled,
+} from '@/hooks/use-vendor'
 
 /**
  * 全局提取限制。跨所有卖家共享，故摆在供应商标签页之外。
@@ -25,7 +30,11 @@ import { useVendorList, useSetVendorPoolTarget } from '@/hooks/use-vendor'
 export function VendorPoolGate() {
   const { data: vendorList } = useVendorList()
   const setPoolTarget = useSetVendorPoolTarget()
+  const setAutoEnabled = useSetVendorAutoPurchaseEnabled()
 
+  // 字段缺失按开启处理，对齐后端默认值 —— 老版本后端不返回这个字段时，
+  // 面板不该显示成「已全局关闭」这种与实际相反的状态。
+  const autoEnabled = vendorList?.autoPurchaseEnabled ?? true
   const saved = vendorList?.poolTarget ?? 0
   // 开了逐渠道的家数：混合配置时阈值要大于它，否则那些家的常驻号会占满总量
   const perChannelCount =
@@ -68,9 +77,57 @@ export function VendorPoolGate() {
     }
   }
 
+  const handleToggleAuto = async (next: boolean) => {
+    try {
+      const r = await setAutoEnabled.mutateAsync(next)
+      const what = r.autoPurchaseEnabled
+        ? '已开启自动提取总闸'
+        : '已全局关闭自动提取'
+      if (r.persisted) {
+        toast.success(what)
+      } else {
+        toast.warning(`${what}，但未能写入配置文件`, {
+          description: r.warning
+            ? `${r.warning}。重启后会回退到文件里的值。`
+            : '重启后会回退到文件里的值。',
+        })
+      }
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换自动提取总闸失败'))
+    }
+  }
+
   return (
     <Card>
-      <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
+      {/* 总闸单独一行、排在阈值之前：它压住所有家，阈值只在它开着时才有意义。
+          关闭时阈值那行整体降透明度，避免让人以为改阈值还能影响什么。 */}
+      <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-3">
+        <div className="text-sm font-medium">自动提取总闸</div>
+        <Switch
+          checked={autoEnabled}
+          onCheckedChange={handleToggleAuto}
+          disabled={setAutoEnabled.isPending}
+          aria-label="全局开关自动提取"
+        />
+        <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+          {autoEnabled ? (
+            <>
+              各家按自己的「自动 / 手动」模式运行。关掉这里可一次性停掉所有家的自动下单。
+            </>
+          ) : (
+            <span className="text-amber-600 dark:text-amber-500">
+              已全局关闭，任何家都不会自动下单（手动提取不受影响）。各家自己的模式
+              保持原样，重新开启后无需逐家恢复。
+            </span>
+          )}
+        </div>
+      </CardContent>
+
+      <CardContent
+        className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 ${
+          autoEnabled ? '' : 'opacity-60'
+        }`}
+      >
         <div className="text-sm font-medium">全局提取限制</div>
 
         <div className="flex items-center gap-2">
@@ -108,6 +165,11 @@ export function VendorPoolGate() {
           <span className="ml-1">
             填 0 表示不限制。此项与各家自己的「单次提取上限」是两层限制：后者管一笔提多少，此项管池子总量。
           </span>
+          {/* 总闸关着时上面那句「不限制 / 达到 N 个就不补」是空话，得说清前提，
+              否则会被读成「现在还会补货」。 */}
+          {!autoEnabled && (
+            <span className="ml-1">总闸已关闭，本项当前不起作用。</span>
+          )}
           {/* 混合配置的坑：开了逐渠道的家常驻的号会占满这个阈值，
               把没开的家挤死。数字对不上时这里直接点出来。 */}
           {perChannelCount > 0 && saved > 0 && saved <= perChannelCount && (

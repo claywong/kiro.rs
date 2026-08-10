@@ -845,6 +845,9 @@ mod tests {
         assert!(decrypt_response(cipher, "deadbeef").is_err());
     }
 
+    /// 造一个**有库存**的商品。`purchasable` 留 false 是刻意的 —— 抓包里活车的
+    /// 这个字段常为 false（疑似库存快照滞后），有货靠 `available` 体现，正是
+    /// [`Product::has_stock`] 要覆盖的形态。缺货场景请显式把 `available` 改成 0。
     fn product(id: &str, sku: Option<i64>, price: f64, health: &str) -> Product {
         Product {
             id: id.to_string(),
@@ -854,6 +857,8 @@ mod tests {
             point_price: Some(price),
             purchasable: Some(false),
             in_stock: Some(false),
+            sku_stock: None,
+            available: Some(1),
             latest_batch: Some(LatestBatch {
                 health: health.to_string(),
                 ..Default::default()

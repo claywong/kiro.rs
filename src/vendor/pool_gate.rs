@@ -5,7 +5,11 @@
 //! 挡死）。代价是多家 Key 同期失效时，三家各自都得出「池子空了」的结论，于是
 //! 各提一份。本模块补上那个缺失的全局视图。
 //!
-//! 两件事必须一起做，只做前者等于没做：
+//! 本模块另外持有**自动提取总闸**（[`PoolGate::auto_enabled`]）。它与阈值无关，
+//! 放这里只因为二者都是跨供应商的量，而本结构体正是各家共享的那一个 `Arc`。
+//! 总闸对所有家一律生效，阈值只管没开逐渠道的家 —— 故判断分成两个方法。
+//!
+//! 阈值这一侧要做的两件事必须一起做，只做前者等于没做：
 //!
 //! 1. **阈值**：池中存活的卖家 Key 达到 `target` 就不再自动补货。
 //! 2. **串行化**：自动提取是 `tokio::spawn` 并发触发的（见
@@ -19,7 +23,7 @@
 //! @author wangzhong
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
@@ -35,16 +39,37 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct PoolGate {
     /// 运行时阈值。0 = 不启用。面板改后立即生效，故用原子量而非读 config 快照。
     target: AtomicU32,
+    /// 自动提取总闸。false = 全局关闭。与 `target` 同放在这里是因为两者都是
+    /// 跨供应商的量，而本结构体就是各家共享的那一个 `Arc` —— 另造一层没有意义。
+    auto_enabled: AtomicBool,
     /// 提取串行锁。守护「盘点 → 下单 → 导入」这段临界区。
     lock: Mutex<()>,
 }
 
 impl PoolGate {
-    pub fn new(target: u32) -> Arc<Self> {
+    /// 只给测试用的简写：总闸取缺省的开启态，与 `Config::auto_purchase_enabled`
+    /// 的默认值一致。生产路径一律走 [`Self::with_auto_enabled`] 显式传入两个初值 ——
+    /// 总闸是个容易被忘掉的全局状态，不该有一条「悄悄用了默认值」的构造路径。
+    #[cfg(test)]
+    fn new(target: u32) -> Arc<Self> {
+        Self::with_auto_enabled(target, true)
+    }
+
+    pub fn with_auto_enabled(target: u32, auto_enabled: bool) -> Arc<Self> {
         Arc::new(Self {
             target: AtomicU32::new(target),
+            auto_enabled: AtomicBool::new(auto_enabled),
             lock: Mutex::new(()),
         })
+    }
+
+    /// 自动提取总闸是否开着。false 表示所有家都不该自动下单。
+    pub fn auto_enabled(&self) -> bool {
+        self.auto_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_enabled(&self, enabled: bool) {
+        self.auto_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// 当前阈值，0 表示不启用
@@ -73,6 +98,17 @@ impl PoolGate {
             })
     }
 
+    /// 总闸判断。`Err(原因)` 表示全局已关闭自动提取，本轮任何家都不该下单。
+    ///
+    /// 与 [`Self::check`] 分成两个方法而不是合并：总闸与阈值的适用范围不同 ——
+    /// 阈值只管没开逐渠道的家，总闸对所有家一律生效，包括开了逐渠道的。
+    pub fn check_auto_enabled(&self) -> Result<(), String> {
+        if self.auto_enabled() {
+            return Ok(());
+        }
+        Err("已全局关闭自动提取（总闸），本轮不补货".to_string())
+    }
+
     /// 按阈值判断当前池量是否已够用。`Err(原因)` 表示本轮不该补货。
     ///
     /// 未启用（阈值 0）时一律放行，保持升级前后行为一致。
@@ -98,6 +134,52 @@ impl PoolGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 总闸缺省开启() {
+        // 与 Config::auto_purchase_enabled 的默认值一致 —— 存量配置没有这个键，
+        // 反过来会让升级后自动提取集体静默停摆
+        assert!(PoolGate::new(0).auto_enabled());
+        assert!(PoolGate::new(0).check_auto_enabled().is_ok());
+    }
+
+    #[test]
+    fn 总闸关闭时拦截() {
+        let g = PoolGate::with_auto_enabled(0, false);
+        assert!(!g.auto_enabled());
+        assert!(g.check_auto_enabled().is_err());
+    }
+
+    #[test]
+    fn 总闸可运行时切换() {
+        let g = PoolGate::new(0);
+        g.set_auto_enabled(false);
+        assert!(g.check_auto_enabled().is_err());
+        g.set_auto_enabled(true);
+        assert!(g.check_auto_enabled().is_ok(), "重开应立即放行");
+    }
+
+    /// 总闸与阈值互不影响：阈值为 0（不启用）时总闸仍能拦，
+    /// 总闸开着时阈值也照旧判 —— 两者适用范围不同，不该互相覆盖。
+    #[test]
+    fn 总闸与阈值互相独立() {
+        let g = PoolGate::with_auto_enabled(0, false);
+        assert!(g.check_auto_enabled().is_err(), "阈值未启用不影响总闸");
+        assert!(g.check(99).is_ok(), "总闸关闭不改变阈值自身的判定");
+
+        let g2 = PoolGate::with_auto_enabled(2, true);
+        assert!(g2.check_auto_enabled().is_ok());
+        assert!(g2.check(5).is_err(), "总闸开着时阈值照旧生效");
+    }
+
+    /// 面板与事件行都要凭这句话判断「为什么没补货」，得点明是总闸而非阈值
+    #[test]
+    fn 总闸拦截原因点明是总闸() {
+        let msg = PoolGate::with_auto_enabled(0, false)
+            .check_auto_enabled()
+            .unwrap_err();
+        assert!(msg.contains("总闸"), "要能与阈值拦截区分开: {msg}");
+    }
 
     #[test]
     fn 阈值为零时不拦截() {

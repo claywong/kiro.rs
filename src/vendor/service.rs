@@ -128,6 +128,19 @@ pub struct PoolTargetChange {
     pub warning: Option<String>,
 }
 
+/// 切换自动提取总闸的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoEnabledChange {
+    /// 切换后的总闸状态（运行时已生效）。false = 全局关闭
+    pub auto_purchase_enabled: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 设置逐渠道补货模式的结果
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,6 +377,59 @@ impl VendorService {
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.auto_purchase_pool_target = target;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    // 总闸的读取不在这里开访问器：它是全局量，面板走
+    // `registry.pool_gate().auto_enabled()`，绕开「从某一家读一个全局值」的错觉。
+    // 本类型只需要写入侧（下面的 set），因为持久化要借用它持有的配置路径。
+
+    /// 切换自动提取总闸：先改运行时值，再尽力写回 config.json。
+    ///
+    /// 与 [`Self::set_pool_target`] 完全同构 —— 改的是所有家共享的那个闸门，
+    /// 挂在 `VendorService` 上只为复用它持有的配置路径；持久化失败不算切换失败。
+    ///
+    /// 刻意**不动各家的 `auto_purchase`**：那是用户对每家的意图，总闸只临时压住
+    /// 出站，重开后各家自动回到原模式，不必逐家恢复。
+    pub fn set_auto_purchase_enabled(&self, enabled: bool) -> AutoEnabledChange {
+        self.pool_gate.set_auto_enabled(enabled);
+        match self.persist_auto_purchase_enabled(enabled) {
+            Ok(()) => AutoEnabledChange {
+                auto_purchase_enabled: enabled,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化自动提取总闸失败（运行时已生效）: {}", e);
+                AutoEnabledChange {
+                    auto_purchase_enabled: enabled,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// 写回 config.json 顶层的 `autoPurchaseEnabled`。
+    ///
+    /// 与 [`Self::persist_pool_target`] 同为顶层字段，不必在 `vendor` / `vendors`
+    /// 里按 id 找那一项。
+    fn persist_auto_purchase_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，自动提取总闸仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_purchase_enabled = enabled;
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
@@ -969,6 +1035,15 @@ impl VendorService {
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     async fn try_auto_purchase(&self, event_id: &str, new_keys: Option<u32>) -> Result<(), String> {
         let vid = self.vendor_id();
+
+        // 0. 自动提取总闸。排在授权判定之前 —— 它是最便宜的检查，且全局关闭时
+        //    不该去消费卖家的失效确认额度。
+        //
+        //    为什么判在这里而不是 `dispatch_event` 里不 spawn：走到本方法的 `Err`
+        //    会被 `spawn_auto_purchase` 写进事件行（`record_skip`），面板上看得到
+        //    「总闸关着」这条跳过原因；提前返回则是静默丢弃，排障时分不清是关了
+        //    还是 webhook 链路断了。
+        self.pool_gate.check_auto_enabled()?;
 
         // 1. 授权：卖家的失效确认，或就地盘点的兜底结论
         let auth = self.resolve_authorization()?;
