@@ -135,6 +135,10 @@ impl From<StockResponse> for StockInfo {
                 stock: z.stock,
                 unit_price: z.unit_price,
                 enabled: z.enabled,
+                // 该家无车次概念
+                departed_at: None,
+                alive_secs: None,
+                alive_text: None,
             })
             .collect();
         // 各区单价不同，报价取区间。只算「开放且有货」的区 —— 把 0 库存区的价

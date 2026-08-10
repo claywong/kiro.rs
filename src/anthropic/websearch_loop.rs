@@ -408,7 +408,12 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    // hook 上挂着本次请求的 tracer（见 post_messages 的 web_search 分支），
+    // 传给 provider 后每跳重试的凭据/状态码/失败分类都会记进 trace。
+    let call_result = match provider
+        .call_api_stream(&request_body, hook.trace_sink(), group)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");

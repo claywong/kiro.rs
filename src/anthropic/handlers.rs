@@ -57,6 +57,12 @@ pub(crate) struct UsageRecordHook {
     /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
     pub effort: Option<String>,
     pub started_at: Instant,
+    /// 可选链路追踪器。挂上后 [`Self::record`] 会顺带 [`RequestTracer::finalize`]，
+    /// 供那些「提前返回、拿不到主链路 tracer」的分支（web_search）补齐请求日志。
+    ///
+    /// 主链路（handle_stream_request / handle_non_stream_request）**不要**挂：
+    /// 它们自己显式调 finalize，挂上会重复落库。
+    tracer: Option<std::sync::Arc<RequestTracer>>,
 }
 
 impl UsageRecordHook {
@@ -69,12 +75,25 @@ impl UsageRecordHook {
             model,
             effort: None,
             started_at: Instant::now(),
+            tracer: None,
         }
     }
 
     /// 设置本次请求最终下发的 effort（在完成请求转换、拿到归一化 effort 后调用）
     pub fn set_effort(&mut self, effort: Option<String>) {
         self.effort = effort;
+    }
+
+    /// 挂上链路追踪器，让 [`Self::record`] 兼任 trace 落库。
+    ///
+    /// 只给 web_search 这类在主链路 tracer 构造之前就 `return` 的分支用。
+    pub(crate) fn attach_tracer(&mut self, tracer: std::sync::Arc<RequestTracer>) {
+        self.tracer = Some(tracer);
+    }
+
+    /// 取出挂载的 tracer 作为 provider 的 trace sink（未挂载时为 None，零开销）。
+    pub(crate) fn trace_sink(&self) -> Option<&dyn TraceSink> {
+        self.tracer.as_ref().map(|t| t.as_ref() as &dyn TraceSink)
     }
 
     pub fn record(
@@ -124,6 +143,27 @@ impl UsageRecordHook {
                     rec.credits,
                 );
             }
+        }
+        // 挂了 tracer 的分支（web_search）在这里补齐 trace 落库。
+        if let Some(tracer) = &self.tracer {
+            let error_type = if status == "success" {
+                None
+            } else {
+                last_attempt_outcome(tracer)
+            };
+            tracer.finalize(
+                status,
+                error_type,
+                None,
+                None,
+                TraceUsage {
+                    input_tokens: rec.input_tokens,
+                    output_tokens: rec.output_tokens,
+                    cache_creation_tokens: rec.cache_creation_tokens,
+                    cache_read_tokens: rec.cache_read_tokens,
+                    credits: rec.credits,
+                },
+            );
         }
     }
 }
@@ -660,6 +700,16 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
+        // 这里在主链路 tracer 构造之前就返回，挂 tracer 到 hook 上补齐请求日志
+        hook.attach_tracer(std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+                effort: None,
+            },
+        )));
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
@@ -684,6 +734,17 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        // 同上：loop 内每个终止点都会调 hook.record，由它兼任 trace 落库；
+        // tracer 同时作为 provider 的 trace sink，逐跳 attempt 也会记下来。
+        hook.attach_tracer(std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+                effort: None,
+            },
+        )));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -1656,6 +1717,16 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
+        // 与 /v1/messages 同理：提前返回路径挂 tracer 补齐请求日志
+        hook.attach_tracer(std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+                effort: None,
+            },
+        )));
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
@@ -1679,6 +1750,15 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        hook.attach_tracer(std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+                effort: None,
+            },
+        )));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -2053,6 +2133,130 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一个只带 trace store 的 hook + tracer，模拟 web_search 分支的接线。
+    fn hook_with_tracer(
+        store: SharedTraceStore,
+        is_stream: bool,
+    ) -> (UsageRecordHook, std::sync::Arc<RequestTracer>) {
+        let tracer = std::sync::Arc::new(RequestTracer {
+            store: Some(store),
+            trace_id: Uuid::new_v4().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 7,
+            key_source: TraceKeySource::ClientKey,
+            model: "gpt-5.6-sol".to_string(),
+            is_stream,
+            effort: None,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            token_manager: None,
+        });
+        let mut hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 7,
+            model: "gpt-5.6-sol".to_string(),
+            effort: None,
+            started_at: Instant::now(),
+            tracer: None,
+        };
+        hook.attach_tracer(tracer.clone());
+        (hook, tracer)
+    }
+
+    /// web_search 分支在主链路 tracer 之前就 return，历史上导致「有次数有用量、
+    /// 请求日志为空」。契约：hook 挂上 tracer 后，record 必须兼任 trace 落库。
+    #[test]
+    fn attached_tracer_finalizes_on_record() {
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, _tracer) = hook_with_tracer(store.clone(), false);
+
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1, "record 应落一条 trace");
+        assert_eq!(rows[0].key_id, 7);
+        assert_eq!(rows[0].final_status, "success");
+        assert_eq!(rows[0].input_tokens, 1000);
+        assert_eq!(rows[0].output_tokens, 200);
+        assert!(rows[0].error_type.is_none());
+    }
+
+    /// 失败时 error_type 取最后一跳的 outcome，且 attempt 要跟着落库
+    /// （provider 拿 hook.trace_sink() 当 sink 上报的那些跳）。
+    #[test]
+    fn attached_tracer_carries_attempts_and_error_type() {
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, tracer) = hook_with_tracer(store.clone(), true);
+
+        // 模拟 provider 逐跳上报：第 0 跳配额耗尽，第 1 跳限流
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 11,
+            endpoint: "ide".to_string(),
+            http_status: Some(429),
+            outcome: outcome::QUOTA_EXHAUSTED.to_string(),
+            error_snippet: None,
+            duration_ms: 5,
+        });
+        tracer.on_attempt(TraceAttempt {
+            attempt: 1,
+            credential_id: 12,
+            endpoint: "ide".to_string(),
+            http_status: Some(429),
+            outcome: outcome::ACCOUNT_THROTTLED.to_string(),
+            error_snippet: Some("slow down".to_string()),
+            duration_ms: 7,
+        });
+
+        hook.record(12, 300, 0, 0, 0, 0.0, "error");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].final_status, "error");
+        assert_eq!(rows[0].error_type.as_deref(), Some(outcome::ACCOUNT_THROTTLED));
+        assert_eq!(rows[0].final_credential_id, 12);
+        assert_eq!(rows[0].attempts.len(), 2, "逐跳 attempt 应一并落库");
+    }
+
+    /// 主链路不挂 tracer（它自己显式 finalize），否则会重复落库。
+    #[test]
+    fn hook_without_tracer_writes_no_trace() {
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 7,
+            model: "claude-opus-5".to_string(),
+            effort: None,
+            started_at: Instant::now(),
+            tracer: None,
+        };
+
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert!(rows.is_empty());
+    }
 
     /// effort 记账要覆盖两族包装键，否则 GPT-5.6 的 effort 在统计/trace 里丢成 None。
     #[test]

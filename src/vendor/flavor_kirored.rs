@@ -240,6 +240,16 @@ struct UserData {
     total_points_used: Option<f64>,
 }
 
+/// `/api/user/user/info` 的 `data` —— 档案嵌在 `user` 键下，与登录响应同构。
+///
+/// 少这一层会让 `UserData` 的字段全部落空成 `None`，症状是面板余额空白而
+/// 接口不报错（`code=0`，只是解不出字段），故单独建型而非直接解 [`UserData`]。
+#[derive(Debug, Deserialize, Default)]
+struct UserInfoData {
+    #[serde(default)]
+    user: Option<UserData>,
+}
+
 /// 商品列表信封 `{list:[...], total}`
 #[derive(Debug, Deserialize, Default)]
 struct ProductList {
@@ -266,6 +276,12 @@ pub struct Product {
     pub purchasable: Option<bool>,
     #[serde(default)]
     pub in_stock: Option<bool>,
+    /// SKU 库存数
+    #[serde(default)]
+    pub sku_stock: Option<u32>,
+    /// 当前可提取数（综合库存、余额等的结果）
+    #[serde(default)]
+    pub available: Option<u32>,
     /// 最新批次，健康度看这里
     #[serde(default)]
     pub latest_batch: Option<LatestBatch>,
@@ -276,6 +292,19 @@ pub struct LatestBatch {
     /// `good` / `dead` / `none`
     #[serde(default)]
     pub health: String,
+    /// 发车时间（Unix 秒）—— 本批次入库的时刻
+    #[serde(default)]
+    pub import_time: Option<i64>,
+    /// 存活秒数。**活车是「已存活多久」、死车是最终存活时长**，见
+    /// [`ZoneStock::alive_secs`](super::protocol::ZoneStock::alive_secs)。
+    #[serde(default)]
+    pub max_alive_seconds: Option<i64>,
+    /// 卖家给的存活时长文案，如「26 分钟 46 秒」
+    #[serde(default)]
+    pub max_alive_text: Option<String>,
+    /// 死亡时间（Unix 秒）。活车为 `0`，故取用前需判非零。
+    #[serde(default)]
+    pub dead_time: Option<i64>,
 }
 
 impl Product {
@@ -285,6 +314,18 @@ impl Product {
             .as_ref()
             .map(|b| b.health.eq_ignore_ascii_case("good"))
             .unwrap_or(false)
+    }
+
+    /// 本商品是否有实际库存可下单。
+    ///
+    /// 综合多个字段判断：`purchasable` 为 true，或 `available` / `sku_stock` 大于 0。
+    /// 早期实现因抓包时看到活车的 `purchasable` 为 false（疑似库存快照滞后）而故意
+    /// 忽略此标志，但实测该标志**与实际库存一致**（都为 0 时下单会失败），
+    /// 故现在恢复为必要条件。
+    pub fn has_stock(&self) -> bool {
+        self.purchasable.unwrap_or(false)
+            || self.available.unwrap_or(0) > 0
+            || self.sku_stock.unwrap_or(0) > 0
     }
 
     /// 选品排序用的积分价：优先 point_price，回退 min_point_price。
@@ -300,6 +341,25 @@ impl Product {
 struct CreateOrderData {
     #[serde(default)]
     id: Option<serde_json::Value>,
+    #[serde(default)]
+    order_no: Option<String>,
+}
+
+/// 历史订单列表信封 `{list, total, page, page_size}`。
+///
+/// 只在下单响应缺数字 `id` 时用来按 `order_no` 反查 —— 详情接口只认数字 `id`。
+#[derive(Debug, Deserialize, Default)]
+struct OrderIndexData {
+    #[serde(default)]
+    list: Vec<OrderIndexItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OrderIndexItem {
+    /// 数字自增 id（字符串形态，如 `"593"`）—— 详情接口要的就是它
+    #[serde(default)]
+    id: Option<String>,
+    /// 24 位业务单号，如 `202608101612130000967407`
     #[serde(default)]
     order_no: Option<String>,
 }
@@ -375,19 +435,16 @@ fn looks_like_region(s: &str) -> bool {
 
 // ============ 选品 ============
 
-/// 从商品列表选一个可下单的：**健康（health=good）且积分最低**者。
+/// 从商品列表选一个可下单的：**健康且有库存、积分最低**者。
 ///
-/// - 只考虑 `latest_batch.health == good` 的商品 —— 其余（dead / none / 预定制）
-///   要么买到即失效，要么无现货。
-/// - 同为健康时取积分价最低者，价同则按 id 字典序保证结果稳定（重试幂等）。
-/// - 无任何健康商品时返回 None，调用方据此报「当前无健康车可提」而不是瞎买。
-///
-/// 注意不校验 `purchasable`：抓包发现即便有活车，列表里的 `purchasable` 也可能
-/// 因库存快照滞后而为 false，真正能不能买以下单结果为准。健康度是更强的信号。
+/// - 必须同时满足 `health == good` 和有实际库存（`purchasable` 或 `available > 0`）。
+///   只有批次活着但库存已耗尽的商品会被过滤掉。
+/// - 同为可订购时取积分价最低者，价同则按 id 字典序保证结果稳定（重试幂等）。
+/// - 无任何可订购商品时返回 None，调用方据此报「当前无车可提」。
 pub fn pick_product(products: &[Product]) -> Option<&Product> {
     products
         .iter()
-        .filter(|p| p.is_healthy() && p.sku_id.is_some())
+        .filter(|p| p.is_healthy() && p.has_stock() && p.sku_id.is_some())
         .min_by(|a, b| {
             a.price()
                 .total_cmp(&b.price())
@@ -537,31 +594,45 @@ impl KiroredClient {
 
     /// 库存与报价：把商品列表折叠成中立 [`StockInfo`]。
     ///
-    /// kiro.red 是商品制，没有「可提取张数」的概念。这里把**健康商品数**当作
-    /// `available`（>0 表示当前有活车可买），并把每个健康商品作为一个 `zone`
-    /// 透出（zone=商品 id、label=名称、unit_price=积分价），供面板展示挑车。
+    /// kiro.red 是商品制，没有「可提取张数」的概念。这里把**可订购商品数**
+    /// （健康且有库存）当作 `available`（>0 表示当前有车可买），并把每个健康商品
+    /// 作为一个 `zone` 透出（zone=商品 id、label=名称、unit_price=积分价），
+    /// 供面板展示车次。缺货商品的 `zone.available` 为 0，面板会显示但标灰。
     pub async fn stock(&self) -> Result<StockInfo, VendorApiError> {
         let products = self.fetch_products().await?;
         let healthy: Vec<&Product> = products.iter().filter(|p| p.is_healthy()).collect();
         let zones: Vec<ZoneStock> = healthy
             .iter()
-            .map(|p| ZoneStock {
-                zone: p.id.clone(),
-                label: Some(p.name.clone()),
-                available: 1,
-                stock: None,
-                unit_price: p.point_price.or(p.min_point_price),
-                enabled: true,
+            .map(|p| {
+                let batch = p.latest_batch.as_ref();
+                let has_stock = p.has_stock();
+                ZoneStock {
+                    zone: p.id.clone(),
+                    label: Some(p.name.clone()),
+                    // 有库存时为 1（可下单），否则为 0（面板显示但标灰）
+                    available: if has_stock { 1 } else { 0 },
+                    // 透出卖家的实际库存数
+                    stock: p.sku_stock.or(p.available),
+                    unit_price: p.point_price.or(p.min_point_price),
+                    enabled: true,
+                    // 0 是卖家表示「无」的写法，别让前端显示 1970 年
+                    departed_at: batch.and_then(|b| b.import_time).filter(|t| *t > 0),
+                    alive_secs: batch.and_then(|b| b.max_alive_seconds),
+                    alive_text: batch.and_then(|b| b.max_alive_text.clone()),
+                }
             })
             .collect();
-        let price_min = healthy
+        // price_min 只从有库存的商品里算
+        let orderable: Vec<&Product> = products.iter().filter(|p| p.is_healthy() && p.has_stock()).collect();
+        let price_min = orderable
             .iter()
             .filter_map(|p| p.point_price.or(p.min_point_price))
             .fold(None, |acc: Option<f64>, v| {
                 Some(acc.map_or(v, |a| a.min(v)))
             });
         Ok(StockInfo {
-            available: healthy.len() as u32,
+            // available 是有库存可下单的商品数
+            available: orderable.len() as u32,
             price_min,
             price_max: None,
             balance: None,
@@ -571,10 +642,13 @@ impl KiroredClient {
 
     /// 账户档案：余额（积分）、已用积分。
     pub async fn profile(&self) -> Result<ProfileInfo, VendorApiError> {
-        let env: Envelope<UserData> = self
+        let env: Envelope<UserInfoData> = self
             .authed_post(PATH_USER_INFO, &serde_json::json!({}))
             .await?;
-        let user = env.into_data("获取账户信息")?;
+        let user = env
+            .into_data("获取账户信息")?
+            .user
+            .unwrap_or_default();
         Ok(ProfileInfo {
             name: user.username,
             email: user.email,
@@ -601,7 +675,7 @@ impl KiroredClient {
         let products = self.fetch_products().await?;
         let chosen = pick_product(&products).ok_or_else(|| VendorApiError {
             status: None,
-            message: "当前无健康车可提（所有商品最新批次均非 good）".to_string(),
+            message: "当前无车可提（所有商品均已缺货或批次已失效）".to_string(),
         })?;
         let sku_id = chosen.sku_id.ok_or_else(|| VendorApiError {
             status: None,
@@ -625,19 +699,42 @@ impl KiroredClient {
         let env: Envelope<CreateOrderData> =
             self.authed_post(PATH_ORDER_CREATE, &create_body).await?;
         let order = env.into_data("下单")?;
-        let order_id = order
+        // 详情接口**只认数字自增 id**，传 24 位 order_no 会得到「订单不存在」。
+        // 下单响应有时只给 order_no，此时按单号去历史列表反查数字 id。
+        let numeric_id = order
             .id
             .as_ref()
             .map(value_to_string)
-            .filter(|s| !s.is_empty())
-            .or_else(|| order.order_no.clone())
-            .ok_or_else(|| VendorApiError {
-                status: None,
-                message: "下单成功但未返回订单号，无法拉取卡密".to_string(),
-            })?;
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && s.len() < 12);
+        let order_no = order.order_no.clone().filter(|s| !s.trim().is_empty());
+        let detail_id = match (numeric_id, &order_no) {
+            (Some(id), _) => id,
+            (None, Some(no)) => self.resolve_order_id(no).await?,
+            (None, None) => {
+                return Err(VendorApiError {
+                    status: None,
+                    message: "下单成功但未返回订单号，无法拉取卡密".to_string(),
+                })
+            }
+        };
 
         // 3. 查订单详情拿卡密（不依赖下单响应体结构）
-        let keys = self.fetch_order_keys(&order_id).await?;
+        //    到这一步积分已经扣掉、订单已成立，取卡密失败**不代表下单失败**。
+        //    错误里必须点明这一点，否则运维看到「订单不存在」会以为没买成而重复下单。
+        let keys = self
+            .fetch_order_keys(&detail_id)
+            .await
+            .map_err(|e| VendorApiError {
+                status: e.status,
+                message: format!(
+                    "下单已成功（订单 {}，积分已扣），但取卡密失败：{}；请到卖家后台查看卡密，不要重复下单",
+                    order_no.as_deref().unwrap_or(&detail_id),
+                    e.message
+                ),
+            })?;
+        // 对外展示优先用业务单号，便于与卖家后台核对
+        let order_id = order_no.unwrap_or(detail_id);
         Ok(PurchaseResult {
             purchased: keys.len() as u32,
             requested: Some(quantity),
@@ -654,9 +751,34 @@ impl KiroredClient {
         })
     }
 
-    /// 按订单号拉卡密（订单详情的 `items[].cards[]`）。
+    /// 按 24 位业务单号反查详情接口要的数字自增 id。
+    ///
+    /// 详情接口只接受数字 `id`（传 `order_no` 返回 code=1「订单不存在」，传
+    /// `{order_no:...}` 返回「请求参数异常」），而下单响应有时只给 `order_no`，
+    /// 故这里翻第一页历史订单按单号匹配。刚下的单必然在首页。
+    async fn resolve_order_id(&self, order_no: &str) -> Result<String, VendorApiError> {
+        let body = serde_json::json!({ "page": 1, "page_size": 20 });
+        let env: Envelope<OrderIndexData> = self.authed_post(PATH_ORDER_INDEX, &body).await?;
+        let list = env.into_data("查询历史订单")?.list;
+        list.iter()
+            .find(|o| o.order_no.as_deref().map(str::trim) == Some(order_no.trim()))
+            .and_then(|o| o.id.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| VendorApiError {
+                status: None,
+                message: format!(
+                    "下单成功（单号 {order_no}）但在历史订单首页未找到该单，无法定位卡密；\
+                     请到卖家后台核对，不要重复下单"
+                ),
+            })
+    }
+
+    /// 按数字自增 id 拉卡密（订单详情的 `items[].cards[]`）。
+    ///
+    /// `order_id` 必须是数字自增 id，不能是业务单号 —— 见 [`Self::resolve_order_id`]。
     async fn fetch_order_keys(&self, order_id: &str) -> Result<Vec<PurchasedKey>, VendorApiError> {
-        // detail 接口按数字 id 查；order_id 可能是纯数字字符串
+        // 详情接口的 id 可传数字或数字字符串，两者都接受
         let id_value: serde_json::Value = order_id
             .parse::<i64>()
             .map(serde_json::Value::from)
@@ -723,6 +845,9 @@ mod tests {
         assert!(decrypt_response(cipher, "deadbeef").is_err());
     }
 
+    /// 造一个**有库存**的商品。`purchasable` 留 false 是刻意的 —— 抓包里活车的
+    /// 这个字段常为 false（疑似库存快照滞后），有货靠 `available` 体现，正是
+    /// [`Product::has_stock`] 要覆盖的形态。缺货场景请显式把 `available` 改成 0。
     fn product(id: &str, sku: Option<i64>, price: f64, health: &str) -> Product {
         Product {
             id: id.to_string(),
@@ -732,8 +857,11 @@ mod tests {
             point_price: Some(price),
             purchasable: Some(false),
             in_stock: Some(false),
+            sku_stock: None,
+            available: Some(1),
             latest_batch: Some(LatestBatch {
                 health: health.to_string(),
+                ..Default::default()
             }),
         }
     }
@@ -806,5 +934,50 @@ mod tests {
             account: None,
         };
         assert!(parse_card(&card).is_none());
+    }
+
+    /// 账户信息的 `data` 外面还套一层 `user`。样例取自卖家真实返回，少这层会让
+    /// 余额静默变 `None`（接口 `code=0` 不报错，只是面板空白）。
+    #[test]
+    fn 账户信息解出嵌套user里的余额() {
+        let raw = r#"{"code":0,"data":{"user":{"id":"96",
+            "username":"kiro_6e202b50","email":"c@example.com","points":66,
+            "total_points_used":34,"order_count":3,"status":1}},"message":"成功"}"#;
+        let env: Envelope<UserInfoData> = serde_json::from_str(raw).unwrap();
+        let user = env.into_data("获取账户信息").unwrap().user.unwrap();
+        assert_eq!(user.points, Some(66.0));
+        assert_eq!(user.total_points_used, Some(34.0));
+        assert_eq!(user.username.as_deref(), Some("kiro_6e202b50"));
+    }
+
+    /// 车次的发车时间与存活时长要透到 zone 上。样例取自卖家真实返回。
+    #[test]
+    fn 商品解出发车时间与存活时长() {
+        let raw = r#"{"id":"55","name":"纯APIKEY 双区混发","sku_id":58,
+            "point_price":12,"latest_batch":{"health":"good","import_time":1786337683,
+            "max_alive_seconds":1606,"max_alive_text":"26 分钟 46 秒","dead_time":0}}"#;
+        let p: Product = serde_json::from_str(raw).unwrap();
+        let b = p.latest_batch.as_ref().unwrap();
+        assert_eq!(b.import_time, Some(1786337683));
+        assert_eq!(b.max_alive_seconds, Some(1606));
+        assert_eq!(b.max_alive_text.as_deref(), Some("26 分钟 46 秒"));
+        assert!(p.is_healthy());
+    }
+
+    /// `latest_batch` 整个缺失时，时间字段退化为 `None` 而非 panic。
+    #[test]
+    fn 商品缺批次时时间字段为空() {
+        let p: Product = serde_json::from_str(r#"{"id":"9","name":"x"}"#).unwrap();
+        assert!(p.latest_batch.is_none());
+        assert!(!p.is_healthy());
+    }
+
+    /// `data` 里没有 `user` 键时不 panic，退化为全 `None`。
+    #[test]
+    fn 账户信息缺user键时退化为空() {
+        let env: Envelope<UserInfoData> =
+            serde_json::from_str(r#"{"code":0,"data":{},"message":"成功"}"#).unwrap();
+        let user = env.into_data("获取账户信息").unwrap().user.unwrap_or_default();
+        assert_eq!(user.points, None);
     }
 }

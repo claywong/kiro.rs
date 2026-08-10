@@ -643,6 +643,15 @@ export interface VendorZoneStock {
   unitPrice?: number
   /** 本区是否开放。关闭的区即使有存货也提不出来。 */
   enabled: boolean
+  /** 发车时间（Unix 秒）。车次制卖家（kiro.red）才有。 */
+  departedAt?: number
+  /**
+   * 存活时长（秒）。**语义随车次状态而变**：车还活着时是「已存活多久」、
+   * 会随时间增长；车已死时是「总共活了多久」的终值。不是「预计还能活多久」。
+   */
+  aliveSecs?: number
+  /** 卖家给的存活时长文案，如「26 分钟 46 秒」。优先用它以与卖家口径一致。 */
+  aliveText?: string
 }
 
 /** 卖家清单项 */
@@ -669,6 +678,14 @@ export interface VendorListResponse {
    * 跨供应商共享，故随清单一起返回而不在按家查的 `/status` 里。
    */
   poolTarget?: number
+  /**
+   * 自动提取总闸。false = 全局关闭，任何家都不再自动下单。
+   *
+   * 与各家的 `autoPurchase` 是两层：那个是逐家的模式选择，本值一刀切压住所有家，
+   * 且关闭时**不修改**各家的 `autoPurchase` —— 重开后各家回到原模式。
+   * 字段缺失按 true 处理（对齐后端默认值）。
+   */
+  autoPurchaseEnabled?: boolean
 }
 
 /** 卖家账号档案（已统一为 camelCase） */
@@ -768,6 +785,16 @@ export interface VendorModeChange {
 export interface VendorPoolTargetChange {
   /** 设置后的阈值（运行时已生效）。0 = 不启用 */
   poolTarget: number
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 切换自动提取总闸的结果 */
+export interface VendorAutoEnabledChange {
+  /** 切换后的总闸状态（运行时已生效）。false = 全局关闭 */
+  autoPurchaseEnabled: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */

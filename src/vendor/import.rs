@@ -18,6 +18,8 @@ use super::store::PurchaseOutcome;
 /// `source_channel` 写成 `vendor:<order_id>` 形式，用于事后追溯这批 Key 的来源；
 /// kiroapp 无订单号，由调用方传入自己的标识。
 /// `api_region` 传入实际成交区域（如 `eu-central-1`），用于设置凭证的 API 区域。
+/// `priority` 是调度优先级，**数值越小越优先**；由调用方按家给，见
+/// [`VendorConfig::effective_default_priority`](crate::model::config::VendorConfig::effective_default_priority)。
 pub async fn import_keys(
     admin: &Arc<AdminService>,
     keys: Vec<String>,
@@ -25,6 +27,7 @@ pub async fn import_keys(
     groups: Vec<String>,
     rpm_limit: u32,
     api_region: Option<String>,
+    priority: u32,
 ) -> PurchaseOutcome {
     let mut outcome = PurchaseOutcome::default();
     for key in keys {
@@ -41,7 +44,7 @@ pub async fn import_keys(
             token_endpoint: None,
             issuer_url: None,
             scopes: None,
-            priority: 0,
+            priority,
             rpm_limit,
             region: None,
             auth_region: None,

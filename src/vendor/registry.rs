@@ -35,10 +35,16 @@ impl VendorRegistry {
         store: SharedVendorStore,
         admin: Arc<AdminService>,
         pool_target: u32,
+        auto_purchase_enabled: bool,
     ) -> Self {
-        let pool_gate = PoolGate::new(pool_target);
+        let pool_gate = PoolGate::with_auto_enabled(pool_target, auto_purchase_enabled);
         if pool_target > 0 {
             tracing::info!(pool_target, "全局提取限制已启用");
+        }
+        // 只在关闭时记一行：这是个容易被忘掉的全局状态，日后排查「为什么不补货」
+        // 时启动日志里得有据可查。开着是常态，不必刷日志。
+        if !auto_purchase_enabled {
+            tracing::warn!("自动提取总闸已全局关闭，各家均不会自动下单");
         }
         let services = vendors
             .into_iter()
@@ -83,6 +89,7 @@ impl VendorRegistry {
             store,
             admin,
             config.auto_purchase_pool_target,
+            config.auto_purchase_enabled,
         )
     }
 
@@ -149,6 +156,7 @@ mod tests {
             webhook_path_token: token.to_string(),
             default_groups: vec![],
             default_rpm_limit: 300,
+            default_priority: None,
             default_api_region: String::new(),
             default_auth_region: String::new(),
             auto_purchase: false,

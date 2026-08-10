@@ -71,6 +71,10 @@ impl From<StockResponse> for StockInfo {
                     stock: Some(us),
                     unit_price: r.price_us,
                     enabled: true,
+                    // 该家无车次概念
+                    departed_at: None,
+                    alive_secs: None,
+                    alive_text: None,
                 });
             }
             if let Some(eu) = r.stock_eu {
@@ -81,6 +85,9 @@ impl From<StockResponse> for StockInfo {
                     stock: Some(eu),
                     unit_price: r.price_eu,
                     enabled: true,
+                    departed_at: None,
+                    alive_secs: None,
+                    alive_text: None,
                 });
             }
             v

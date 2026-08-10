@@ -133,6 +133,14 @@ pub struct VendorConfig {
     #[serde(default = "default_vendor_rpm_limit")]
     pub default_rpm_limit: u32,
 
+    /// 提取入库时写入凭据的调度优先级。**数值越小越优先**（选号取 priority 最小者）。
+    ///
+    /// 不配时按 flavor 取缺省：车次制的 kiro.red 给 10（拼车号存活短，排在自有号
+    /// 之后当兜底），其余家给 0（与本配置项引入前的行为一致）。取值见
+    /// [`Self::effective_default_priority`]。
+    #[serde(default)]
+    pub default_priority: Option<u32>,
+
     /// 提取入库时写入凭据的 API Region（默认不写）。
     ///
     /// 卖家 Key 是 API Key 凭据，`effective_api_region` 只看凭据的 `apiRegion`
@@ -219,6 +227,9 @@ fn default_vendor_rpm_limit() -> u32 {
     300
 }
 
+/// kiro.red 入库凭据的缺省优先级。数值越小越优先，10 表示排在自有号（0）之后。
+pub const DEFAULT_KIRORED_PRIORITY: u32 = 10;
+
 /// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
 pub const DEFAULT_VENDOR_ID: &str = "default";
 
@@ -287,6 +298,8 @@ impl LegacyKiroappCcConfig {
             webhook_path_token: String::new(),
             default_groups: self.default_groups.clone(),
             default_rpm_limit: self.default_rpm_limit,
+            // 该家非车次制，按 flavor 缺省取 0
+            default_priority: None,
             default_api_region: String::new(),
             default_auth_region: String::new(),
             auto_purchase: false,
@@ -301,6 +314,21 @@ impl LegacyKiroappCcConfig {
 }
 
 impl VendorConfig {
+    /// 入库凭据的调度优先级。显式配了就用配的，否则按 flavor 取缺省。
+    ///
+    /// kiro.red 缺省 10 而非 0：那家是拼车车次，号的存活时长以分钟计（实测多为
+    /// 半小时到一小时），排在自有号之后当兜底更合适。缺省值放在代码里而不是要求
+    /// 写进配置文件，是为了让「不配也对」—— 新加这家的人不必知道要补这一项。
+    pub fn effective_default_priority(&self) -> u32 {
+        if let Some(p) = self.default_priority {
+            return p;
+        }
+        match self.flavor {
+            crate::vendor::protocol::VendorFlavor::Kirored => DEFAULT_KIRORED_PRIORITY,
+            _ => 0,
+        }
+    }
+
     /// 规整后的 base URL（去掉末尾斜杠）
     pub fn normalized_base_url(&self) -> &str {
         self.base_url.trim_end_matches('/')
@@ -766,6 +794,21 @@ pub struct Config {
     #[serde(default)]
     pub auto_purchase_pool_target: u32,
 
+    /// 自动提取总闸。`false` = 全局关闭，任何家都不再自动下单。默认 `true`。
+    ///
+    /// 与各家 `autoPurchase` 的分工：那个是**逐家**的模式选择（这一家走自动还是
+    /// 手动），本值是**跨家**的一刀切。想全停时逐家去关有两个毛病 —— 家数多要点
+    /// N 次，且新增一家时默认值取自它自己的配置块，很容易漏掉一家又悄悄开始下单。
+    /// 故单独留一个总闸，语义是「先问它，再问各家」。
+    ///
+    /// 关闭时**不改各家的 `autoPurchase`**：那是用户对每家的意图，总闸只是临时
+    /// 压住出站。重新打开后各家回到原来各自的模式，不需要再逐家恢复一遍。
+    ///
+    /// 默认 `true` 而非 `false`：存量 `config.json` 里没有这个键，反过来会让升级
+    /// 后自动提取集体静默停摆，且现场几乎无从发现。
+    #[serde(default = "default_auto_purchase_enabled")]
+    pub auto_purchase_enabled: bool,
+
     // 逐渠道补货是**逐家**配置，见 [`VendorConfig::auto_purchase_per_channel`]。
     // 早期版本曾在此处放过一个同名顶层开关，是设计错误：那样一开就是全家生效，
     // 无法「A 家各自保底、B 家仍按总量控」。已移除，不保留别名 —— 该版本没发布过。
@@ -891,6 +934,11 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+/// 自动提取总闸缺省开启，理由见 [`Config::auto_purchase_enabled`]
+fn default_auto_purchase_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -935,6 +983,7 @@ impl Default for Config {
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,
+            auto_purchase_enabled: default_auto_purchase_enabled(),
             legacy_kiroapp_cc: None,
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
@@ -1431,5 +1480,75 @@ mod vendor_config_compat_tests {
             Some(VendorFlavor::KiroappCc)
         );
         assert_ne!(VendorFlavor::Kiroapp, VendorFlavor::KiroappCc);
+    }
+
+    /// kiro.red 不配 priority 时缺省 10 —— 车次号存活短，排在自有号（0）之后兜底。
+    #[test]
+    fn kirored不配优先级时缺省10() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://kiro.red","apiKey":"a@b.c","flavor":"kirored"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_priority, None, "配置里确实没这一项");
+        assert_eq!(cfg.effective_default_priority(), 10);
+    }
+
+    /// 其余家缺省 0，与本配置项引入前的行为一致（原先硬编码 0）。
+    #[test]
+    fn 其余家不配优先级时缺省0() {
+        for flavor in ["legacy", "kiroapp", "kiroapp-cc", "drop", "kiromarket"] {
+            let cfg: VendorConfig = serde_json::from_str(&format!(
+                r#"{{"baseUrl":"https://x","apiKey":"k","flavor":"{flavor}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                cfg.effective_default_priority(),
+                0,
+                "flavor={flavor} 应保持原有的 0"
+            );
+        }
+    }
+
+    /// 显式配了就以配置为准，包括把这家改回 0。
+    #[test]
+    fn 显式配置覆盖缺省优先级() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://kiro.red","apiKey":"a@b.c","flavor":"kirored",
+                "defaultPriority":0}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_default_priority(), 0);
+
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"baseUrl":"https://x","apiKey":"k","flavor":"legacy","defaultPriority":7}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_default_priority(), 7);
+    }
+
+    /// 存量 config.json 没有 `autoPurchaseEnabled` 这个键。若默认成 false，
+    /// 升级后所有家的自动提取会集体静默停摆，且现场几乎无从发现。
+    #[test]
+    fn 自动提取总闸缺省开启() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.auto_purchase_enabled);
+        assert!(Config::default().auto_purchase_enabled);
+    }
+
+    /// 显式写 false 要能关掉 —— 总闸的整个用途就在这里
+    #[test]
+    fn 自动提取总闸可显式关闭() {
+        let config: Config = serde_json::from_str(r#"{"autoPurchaseEnabled":false}"#).unwrap();
+        assert!(!config.auto_purchase_enabled);
+    }
+
+    /// 总闸与阈值是两个独立的顶层字段，读一个不该带出另一个的默认值
+    #[test]
+    fn 总闸与池阈值互不干扰() {
+        let config: Config =
+            serde_json::from_str(r#"{"autoPurchaseEnabled":false,"autoPurchasePoolTarget":5}"#)
+                .unwrap();
+        assert!(!config.auto_purchase_enabled);
+        assert_eq!(config.auto_purchase_pool_target, 5);
     }
 }
