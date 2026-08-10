@@ -39,7 +39,7 @@ use super::types::{
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
+    HealthGateStateResponse, ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
@@ -229,6 +229,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 健康联动看门狗句柄（总开关运行时可切）。None = 未配置
+    health_gate: Option<crate::admin::health_gate::SharedGateState>,
 }
 
 /// Social 登录会话状态
@@ -563,6 +565,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            health_gate: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -602,6 +605,23 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    /// 注入健康联动看门狗的运行时句柄，用于面板读写总开关。
+    ///
+    /// `None` 表示未配置（baseUrl / token / accountIds 没填全），此时面板上这个
+    /// 开关是不可用状态 —— 与「配好了但关着」是两种不同的展示，不能混为一谈。
+    pub fn with_health_gate(
+        mut self,
+        state: Option<crate::admin::health_gate::SharedGateState>,
+    ) -> Self {
+        self.health_gate = state;
+        self
+    }
+
+    /// 健康联动运行时句柄。`None` = 未配置
+    pub fn health_gate(&self) -> Option<&crate::admin::health_gate::SharedGateState> {
+        self.health_gate.as_ref()
     }
 
     /// 获取所有凭据状态
@@ -2108,6 +2128,76 @@ impl AdminService {
             consecutive_rounds,
             total_count,
         }
+    }
+
+    /// 读健康联动总开关状态。
+    ///
+    /// 未配置与"配好了但关着"要分开：前者面板上该置灰不可点（改了也没用，
+    /// 没有循环在跑），后者是可以随时打开的正常状态。
+    pub fn get_health_gate_state(&self) -> HealthGateStateResponse {
+        let cfg = &self.token_manager.config().health_gate;
+        match self.health_gate() {
+            Some(state) => HealthGateStateResponse {
+                configured: true,
+                enabled: state.enabled(),
+                base_url: cfg.normalized_base_url().to_string(),
+                account_count: cfg.account_ids.len(),
+                verdict: state.verdict().map(str::to_string),
+                applied_schedulable: state.applied(),
+            },
+            None => HealthGateStateResponse {
+                configured: false,
+                enabled: false,
+                base_url: cfg.normalized_base_url().to_string(),
+                account_count: cfg.account_ids.len(),
+                verdict: None,
+                applied_schedulable: None,
+            },
+        }
+    }
+
+    /// 切健康联动总开关：运行时立即生效，并尽力写回 config.json。
+    ///
+    /// 关掉时**不动对方状态** —— 看门狗是单向推送、不读对方，替用户决定对方该开
+    /// 还是该关比留在原处更容易出错。残留值由 `appliedSchedulable` 显示出来。
+    ///
+    /// 持久化失败不算设置失败（运行时已生效），与卖家那边 `set_pool_target`
+    /// 同一套取舍，由返回值里的状态告知面板。
+    pub fn set_health_gate_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<HealthGateStateResponse, AdminServiceError> {
+        let Some(state) = self.health_gate() else {
+            // 沿用本文件校验类错误的既有变体（见 `set_self_heal_config`）
+            return Err(AdminServiceError::InvalidCredential(
+                "健康联动未配置（需填 healthGate 的 baseUrl / token / accountIds），无法切换"
+                    .to_string(),
+            ));
+        };
+        state.set_enabled(enabled);
+        if let Err(e) = self.persist_health_gate_enabled(enabled) {
+            tracing::warn!("持久化健康联动总开关失败（运行时已生效）: {}", e);
+        }
+        Ok(self.get_health_gate_state())
+    }
+
+    /// 写回 config.json 的 `healthGate.enabled`。
+    fn persist_health_gate_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，总开关仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.health_gate.enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 更新自愈治理配置

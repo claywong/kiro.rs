@@ -56,7 +56,7 @@ impl PoolGate {
         self.target.store(target, Ordering::Relaxed);
     }
 
-    /// 是否启用了池闸
+    /// 是否启用了全局阈值闸
     pub fn enabled(&self) -> bool {
         self.target() > 0
     }
@@ -76,6 +76,11 @@ impl PoolGate {
     /// 按阈值判断当前池量是否已够用。`Err(原因)` 表示本轮不该补货。
     ///
     /// 未启用（阈值 0）时一律放行，保持升级前后行为一致。
+    ///
+    /// 开了逐渠道的家**不调用本方法**（判据换成本家盘点，见
+    /// [`VendorConfig::auto_purchase_per_channel`](crate::model::config::VendorConfig::auto_purchase_per_channel)）。
+    /// 但它们买来的号仍会计入别家的 `pool_alive` —— 这是刻意的不对称：开着的家
+    /// 只看自己，关着的家看总量且总量含开着的家。
     pub fn check(&self, pool_alive: u32) -> Result<(), String> {
         let target = self.target();
         if target == 0 {

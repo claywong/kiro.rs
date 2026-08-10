@@ -8,6 +8,7 @@ import type {
   VendorPurchaseResult,
   VendorRedeemResult,
   VendorListResponse,
+  VendorPerChannelChange,
   VendorPoolTargetChange,
 } from '@/types/api'
 
@@ -184,6 +185,22 @@ export async function setVendorPoolTarget(
   const { data } = await api.put<VendorPoolTargetChange>('/pool-target', {
     poolTarget,
   })
+  return data
+}
+
+/**
+ * 设置**某一家**的逐渠道补货。与 `setVendorPoolTarget` 不同，这是逐家设置，
+ * 必须带 vendorId —— 每家可以各自决定判据，混合配置是本特性的用法。
+ */
+export async function setVendorPerChannel(
+  perChannel: boolean,
+  vendorId?: string
+): Promise<VendorPerChannelChange> {
+  const { data } = await api.put<VendorPerChannelChange>(
+    '/per-channel',
+    { perChannel },
+    { params: vendorId ? { vendorId } : {} }
+  )
   return data
 }
 

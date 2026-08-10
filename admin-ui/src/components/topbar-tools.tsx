@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
+  Link2, Link2Off,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -20,6 +21,7 @@ import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
   useSelfHealConfig, useSetSelfHealConfig,
+  useHealthGateState, useSetHealthGateEnabled,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
@@ -267,8 +269,11 @@ function FullTools({ controls }: { controls: ToolControls }) {
 
 function StrategyMenu({ controls }: { controls: ToolControls }) {
   const { data: selfHeal } = useSelfHealConfig()
+  const { data: gate } = useHealthGateState()
   const throttle = readThrottleState(controls.throttleConfig)
   const selfHealOn = selfHeal?.enabled ?? true
+  // 未配置时传 undefined，让 tooltip 干脆不提这一项
+  const gateOn = gate?.configured ? gate.enabled : undefined
   const balanced = controls.loadBalancingMode === 'balanced'
 
   return (
@@ -277,7 +282,7 @@ function StrategyMenu({ controls }: { controls: ToolControls }) {
         <Button
           variant="outline"
           size="sm"
-          title={strategyTitle(controls.loadBalancingMode, throttle, selfHealOn)}
+          title={strategyTitle(controls.loadBalancingMode, throttle, selfHealOn, gateOn)}
         >
           <Activity className="h-3.5 w-3.5" />
           <span className="hidden md:inline">
@@ -319,6 +324,8 @@ function StrategyMenu({ controls }: { controls: ToolControls }) {
         />
         <DropdownMenuSeparator />
         <SelfHealPanels />
+        <DropdownMenuSeparator />
+        <HealthGatePanels />
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -372,12 +379,15 @@ function strategyTitle(
   mode: ToolControls['loadBalancingMode'],
   throttle: ThrottleState,
   selfHealOn: boolean,
+  /** 健康联动：undefined = 未配置，此时不在 tooltip 里提，免得像是坏了 */
+  gateOn?: boolean,
 ) {
   const modeText = mode === 'balanced' ? '均衡负载' : '优先级'
   const throttleText = throttle.failover
     ? `故障转移开（冷却 ${throttle.cooldownMin}m）`
     : '故障转移关'
-  return `运行策略：${modeText} · ${throttleText} · 自愈${selfHealOn ? '开' : '关'}`
+  const gateText = gateOn === undefined ? '' : ` · 联动${gateOn ? '开' : '关'}`
+  return `运行策略：${modeText} · ${throttleText} · 自愈${selfHealOn ? '开' : '关'}${gateText}`
 }
 
 /** 「运行策略」下拉里的故障转移区块（含冷却时长），自带自定义输入的局部状态 */
@@ -457,6 +467,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <SelfHealCompactItems />
+        <HealthGateCompactItems />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -809,6 +820,107 @@ function SelfHealPanels() {
   )
 }
 
+// ============ 健康联动 ============
+
+/**
+ * 健康联动总开关（下拉）。
+ *
+ * 语义与同栏其余开关不同，值得注意：这里控制的是**往外部系统推调度开关**，
+ * 不是本地怎么调度请求。本地稳则关闭外部调度、不稳则打开（反向映射，因为
+ * 外部账号是兜底池，平时闲着更好）。
+ *
+ * 关掉时后端**不改对方当前状态** —— 看门狗单向推送、不读对方，替用户决定
+ * 对方该开还是该关比留在原处更容易出错。代价是残留值不确定，故这里把
+ * 「已推送」显示出来：兜底池永久开着（计费）与永久关着（无兜底）后果完全不同，
+ * 你关掉后至少能看到它停在哪一档。
+ *
+ * 未配置与「配好了但关着」分开展示：前者改了也没用（没有循环在跑），
+ * 故置灰并说明缺什么。
+ */
+function HealthGatePanels() {
+  const { data: state, isLoading } = useHealthGateState()
+  const { mutate, isPending } = useSetHealthGateEnabled()
+
+  const configured = state?.configured ?? false
+  const enabled = state?.enabled ?? false
+  const busy = isLoading || isPending
+
+  const toggle = (v: boolean) => {
+    mutate(v, {
+      onSuccess: (r) =>
+        toast.success(
+          v
+            ? '已开启健康联动'
+            : `已关闭健康联动，外部调度保持${appliedText(r.appliedSchedulable)}`,
+        ),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  return (
+    <>
+      <DropdownMenuLabel>健康联动</DropdownMenuLabel>
+      <div className="px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="min-w-0 text-xs">
+            <div className="font-medium">
+              {!configured ? '未配置' : enabled ? '已启用' : '已关闭'}
+            </div>
+            <div className="truncate text-muted-foreground">
+              {configured ? (
+                <>本地不稳时放外部兜底池接量</>
+              ) : (
+                <>需先配 healthGate 的地址 / token / 账号</>
+              )}
+            </div>
+          </div>
+          <Switch
+            checked={enabled}
+            disabled={busy || !configured}
+            onCheckedChange={toggle}
+            aria-label="健康联动总开关"
+          />
+        </div>
+
+        {configured && state && (
+          <div className="mt-2 space-y-1 rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate">{hostOf(state.baseUrl)}</span>
+              <span>{state.accountCount} 个账号</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span>判定：{state.verdict ?? '未判定'}</span>
+              <span>已推送：{appliedText(state.appliedSchedulable)}</span>
+            </div>
+            {!enabled && (
+              // 关闭状态下这句是重点：对方停在上面那个「已推送」值不动，
+              // 需要改就得去对方后台。不说清楚会让人以为关掉=对方也停了。
+              <div className="pt-0.5 text-[11px] leading-snug">
+                已停止判定与推送，外部调度保持上述状态不变。
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
+/** 已推送值的中文说明。null = 本进程还没推过，对方可能残留上次运行的值 */
+function appliedText(applied: boolean | null | undefined): string {
+  if (applied === null || applied === undefined) return '未知'
+  return applied ? '可调度' : '不可调度'
+}
+
+/** 只取主机名，下拉里宽度有限，完整 URL 会挤掉右边的账号数 */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url || '—'
+  }
+}
+
 /** 紧凑模式（下拉菜单内）的自愈开关项 */
 function SelfHealCompactItems() {
   const { data: config, isLoading } = useSelfHealConfig()
@@ -837,6 +949,47 @@ function SelfHealCompactItems() {
           : enabled
             ? `关闭自愈（连续 ${config?.consecutiveRounds ?? 0} 轮）`
             : '开启全账号自愈'}
+      </DropdownMenuItem>
+    </>
+  )
+}
+
+/**
+ * 紧凑模式（窄屏）的健康联动开关项。
+ *
+ * 未配置时整项不渲染 —— 紧凑菜单空间有限，摆一个点不动的项没有意义
+ * （宽屏那版会显示"未配置"并说明缺什么，那里有地方写）。
+ */
+function HealthGateCompactItems() {
+  const { data: state, isLoading } = useHealthGateState()
+  const { mutate, isPending } = useSetHealthGateEnabled()
+
+  if (!state?.configured) return null
+
+  const enabled = state.enabled
+  const busy = isLoading || isPending
+
+  return (
+    <>
+      <DropdownMenuLabel>健康联动</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={busy}
+        onSelect={() =>
+          mutate(!enabled, {
+            onSuccess: (r) =>
+              toast.success(
+                !enabled
+                  ? '已开启健康联动'
+                  : `已关闭健康联动，外部调度保持${appliedText(r.appliedSchedulable)}`,
+              ),
+            onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+          })
+        }
+      >
+        {enabled ? <Link2 /> : <Link2Off />}
+        {enabled
+          ? `关闭联动（当前${state.verdict ?? '未判定'}）`
+          : `开启联动（外部停在${appliedText(state.appliedSchedulable)}）`}
       </DropdownMenuItem>
     </>
   )

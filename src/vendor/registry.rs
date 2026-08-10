@@ -49,6 +49,7 @@ impl VendorRegistry {
                     flavor = cfg.flavor.as_str(),
                     inbound = cfg.inbound_enabled(),
                     auto_purchase = cfg.auto_purchase,
+                    per_channel = cfg.auto_purchase_per_channel,
                     "已注册卖家"
                 );
                 Arc::new(VendorService::new(
@@ -153,6 +154,7 @@ mod tests {
             auto_purchase: false,
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],
+            auto_purchase_per_channel: false,
         }
     }
 

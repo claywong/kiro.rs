@@ -537,6 +537,33 @@ pub struct SetSelfHealConfigRequest {
     pub max_consecutive_rounds: Option<u32>,
 }
 
+/// 健康联动总开关状态
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthGateStateResponse {
+    /// 是否已配置（baseUrl / token / accountIds 填全）。false 时开关不可用
+    pub configured: bool,
+    /// 总开关当前状态。未配置时恒为 false
+    pub enabled: bool,
+    /// 外部系统基址，用于面板显示联动的是谁（如 `https://4code.us`）
+    pub base_url: String,
+    /// 联动的外部账号数
+    pub account_count: usize,
+    /// 最近一轮判定：`稳定` / `不稳定`。null = 还没判过（刚启动或开关关着）
+    pub verdict: Option<String>,
+    /// 已推给对方的 `schedulable`。null = 本进程还没推过 ——
+    /// 此时对方可能残留上次运行留下的值，面板要照实显示「未知」
+    pub applied_schedulable: Option<bool>,
+}
+
+/// 设置健康联动总开关
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetHealthGateRequest {
+    /// true = 恢复周期判定；false = 停止判定与推送（**不改对方当前状态**）
+    pub enabled: bool,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

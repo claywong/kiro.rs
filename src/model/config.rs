@@ -91,8 +91,19 @@ pub struct VendorConfig {
     #[serde(default)]
     pub name: String,
 
-    /// 协议风味：`legacy`（`/api/my/*` + `X-API-Key`）或
-    /// `kiroapp`（`/api/me/*` + `Authorization: Bearer`）。缺省 `legacy`。
+    /// 协议风味，决定路径前缀、鉴权头与响应字段映射。缺省 `legacy`。
+    ///
+    /// | 值 | 卖家 | 路径 + 鉴权 |
+    /// |---|---|---|
+    /// | `legacy` | 首家 | `/api/my/*` + `X-API-Key` |
+    /// | `kiroapp` | kiroapp**.io** | `/api/me/*` + `Authorization: Bearer` |
+    /// | `kiroapp-cc` | kiroapp**.cc** | `/openapi/*` + `Authorization: Bearer` |
+    /// | `drop` | drop.kiro.ss | `/api/my/*` + `X-API-Key`，人民币计价 |
+    /// | `kiromarket` | api.91kiro.com | `/api/my/*` + `X-API-Key`，逐张实付 |
+    ///
+    /// 拼错时**直接报错而非静默回退** —— 被当成默认值会对着错误的路径和鉴权头
+    /// 发请求，症状是一片 401/404。可选值见
+    /// [`crate::vendor::protocol::VendorFlavor::all_names`]。
     #[serde(default)]
     pub flavor: crate::vendor::protocol::VendorFlavor,
 
@@ -163,6 +174,31 @@ pub struct VendorConfig {
     /// `autoPurchaseWindows` 是别名，原因同 [`VendorConfig::webhook_path_token`]。
     #[serde(default, alias = "autoPurchaseWindows")]
     pub auto_purchase_schedule: Vec<crate::vendor::schedule::AutoPurchaseWindow>,
+
+    /// 逐渠道补货：本家只看**自己**有没有存活 Key，没有就补，不看池子总量。
+    ///
+    /// 逐家独立配置，故意做成**不对称**的：
+    ///
+    /// | 本家设置 | 判据 | 别家补货对本家的影响 |
+    /// |---|---|---|
+    /// | `true` | 本家存活 == 0 | 无 —— 只看自己 |
+    /// | `false`（默认） | 池中存活 < `autoPurchasePoolTarget` | 有 —— 别家的号占用总量 |
+    ///
+    /// 开着的家彼此独立、各自保底；关着的家仍按全局总量判，而那个总量**包含**
+    /// 开着的那些家买来的号。混合配置时要注意：`poolTarget` 必须大于「开了本项
+    /// 的家数」，否则那些家常驻的号会把总量占满，关着的家永远轮不到补货
+    /// （A 开且常驻 1 张时，`poolTarget=1` 会让 B 恒被挡住，得配 2）。
+    ///
+    /// 为什么它仍然是有界的：兜底路径（就地盘点）不消费卖家额度、会反复成立，
+    /// 原本唯一的刹车是全局阈值。本项换了另一个刹车 —— **本家自己的盘点**：
+    /// 买到一张后本家 `alive == 1`，下一条推送即被 `StillAlive` 拒掉。故上限是
+    /// 「本家常驻 `autoPurchaseMaxCount` 张」，不会无限扣费。
+    ///
+    /// 代价要清楚：开着的每家都各自维持库存，账号消耗约等于开着的家数倍。
+    /// 且买来的号若立刻被封（`Suspended`），本家又回到 `alive == 0`，会再买一张 ——
+    /// 这是本项的**预期语义**（渠道无可用即补），封号率高时消耗会明显上升。
+    #[serde(default)]
+    pub auto_purchase_per_channel: bool,
 }
 
 fn default_vendor_auto_max_count() -> u32 {
@@ -246,6 +282,8 @@ impl LegacyKiroappCcConfig {
             auto_purchase: false,
             auto_purchase_max_count: default_vendor_auto_max_count(),
             auto_purchase_schedule: Vec::new(),
+            // 不开自动提取的家谈不上逐渠道补货，与上面 auto_purchase 保持一致
+            auto_purchase_per_channel: false,
         }
     }
 }
@@ -427,8 +465,17 @@ impl HealthGateConfig {
     /// 配置是否完整可用：开关开着，且基址 / token / 账号列表都给全了。
     /// 缺任一项都当没启用处理 —— 半配状态下静默不跑比每周期报错刷屏好。
     pub fn is_usable(&self) -> bool {
-        self.enabled
-            && !self.base_url.trim().is_empty()
+        self.enabled && self.is_configured()
+    }
+
+    /// 配置是否齐全（不看 `enabled`）。
+    ///
+    /// 与 [`Self::is_usable`] 的分工：本方法答「填全了吗」，`is_usable` 答
+    /// 「填全了且现在开着吗」。看门狗按本方法决定要不要**起任务** —— 起了之后
+    /// `enabled` 由面板运行时切换，若按 `is_usable` 起任务，启动时是关的就压根
+    /// 没有循环在跑，面板打开开关后要等到重启才生效。
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
             && !self.token.trim().is_empty()
             && !self.account_ids.is_empty()
     }
@@ -697,6 +744,10 @@ pub struct Config {
     /// 不额外设开关，避免「开关开着但阈值为 0」这种无意义组合。
     #[serde(default)]
     pub auto_purchase_pool_target: u32,
+
+    // 逐渠道补货是**逐家**配置，见 [`VendorConfig::auto_purchase_per_channel`]。
+    // 早期版本曾在此处放过一个同名顶层开关，是设计错误：那样一开就是全家生效，
+    // 无法「A 家各自保底、B 家仍按总量控」。已移除，不保留别名 —— 该版本没发布过。
 
     /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
     ///
@@ -1182,6 +1233,41 @@ mod vendor_config_compat_tests {
     fn 全局池闸读取配置值() {
         let config: Config = serde_json::from_str(r#"{"autoPurchasePoolTarget":3}"#).unwrap();
         assert_eq!(config.auto_purchase_pool_target, 3);
+    }
+
+    /// 逐渠道补货是**逐家**配置，不是顶层开关 —— 混着配是本特性的用法：
+    /// 开着的家只看自己，关着的家仍按 `autoPurchasePoolTarget` 判总量。
+    #[test]
+    fn 逐渠道补货按家独立配置() {
+        let config: Config = serde_json::from_str(
+            r#"{"autoPurchasePoolTarget":2,
+                "vendors":[
+                  {"id":"a","baseUrl":"https://a","apiKey":"k","autoPurchasePerChannel":true},
+                  {"id":"b","baseUrl":"https://b","apiKey":"k"}
+                ]}"#,
+        )
+        .unwrap();
+        let vs = config.resolved_vendors();
+        let a = vs.iter().find(|v| v.vendor_id() == "a").unwrap();
+        let b = vs.iter().find(|v| v.vendor_id() == "b").unwrap();
+        assert!(a.auto_purchase_per_channel, "a 家开着");
+        assert!(!b.auto_purchase_per_channel, "b 家默认关闭");
+        // 全局阈值仍在，供 b 家使用
+        assert_eq!(config.auto_purchase_pool_target, 2);
+    }
+
+    #[test]
+    fn 逐渠道补货默认关闭且回写不丢() {
+        let v: VendorConfig =
+            serde_json::from_str(r#"{"baseUrl":"https://x","apiKey":"k"}"#).unwrap();
+        assert!(!v.auto_purchase_per_channel, "默认关闭 —— 会多花钱的特性不默认开");
+
+        let mut v2 = v.clone();
+        v2.auto_purchase_per_channel = true;
+        let json = serde_json::to_string(&v2).unwrap();
+        assert!(json.contains("autoPurchasePerChannel"), "落盘要带上本字段");
+        let back: VendorConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_purchase_per_channel);
     }
 
     /// vendors 里显式配了同 id 时，显式配置胜出（迁移项排在最后）

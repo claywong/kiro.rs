@@ -14,15 +14,22 @@ import { useVendorList, useSetVendorPoolTarget } from '@/hooks/use-vendor'
  * 健康的 Key 算进来，A 的补货会被 B 挡死）。代价是多家 Key 同期失效时，
  * 三家各自都得出「池子空了」的结论，于是各提一份、各扣一次费。
  *
- * 刻意不做成开关 + 数字两个控件：那会产生「开关开着但阈值为 0」这种无意义
+ * 阈值刻意不做成开关 + 数字两个控件：那会产生「开关开着但阈值为 0」这种无意义
  * 组合，语义上等于永久禁止自动补货，几乎肯定是误填。用单一数字 + 0 表示不启用，
  * 与后端 `autoPurchaseSchedule` 的 `maxCount: 0` 是同一套约定。
+ *
+ * 「逐渠道补货」不在这里 —— 它是**逐家**配置，在各家标签页的状态条上
+ * （见 `vendor-status-bar.tsx`）。本阈值只管那些没开逐渠道的家，但统计的池量
+ * **包含**开了的那些家买来的号。
  */
 export function VendorPoolGate() {
   const { data: vendorList } = useVendorList()
   const setPoolTarget = useSetVendorPoolTarget()
 
   const saved = vendorList?.poolTarget ?? 0
+  // 开了逐渠道的家数：混合配置时阈值要大于它，否则那些家的常驻号会占满总量
+  const perChannelCount =
+    vendorList?.vendors?.filter((v) => v.perChannel).length ?? 0
   const [input, setInput] = useState(String(saved))
 
   // 服务端值变化时同步到输入框（首次加载完成、或保存后拉回实际值）。
@@ -101,6 +108,14 @@ export function VendorPoolGate() {
           <span className="ml-1">
             填 0 表示不限制。此项与各家自己的「单次提取上限」是两层限制：后者管一笔提多少，此项管池子总量。
           </span>
+          {/* 混合配置的坑：开了逐渠道的家常驻的号会占满这个阈值，
+              把没开的家挤死。数字对不上时这里直接点出来。 */}
+          {perChannelCount > 0 && saved > 0 && saved <= perChannelCount && (
+            <span className="ml-1 text-amber-600 dark:text-amber-500">
+              有 {perChannelCount} 家开了「逐渠道补货」，它们常驻的 Key 会占满这个
+              上限，其余家将无法自动补货 —— 需把本值设为大于 {perChannelCount}。
+            </span>
+          )}
         </div>
       </CardContent>
     </Card>

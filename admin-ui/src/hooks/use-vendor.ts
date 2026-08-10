@@ -9,6 +9,7 @@ import {
   ackVendorEvents,
   redeemVendorCode,
   setVendorMode,
+  setVendorPerChannel,
   setVendorPoolTarget,
   testVendorWebhook,
   setVendorWebhookUrl,
@@ -127,6 +128,23 @@ export function useSetVendorPoolTarget() {
   return useMutation({
     mutationFn: (poolTarget: number) => setVendorPoolTarget(poolTarget),
     onSettled: () => qc.invalidateQueries({ queryKey: ['vendor-list'] }),
+  })
+}
+
+/**
+ * 设置某一家的逐渠道补货。用 `onSettled` 而非 `onSuccess`：持久化失败时后端
+ * 仍返回 200（运行时已生效，只是重启会回退），失败分支也该把实际值拉回来。
+ *
+ * 同时刷 status 与 list：状态条读 status，标签页那层读 list。
+ */
+export function useSetVendorPerChannel(vendorId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (perChannel: boolean) => setVendorPerChannel(perChannel, vendorId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
+      qc.invalidateQueries({ queryKey: ['vendor-list'] })
+    },
   })
 }
 

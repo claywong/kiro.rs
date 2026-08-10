@@ -654,6 +654,8 @@ export interface VendorListItem {
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
+  /** 逐渠道补货（逐家独立）：true = 只看本家存活，false = 按全局阈值判总量 */
+  perChannel: boolean
   unacked: number
 }
 
@@ -713,6 +715,16 @@ export interface VendorStatus {
   autoPurchaseBaseMaxCount?: number
   /** 当前命中的时段描述，如 `14:00–23:00`；未配时段表或未命中为 null */
   autoPurchaseWindow?: string | null
+  /**
+   * 逐渠道补货（运行时值，逐家独立）。
+   *
+   * - `true`：本家只看**自己**有没有存活 Key，没有就补，不看全局池量
+   * - `false`：按 `poolTarget` 判池子总量，而该总量**包含**开着本项的那些家
+   *
+   * 不对称是刻意的。混合配置时 `poolTarget` 要大于「开着本项的家数」，
+   * 否则那些家常驻的号会占满总量，关着的家永远轮不到补货。
+   */
+  autoPurchasePerChannel?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
@@ -756,6 +768,16 @@ export interface VendorModeChange {
 export interface VendorPoolTargetChange {
   /** 设置后的阈值（运行时已生效）。0 = 不启用 */
   poolTarget: number
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 设置逐渠道补货模式的结果 */
+export interface VendorPerChannelChange {
+  /** 设置后的模式（运行时已生效） */
+  perChannel: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */
