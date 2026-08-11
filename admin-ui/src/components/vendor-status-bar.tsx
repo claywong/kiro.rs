@@ -420,11 +420,11 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
       const ok = await confirm({
         title: '让轮询越过总闸？',
         description:
-          '关闭后，即便全局总闸处于关闭状态，本家仍会继续轮询、发现新车并自动下单。' +
-          '也就是说总闸对本家不再是急停 —— 而总闸会被健康联动自动翻转。' +
-          '要停掉本家的自动扣费，得同时关本家的「自动提取」与「自动预定」开关，' +
-          '或把轮询间隔改为 0。现货提取仍受池闸与失效授权限制；自动预定不看池量，' +
-          '但最多维持一张待发货单。',
+          '关闭后，只要本家处于自动提取模式，即便全局总闸关闭，本家仍会继续轮询、' +
+          '发现新车并自动下单。也就是说总闸对本家不再是急停 —— 而总闸会被健康联动' +
+          '自动翻转。要停掉本家的自动扣费，得关本家的「自动提取」开关（关了就连库存' +
+          '都不查），或把轮询间隔改为 0。现货提取仍受池闸与失效授权限制；自动预定' +
+          '不看池量，但最多维持一张待发货单。',
         confirmText: '确认越过',
         destructive: true,
       })
@@ -604,25 +604,34 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         )}
 
         {/* 库存轮询：只在开了轮询（stockPollIntervalSecs > 0）的家显示。
-            关掉「遵循总闸」后总闸对本家整条轮询链路失效（含下单），故用告警色标出。 */}
+            关掉「遵循总闸」后总闸对本家整条轮询链路失效（含下单），故用告警色标出。
+
+            手动提取时轮询整轮不查库存，此时讲「遵循/越过总闸」是误导 —— 那个开关
+            要到切回自动才有意义。故先按提取模式分出待机态，再谈总闸。 */}
         {status?.stockPollIntervalSecs && status.stockPollIntervalSecs > 0 && (
           <div
             className={`flex items-center gap-2.5 rounded-md border px-3 py-1.5 ${
-              status.stockPollRespectGlobalGate
+              !status.autoPurchase
                 ? 'border-border bg-muted/30'
-                : 'border-amber-500/40 bg-amber-500/5'
+                : status.stockPollRespectGlobalGate
+                  ? 'border-border bg-muted/30'
+                  : 'border-amber-500/40 bg-amber-500/5'
             }`}
           >
             <div className="text-xs">
               <span className="font-medium">
-                {status.stockPollRespectGlobalGate
-                  ? '轮询遵循总闸'
-                  : '轮询已越过总闸'}
+                {!status.autoPurchase
+                  ? '轮询待机中'
+                  : status.stockPollRespectGlobalGate
+                    ? '轮询遵循总闸'
+                    : '轮询已越过总闸'}
               </span>
               <span className="ml-1.5 text-muted-foreground">
-                {status.stockPollRespectGlobalGate
-                  ? '总闸关闭时停止轮询（连库存都不查）'
-                  : '总闸关闭时本家仍会发现新车并自动下单，总闸对本家不再是急停'}
+                {!status.autoPurchase
+                  ? '手动提取模式下不查库存，切到自动后最迟一个周期恢复'
+                  : status.stockPollRespectGlobalGate
+                    ? '总闸关闭时停止轮询（连库存都不查）'
+                    : '总闸关闭时本家仍会发现新车并自动下单，总闸对本家不再是急停'}
               </span>
             </div>
             <Switch

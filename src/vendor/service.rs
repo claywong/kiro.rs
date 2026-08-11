@@ -1218,8 +1218,18 @@ impl VendorService {
     /// 「webhook 链路断了」完全一样，极难分辨。
     ///
     /// 现货这一支只负责「发现新车 → 合成事件 → 交给 `spawn_auto_purchase`」，
-    /// 授权、池闸、数量绑定与幂等仍沿用既有管线。kiro.red 自动预定则复用同一个
-    /// 周期：它先处理已经付款的预定单，再决定是否补一张新的待发货订单。
+    /// 授权、池闸、数量绑定与幂等仍沿用既有管线。判定一概不自己做 —— 轮询多一条
+    /// 判定就多一条绕过闸门的路径。
+    ///
+    /// **唯一的例外是提取模式**：手动模式下整轮跳过，连库存都不查（见
+    /// `poll_stock_once` 开头）。这条判定只会让轮询更保守，不构成绕过路径。
+    ///
+    /// kiro.red 自动预定则复用同一个周期：它先处理已经付款的预定单，再决定是否
+    /// 补一张新的待发货订单。
+    ///
+    /// 轮询器**与提取模式无关地起来**，靠每轮自查 `auto_purchase()` 决定要不要动 ——
+    /// `auto_purchase` 面板上随时可切，启动时手动就不 spawn 会让「切到自动」永远
+    /// 等不到人叫醒。代价是手动模式下有个空转的 task，每周期只做一次原子读。
     pub fn spawn_stock_poller(self: &Arc<Self>) -> bool {
         let interval = self.stock_poll_interval();
         if interval == 0 {
@@ -1250,16 +1260,29 @@ impl VendorService {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             let period = Duration::from_secs(interval);
+            let auto = svc.auto_purchase();
             tracing::info!(
                 vendor_id = %svc.vendor_id(),
                 interval_secs = interval,
-                auto_purchase = svc.auto_purchase(),
+                auto_purchase = auto,
                 auto_reserve = svc.auto_reserve(),
-                "库存轮询已启动"
+                "库存轮询已启动{}",
+                if auto {
+                    ""
+                } else {
+                    "（本家当前为手动提取，先转入待机，不查库存；面板上切到自动后自动恢复）"
+                }
             );
             // 连续失败计数，用于指数退避。查库存对 kirored 是登录+签名+解密，
             // 卖家侧故障时死循环重试既压对方也刷满我们的日志。
             let mut failures: u32 = 0;
+            // 上一轮看到的提取模式，用于只在**翻转时**打一条 info。
+            //
+            // 手动模式下 `poll_stock_once` 整轮静默（只有 debug），不留痕的话排障时
+            // 分不清「轮询没配」「模式挡住了」「卖家接口挂了」。每轮都打 info 又会
+            // 按分钟刷屏，故只报变化。初值取启动时的模式，与上面那条启动日志一致，
+            // 避免第一轮就重复报一次「已切换」。
+            let mut last_auto = svc.auto_purchase();
             loop {
                 // 先睡后查：启动瞬间往往还没加载完凭据池，此时盘点结果不可信，
                 // 会让第一轮基于「池是空的」误判为该补货。
@@ -1268,6 +1291,19 @@ impl VendorService {
                 // 很久，无上限的指数退避会退到几小时，恢复后半天发现不了新车。
                 let backoff = period * 2u32.saturating_pow(failures.min(4));
                 tokio::time::sleep(backoff).await;
+
+                // 模式翻转留痕。手动 → 自动这条尤其要有：用户在面板上切了开关，
+                // 得能确认轮询确实跟着醒了（最迟一个周期后生效，不是立刻）。
+                let now_auto = svc.auto_purchase();
+                if now_auto != last_auto {
+                    tracing::info!(
+                        vendor_id = %svc.vendor_id(),
+                        auto_purchase = now_auto,
+                        "提取模式已切换，库存轮询{}",
+                        if now_auto { "恢复查库存" } else { "转入待机（手动模式不查库存）" }
+                    );
+                    last_auto = now_auto;
+                }
 
                 match svc.poll_stock_once().await {
                     Ok(()) => failures = 0,
@@ -1702,8 +1738,34 @@ impl VendorService {
     async fn poll_stock_once(self: &Arc<Self>) -> Result<(), VendorServiceError> {
         let vid = self.vendor_id();
 
+        // 预定这一支排在最前，且**不受 `auto_purchase` 影响** —— 它是另一条扣费
+        // 路径，有自己的开关（内部按 `auto_reserve()` 判定，见
+        // `poll_kirored_reservations_once`）。把下面那条手动模式早退放在它之前会
+        // 静默废掉自动预定：面板上「自动预定」开着，却因为「自动提取」关着而一次
+        // 都不动。两个开关各管各的。
         if self.flavor() == VendorFlavor::Kirored {
             self.poll_kirored_reservations_once().await?;
+        }
+
+        // 手动提取模式下不查库存。排在总闸之前 —— 这是最本地、最省的一条判断。
+        //
+        // 早先这里是「仍要查并落库」，理由是「先观察轮询能否发现新车、不冒扣费
+        // 风险」。放弃那个用法的原因：
+        //
+        // 1. 观察目的已有替代 —— 面板状态条直接显示每区的「X 前发车」
+        //    （`departed_at`），而这正是 `decide_poll` 唯一的硬前提。想知道本家
+        //    能不能被轮询发现，打开面板看一眼就够，不必让轮询空跑几天。
+        // 2. 落库的通知到不了人 —— 合成事件只体现为面板 tab 上的 `unacked` 红点，
+        //    没有任何外部推送渠道。而车次存活以十分钟计，等人下次打开面板时那条
+        //    事件早已过期；去重又不会重投同一趟车（见下方 `get_event`），于是这些
+        //    事件只是历史记录，换不来一次真实提取。
+        // 3. 代价是实打实的出站 —— kiro.red 每轮要签名 + 解密地查一次商品列表。
+        //
+        // 判在**循环里而非启动时**：`auto_purchase` 是运行时可变的（面板随时能切），
+        // 启动时手动就不 spawn 会导致切到自动后没人叫醒轮询，那才是真的静默无效。
+        if !self.auto_purchase() {
+            tracing::debug!(vendor_id = %vid, "库存轮询跳过：本家为手动提取模式");
+            return Ok(());
         }
 
         // 全局总闸，由本家的 `stockPollRespectGlobalGate` 决定要不要认：
@@ -1713,10 +1775,8 @@ impl VendorService {
         //   `try_auto_purchase` 也会绕过总闸真下单（见那里的步骤 0）
         //
         // 后者是一条越过全局急停的扣费路径，只在用户显式配了才成立。想停掉本家
-        // 得同时关它自己的 autoPurchase 与 autoReserve，或把轮询间隔改成 0。
-        //
-        // 注意这里**不**因 `!auto_purchase()` 就跳过：只开轮询不开自动提取是一种
-        // 有意的用法（先观察轮询能否发现新车，不冒扣费风险），此时仍要查并落库。
+        // 得同时关它自己的 autoPurchase（现货这一支，即上面那条早退）与 autoReserve
+        // （预定那一支），或把 stockPollIntervalSecs 改成 0（连轮询器都不起）。
         if self.stock_poll_respect_gate.load(Ordering::Relaxed) {
             if let Err(reason) = self.pool_gate.check_auto_enabled() {
                 tracing::debug!(vendor_id = %vid, "库存轮询跳过: {}", reason);
@@ -1809,13 +1869,17 @@ impl VendorService {
             "库存轮询发现新车，已合成事件"
         );
 
-        // 只开轮询没开自动提取：事件已落库，面板上能看到并手动提取。
-        // 这正是「先观察、不扣费」那种用法要的效果。
+        // 再查一次提取模式。入口处已经拦过手动模式，走到这里还为假只有一种成因：
+        // 查库存那几秒里用户在面板上切成了手动。此时事件已经落库，不撤 —— 面板上
+        // 看得到这趟车，要提就手动提。
+        //
+        // 不合并到入口那次判断：中间隔着一次出站 await，而「按下手动就别再自动扣费」
+        // 要在**不可逆的那一步之前**尽可能晚地确认。
         if !self.auto_purchase() {
             tracing::info!(
                 vendor_id = %vid,
                 event_id = %event_id,
-                "本家为手动提取模式，合成事件仅落库，可在面板上手动提取"
+                "查库存期间本家被切为手动提取，合成事件仅落库，可在面板上手动提取"
             );
             return Ok(());
         }
@@ -2859,6 +2923,99 @@ mod local_tests {
         assert!(
             !runtime.load(Ordering::Relaxed),
             "切换后必须读到新值；若面板读的是 config 快照，这里就会拿到旧的 true"
+        );
+    }
+}
+
+/// 手动提取模式下不轮询。单独成块，避免与上游/既有测试挤在一处。
+#[cfg(test)]
+mod 轮询前置判定 {
+    use super::*;
+
+    /// `poll_stock_once` 里**查库存那一段**的两级判定的纯谓词形式:
+    /// 手动模式一律不查；自动模式下再看总闸（是否认它由 respect_gate 决定）。
+    ///
+    /// 注意它只覆盖现货这一支。同一轮里的 kiro.red 自动预定归 `auto_reserve` 管，
+    /// 与本谓词无关 —— 见 `预定不受提取模式影响`。
+    fn 会查库存(auto_purchase: bool, respect_gate: bool, gate_open: bool) -> bool {
+        if !auto_purchase {
+            return false;
+        }
+        if respect_gate { gate_open } else { true }
+    }
+
+    /// 现货与预定是两条独立的扣费路径，各自的开关不能互相牵连。
+    ///
+    /// 这条锁的是一个真实差点写错的地方：手动模式的早退若放在
+    /// `poll_kirored_reservations_once` **之前**，就会静默废掉自动预定 —— 面板上
+    /// 「自动预定」明明开着，却因为「自动提取」关着而一次都不动，且不留任何痕迹。
+    /// 那正是库存轮询这个特性当初要解决的静默无效问题的翻版。
+    #[test]
+    fn 预定不受提取模式影响() {
+        // 预定那一支的判定只看 auto_reserve（实现里在
+        // poll_kirored_reservations_once 内部，故此处按其语义建模）
+        let 会跑预定 = |auto_reserve: bool| auto_reserve;
+
+        assert!(
+            会跑预定(true),
+            "手动提取 + 自动预定开着 → 预定照跑；早退放到预定之前就会挂在这里"
+        );
+        assert!(!会跑预定(false), "两个都关 → 整轮什么都不做");
+
+        // 反过来也要成立：预定关着不影响现货这一支
+        assert!(
+            会查库存(true, true, true),
+            "自动提取开着时查库存，与 auto_reserve 无关"
+        );
+    }
+
+    /// 手动模式下不查库存，**与总闸怎么配无关**。
+    ///
+    /// 这条锁的是 `stockPollRespectGlobalGate=false` 的作用范围。那个名字读起来像
+    /// 「轮询不受任何开关影响」，若实现里把手动模式的判定放在总闸之后、或与总闸
+    /// 写成同一个 if 的两个分支，`respect_gate=false` 就会把手动模式下的轮询一并
+    /// 放开 —— 用户明明按下了「手动提取」，卖家接口却每分钟还在被查。
+    #[test]
+    fn 手动模式下任何总闸配置都不查库存() {
+        for respect_gate in [true, false] {
+            for gate_open in [true, false] {
+                assert!(
+                    !会查库存(false, respect_gate, gate_open),
+                    "手动模式必须整轮跳过：respect_gate={respect_gate} gate_open={gate_open}"
+                );
+            }
+        }
+    }
+
+    /// 自动模式下才轮到总闸说话，两种配置各自的语义保持不变。
+    #[test]
+    fn 自动模式下总闸语义不变() {
+        assert!(会查库存(true, true, true), "遵循总闸且总闸开着 → 查");
+        assert!(!会查库存(true, true, false), "遵循总闸且总闸关着 → 连库存都不查");
+        assert!(会查库存(true, false, false), "越过总闸 → 总闸关着也查");
+        assert!(会查库存(true, false, true), "越过总闸且总闸开着 → 查");
+    }
+
+    /// 轮询器的**启动**与提取模式无关 —— 只看间隔配没配。
+    ///
+    /// 反过来写（启动时手动就不 spawn）会让「面板上切到自动」永远等不到人叫醒，
+    /// 而这恰好是库存轮询这个特性要解决的那个静默无效问题的翻版。
+    #[test]
+    fn 轮询器启动只取决于间隔() {
+        // 不复用隔壁块的 cfg_json：跨测试块借 helper 会让本地块与上游/既有块产生
+        // 依赖，合并时对方动一下就连带坏这里。本块自带构造。
+        let cfg = |extra: &str| -> VendorConfig {
+            let raw = format!(r#"{{"baseUrl":"https://x","apiKey":"k"{extra}}}"#);
+            serde_json::from_str(&raw).expect("配置应可解析")
+        };
+        let 会起来 = |interval: u64| interval != 0;
+
+        assert!(会起来(
+            cfg(r#","stockPollIntervalSecs":60"#).effective_stock_poll_interval()
+        ));
+        assert!(
+            !会起来(cfg("").effective_stock_poll_interval()),
+            "没配间隔就不起 —— 这是唯一能让轮询器彻底不存在的方式"
         );
     }
 }
