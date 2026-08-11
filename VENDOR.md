@@ -99,6 +99,10 @@ Kiro 支持对接多个 Key 供应商，自动接收 webhook 推送并提取凭�
 | `autoPurchase` | 是否自动提取 | `false` |
 | `autoPurchaseMaxCount` | 单次提取上限 | `1` |
 | `autoPurchaseSchedule` | 时段表（见下文） | 无 |
+| `autoPurchasePerChannel` | 是否只按本供应商凭据存活情况补货 | `false` |
+| `autoReserve` | kiro.red 是否自动维持一张待发货预定单 | `false` |
+| `stockPollIntervalSecs` | 无 webhook 卖家的轮询间隔，0 = 关闭 | `0` |
+| `stockPollRespectGlobalGate` | 轮询扣费是否遵循全局自动提取总闸 | `true` |
 | `defaultGroups` | 提取入库时写入凭据的分组 | `[]` |
 | `defaultRpmLimit` | RPM 限流值 | `300` |
 | `defaultApiRegion` | 凭据的 `apiRegion`（空串=沿用全局） | `""` |
@@ -411,6 +415,7 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
   "id": "kirored",
   "flavor": "kirored",
   "autoPurchase": true,
+  "autoReserve": true,
   "stockPollIntervalSecs": 60,
   "stockPollRespectGlobalGate": true
 }
@@ -421,10 +426,32 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 | `stockPollIntervalSecs` | 轮询间隔秒数，**0 = 关闭（默认）**。下限 60，配小了抬到 60 并告警 |
 | `stockPollRespectGlobalGate` | 是否遵循全局总闸 `autoPurchaseEnabled`，默认 `true` |
 
-**与 `autoPurchase` 是 AND 关系。** 轮询非 0 只让轮询器跑起来，下不下单仍由
-`autoPurchase` 与各级闸门决定。分开是有意的：**单独开轮询、不开 autoPurchase**，
+**现货自动提取与 `autoPurchase` 是 AND 关系。** 轮询非 0 只让轮询器跑起来，现货
+下不下单仍由 `autoPurchase` 与各级闸门决定。分开是有意的：**单独开轮询、不开 autoPurchase**，
 可以先只观察「轮询能否发现新车」—— 合成事件照样落库、面板上看得到，可人工提取，
 不冒扣费风险。确认节奏对了再开 `autoPurchase`。
+
+### kiro.red 自动预定
+
+`autoReserve=true` 是独立于现货 `autoPurchase` 的策略。每轮先查完整预定订单列表：
+
+1. 已有待发货预定单时只跟踪，不再创建第二张。
+2. 已跟踪订单发货后读取订单详情，把卡密按卡上自带区域导入凭据池。
+3. 确认没有待发货单后，从允许预定的商品中选择名称忽略空白后以 `Kiro拼车` 开头、
+   积分价格最低的一件，调用预定接口。实际商品名 `Kiro 拼车 ...` 同样能匹配。
+
+预定成功会**立即扣积分**并进入待发货队列。它刻意不检查本地是否还有存活 Key，
+也不受 `autoPurchasePoolTarget` 限制；目的就是在当前凭证仍能使用时提前排队。但任一
+时刻最多维持一张远端待发货单，且本地会持久化待认领标记，服务重启或关闭开关不会
+丢掉已经付款的订单。
+
+关闭 `autoReserve` 只停止创建新预定。已经付款且被本地跟踪的订单仍会继续轮询，
+发货后照常取凭证、验活和入库。`stockPollIntervalSecs=0` 时没有执行器，自动预定不会
+运行；新预定是否受全局总闸控制，沿用 `stockPollRespectGlobalGate` 的规则。
+
+自动预定请求成功后会写入一条 `reservation_created` 卖家事件；轮询发现订单已发货时
+再写一条 `reservation_delivered` 事件。两类事件都使用稳定的本地事件 id，轮询重试和
+进程重启不会重复制造通知，也不会被当作 `new_keys_available` 触发另一笔提取。
 
 ### `stockPollRespectGlobalGate=false` 会越过全局急停
 
@@ -434,8 +461,8 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 新车，并且 `try_auto_purchase` 会跳过总闸检查真的扣费。这条路每次触发都打 `WARN`。
 
 代价要清楚：**总闸不再是能一键停掉全部自动扣费的急停**，而它会被健康联动自动
-翻转。想停掉本家只有两个办法 —— 关本家的 `autoPurchase`，或把
-`stockPollIntervalSecs` 改成 0。
+翻转。想停掉本家的新扣费，需要同时关本家的 `autoPurchase` 与 `autoReserve`，或把
+`stockPollIntervalSecs` 改成 0。已经付款的预定单仍会完成取货。
 
 绕过的范围**只有总闸，且只有轮询这条路**：
 
@@ -443,15 +470,18 @@ DTO，用一个 `untagged` 枚举同时接字符串与数字。金额单位是�
 |---|---|---|
 | 卖家 webhook 推送 | 受总闸管 | **仍受总闸管** |
 | 本地库存轮询 | 受总闸管 | **越过总闸** |
+| kiro.red 新预定 | 受总闸管 | **越过总闸** |
 
 webhook 那一格是刻意锁死的（见 `AutoPurchaseSource`）：若判据只看
 `!respectGate`，推送触发的自动提取会一并放开，比开关名承诺的范围宽得多，而用户
 从名字上看不出 webhook 也被放开了。
 
-池闸（`autoPurchasePoolTarget`）、失效授权判定（`LocalCensus`）、并发锁**都不绕**，
-所以仍然是有界的，不会无上限扣费。
+现货自动提取的池闸（`autoPurchasePoolTarget`）、失效授权判定（`LocalCensus`）与并发锁
+**都不绕**。自动预定只复用并发锁，刻意越过池量和失效判定，但靠“最多一张待发货单”
+限制在途数量。
 
-**判定与扣费全部复用既有管线**，轮询自己一步判定都不做（多一条判定就多一条绕过
+**下面这段只描述现货自动提取：**判定与扣费全部复用既有管线，库存发现本身不做授权
+判定（多一条判定就多一条绕过
 闸门的路径）。真正放行要同时满足：新批次出现 **且** 授权通过（本家盘点无存活 Key，
 即 `LocalCensus`）**且** 过池闸。所以不是「有新车就买」，而是「我手上没号了、
 且正好有新车」才买。

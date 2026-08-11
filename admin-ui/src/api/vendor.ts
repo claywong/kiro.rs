@@ -9,6 +9,7 @@ import type {
   VendorRedeemResult,
   VendorListResponse,
   VendorAutoEnabledChange,
+  VendorAutoReserveChange,
   VendorPerChannelChange,
   VendorStockPollGateChange,
   VendorPoolTargetChange,
@@ -172,6 +173,19 @@ export async function setVendorMode(
   const { data } = await api.put<VendorModeChange>(
     '/mode',
     { autoPurchase, vendorId },
+    { params: vendorId ? { vendorId } : {} }
+  )
+  return data
+}
+
+/** kiro.red 自动维持一张待发货预定单；关闭后已付款订单仍会继续取货。 */
+export async function setVendorAutoReserve(
+  autoReserve: boolean,
+  vendorId?: string
+): Promise<VendorAutoReserveChange> {
+  const { data } = await api.put<VendorAutoReserveChange>(
+    '/auto-reserve',
+    { autoReserve },
     { params: vendorId ? { vendorId } : {} }
   )
   return data

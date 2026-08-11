@@ -179,6 +179,7 @@ mod tests {
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
+            auto_reserve: false,
             vendor_password: String::new(),
             stock_poll_interval_secs: 0,
             stock_poll_respect_global_gate: true,

@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
@@ -45,6 +45,8 @@ pub const PATH_PRODUCTS: &str = "/api/common/products";
 pub const PATH_USER_INFO: &str = "/api/user/user/info";
 /// 下单（POST `{sku_id,quantity}`）
 pub const PATH_ORDER_CREATE: &str = "/api/user/order/create";
+/// 预定下一批次（POST `{product_id}`，固定预定 1 件并立即扣积分）
+pub const PATH_ORDER_RESERVE: &str = "/api/user/order/reserve";
 /// 订单详情（POST `{id}`），卡密在这里
 pub const PATH_ORDER_DETAIL: &str = "/api/user/order/detail";
 /// 历史订单列表（POST `{page,page_size}`）
@@ -168,10 +170,7 @@ fn store_token(base_url: &str, email: &str, token: String, expires_in: i64) {
     if let Ok(mut guard) = token_cache().lock() {
         // 留 5 分钟余量
         let expire_at = now_secs() + expires_in.max(0) - 300;
-        guard.insert(
-            cache_key(base_url, email),
-            CachedToken { token, expire_at },
-        );
+        guard.insert(cache_key(base_url, email), CachedToken { token, expire_at });
     }
 }
 
@@ -203,6 +202,23 @@ impl<T: Default> Envelope<T> {
                 status: None,
                 message: format!("{what}：响应 code=0 但缺 data"),
             })
+        } else {
+            Err(VendorApiError {
+                status: None,
+                message: format!(
+                    "{what}失败（code={}）: {}",
+                    self.code,
+                    self.message.unwrap_or_default()
+                ),
+            })
+        }
+    }
+
+    /// 只校验成功码。预定接口的成功响应可能不给 `data`，而积分已经扣除，不能因为
+    /// 缺少无关的响应体字段把成功误报成失败、诱发重复预定。
+    fn into_optional_data(self, what: &str) -> Result<Option<T>, VendorApiError> {
+        if self.code == 0 {
+            Ok(self.data)
         } else {
             Err(VendorApiError {
                 status: None,
@@ -283,6 +299,12 @@ pub struct Product {
     /// 当前可提取数（综合库存、余额等的结果）
     #[serde(default)]
     pub available: Option<u32>,
+    /// 发货方式。1 = 自动发货；站点只对自动发货商品展示预定入口。
+    #[serde(default)]
+    pub delivery_type: Option<i64>,
+    /// 是否允许预定下一批次。卖家用 0 / 1 表示。
+    #[serde(default)]
+    pub allow_reserve: Option<i64>,
     /// 最新批次，健康度看这里
     #[serde(default)]
     pub latest_batch: Option<LatestBatch>,
@@ -374,6 +396,12 @@ pub struct OrderIndexItem {
     /// 下单方自带的幂等键。我们下单不传，故本家实测恒为 null。
     #[serde(default)]
     pub client_order_id: Option<String>,
+    /// 1 表示预定单，0 表示普通现货订单。
+    #[serde(default)]
+    pub is_reserve: Option<i64>,
+    /// 1 = 已扣积分；2 = 已退积分；3 = 已取消。
+    #[serde(default)]
+    pub pay_status: Option<i64>,
     /// 本单消耗积分（**未扣退款**，净支出要减 `refund_points`）
     #[serde(default)]
     pub point_cost: Option<f64>,
@@ -394,12 +422,84 @@ pub struct OrderIndexItem {
 /// 历史订单的明细行
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OrderIndexLine {
+    /// 商品 id。卖家有时返回数字，故保留为 Value 后统一转字符串。
+    #[serde(default)]
+    pub product_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub product_name: Option<String>,
     /// 本行件数
     #[serde(default)]
     pub quantity: Option<u32>,
     /// 本行发货状态，1 已发货
     #[serde(default)]
     pub deliver_status: Option<i64>,
+}
+
+/// 自动预定轮询需要的订单视图。数字自增 `id` 是详情接口唯一接受的标识；
+/// `order_no` 只用于日志与凭据来源追溯。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReservationOrder {
+    pub id: String,
+    pub order_no: Option<String>,
+    pub product_id: Option<String>,
+    pub product_name: Option<String>,
+    pub point_cost: Option<f64>,
+    pub pay_status: i64,
+    pub deliver_status: i64,
+    pub create_time: Option<i64>,
+}
+
+/// 成功提交自动预定后用于日志的商品摘要。订单 id 统一在下一次订单列表轮询时认领，
+/// 避免依赖预定接口尚未完全确认的响应体形态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReservedProduct {
+    pub product_id: String,
+    pub product_name: String,
+    pub point_price: f64,
+}
+
+impl ReservationOrder {
+    pub fn is_pending(&self) -> bool {
+        self.pay_status == 1 && self.deliver_status == 0
+    }
+
+    pub fn is_delivered(&self) -> bool {
+        self.pay_status == 1 && self.deliver_status == 1
+    }
+
+    pub fn is_closed(&self) -> bool {
+        matches!(self.pay_status, 2 | 3)
+    }
+}
+
+impl OrderIndexItem {
+    fn into_reservation(self) -> Option<ReservationOrder> {
+        if self.is_reserve != Some(1) {
+            return None;
+        }
+        let id = self
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let line = self.items.first();
+        Some(ReservationOrder {
+            id,
+            order_no: self.order_no.filter(|s| !s.trim().is_empty()),
+            product_id: line
+                .and_then(|l| l.product_id.as_ref())
+                .map(value_to_string)
+                .filter(|s| !s.trim().is_empty()),
+            product_name: line
+                .and_then(|l| l.product_name.clone())
+                .filter(|s| !s.trim().is_empty()),
+            point_cost: self.point_cost,
+            pay_status: self.pay_status.unwrap_or_default(),
+            deliver_status: self.deliver_status.unwrap_or_default(),
+            create_time: self.create_time.filter(|t| *t > 0),
+        })
+    }
 }
 
 impl From<OrderIndexItem> for OrderInfo {
@@ -561,6 +661,35 @@ pub fn pick_product(products: &[Product]) -> Option<&Product> {
         })
 }
 
+/// 从商品列表选择自动预定目标：名称忽略空白后以 `Kiro拼车` 开头，卖家明确允许
+/// 预定，且积分价为正；候选中取最便宜者，同价按商品 id 稳定排序。
+///
+/// 实际商品名是 `Kiro 拼车 ...`（中间有空格），而业务口径通常写作 `Kiro拼车`，
+/// 因此这里只忽略 Unicode 空白，不做更宽泛的模糊匹配，避免误选其它品类。
+pub fn pick_reservable_product(products: &[Product]) -> Option<&Product> {
+    products
+        .iter()
+        .filter(|p| {
+            let compact_name: String = p
+                .name
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            compact_name.starts_with("kiro拼车")
+                && p.delivery_type == Some(1)
+                && p.allow_reserve == Some(1)
+                && p.price().is_finite()
+                && p.price() > 0.0
+                && !p.id.trim().is_empty()
+        })
+        .min_by(|a, b| {
+            a.price()
+                .total_cmp(&b.price())
+                .then_with(|| a.id.cmp(&b.id))
+        })
+}
+
 // ============ 请求管线 ============
 
 /// kiro.red 出站客户端。与 [`super::client::VendorClient`] 相互独立。
@@ -701,6 +830,25 @@ impl KiroredClient {
         Ok(env.into_data("拉取商品列表")?.list)
     }
 
+    /// 预定一个符合业务口径的最便宜拼车商品。预定固定为 1 件，确认成功即扣积分并
+    /// 生成待发货订单；订单身份在后续列表轮询中获取并持久化。
+    pub async fn reserve_cheapest_share(&self) -> Result<ReservedProduct, VendorApiError> {
+        let products = self.fetch_products().await?;
+        let chosen = pick_reservable_product(&products).ok_or_else(|| VendorApiError {
+            status: None,
+            message: "当前没有名称以 Kiro拼车 开头且允许预定的正价商品".to_string(),
+        })?;
+        let point_price = chosen.price();
+        let body = serde_json::json!({ "product_id": chosen.id.clone() });
+        let env: Envelope<serde_json::Value> = self.authed_post(PATH_ORDER_RESERVE, &body).await?;
+        let _ = env.into_optional_data("预定")?;
+        Ok(ReservedProduct {
+            product_id: chosen.id.clone(),
+            product_name: chosen.name.clone(),
+            point_price,
+        })
+    }
+
     /// 库存与报价：把商品列表折叠成中立 [`StockInfo`]。
     ///
     /// kiro.red 是商品制，没有「可提取张数」的概念。这里把**可订购商品数**
@@ -732,7 +880,10 @@ impl KiroredClient {
             })
             .collect();
         // price_min 只从有库存的商品里算
-        let orderable: Vec<&Product> = products.iter().filter(|p| p.is_healthy() && p.has_stock()).collect();
+        let orderable: Vec<&Product> = products
+            .iter()
+            .filter(|p| p.is_healthy() && p.has_stock())
+            .collect();
         let price_min = orderable
             .iter()
             .filter_map(|p| p.point_price.or(p.min_point_price))
@@ -754,10 +905,7 @@ impl KiroredClient {
         let env: Envelope<UserInfoData> = self
             .authed_post(PATH_USER_INFO, &serde_json::json!({}))
             .await?;
-        let user = env
-            .into_data("获取账户信息")?
-            .user
-            .unwrap_or_default();
+        let user = env.into_data("获取账户信息")?.user.unwrap_or_default();
         Ok(ProfileInfo {
             name: user.username,
             email: user.email,
@@ -824,7 +972,7 @@ impl KiroredClient {
                 return Err(VendorApiError {
                     status: None,
                     message: "下单成功但未返回订单号，无法拉取卡密".to_string(),
-                })
+                });
             }
         };
 
@@ -869,12 +1017,79 @@ impl KiroredClient {
         page: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<Paged<OrderInfo>, VendorApiError> {
+        let data = self
+            .fetch_order_index(
+                page.unwrap_or(1).max(1),
+                page_size.unwrap_or(50).clamp(1, 100),
+            )
+            .await?;
+        Ok(orders_to_paged(data))
+    }
+
+    /// 拉取全部预定订单。判断“当前没有待发货订单”必须看完整列表；只翻第一页会在
+    /// 待发货时间较长、后续普通订单较多时漏掉旧预定，随后错误地再扣一次积分。
+    pub async fn reservation_orders(&self) -> Result<Vec<ReservationOrder>, VendorApiError> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 1000;
+
+        let mut page = 1u32;
+        let mut reservations = Vec::new();
+        loop {
+            let data = self.fetch_order_index(page, PAGE_SIZE).await?;
+            let row_count = data.list.len() as u32;
+            let total = data.total;
+            reservations.extend(
+                data.list
+                    .into_iter()
+                    .filter_map(OrderIndexItem::into_reservation),
+            );
+
+            let reached_total = total.is_some_and(|n| page.saturating_mul(PAGE_SIZE) >= n);
+            if row_count < PAGE_SIZE || reached_total {
+                break;
+            }
+            if page >= MAX_PAGES {
+                return Err(VendorApiError {
+                    status: None,
+                    message: format!("查询预定订单超过 {MAX_PAGES} 页，拒绝继续翻页"),
+                });
+            }
+            page += 1;
+        }
+        Ok(reservations)
+    }
+
+    /// 已发货预定单转成共用的下单结果，后续直接复用凭据入库管线。
+    pub async fn reservation_delivery(
+        &self,
+        order: &ReservationOrder,
+    ) -> Result<PurchaseResult, VendorApiError> {
+        let keys = self.fetch_order_keys(&order.id).await?;
+        let purchased = keys.len() as u32;
+        Ok(PurchaseResult {
+            purchased,
+            requested: Some(1),
+            remaining: None,
+            unit_price: order.point_cost,
+            total_debit: order.point_cost,
+            order_id: order.order_no.clone().or_else(|| Some(order.id.clone())),
+            keys,
+            replayed: true,
+            zone: order.product_id.clone(),
+        })
+    }
+
+    async fn fetch_order_index(
+        &self,
+        page: u32,
+        page_size: u32,
+    ) -> Result<OrderIndexData, VendorApiError> {
         let body = serde_json::json!({
-            "page": page.unwrap_or(1).max(1),
-            "page_size": page_size.unwrap_or(50).clamp(1, 100),
+            "page": page.max(1),
+            "page_size": page_size.clamp(1, 100),
         });
         let env: Envelope<OrderIndexData> = self.authed_post(PATH_ORDER_INDEX, &body).await?;
-        Ok(orders_to_paged(env.into_data("查询历史订单")?))
+        env.into_data("查询历史订单")
     }
 
     /// 按 24 位业务单号反查详情接口要的数字自增 id。
@@ -883,9 +1098,7 @@ impl KiroredClient {
     /// `{order_no:...}` 返回「请求参数异常」），而下单响应有时只给 `order_no`，
     /// 故这里翻第一页历史订单按单号匹配。刚下的单必然在首页。
     async fn resolve_order_id(&self, order_no: &str) -> Result<String, VendorApiError> {
-        let body = serde_json::json!({ "page": 1, "page_size": 20 });
-        let env: Envelope<OrderIndexData> = self.authed_post(PATH_ORDER_INDEX, &body).await?;
-        let list = env.into_data("查询历史订单")?.list;
+        let list = self.fetch_order_index(1, 20).await?.list;
         list.iter()
             .find(|o| o.order_no.as_deref().map(str::trim) == Some(order_no.trim()))
             .and_then(|o| o.id.clone())
@@ -985,6 +1198,8 @@ mod tests {
             in_stock: Some(false),
             sku_stock: None,
             available: Some(1),
+            delivery_type: Some(1),
+            allow_reserve: Some(0),
             latest_batch: Some(LatestBatch {
                 health: health.to_string(),
                 ..Default::default()
@@ -1019,6 +1234,53 @@ mod tests {
     fn 缺skuid不选() {
         let products = vec![product("9", None, 5.0, "good")];
         assert!(pick_product(&products).is_none());
+    }
+
+    #[test]
+    fn 自动预定只选可预定的kiro拼车且取最低价() {
+        let mut wrong_kind = product("1", Some(1), 1.0, "dead");
+        wrong_kind.name = "kiro pro 个人号".to_string();
+        wrong_kind.allow_reserve = Some(1);
+
+        let mut disabled = product("2", Some(2), 2.0, "dead");
+        disabled.name = "Kiro 拼车 账密".to_string();
+        disabled.allow_reserve = Some(0);
+
+        let mut expensive = product("55", Some(58), 15.0, "dead");
+        expensive.name = "Kiro 拼车 纯APIKEY 双区混发".to_string();
+        expensive.allow_reserve = Some(1);
+
+        let mut cheap = product("57", Some(60), 12.0, "dead");
+        cheap.name = "Kiro拼车 纯APIKEY 美区".to_string();
+        cheap.allow_reserve = Some(1);
+
+        let products = vec![wrong_kind, disabled, expensive, cheap];
+        let chosen = pick_reservable_product(&products).expect("应选出可预定拼车商品");
+        assert_eq!(chosen.id, "57");
+    }
+
+    #[test]
+    fn 自动预定同价按商品id稳定选择() {
+        let mut b = product("60", Some(60), 12.0, "dead");
+        b.name = "Kiro 拼车 B".to_string();
+        b.allow_reserve = Some(1);
+        let mut a = product("59", Some(59), 12.0, "dead");
+        a.name = "Kiro 拼车 A".to_string();
+        a.allow_reserve = Some(1);
+        let products = vec![b, a];
+        assert_eq!(pick_reservable_product(&products).unwrap().id, "59");
+    }
+
+    #[test]
+    fn 非正价或非自动发货商品不可预定() {
+        let mut free = product("1", Some(1), 0.0, "dead");
+        free.name = "Kiro 拼车 免费".to_string();
+        free.allow_reserve = Some(1);
+        let mut manual = product("2", Some(2), 10.0, "dead");
+        manual.name = "Kiro 拼车 人工发货".to_string();
+        manual.allow_reserve = Some(1);
+        manual.delivery_type = Some(2);
+        assert!(pick_reservable_product(&[free, manual]).is_none());
     }
 
     /// 纯 APIKEY 卡密：`ksk_xxx----region`，只入 key，region 识别为非账号。
@@ -1113,6 +1375,31 @@ mod tests {
         assert_eq!(o.purchased, Some(1));
         assert_eq!(o.total_debit, Some(15.0));
         assert_eq!(o.created_at.as_deref(), Some("2026-08-10T13:07:13+00:00"));
+    }
+
+    #[test]
+    fn 预定订单识别待发货与商品() {
+        let raw = r#"{
+            "id":"700","order_no":"202608110001","is_reserve":1,
+            "pay_status":1,"deliver_status":0,"point_cost":15,"create_time":1786400000,
+            "items":[{"product_id":55,"product_name":"Kiro 拼车 纯APIKEY 双区混发",
+                       "quantity":1,"deliver_status":0}]
+        }"#;
+        let row: OrderIndexItem = serde_json::from_str(raw).unwrap();
+        let order = row.into_reservation().expect("应识别成预定单");
+        assert_eq!(order.id, "700");
+        assert_eq!(order.product_id.as_deref(), Some("55"));
+        assert!(order.is_pending());
+        assert!(!order.is_delivered());
+    }
+
+    #[test]
+    fn 普通订单不进入预定跟踪() {
+        let row: OrderIndexItem = serde_json::from_str(
+            r#"{"id":"701","is_reserve":0,"pay_status":1,"deliver_status":1}"#,
+        )
+        .unwrap();
+        assert!(row.into_reservation().is_none());
     }
 
     /// API 下单时卖家不给 order_no、只给 client_order_id（我们的幂等键）。
@@ -1239,7 +1526,11 @@ mod tests {
     fn 账户信息缺user键时退化为空() {
         let env: Envelope<UserInfoData> =
             serde_json::from_str(r#"{"code":0,"data":{},"message":"成功"}"#).unwrap();
-        let user = env.into_data("获取账户信息").unwrap().user.unwrap_or_default();
+        let user = env
+            .into_data("获取账户信息")
+            .unwrap()
+            .user
+            .unwrap_or_default();
         assert_eq!(user.points, None);
     }
 }

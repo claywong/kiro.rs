@@ -9,6 +9,7 @@ import {
   ackVendorEvents,
   redeemVendorCode,
   setVendorAutoPurchaseEnabled,
+  setVendorAutoReserve,
   setVendorMode,
   setVendorPerChannel,
   setStockPollRespectGate,
@@ -120,6 +121,18 @@ export function useSetVendorMode(vendorId?: string) {
   })
 }
 
+/** 切换 kiro.red 自动预定。运行时先更新、持久化可能失败，故始终回查状态。 */
+export function useSetVendorAutoReserve(vendorId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (autoReserve: boolean) => setVendorAutoReserve(autoReserve, vendorId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
+      qc.invalidateQueries({ queryKey: ['vendor-list'] })
+    },
+  })
+}
+
 /**
  * 设置全局提取限制。
  *
@@ -195,4 +208,3 @@ export function useSetVendorWebhookUrl(vendorId?: string) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] }),
   })
 }
-

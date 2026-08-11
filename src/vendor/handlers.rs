@@ -180,7 +180,7 @@ pub async fn receive_webhook(
 /// - `all_keys_dead`：启动失效确认观察窗口。与提取模式无关 —— 手动模式下这个
 ///   结论也是有用的诊断信息，且用户可能随时切到自动。
 /// - `new_keys_available`：仅自动模式下尝试提取，且需通过失效确认。
-/// - `key_revoked_abuse` / `test`：只落库，不派发任何动作。
+/// - 预定状态 / `key_revoked_abuse` / `test`：只落库，不派发任何动作。
 fn dispatch_event(service: &std::sync::Arc<VendorService>, event: &IncomingEvent) {
     match event.kind {
         VendorEventKind::AllKeysDead => {
@@ -214,7 +214,10 @@ fn dispatch_event(service: &std::sync::Arc<VendorService>, event: &IncomingEvent
                 "卖家通报密钥因滥用被回收，需人工处置"
             );
         }
-        VendorEventKind::Test | VendorEventKind::Unknown => {}
+        VendorEventKind::ReservationCreated
+        | VendorEventKind::ReservationDelivered
+        | VendorEventKind::Test
+        | VendorEventKind::Unknown => {}
     }
 }
 
@@ -250,6 +253,7 @@ pub async fn list_vendors(State(state): State<VendorState>) -> Response {
                 "capabilities": s.capabilities(),
                 "inboundEnabled": s.config().inbound_enabled(),
                 "autoPurchase": s.auto_purchase(),
+                "autoReserve": s.auto_reserve(),
                 // 逐家独立：开着的只看自己，关着的按全局阈值判
                 "perChannel": s.per_channel(),
                 "unacked": unacked,
@@ -282,7 +286,10 @@ pub async fn list_events(State(state): State<VendorState>, Query(q): Query<ListQ
     let vid = service.vendor_id();
     let store = service.store();
 
-    match (store.list_events(Some(vid), limit), store.unacked_count(Some(vid))) {
+    match (
+        store.list_events(Some(vid), limit),
+        store.unacked_count(Some(vid)),
+    ) {
         (Ok(events), Ok(unacked)) => Json(serde_json::json!({
             "vendorId": vid,
             "events": events,
@@ -302,7 +309,10 @@ pub async fn list_events(State(state): State<VendorState>, Query(q): Query<ListQ
 ///
 /// 出站请求按该卖家的能力集裁剪后并发发出；任一失败不影响其余字段
 /// （各自返回对应 error 字段）。不支持的能力压根不发请求。
-pub async fn get_status(State(state): State<VendorState>, Query(sel): Query<VendorSelector>) -> Response {
+pub async fn get_status(
+    State(state): State<VendorState>,
+    Query(sel): Query<VendorSelector>,
+) -> Response {
     let service = match pick(&state, &sel) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -328,6 +338,8 @@ pub async fn get_status(State(state): State<VendorState>, Query(sel): Query<Vend
         "defaultAuthRegion": cfg.default_auth_region.clone(),
         // 运行时值，可能已被面板改过，与 config.json 的启动快照不一定一致
         "autoPurchase": service.auto_purchase(),
+        // kiro.red 自动预定运行时值。独立于现货自动提取。
+        "autoReserve": service.auto_reserve(),
         // 当前时刻实际生效的上限（已应用时段表），面板展示与判定必须用它，
         // 否则配了时段表后显示的数与真实行为不一致
         "autoPurchaseMaxCount": service.auto_max_count(),
@@ -397,7 +409,10 @@ pub struct PagedQuery {
 }
 
 /// `GET /api/admin/vendor/orders` —— 卖家侧历史提取订单
-pub async fn list_orders(State(state): State<VendorState>, Query(q): Query<PagedQuery>) -> Response {
+pub async fn list_orders(
+    State(state): State<VendorState>,
+    Query(q): Query<PagedQuery>,
+) -> Response {
     let sel = VendorSelector {
         vendor_id: q.vendor_id.clone(),
     };
@@ -434,7 +449,10 @@ pub struct LedgerQuery {
 }
 
 /// `GET /api/admin/vendor/ledger` —— 积分流水（仅支持该能力的卖家）
-pub async fn list_ledger(State(state): State<VendorState>, Query(q): Query<LedgerQuery>) -> Response {
+pub async fn list_ledger(
+    State(state): State<VendorState>,
+    Query(q): Query<LedgerQuery>,
+) -> Response {
     let sel = VendorSelector {
         vendor_id: q.vendor_id.clone(),
     };
@@ -469,7 +487,10 @@ pub struct MyKeysQuery {
 ///
 /// 用途是对账与判断 Key 新鲜度（卖家的库存接口不给任何时间字段，
 /// 这里的 `createdAt` 是开号时刻）。响应里含密钥明文，仅在管理接口内使用。
-pub async fn list_my_keys(State(state): State<VendorState>, Query(q): Query<MyKeysQuery>) -> Response {
+pub async fn list_my_keys(
+    State(state): State<VendorState>,
+    Query(q): Query<MyKeysQuery>,
+) -> Response {
     let sel = VendorSelector {
         vendor_id: q.vendor_id.clone(),
     };
@@ -728,6 +749,13 @@ pub struct SetStockPollRespectGateRequest {
     pub respect: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoReserveRequest {
+    /// true = 自动维持一张待发货预定单；false = 停止创建新预定
+    pub auto_reserve: bool,
+}
+
 /// `PUT /api/admin/vendor/per-channel?vendorId=xxx` —— 设置**某一家**的逐渠道补货
 ///
 /// 与 `set_pool_target` 不同，这是**逐家**设置，要认 `vendorId` —— 每家可以各自
@@ -773,6 +801,31 @@ pub async fn set_stock_poll_respect_gate(
     Json(result).into_response()
 }
 
+/// `PUT /api/admin/vendor/auto-reserve?vendorId=xxx` —— 切换 kiro.red 自动预定。
+pub async fn set_auto_reserve(
+    State(state): State<VendorState>,
+    Query(sel): Query<VendorSelector>,
+    Json(req): Json<SetAutoReserveRequest>,
+) -> Response {
+    let service = match pick(&state, &sel) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if service.flavor() != super::protocol::VendorFlavor::Kirored {
+        return err_response(VendorServiceError::Upstream(
+            super::protocol::VendorApiError::unsupported("自动预定"),
+        ));
+    }
+    let result = service.set_auto_reserve(req.auto_reserve);
+    tracing::info!(
+        vendor_id = %service.vendor_id(),
+        auto_reserve = result.auto_reserve,
+        persisted = result.persisted,
+        "自动预定已切换"
+    );
+    Json(result).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AckRequest {
@@ -793,7 +846,11 @@ pub async fn ack_events(State(state): State<VendorState>, Json(req): Json<AckReq
         None => return unknown_vendor(None),
     };
     // 指定了卖家就必须存在，避免静默无操作让用户以为已读成功
-    if let Some(id) = req.vendor_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    if let Some(id) = req
+        .vendor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         && state.registry.get(id).is_none()
     {
         return unknown_vendor(Some(id));

@@ -210,6 +210,20 @@ pub struct VendorConfig {
     #[serde(default)]
     pub auto_purchase_per_channel: bool,
 
+    /// kiro.red 自动预定下一批次。默认关闭；只控制**创建新的付费预定单**，不控制
+    /// 已付款订单发货后的取卡与入库。
+    ///
+    /// 预定与现货自动提取是两套独立策略：本项开启后，只要卖家侧没有任何待发货
+    /// 预定单，就预定 1 件名称以 `Kiro拼车`（忽略空白）开头的最便宜可预定商品。
+    /// 它刻意不看本地是否还有可用 Key，也不受 `autoPurchasePoolTarget` 限制，因为
+    /// 目标是在旧 Key 仍可用时提前排队。
+    ///
+    /// 新预定会立即扣积分，故仍遵循库存轮询的总闸语义：
+    /// `stockPollRespectGlobalGate=true` 时受顶层 `autoPurchaseEnabled` 控制；为 false
+    /// 时与现有轮询下单一样越过总闸。轮询间隔为 0 时没有执行器，本项不会生效。
+    #[serde(default)]
+    pub auto_reserve: bool,
+
     /// 登录密码，仅 `kirored`（kiro.red）用。该家不用静态 Key，而是用
     /// email + 密码登录换 JWT —— email 复用 `api_key` 字段，密码放这里。
     ///
@@ -375,6 +389,7 @@ impl LegacyKiroappCcConfig {
             auto_purchase_schedule: Vec::new(),
             // 不开自动提取的家谈不上逐渠道补货，与上面 auto_purchase 保持一致
             auto_purchase_per_channel: false,
+            auto_reserve: false,
             // kiroapp.cc 走静态 Key，不用登录密码
             vendor_password: String::new(),
             // 存量配置不擅自开轮询：那会带来扣费行为，必须用户显式配
@@ -883,7 +898,6 @@ pub struct Config {
     // 逐渠道补货是**逐家**配置，见 [`VendorConfig::auto_purchase_per_channel`]。
     // 早期版本曾在此处放过一个同名顶层开关，是设计错误：那样一开就是全家生效，
     // 无法「A 家各自保底、B 家仍按总量控」。已移除，不保留别名 —— 该版本没发布过。
-
     /// **已废弃**：kiroapp.cc 的独立配置块，仅兼容存量 `config.json`。
     ///
     /// 注意键名 `kiroapp` 指的是 kiroapp**.cc**，而非 `flavor: "kiroapp"` 对应的
@@ -1227,7 +1241,8 @@ mod vendor_api_region_tests {
     #[test]
     fn 未配置时不写region沿用全局() {
         let cfg: VendorConfig =
-            serde_json::from_str(r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x"}"#).unwrap();
+            serde_json::from_str(r#"{"baseUrl":"https://v.example.com","apiKey":"usr-x"}"#)
+                .unwrap();
         assert!(cfg.default_api_region.is_empty());
         assert!(cfg.default_auth_region.is_empty());
     }
@@ -1401,7 +1416,10 @@ mod vendor_config_compat_tests {
     fn 逐渠道补货默认关闭且回写不丢() {
         let v: VendorConfig =
             serde_json::from_str(r#"{"baseUrl":"https://x","apiKey":"k"}"#).unwrap();
-        assert!(!v.auto_purchase_per_channel, "默认关闭 —— 会多花钱的特性不默认开");
+        assert!(
+            !v.auto_purchase_per_channel,
+            "默认关闭 —— 会多花钱的特性不默认开"
+        );
 
         let mut v2 = v.clone();
         v2.auto_purchase_per_channel = true;
@@ -1409,6 +1427,20 @@ mod vendor_config_compat_tests {
         assert!(json.contains("autoPurchasePerChannel"), "落盘要带上本字段");
         let back: VendorConfig = serde_json::from_str(&json).unwrap();
         assert!(back.auto_purchase_per_channel);
+    }
+
+    #[test]
+    fn 自动预定默认关闭且回写不丢() {
+        let v: VendorConfig =
+            serde_json::from_str(r#"{"baseUrl":"https://kiro.red","apiKey":"a@b.c"}"#).unwrap();
+        assert!(!v.auto_reserve, "自动扣积分的功能不能在升级后默认开启");
+
+        let mut enabled = v;
+        enabled.auto_reserve = true;
+        let json = serde_json::to_string(&enabled).unwrap();
+        assert!(json.contains("autoReserve"));
+        let back: VendorConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_reserve);
     }
 
     /// vendors 里显式配了同 id 时，显式配置胜出（迁移项排在最后）
@@ -1457,7 +1489,10 @@ mod vendor_config_compat_tests {
             .find(|v| v.flavor == VendorFlavor::Drop)
             .expect("缺 Kiro Drop");
         assert!(drop.normalized_base_url().contains("drop.kiro.ss"));
-        assert!(drop.inbound_enabled(), "示例里的 webhook token 必须真正生效");
+        assert!(
+            drop.inbound_enabled(),
+            "示例里的 webhook token 必须真正生效"
+        );
     }
 
     /// 示例配置里**不能有任何被 serde 静默忽略的键**。
@@ -1524,10 +1559,20 @@ mod vendor_config_compat_tests {
     fn flavor序列化用连字符形态() {
         let json = serde_json::to_string(&VendorFlavor::KiroappCc).unwrap();
         assert_eq!(json, r#""kiroapp-cc""#, "不能写成 kiroappCc");
-        assert_eq!(serde_json::to_string(&VendorFlavor::Kiroapp).unwrap(), r#""kiroapp""#);
-        assert_eq!(serde_json::to_string(&VendorFlavor::Legacy).unwrap(), r#""legacy""#);
+        assert_eq!(
+            serde_json::to_string(&VendorFlavor::Kiroapp).unwrap(),
+            r#""kiroapp""#
+        );
+        assert_eq!(
+            serde_json::to_string(&VendorFlavor::Legacy).unwrap(),
+            r#""legacy""#
+        );
         // 往返稳定
-        for f in [VendorFlavor::Legacy, VendorFlavor::Kiroapp, VendorFlavor::KiroappCc] {
+        for f in [
+            VendorFlavor::Legacy,
+            VendorFlavor::Kiroapp,
+            VendorFlavor::KiroappCc,
+        ] {
             let s = serde_json::to_string(&f).unwrap();
             let back: VendorFlavor = serde_json::from_str(&s).unwrap();
             assert_eq!(back, f);

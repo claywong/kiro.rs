@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   RefreshCw, PackagePlus, SkullIcon, ChevronDown, ChevronRight, Check, CheckCheck, Repeat,
-  Zap, Hand,
+  Zap, Hand, CalendarCheck, Truck,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -52,6 +52,22 @@ function EventTypeBadge({ type }: { type: string }) {
       <Badge className="border-destructive/40 bg-destructive/10 text-destructive">
         <SkullIcon className="mr-1 h-3 w-3" />
         全部失效
+      </Badge>
+    )
+  }
+  if (type === 'reservation_created') {
+    return (
+      <Badge className="border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-400">
+        <CalendarCheck className="mr-1 h-3 w-3" />
+        预定成功
+      </Badge>
+    )
+  }
+  if (type === 'reservation_delivered') {
+    return (
+      <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400">
+        <Truck className="mr-1 h-3 w-3" />
+        卖家发货
       </Badge>
     )
   }
@@ -108,6 +124,12 @@ function ValidationCell({ event }: { event: VendorEvent }) {
 
 /** 提取结果列 */
 function PurchaseStatusCell({ event }: { event: VendorEvent }) {
+  if (event.eventType === 'reservation_created') {
+    return <span className="text-xs text-muted-foreground">等待发货</span>
+  }
+  if (event.eventType === 'reservation_delivered') {
+    return <span className="text-xs font-medium text-emerald-600 dark:text-emerald-500">已发货</span>
+  }
   if (!event.purchaseStatus) {
     return <span className="text-xs text-muted-foreground">未提取</span>
   }

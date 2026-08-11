@@ -27,14 +27,14 @@ use super::auto;
 use super::client::VendorClient;
 use super::pool_gate::PoolGate;
 // 本地新增模块单独成行，避免上游改动这批 use 时反复冲突。
-use super::schedule;
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
     StockInfo, VendorApiError, VendorCapabilities, VendorFlavor, VendorKeyInfo,
 };
+use super::schedule;
 use super::store::{
     IncomingEvent, PurchaseOutcome, PurchaseStatus, PurchaseTrigger, RecordOutcome,
-    SharedVendorStore, ValidationStatus, VendorEventKind,
+    SharedVendorStore, TrackedReservation, ValidationStatus, VendorEventKind,
 };
 
 /// 单张提取到的 Key 的附带信息（返回给前端）。
@@ -115,6 +115,18 @@ pub struct ModeChange {
     /// 是否已写回 config.json。false 表示重启后会回退
     pub persisted: bool,
     /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// 切换 kiro.red 自动预定的结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoReserveChange {
+    /// 切换后的运行时值
+    pub auto_reserve: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -281,6 +293,8 @@ pub struct VendorService {
     /// 提取模式的运行时值。`config.auto_purchase` 只是启动快照，面板切换后
     /// 以本字段为准 —— 读它而不是读 config。
     auto_purchase: AtomicBool,
+    /// kiro.red 自动预定的运行时值。独立于现货自动提取。
+    auto_reserve: AtomicBool,
     /// 逐渠道补货的运行时值。同上，面板切换后以本字段为准。
     per_channel: AtomicBool,
     /// 库存轮询是否遵循全局总闸的运行时值。同上，面板切换后以本字段为准。
@@ -299,6 +313,7 @@ impl VendorService {
         pool_gate: Arc<PoolGate>,
     ) -> Self {
         let auto_purchase = config.auto_purchase;
+        let auto_reserve = config.auto_reserve;
         let per_channel = config.auto_purchase_per_channel;
         let respect_gate = config.stock_poll_respect_global_gate;
         Self {
@@ -308,6 +323,7 @@ impl VendorService {
             store,
             admin,
             auto_purchase: AtomicBool::new(auto_purchase),
+            auto_reserve: AtomicBool::new(auto_reserve),
             per_channel: AtomicBool::new(per_channel),
             stock_poll_respect_gate: AtomicBool::new(respect_gate),
             pool_gate,
@@ -370,6 +386,31 @@ impl VendorService {
         }
     }
 
+    pub fn auto_reserve(&self) -> bool {
+        self.auto_reserve.load(Ordering::Relaxed)
+    }
+
+    /// 切换自动预定：先改运行时值，再尽力写回配置。关闭只停止新预定；已经付款的
+    /// 在途订单仍由轮询继续取货入库。
+    pub fn set_auto_reserve(&self, enabled: bool) -> AutoReserveChange {
+        self.auto_reserve.store(enabled, Ordering::Relaxed);
+        match self.persist_auto_reserve(enabled) {
+            Ok(()) => AutoReserveChange {
+                auto_reserve: enabled,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                tracing::warn!("持久化自动预定失败（运行时已生效）: {}", e);
+                AutoReserveChange {
+                    auto_reserve: enabled,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
     /// 设置全局提取限制：先改运行时值，再尽力写回 config.json。
     ///
     /// 与 [`Self::set_auto_purchase`] 同样的取舍 —— 持久化失败不算设置失败，
@@ -408,9 +449,7 @@ impl VendorService {
             .config()
             .config_path()
             .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                anyhow::anyhow!("配置文件路径未知，全局提取限制仅在当前进程生效")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，全局提取限制仅在当前进程生效"))?;
 
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
@@ -511,7 +550,8 @@ impl VendorService {
     }
 
     pub fn set_stock_poll_respect_gate(&self, respect: bool) -> StockPollGateChange {
-        self.stock_poll_respect_gate.store(respect, Ordering::Relaxed);
+        self.stock_poll_respect_gate
+            .store(respect, Ordering::Relaxed);
         match self.persist_stock_poll_respect_gate(respect) {
             Ok(()) => StockPollGateChange {
                 respect,
@@ -572,6 +612,45 @@ impl VendorService {
             anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化提取模式");
         }
 
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 写回 config.json 里本供应商的 `autoReserve`。
+    fn persist_auto_reserve(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，自动预定仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        let target = self.vendor_id();
+        let mut hit = false;
+        if let Some(v) = config.vendor.as_mut()
+            && v.vendor_id() == target
+        {
+            v.auto_reserve = enabled;
+            hit = true;
+        }
+        if !hit {
+            for v in config.vendors.iter_mut() {
+                if v.vendor_id() == target {
+                    v.auto_reserve = enabled;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化自动预定");
+        }
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
@@ -744,9 +823,9 @@ impl VendorService {
             // 卖家给订单号起个独立字段）。校验 hex32（实测订单号确是 32 位十六进制）。
             VendorFlavor::KiroOoo => {
                 let oid = str_field("client_order_id").or_else(|| str_field("purchase_order_id"));
-                let oid = oid.filter(|s| is_hex32(s)).or_else(|| {
-                    Some(derive_client_order_id(vendor_id, &event_id))
-                });
+                let oid = oid
+                    .filter(|s| is_hex32(s))
+                    .or_else(|| Some(derive_client_order_id(vendor_id, &event_id)));
                 (oid, None)
             }
         };
@@ -755,8 +834,7 @@ impl VendorService {
         // 事件名已知的只有文档一句「推一条到货通知」，已见的通知开关名是
         // `on_key_new` / `on_key_dead` / `on_dispatch`。宽松归一化，见 normalize_event_type。
         let event_type = if flavor == VendorFlavor::KiroOoo {
-            super::flavor_kiroooo::normalize_event_type(event_type)
-                .unwrap_or(event_type)
+            super::flavor_kiroooo::normalize_event_type(event_type).unwrap_or(event_type)
         } else {
             event_type
         };
@@ -768,7 +846,10 @@ impl VendorService {
             purchase_order_id,
             batch_order_id,
             message: str_field("message"),
-            new_keys: obj.get("new_keys").and_then(|v| v.as_u64()).map(|v| v as u32),
+            new_keys: obj
+                .get("new_keys")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
             dead: obj.get("dead").and_then(|v| v.as_u64()).map(|v| v as u32),
             raw_payload: String::from_utf8_lossy(raw).to_string(),
         })
@@ -925,10 +1006,7 @@ impl VendorService {
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
         let vid = self.vendor_id();
-        let resp = match client
-            .purchase(count, order_id, batch_order_id, zone)
-            .await
-        {
+        let resp = match client.purchase(count, order_id, batch_order_id, zone).await {
             Ok(r) => r,
             Err(e) => {
                 // 记失败但保留 bound_count，便于按同一数量重试
@@ -973,10 +1051,17 @@ impl VendorService {
         let rpm_limit = cfg.default_rpm_limit;
         let priority = cfg.effective_default_priority();
         // 来源渠道带上供应商 id，便于按家盘点与对账
-        let source_channel = format!("{}{}:{}", auto::VENDOR_CHANNEL_PREFIX, self.vendor_id(), order_id);
+        let source_channel = format!(
+            "{}{}:{}",
+            auto::VENDOR_CHANNEL_PREFIX,
+            self.vendor_id(),
+            order_id
+        );
 
         // 整条带过去：单张卡自带区域时（kiro.red 双区混发）入库要以卡上的为准
-        let keys: Vec<_> = resp.keys.iter()
+        let keys: Vec<_> = resp
+            .keys
+            .iter()
             .filter(|k| !k.key.trim().is_empty())
             .cloned()
             .collect();
@@ -986,24 +1071,27 @@ impl VendorService {
         // 而非两字母简码，故映射扩成也认含连字符的完整 ID —— 直接用。
         // 注意：kiro.red 的 zone 是**商品 id**（如 `55`）而非区域，不能只看
         // 「含连字符」就当区域用 —— 那家的区在每张卡上，走 PurchasedKey::region。
-        let api_region = resp.zone.as_deref().and_then(|z| {
-            if looks_like_aws_region(z) {
-                // 完整 AWS 区域标识，直接用（kiro.ooo 走此分支）
-                Some(z.to_ascii_lowercase())
-            } else if z == "eu" {
-                // 两字母简码的首家 / Drop / kiromarket 走这里
-                Some("eu-central-1".to_string())
-            } else {
-                None
-            }
-        })
-        // 都推不出来时用该家配置的 defaultApiRegion。此前这个配置项在入库路径上
-        // 完全没被读过，卡上无区、zone 又不是区域的家（kiro.red）只能拿到 None，
-        // 于是回落全局默认区、连错端点报凭证失效。
-        .or_else(|| {
-            let d = cfg.default_api_region.trim();
-            (!d.is_empty()).then(|| d.to_ascii_lowercase())
-        });
+        let api_region = resp
+            .zone
+            .as_deref()
+            .and_then(|z| {
+                if looks_like_aws_region(z) {
+                    // 完整 AWS 区域标识，直接用（kiro.ooo 走此分支）
+                    Some(z.to_ascii_lowercase())
+                } else if z == "eu" {
+                    // 两字母简码的首家 / Drop / kiromarket 走这里
+                    Some("eu-central-1".to_string())
+                } else {
+                    None
+                }
+            })
+            // 都推不出来时用该家配置的 defaultApiRegion。此前这个配置项在入库路径上
+            // 完全没被读过，卡上无区、zone 又不是区域的家（kiro.red）只能拿到 None，
+            // 于是回落全局默认区、连错端点报凭证失效。
+            .or_else(|| {
+                let d = cfg.default_api_region.trim();
+                (!d.is_empty()).then(|| d.to_ascii_lowercase())
+            });
 
         // kiro.red 的 key 自动设置 4k credit 限额
         let credit_limit = if self.config.flavor == super::protocol::VendorFlavor::Kirored {
@@ -1021,7 +1109,8 @@ impl VendorService {
             api_region,
             priority,
             credit_limit,
-        ).await
+        )
+        .await
     }
 
     // ============ 自动模式 ============
@@ -1128,9 +1217,9 @@ impl VendorService {
     /// 且因为流程从未启动，连 `record_skip` 的跳过原因都不会留 —— 现象与
     /// 「webhook 链路断了」完全一样，极难分辨。
     ///
-    /// 本轮询器只负责「发现新车 → 合成事件 → 交给 `spawn_auto_purchase`」，
-    /// **一步判定都不自己做**：授权、池闸、并发锁、数量绑定、幂等全部沿用既有管线。
-    /// 这是有意的 —— 轮询多一条判定就多一条绕过闸门的路径。
+    /// 现货这一支只负责「发现新车 → 合成事件 → 交给 `spawn_auto_purchase`」，
+    /// 授权、池闸、数量绑定与幂等仍沿用既有管线。kiro.red 自动预定则复用同一个
+    /// 周期：它先处理已经付款的预定单，再决定是否补一张新的待发货订单。
     pub fn spawn_stock_poller(self: &Arc<Self>) -> bool {
         let interval = self.stock_poll_interval();
         if interval == 0 {
@@ -1165,6 +1254,7 @@ impl VendorService {
                 vendor_id = %svc.vendor_id(),
                 interval_secs = interval,
                 auto_purchase = svc.auto_purchase(),
+                auto_reserve = svc.auto_reserve(),
                 "库存轮询已启动"
             );
             // 连续失败计数，用于指数退避。查库存对 kirored 是登录+签名+解密，
@@ -1196,12 +1286,425 @@ impl VendorService {
         true
     }
 
-    /// 轮询一轮：查库存 → 判定 → 发现新车则合成事件并走自动提取。
+    fn record_reservation_created_event(
+        &self,
+        marker_id: &str,
+        product_id: Option<&str>,
+        product_name: Option<&str>,
+        point_cost: Option<f64>,
+    ) -> Result<(), VendorServiceError> {
+        let product = product_name.unwrap_or("Kiro 拼车商品");
+        let cost = point_cost
+            .map(|value| format!("，支付 {value} 积分"))
+            .unwrap_or_default();
+        let event = IncomingEvent {
+            vendor_id: self.vendor_id().to_string(),
+            event_id: format!("reservation-created:{marker_id}"),
+            kind: VendorEventKind::ReservationCreated,
+            purchase_order_id: None,
+            batch_order_id: None,
+            message: Some(format!("自动预定成功：{product}{cost}，等待卖家发货")),
+            new_keys: None,
+            dead: None,
+            raw_payload: serde_json::json!({
+                "source": "auto_reserve",
+                "markerId": marker_id,
+                "productId": product_id,
+                "productName": product_name,
+                "pointCost": point_cost,
+            })
+            .to_string(),
+        };
+        let outcome = self
+            .store
+            .record_local_event(&event)
+            .map_err(|e| VendorServiceError::Storage(format!("写入自动预定成功事件失败: {e}")))?;
+        if outcome == RecordOutcome::Inserted {
+            tracing::info!(
+                vendor_id = %self.vendor_id(),
+                event_id = %event.event_id,
+                "已写入自动预定成功卖家事件"
+            );
+        }
+        Ok(())
+    }
+
+    fn record_reservation_delivered_event(
+        &self,
+        tracked: &TrackedReservation,
+    ) -> Result<(), VendorServiceError> {
+        let product = tracked.product_name.as_deref().unwrap_or("Kiro 拼车商品");
+        let order_ref = tracked.order_no.as_deref().unwrap_or(&tracked.order_id);
+        let event = IncomingEvent {
+            vendor_id: self.vendor_id().to_string(),
+            event_id: format!("reservation-delivered:{}", tracked.order_id),
+            kind: VendorEventKind::ReservationDelivered,
+            purchase_order_id: None,
+            batch_order_id: None,
+            message: Some(format!(
+                "卖家已发货：{product}，订单 {order_ref}，正在自动获取凭证"
+            )),
+            new_keys: Some(1),
+            dead: None,
+            raw_payload: serde_json::json!({
+                "source": "reservation_poll",
+                "orderId": tracked.order_id,
+                "orderNo": tracked.order_no,
+                "productId": tracked.product_id,
+                "productName": tracked.product_name,
+                "pointCost": tracked.point_cost,
+            })
+            .to_string(),
+        };
+        let outcome = self
+            .store
+            .record_local_event(&event)
+            .map_err(|e| VendorServiceError::Storage(format!("写入预定单卖家发货事件失败: {e}")))?;
+        if outcome == RecordOutcome::Inserted {
+            tracing::info!(
+                vendor_id = %self.vendor_id(),
+                order_id = %tracked.order_id,
+                event_id = %event.event_id,
+                "已写入卖家发货事件"
+            );
+        }
+        Ok(())
+    }
+
+    /// kiro.red 预定轮询：认领待发货单、取回已发货凭证，最后按条件补一张新预定。
+    ///
+    /// 已付款订单的取货不受开关和总闸影响；它们只控制后续是否再花积分。预定也不
+    /// 盘点本地 Key、不检查 `autoPurchasePoolTarget`，因为业务目标就是在旧 Key
+    /// 仍可用时提前排队。
+    async fn poll_kirored_reservations_once(&self) -> Result<(), VendorServiceError> {
+        const AWAITING_PREFIX: &str = "awaiting:";
+        const RESOLVE_WINDOW_SECS: u64 = 15 * 60;
+
+        let vid = self.vendor_id();
+        let initial_active = self
+            .store
+            .active_reservations(vid)
+            .map_err(|e| VendorServiceError::Storage(format!("查询本地预定跟踪状态失败: {e}")))?;
+
+        // 先补本地事件再判断是否需要访问卖家。查询也覆盖已关闭的 awaiting 标记，
+        // 因而升级前已经成功预定、随后已认领真实订单的记录不会漏掉。
+        let missing_created_events = self
+            .store
+            .reservation_markers_missing_created_event(vid)
+            .map_err(|e| VendorServiceError::Storage(format!("查询待补预定事件失败: {e}")))?;
+        for marker in missing_created_events {
+            self.record_reservation_created_event(
+                &marker.order_id,
+                marker.product_id.as_deref(),
+                marker.product_name.as_deref(),
+                marker.point_cost,
+            )?;
+        }
+        if !self.auto_reserve() && initial_active.is_empty() {
+            return Ok(());
+        }
+
+        let client = self.client()?;
+        let orders = client
+            .kirored_reservation_orders()
+            .await
+            .map_err(VendorServiceError::Upstream)?;
+        let awaiting: Vec<_> = initial_active
+            .iter()
+            .filter(|row| row.order_id.starts_with(AWAITING_PREFIX))
+            .collect();
+
+        // 开关打开时接管当前待发货预定；已经成功预定但尚未拿到订单 id 时，即使
+        // 开关随后被关掉，也要继续认领卖家列表里对应的订单。
+        if self.auto_reserve() || !awaiting.is_empty() {
+            for order in orders.iter().filter(|order| order.is_pending()) {
+                self.store
+                    .track_reservation(
+                        vid,
+                        &order.id,
+                        order.order_no.as_deref(),
+                        order.product_id.as_deref(),
+                        order.product_name.as_deref(),
+                        order.point_cost,
+                        order.create_time,
+                    )
+                    .map_err(|e| {
+                        VendorServiceError::Storage(format!("认领待发货预定单失败: {e}"))
+                    })?;
+            }
+        }
+
+        // reserve 成功后先写 awaiting 标记，下一轮用商品与下单时间匹配真实订单。
+        // 正常情况匹配到 pending；服务停机较久时订单可能已经发货，因此 delivered
+        // 也允许接棒，但时间窗口限制能避免误认同商品的历史订单。
+        let mut unresolved_marker = false;
+        for marker in awaiting {
+            let marker_ts = chrono::DateTime::parse_from_rfc3339(&marker.created_at)
+                .ok()
+                .map(|dt| dt.timestamp());
+            let matched = orders
+                .iter()
+                .filter(|order| order.is_pending() || order.is_delivered())
+                .filter(|order| {
+                    let same_product =
+                        match (marker.product_id.as_deref(), order.product_id.as_deref()) {
+                            (Some(left), Some(right)) => left == right,
+                            _ => match (
+                                marker.product_name.as_deref(),
+                                order.product_name.as_deref(),
+                            ) {
+                                (Some(left), Some(right)) => left == right,
+                                _ => false,
+                            },
+                        };
+                    let near_created_at = match (marker_ts, order.create_time) {
+                        (Some(left), Some(right)) => left.abs_diff(right) <= RESOLVE_WINDOW_SECS,
+                        _ => false,
+                    };
+                    same_product && near_created_at
+                })
+                .max_by_key(|order| order.create_time.unwrap_or_default());
+
+            let Some(order) = matched else {
+                unresolved_marker = true;
+                continue;
+            };
+            self.store
+                .track_reservation(
+                    vid,
+                    &order.id,
+                    order.order_no.as_deref(),
+                    order.product_id.as_deref(),
+                    order.product_name.as_deref(),
+                    order.point_cost,
+                    order.create_time,
+                )
+                .map_err(|e| VendorServiceError::Storage(format!("认领自动预定订单失败: {e}")))?;
+            self.store
+                .close_reservation(vid, &marker.order_id)
+                .map_err(|e| {
+                    VendorServiceError::Storage(format!("完成自动预定订单认领失败: {e}"))
+                })?;
+        }
+
+        let active = self
+            .store
+            .active_reservations(vid)
+            .map_err(|e| VendorServiceError::Storage(format!("查询待取货预定单失败: {e}")))?;
+        let mut missing_remote_order = false;
+        for tracked in active
+            .iter()
+            .filter(|row| !row.order_id.starts_with(AWAITING_PREFIX))
+        {
+            let Some(order) = orders.iter().find(|order| order.id == tracked.order_id) else {
+                missing_remote_order = true;
+                tracing::warn!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    "本地跟踪的预定单未出现在卖家订单列表，暂停创建新预定"
+                );
+                continue;
+            };
+
+            if order.is_closed() {
+                self.store
+                    .close_reservation(vid, &tracked.order_id)
+                    .map_err(|e| {
+                        VendorServiceError::Storage(format!("关闭已取消预定单失败: {e}"))
+                    })?;
+                tracing::info!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    "预定单已取消或退款，停止跟踪"
+                );
+                continue;
+            }
+            if !order.is_delivered() {
+                if !order.is_pending() {
+                    missing_remote_order = true;
+                    tracing::warn!(
+                        vendor_id = %vid,
+                        order_id = %tracked.order_id,
+                        pay_status = order.pay_status,
+                        deliver_status = order.deliver_status,
+                        "预定单处于未知状态，暂停创建新预定"
+                    );
+                }
+                continue;
+            }
+
+            // 发货是卖家侧已经发生的事实，先落事件再取凭证。详情接口或入库暂时失败时，
+            // 事件仍然可见；下轮重试只会命中同一事件，不会制造重复通知。
+            self.record_reservation_delivered_event(tracked)?;
+
+            let response = match client.kirored_reservation_delivery(order).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Err(store_error) =
+                        self.store
+                            .fail_reservation(vid, &tracked.order_id, &error.to_string())
+                    {
+                        tracing::warn!(
+                            vendor_id = %vid,
+                            order_id = %tracked.order_id,
+                            "记录预定单取货失败状态失败: {}",
+                            store_error
+                        );
+                    }
+                    tracing::warn!(
+                        vendor_id = %vid,
+                        order_id = %tracked.order_id,
+                        "预定单已发货但取凭证失败，下轮重试: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            let source_order = response
+                .order_id
+                .as_deref()
+                .unwrap_or(&tracked.order_id)
+                .to_string();
+            let mut outcome = self.import_purchased(&response, &source_order).await;
+            outcome.purchased = response.purchased;
+            let success = outcome.failed == 0 && response.purchased > 0;
+            self.store
+                .finish_reservation(vid, &tracked.order_id, success, &outcome)
+                .map_err(|e| VendorServiceError::Storage(format!("写回预定单取货结果失败: {e}")))?;
+            if success {
+                tracing::info!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    imported = outcome.imported,
+                    duplicated = outcome.duplicated,
+                    "预定单已发货，凭证已完成入库"
+                );
+            } else {
+                tracing::warn!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    failed = outcome.failed,
+                    "预定单凭证入库未完成，下轮重试"
+                );
+            }
+        }
+
+        if !self.auto_reserve() {
+            return Ok(());
+        }
+        if orders.iter().any(|order| order.is_pending())
+            || unresolved_marker
+            || missing_remote_order
+        {
+            return Ok(());
+        }
+
+        let bypass_global_gate = !self.stock_poll_respect_gate();
+        if let Err(reason) = self.pool_gate.check_auto_enabled() {
+            if !bypass_global_gate {
+                tracing::debug!(vendor_id = %vid, "自动预定跳过: {}", reason);
+                return Ok(());
+            }
+            tracing::warn!(
+                vendor_id = %vid,
+                gate_says = %reason,
+                "stockPollRespectGlobalGate=false，自动预定越过全局总闸继续"
+            );
+        }
+
+        // 与其它自动提取共享串行锁，但不使用池量阈值。拿锁后重查订单，防止等待
+        // 期间另一轮或人工操作已经创建待发货单。
+        let _guard = match self.pool_gate.acquire().await {
+            Ok(guard) => guard,
+            Err(reason) => {
+                tracing::debug!(vendor_id = %vid, "自动预定跳过: {}", reason);
+                return Ok(());
+            }
+        };
+        if !self.auto_reserve() {
+            return Ok(());
+        }
+        if self.stock_poll_respect_gate()
+            && let Err(reason) = self.pool_gate.check_auto_enabled()
+        {
+            tracing::debug!(vendor_id = %vid, "自动预定跳过: {}", reason);
+            return Ok(());
+        }
+
+        let fresh_orders = client
+            .kirored_reservation_orders()
+            .await
+            .map_err(VendorServiceError::Upstream)?;
+        let pending: Vec<_> = fresh_orders
+            .iter()
+            .filter(|order| order.is_pending())
+            .collect();
+        if !pending.is_empty() {
+            for order in pending {
+                self.store
+                    .track_reservation(
+                        vid,
+                        &order.id,
+                        order.order_no.as_deref(),
+                        order.product_id.as_deref(),
+                        order.product_name.as_deref(),
+                        order.point_cost,
+                        order.create_time,
+                    )
+                    .map_err(|e| {
+                        VendorServiceError::Storage(format!("认领待发货预定单失败: {e}"))
+                    })?;
+            }
+            return Ok(());
+        }
+
+        let product = client
+            .kirored_reserve_cheapest_share()
+            .await
+            .map_err(VendorServiceError::Upstream)?;
+        let marker_id = format!("{AWAITING_PREFIX}{}", chrono::Utc::now().timestamp_millis());
+        self.store
+            .track_reservation(
+                vid,
+                &marker_id,
+                None,
+                Some(&product.product_id),
+                Some(&product.product_name),
+                Some(product.point_price),
+                None,
+            )
+            .map_err(|e| {
+                VendorServiceError::Storage(format!(
+                    "预定已成功但写入本地待认领标记失败（请勿重复预定）: {e}"
+                ))
+            })?;
+        self.record_reservation_created_event(
+            &marker_id,
+            Some(&product.product_id),
+            Some(&product.product_name),
+            Some(product.point_price),
+        )?;
+        tracing::info!(
+            vendor_id = %vid,
+            product_id = %product.product_id,
+            product_name = %product.product_name,
+            point_price = product.point_price,
+            "已自动预定最便宜的 Kiro 拼车商品，等待发货"
+        );
+        Ok(())
+    }
+
+    /// 轮询一轮：先处理 kiro.red 预定，再查库存并走现有自动提取。
     ///
     /// `Err` 只用于**出站失败**（触发退避）；「没货」「没有新车」都是正常结果，
     /// 记 debug 日志后返回 `Ok`。
     async fn poll_stock_once(self: &Arc<Self>) -> Result<(), VendorServiceError> {
         let vid = self.vendor_id();
+
+        if self.flavor() == VendorFlavor::Kirored {
+            self.poll_kirored_reservations_once().await?;
+        }
 
         // 全局总闸，由本家的 `stockPollRespectGlobalGate` 决定要不要认：
         //
@@ -1210,7 +1713,7 @@ impl VendorService {
         //   `try_auto_purchase` 也会绕过总闸真下单（见那里的步骤 0）
         //
         // 后者是一条越过全局急停的扣费路径，只在用户显式配了才成立。想停掉本家
-        // 得关它自己的 autoPurchase，或把 stockPollIntervalSecs 改成 0。
+        // 得同时关它自己的 autoPurchase 与 autoReserve，或把轮询间隔改成 0。
         //
         // 注意这里**不**因 `!auto_purchase()` 就跳过：只开轮询不开自动提取是一种
         // 有意的用法（先观察轮询能否发现新车，不冒扣费风险），此时仍要查并落库。
@@ -1525,12 +2028,7 @@ impl VendorService {
             "自动提取开始"
         );
         match self
-            .purchase_for_event_zoned(
-                event_id,
-                count,
-                zone_hint.as_deref(),
-                PurchaseTrigger::Auto,
-            )
+            .purchase_for_event_zoned(event_id, count, zone_hint.as_deref(), PurchaseTrigger::Auto)
             .await
         {
             Ok(r) => {
@@ -1669,10 +2167,7 @@ fn build_result(
     PurchaseImportResult {
         count,
         // 卖家回显的区优先；没回显时用我们下单时指定的那个
-        zone: resp
-            .zone
-            .clone()
-            .or_else(|| zone.map(|s| s.to_string())),
+        zone: resp.zone.clone().or_else(|| zone.map(|s| s.to_string())),
         requested: resp.requested,
         purchased: resp.purchased,
         imported: outcome.imported,
@@ -1882,7 +2377,8 @@ mod tests {
     /// 而下单接口要求 32 位十六进制 —— 必须换成派生值，否则下单被 400 拒。
     #[test]
     fn drop_非法形态的订单号被换成派生值() {
-        let raw = br#"{"event":"new_keys_available","event_id":"e1","purchase_order_id":"batch_xxx"}"#;
+        let raw =
+            br#"{"event":"new_keys_available","event_id":"e1","purchase_order_id":"batch_xxx"}"#;
         let order = parse_drop(raw).unwrap().purchase_order_id.unwrap();
         assert_ne!(order, "batch_xxx", "原值不合法，不能直接拿去下单");
         assert!(is_hex32(&order), "派生值必须合法: {order}");
@@ -1892,10 +2388,14 @@ mod tests {
     #[test]
     fn drop_合法订单号直接沿用() {
         let given = "ffffffffffffffffffffffffffffffff";
-        let raw =
-            format!(r#"{{"event":"new_keys_available","event_id":"e1","purchase_order_id":"{given}"}}"#);
+        let raw = format!(
+            r#"{{"event":"new_keys_available","event_id":"e1","purchase_order_id":"{given}"}}"#
+        );
         assert_eq!(
-            parse_drop(raw.as_bytes()).unwrap().purchase_order_id.as_deref(),
+            parse_drop(raw.as_bytes())
+                .unwrap()
+                .purchase_order_id
+                .as_deref(),
             Some(given)
         );
     }
@@ -1934,8 +2434,9 @@ mod tests {
         assert_eq!(e.kind, VendorEventKind::AllKeysDead);
         assert_eq!(e.dead, Some(5));
 
-        let t = parse_drop(r#"{"event":"test","event_id":"t1","message":"这是一条测试"}"#.as_bytes())
-            .unwrap();
+        let t =
+            parse_drop(r#"{"event":"test","event_id":"t1","message":"这是一条测试"}"#.as_bytes())
+                .unwrap();
         assert_eq!(t.kind, VendorEventKind::Test);
     }
 
@@ -2033,7 +2534,10 @@ mod tests {
         let raw = br#"{"event":"new_keys_available","event_id":"x",
             "client_order_id":"  ","order_id":""}"#;
         let e = parse_kiroapp(raw).unwrap();
-        assert!(e.purchase_order_id.is_none(), "空白订单号不能当成有效幂等键");
+        assert!(
+            e.purchase_order_id.is_none(),
+            "空白订单号不能当成有效幂等键"
+        );
         assert!(e.batch_order_id.is_none());
     }
 
@@ -2236,7 +2740,10 @@ mod local_tests {
     #[test]
     fn 商品id不被当成区域() {
         assert!(!looks_like_aws_region("55"), "纯数字商品 id");
-        assert!(!looks_like_aws_region("sku-58"), "两段、末段是数字但缺地理段");
+        assert!(
+            !looks_like_aws_region("sku-58"),
+            "两段、末段是数字但缺地理段"
+        );
         assert!(!looks_like_aws_region("纯APIKEY-双区-1"), "非 ASCII 字母");
         assert!(!looks_like_aws_region("us-east-x"), "末段必须是数字");
         assert!(looks_like_aws_region("ap-southeast-2"));
@@ -2255,7 +2762,11 @@ mod local_tests {
     /// 0 就是关闭 —— 不能被下限抬成「开着」，那等于替用户开了一条扣费路径
     #[test]
     fn 轮询间隔为零表示关闭() {
-        assert_eq!(cfg_json("").effective_stock_poll_interval(), 0, "缺省即关闭");
+        assert_eq!(
+            cfg_json("").effective_stock_poll_interval(),
+            0,
+            "缺省即关闭"
+        );
         assert_eq!(
             cfg_json(r#","stockPollIntervalSecs":0"#).effective_stock_poll_interval(),
             0
@@ -2340,9 +2851,8 @@ mod local_tests {
     fn 轮询总闸遵循以运行时值为准() {
         // 起始为 true（缺省），切成 false 后读回来必须是 false。
         // 用真实的 AtomicBool 语义验证，不构造整个 VendorService。
-        let runtime = std::sync::atomic::AtomicBool::new(
-            cfg_json("").stock_poll_respect_global_gate,
-        );
+        let runtime =
+            std::sync::atomic::AtomicBool::new(cfg_json("").stock_poll_respect_global_gate);
         assert!(runtime.load(Ordering::Relaxed), "初值取自配置");
 
         runtime.store(false, Ordering::Relaxed);

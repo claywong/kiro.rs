@@ -9,9 +9,9 @@ use axum::{
 };
 
 use super::handlers::{
-    VendorState, ack_events, get_status, list_events, purchase_ad_hoc, purchase_for_event,
-    receive_webhook, redeem, set_auto_purchase_enabled, set_mode, set_per_channel, set_pool_target,
-    set_webhook_url, test_webhook, list_orders,
+    VendorState, ack_events, get_status, list_events, list_orders, purchase_ad_hoc,
+    purchase_for_event, receive_webhook, redeem, set_auto_purchase_enabled, set_auto_reserve,
+    set_mode, set_per_channel, set_pool_target, set_webhook_url, test_webhook,
 };
 // 本地新增的多卖家接口单独成行，避免与上游改动撞在同一批 use 上。
 use super::handlers::{list_ledger, list_my_keys, list_vendors, set_stock_poll_respect_gate};
@@ -48,6 +48,7 @@ pub fn create_vendor_admin_router(state: VendorState) -> Router {
         .route("/auto-purchase-enabled", put(set_auto_purchase_enabled))
         .route("/per-channel", put(set_per_channel))
         .route("/stock-poll-respect-gate", put(set_stock_poll_respect_gate))
+        .route("/auto-reserve", put(set_auto_reserve))
         .route("/redeem", post(redeem))
         .route("/webhook", put(set_webhook_url))
         .route("/webhook/test", post(test_webhook))

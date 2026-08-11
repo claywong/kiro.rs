@@ -90,7 +90,10 @@
       "defaultGroups": [],
       "defaultRpmLimit": 300,
       "autoPurchase": false,
-      "autoPurchaseMaxCount": 1
+      "autoPurchaseMaxCount": 1,
+      "autoReserve": false,
+      "stockPollIntervalSecs": 60,
+      "stockPollRespectGlobalGate": true
     },
     {
       "id": "kiro-ooo",

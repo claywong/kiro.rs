@@ -223,8 +223,7 @@ impl VendorClient {
         if !status.is_success() {
             return Err(VendorApiError {
                 status: Some(status.as_u16()),
-                message: kiroapp_cc::error_message(&text)
-                    .unwrap_or_else(|| truncate(&text, 300)),
+                message: kiroapp_cc::error_message(&text).unwrap_or_else(|| truncate(&text, 300)),
             });
         }
 
@@ -554,9 +553,7 @@ impl VendorClient {
             }
             // kiro.red 走独立管线：内部完成登录 → 选品 → 下单 → 查卡密。
             // batch_order_id / zone 对本家无意义（选品在运行时按 health 自动做）。
-            VendorFlavor::Kirored => {
-                self.kirored_client().purchase(count, client_order_id).await
-            }
+            VendorFlavor::Kirored => self.kirored_client().purchase(count, client_order_id).await,
             // kiro.ooo：路径是 /my/keys/claim（不是 /my/purchase），数量参数与首家
             // 同名（count + client_order_id），但**区域参数叫 `region` 而非 `zone``**，
             // 且不传时卖家默认 us-east-1 —— 而美区常关停 0 库存，所以有区就必须带。
@@ -748,8 +745,7 @@ impl VendorClient {
             }
             VendorFlavor::KiroOoo => {
                 // 与首家同样返回裸数组、无分页参数，固定最近 50 条
-                let orders: Vec<kiroooo::PurchaseOrderRow> =
-                    self.get(kiroooo::PATH_ORDERS).await?;
+                let orders: Vec<kiroooo::PurchaseOrderRow> = self.get(kiroooo::PATH_ORDERS).await?;
                 Ok(kiroooo::orders_to_paged(orders))
             }
             VendorFlavor::Kirored => {
@@ -765,6 +761,37 @@ impl VendorClient {
                 pages: Some(0),
             }),
         }
+    }
+
+    /// kiro.red 自动预定专用：完整列出预定单，供轮询判断是否已有待发货订单。
+    pub async fn kirored_reservation_orders(
+        &self,
+    ) -> Result<Vec<kirored::ReservationOrder>, VendorApiError> {
+        if self.flavor != VendorFlavor::Kirored {
+            return Err(VendorApiError::unsupported("自动预定订单查询"));
+        }
+        self.kirored_client().reservation_orders().await
+    }
+
+    /// kiro.red 自动预定专用：选择最便宜的可预定 Kiro 拼车商品并预定 1 件。
+    pub async fn kirored_reserve_cheapest_share(
+        &self,
+    ) -> Result<kirored::ReservedProduct, VendorApiError> {
+        if self.flavor != VendorFlavor::Kirored {
+            return Err(VendorApiError::unsupported("自动预定"));
+        }
+        self.kirored_client().reserve_cheapest_share().await
+    }
+
+    /// kiro.red 自动预定专用：读取已发货预定单里的卡密。
+    pub async fn kirored_reservation_delivery(
+        &self,
+        order: &kirored::ReservationOrder,
+    ) -> Result<PurchaseResult, VendorApiError> {
+        if self.flavor != VendorFlavor::Kirored {
+            return Err(VendorApiError::unsupported("预定订单取货"));
+        }
+        self.kirored_client().reservation_delivery(order).await
     }
 
     /// 兑换码充值。两家均对「同账号 + 同码」幂等，超时重试原样重发即可。
@@ -988,13 +1015,11 @@ impl VendorClient {
         }
         match self.flavor {
             VendorFlavor::Kiroapp => {
-                let r: kiroapp::CreatedAtResponse =
-                    self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
+                let r: kiroapp::CreatedAtResponse = self.get(kiroapp::PATH_KEYS_CREATED_AT).await?;
                 Ok(r.into())
             }
             VendorFlavor::KiroOoo => {
-                let r: kiroooo::CreatedAtResponse =
-                    self.get(kiroooo::PATH_KEYS_CREATED_AT).await?;
+                let r: kiroooo::CreatedAtResponse = self.get(kiroooo::PATH_KEYS_CREATED_AT).await?;
                 Ok(r.into())
             }
             _ => Err(VendorApiError::unsupported("最早密钥时间查询")),
@@ -1041,14 +1066,9 @@ fn scan_keys(text: &str) -> Vec<crate::vendor::protocol::PurchasedKey> {
 /// 故 `offset = (page - 1) × limit`；`page` 为 0 或缺失都按第一页处理。
 /// `limit` 收敛到卖家上限（200），超了只会白拿一个 400。
 fn limit_offset(page: Option<u32>, page_size: Option<u32>) -> Vec<(&'static str, String)> {
-    let limit = page_size
-        .unwrap_or(50)
-        .clamp(1, kiromarket::MAX_LIMIT);
+    let limit = page_size.unwrap_or(50).clamp(1, kiromarket::MAX_LIMIT);
     let offset = page.unwrap_or(1).saturating_sub(1) * limit;
-    vec![
-        ("limit", limit.to_string()),
-        ("offset", offset.to_string()),
-    ]
+    vec![("limit", limit.to_string()), ("offset", offset.to_string())]
 }
 
 /// 构造分页查询参数。`page_size` 超过卖家上限时收敛，避免白拿一个 400。
@@ -1099,6 +1119,7 @@ mod tests {
             auto_purchase_max_count: 1,
             auto_purchase_schedule: vec![],
             auto_purchase_per_channel: false,
+            auto_reserve: false,
             vendor_password: String::new(),
             stock_poll_interval_secs: 0,
             stock_poll_respect_global_gate: true,
@@ -1157,7 +1178,11 @@ mod tests {
         assert!(e.message.contains("webhook"), "实际: {}", e.message);
 
         // 反向：legacy 不支持 kiroapp 的独有能力
-        let legacy_client = VendorClient::new(&cfg("http://127.0.0.1:1", "usr-x", "t"), None, TlsBackend::Rustls)
+        let legacy_client = VendorClient::new(
+            &cfg("http://127.0.0.1:1", "usr-x", "t"),
+            None,
+            TlsBackend::Rustls,
+        )
             .unwrap();
         assert!(legacy_client.ledger(None, None, None).await.is_err());
         assert!(legacy_client.my_keys(false, None, None).await.is_err());
@@ -1207,8 +1232,7 @@ mod tests {
         assert_eq!(body["count"], 2, "参数名必须是 count（文档主名）");
         assert!(body.get("quantity").is_none(), "不该发 quantity");
         assert_eq!(
-            body["client_order_id"],
-            "0123456789abcdef0123456789abcdef",
+            body["client_order_id"], "0123456789abcdef0123456789abcdef",
             "订单号字段名必须是 client_order_id"
         );
         // 幂等保护字段不发：报价接口已撤，拿不到当前单价，填不出合理上限
@@ -1231,7 +1255,10 @@ mod tests {
         let mut c = cfg("https://drop.kiro.ss", "usr-x", "t");
         c.flavor = VendorFlavor::Drop;
         let client = VendorClient::new(&c, None, TlsBackend::Rustls).unwrap();
-        assert_eq!(client.webhook_path(), crate::vendor::flavor_drop::PATH_WEBHOOK);
+        assert_eq!(
+            client.webhook_path(),
+            crate::vendor::flavor_drop::PATH_WEBHOOK
+        );
         assert_eq!(
             client.webhook_test_path(),
             crate::vendor::flavor_drop::PATH_WEBHOOK_TEST

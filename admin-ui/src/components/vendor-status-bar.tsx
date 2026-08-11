@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   Wallet, PackageOpen, Send, Ticket, Upload, ShoppingCart,
-  Boxes, Zap, Hand, History,
+  Boxes, Zap, Hand, History, CalendarClock,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -18,7 +18,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
   useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode, useSetVendorPerChannel,
-  useSetStockPollRespectGate,
+  useSetStockPollRespectGate, useSetVendorAutoReserve,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
 // 本地新增：Region 展示文案，单独成行避免与上游 import 块相撞。
@@ -218,6 +218,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   const setWebhookUrl = useSetVendorWebhookUrl(vendorId)
   const purchaseAdHoc = usePurchaseAdHoc(vendorId)
   const setMode = useSetVendorMode(vendorId)
+  const setAutoReserve = useSetVendorAutoReserve(vendorId)
   const setPerChannel = useSetVendorPerChannel(vendorId)
   const setStockPollRespectGate = useSetStockPollRespectGate(vendorId)
   const confirm = useConfirm()
@@ -332,6 +333,47 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
     }
   }
 
+  const handleToggleAutoReserve = async (next: boolean) => {
+    if (next) {
+      const bypassesGate = status?.stockPollRespectGlobalGate === false
+      const pollInterval = status?.stockPollIntervalSecs ?? 0
+      const ok = await confirm({
+        title: '开启自动预定？',
+        description:
+          '开启后，kiro.red 没有待发货预定单时，会选择名称以「Kiro拼车」开头、' +
+          '允许预定且价格最低的商品预定 1 件，预定成功会立即扣积分。' +
+          '它不会等待当前凭证失效，也不受全局池量限制；始终最多维持一张待发货单。' +
+          (bypassesGate
+            ? '当前轮询已越过全局总闸，因此总闸关闭时仍会创建新预定。'
+            : '当前轮询遵循全局总闸，总闸关闭时不会创建新预定。') +
+          (pollInterval > 0
+            ? `订单每 ${pollInterval} 秒检查一次。`
+            : '当前轮询间隔为 0，开启后也不会执行，需先在配置中启用轮询。') +
+          '关闭开关只停止创建新预定，已经付款的订单发货后仍会自动取凭证并入库。',
+        confirmText: '开启自动预定',
+        destructive: true,
+      })
+      if (!ok) return
+    }
+    try {
+      const r = await setAutoReserve.mutateAsync(next)
+      const what = next ? '自动预定已开启' : '自动预定已关闭'
+      if (!r.persisted) {
+        toast.warning(`${what}（仅本次运行）`, {
+          description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
+        })
+        return
+      }
+      toast.success(what, {
+        description: next
+          ? '没有待发货订单时会自动预定最便宜的 Kiro 拼车商品'
+          : '已付款订单仍会继续轮询取货',
+      })
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换自动预定失败'))
+    }
+  }
+
   /**
    * 切逐渠道补货。开启要确认 —— 它会让本家独立维持库存，账号消耗上升。
    *
@@ -380,8 +422,9 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
         description:
           '关闭后，即便全局总闸处于关闭状态，本家仍会继续轮询、发现新车并自动下单。' +
           '也就是说总闸对本家不再是急停 —— 而总闸会被健康联动自动翻转。' +
-          '要停掉本家的自动扣费，得关本家的「自动提取」开关，或把轮询间隔改为 0。' +
-          '池闸、失效授权判定仍然生效，不会无上限扣费。',
+          '要停掉本家的自动扣费，得同时关本家的「自动提取」与「自动预定」开关，' +
+          '或把轮询间隔改为 0。现货提取仍受池闸与失效授权限制；自动预定不看池量，' +
+          '但最多维持一张待发货单。',
         confirmText: '确认越过',
         destructive: true,
       })
@@ -502,6 +545,40 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
             aria-label="切换自动 / 手动提取模式"
           />
         </div>
+
+        {status?.flavor === 'kirored' && (
+          <div
+            className={`flex items-center gap-2.5 rounded-md border px-3 py-1.5 ${
+              status.autoReserve
+                ? 'border-amber-500/40 bg-amber-500/5'
+                : 'border-border bg-muted/30'
+            }`}
+          >
+            <CalendarClock
+              className={`h-3.5 w-3.5 ${
+                status.autoReserve
+                  ? 'text-amber-600 dark:text-amber-500'
+                  : 'text-muted-foreground'
+              }`}
+            />
+            <div className="text-xs">
+              <span className="font-medium">
+                {status.autoReserve ? '自动预定' : '预定已关闭'}
+              </span>
+              <span className="ml-1.5 text-muted-foreground">
+                {status.autoReserve
+                  ? '无待发货单时预定最便宜的 Kiro 拼车商品'
+                  : '不会创建新预定；已付款订单仍会取货'}
+              </span>
+            </div>
+            <Switch
+              checked={status.autoReserve ?? false}
+              onCheckedChange={handleToggleAutoReserve}
+              disabled={setAutoReserve.isPending}
+              aria-label="切换 kiro.red 自动预定"
+            />
+          </div>
+        )}
 
         {/* 逐渠道补货：只在自动模式下有意义，手动模式下整块隐藏 ——
             手动提取不过任何闸门，摆在那里只会让人以为它有作用。 */}

@@ -663,6 +663,8 @@ export interface VendorListItem {
   capabilities: VendorCapabilities
   inboundEnabled: boolean
   autoPurchase: boolean
+  /** kiro.red 自动维持一张待发货预定单；其他 flavor 缺省 */
+  autoReserve?: boolean
   /** 逐渠道补货（逐家独立）：true = 只看本家存活，false = 按全局阈值判总量 */
   perChannel: boolean
   unacked: number
@@ -723,6 +725,8 @@ export interface VendorStatus {
   defaultAuthRegion?: string
   /** 提取模式：true = 自动，false = 手动。运行时值，切换后立即生效 */
   autoPurchase: boolean
+  /** kiro.red 自动预定运行时值；只控制创建新预定，不影响已付款订单取货 */
+  autoReserve?: boolean
   /**
    * 当前时刻实际生效的单次提取上限（已应用时段表）。
    * 实际数量 = min(newKeys, stockMax, 本值)
@@ -748,7 +752,7 @@ export interface VendorStatus {
    * 事件走同一条管线。已抬过下限，与 config.json 的原值不一定相同。
    */
   stockPollIntervalSecs?: number
-  /** 轮询是否遵循全局总闸。关着时总闸停了也继续发现新车（但仍不会自动下单） */
+  /** 轮询是否遵循全局总闸。false 时现货自动提取与自动预定都可越过总闸扣费 */
   stockPollRespectGlobalGate?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
@@ -786,6 +790,14 @@ export interface VendorModeChange {
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 切换 kiro.red 自动预定的结果 */
+export interface VendorAutoReserveChange {
+  autoReserve: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
   warning?: string
 }
 
@@ -871,7 +883,7 @@ export interface VendorGenLogs {
 /** 卖家推来的一条 webhook 事件 */
 export interface VendorEvent {
   eventId: string
-  /** new_keys_available / all_keys_dead / unknown */
+  /** new_keys_available / all_keys_dead / reservation_created / reservation_delivered / unknown */
   eventType: string
   /** 提取用订单号，必须原样作为 client_order_id */
   purchaseOrderId?: string

@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS vendor_events (
     bound_zone         TEXT,
     PRIMARY KEY (vendor_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS vendor_reservations (
+    vendor_id       TEXT NOT NULL,
+    order_id        TEXT NOT NULL,
+    order_no        TEXT,
+    product_id      TEXT,
+    product_name    TEXT,
+    point_cost      REAL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    imported_at     TEXT,
+    purchased       INTEGER,
+    imported        INTEGER,
+    duplicated      INTEGER,
+    failed          INTEGER,
+    last_error      TEXT,
+    PRIMARY KEY (vendor_id, order_id)
+);
 "#;
 
 /// 索引单独一批执行。
@@ -62,6 +80,8 @@ CREATE INDEX IF NOT EXISTS idx_vendor_events_received
     ON vendor_events (vendor_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vendor_events_acked
     ON vendor_events (vendor_id, acked, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vendor_reservations_active
+    ON vendor_reservations (vendor_id, state, created_at DESC);
 "#;
 
 /// 存量库补列。`CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，而这个库里的
@@ -86,6 +106,10 @@ const MIGRATIONS: &[&str] = &[
 pub enum VendorEventKind {
     NewKeysAvailable,
     AllKeysDead,
+    /// kiro.red 自动预定请求已经被卖家接受并扣除积分。
+    ReservationCreated,
+    /// kiro.red 预定单已经由卖家发货，随后会自动获取凭证并入库。
+    ReservationDelivered,
     /// 密钥因滥用被回收（kiroapp 独有）。不触发提取，但要落库告警 ——
     /// 它意味着本地某张 Key 已被上游作废，与正常失效的处置不同。
     KeyRevokedAbuse,
@@ -99,6 +123,8 @@ impl VendorEventKind {
         match self {
             Self::NewKeysAvailable => "new_keys_available",
             Self::AllKeysDead => "all_keys_dead",
+            Self::ReservationCreated => "reservation_created",
+            Self::ReservationDelivered => "reservation_delivered",
             Self::KeyRevokedAbuse => "key_revoked_abuse",
             Self::Test => "test",
             Self::Unknown => "unknown",
@@ -112,6 +138,8 @@ impl VendorEventKind {
             // 有新货可提），而对方实现是否同步改过无从确认，漏认一条会错过补货。
             "new_keys_available" | "batch.completed" => Self::NewKeysAvailable,
             "all_keys_dead" => Self::AllKeysDead,
+            "reservation_created" => Self::ReservationCreated,
+            "reservation_delivered" => Self::ReservationDelivered,
             "key_revoked_abuse" => Self::KeyRevokedAbuse,
             "test" => Self::Test,
             _ => Self::Unknown,
@@ -290,6 +318,23 @@ pub struct PurchaseOutcome {
     pub last_error: Option<String>,
 }
 
+/// 本地正在跟踪的 kiro.red 预定单。只记录自动预定创建后看到的、或自动预定开启时
+/// 发现的当前待发货单；不会认领已经发货的历史订单。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackedReservation {
+    pub vendor_id: String,
+    /// 卖家数字自增 id，订单详情接口只接受它。
+    pub order_id: String,
+    pub order_no: Option<String>,
+    pub product_id: Option<String>,
+    pub product_name: Option<String>,
+    pub point_cost: Option<f64>,
+    /// pending / failed。done / closed 不会由 active 查询返回。
+    pub state: String,
+    pub created_at: String,
+    pub last_error: Option<String>,
+}
+
 pub type SharedVendorStore = std::sync::Arc<VendorStore>;
 
 /// 卖家事件存储
@@ -375,6 +420,36 @@ impl VendorStore {
         )?;
         let _ = changed;
         Ok(if count <= 1 {
+            RecordOutcome::Inserted
+        } else {
+            RecordOutcome::Duplicate
+        })
+    }
+
+    /// 写入程序自身合成的事件。与 webhook 不同，本地轮询重复观察到同一状态不算
+    /// 卖家重投，因此冲突时保持原记录和 `delivery_count` 不变。
+    pub fn record_local_event(&self, event: &IncomingEvent) -> rusqlite::Result<RecordOutcome> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT INTO vendor_events
+                (vendor_id, event_id, event_type, purchase_order_id, batch_order_id,
+                 message, new_keys, dead, raw_payload, received_at, delivery_count, acked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, 0)
+             ON CONFLICT(vendor_id, event_id) DO NOTHING",
+            rusqlite::params![
+                event.vendor_id,
+                event.event_id,
+                event.kind.as_str(),
+                event.purchase_order_id,
+                event.batch_order_id,
+                event.message,
+                event.new_keys,
+                event.dead,
+                event.raw_payload,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(if changed == 1 {
             RecordOutcome::Inserted
         } else {
             RecordOutcome::Duplicate
@@ -645,6 +720,173 @@ impl VendorStore {
         )?;
         Ok(())
     }
+
+    /// 认领一张当前待发货的预定单。冲突时只补充卖家侧元数据，不重置已经完成或关闭的
+    /// 本地状态；同一订单不会因为列表反复出现而重新进入入库流程。
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_reservation(
+        &self,
+        vendor_id: &str,
+        order_id: &str,
+        order_no: Option<&str>,
+        product_id: Option<&str>,
+        product_name: Option<&str>,
+        point_cost: Option<f64>,
+        created_at: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let created = created_at
+            .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts, 0))
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| now.clone());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO vendor_reservations
+                (vendor_id, order_id, order_no, product_id, product_name, point_cost,
+                 state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)
+             ON CONFLICT(vendor_id, order_id) DO UPDATE SET
+                order_no = COALESCE(excluded.order_no, order_no),
+                product_id = COALESCE(excluded.product_id, product_id),
+                product_name = COALESCE(excluded.product_name, product_name),
+                point_cost = COALESCE(excluded.point_cost, point_cost),
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                vendor_id,
+                order_id,
+                order_no,
+                product_id,
+                product_name,
+                point_cost,
+                created,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 尚需继续跟踪的预定单。导入失败也算 active，下轮应继续取详情并重试入库。
+    pub fn active_reservations(
+        &self,
+        vendor_id: &str,
+    ) -> rusqlite::Result<Vec<TrackedReservation>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT vendor_id, order_id, order_no, product_id, product_name, point_cost,
+                    state, created_at, last_error
+             FROM vendor_reservations
+             WHERE vendor_id = ?1 AND state IN ('pending', 'failed')
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([vendor_id], |row| {
+            Ok(TrackedReservation {
+                vendor_id: row.get(0)?,
+                order_id: row.get(1)?,
+                order_no: row.get(2)?,
+                product_id: row.get(3)?,
+                product_name: row.get(4)?,
+                point_cost: row.get(5)?,
+                state: row.get(6)?,
+                created_at: row.get(7)?,
+                last_error: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// 找出尚未写入“预定成功”事件的本地待认领标记。包含已经关闭的标记，既用于
+    /// 进程在两次落库之间退出后的恢复，也用于升级前已经成功预定的订单补事件。
+    pub fn reservation_markers_missing_created_event(
+        &self,
+        vendor_id: &str,
+    ) -> rusqlite::Result<Vec<TrackedReservation>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT r.vendor_id, r.order_id, r.order_no, r.product_id, r.product_name,
+                    r.point_cost, r.state, r.created_at, r.last_error
+             FROM vendor_reservations r
+             LEFT JOIN vendor_events e
+               ON e.vendor_id = r.vendor_id
+              AND e.event_id = ('reservation-created:' || r.order_id)
+             WHERE r.vendor_id = ?1
+               AND r.order_id LIKE 'awaiting:%'
+               AND e.event_id IS NULL
+             ORDER BY r.created_at ASC",
+        )?;
+        let rows = stmt.query_map([vendor_id], |row| {
+            Ok(TrackedReservation {
+                vendor_id: row.get(0)?,
+                order_id: row.get(1)?,
+                order_no: row.get(2)?,
+                product_id: row.get(3)?,
+                product_name: row.get(4)?,
+                point_cost: row.get(5)?,
+                state: row.get(6)?,
+                created_at: row.get(7)?,
+                last_error: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// 记录一次预定单取货入库结果。失败保持 active；成功（含凭据已存在）后永久完成。
+    pub fn finish_reservation(
+        &self,
+        vendor_id: &str,
+        order_id: &str,
+        success: bool,
+        outcome: &PurchaseOutcome,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE vendor_reservations SET
+                state = ?3, updated_at = ?4,
+                imported_at = CASE WHEN ?3 = 'done' THEN ?4 ELSE imported_at END,
+                purchased = ?5, imported = ?6, duplicated = ?7, failed = ?8,
+                last_error = ?9
+             WHERE vendor_id = ?1 AND order_id = ?2",
+            rusqlite::params![
+                vendor_id,
+                order_id,
+                if success { "done" } else { "failed" },
+                now,
+                outcome.purchased,
+                outcome.imported,
+                outcome.duplicated,
+                outcome.failed,
+                outcome.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 详情暂时取不到或本地入库发生出站错误，保留订单供下一轮重试。
+    pub fn fail_reservation(
+        &self,
+        vendor_id: &str,
+        order_id: &str,
+        error: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE vendor_reservations SET state = 'failed', last_error = ?3, updated_at = ?4
+             WHERE vendor_id = ?1 AND order_id = ?2",
+            rusqlite::params![vendor_id, order_id, error, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 卖家已将预定取消或退款，本地停止跟踪，下一轮可以补一张新预定。
+    pub fn close_reservation(&self, vendor_id: &str, order_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE vendor_reservations SET state = 'closed', updated_at = ?3
+             WHERE vendor_id = ?1 AND order_id = ?2",
+            rusqlite::params![vendor_id, order_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
 }
 
 /// 逐条执行补列语句。「列已存在」是正常情况（新建库已含全部列），静默跳过；
@@ -820,6 +1062,33 @@ mod tests {
     }
 
     #[test]
+    fn 本地合成事件重复观察不累计投递次数() {
+        let s = store();
+        let mut e = event("reservation-delivered:617");
+        e.kind = VendorEventKind::ReservationDelivered;
+        assert_eq!(s.record_local_event(&e).unwrap(), RecordOutcome::Inserted);
+        assert_eq!(s.record_local_event(&e).unwrap(), RecordOutcome::Duplicate);
+        let rec = s.get_event(V, &e.event_id).unwrap().unwrap();
+        assert_eq!(rec.event_type, "reservation_delivered");
+        assert_eq!(rec.delivery_count, 1);
+    }
+
+    #[test]
+    fn 预定事件类型可稳定往返() {
+        for (raw, expected) in [
+            ("reservation_created", VendorEventKind::ReservationCreated),
+            (
+                "reservation_delivered",
+                VendorEventKind::ReservationDelivered,
+            ),
+        ] {
+            let kind = VendorEventKind::from_str(raw);
+            assert_eq!(kind, expected);
+            assert_eq!(kind.as_str(), raw);
+        }
+    }
+
+    #[test]
     fn 重投不清掉已有提取结果() {
         let s = store();
         let e = event("e1");
@@ -880,10 +1149,7 @@ mod tests {
         let s = store();
         s.record_event(&event("e1")).unwrap();
         assert_eq!(s.bind_count_zone(V, "e1", 3, None).unwrap(), Ok((3, None)));
-        assert_eq!(
-            s.bind_count_zone(V, "e1", 3, None).unwrap(),
-            Err((3, None))
-        );
+        assert_eq!(s.bind_count_zone(V, "e1", 3, None).unwrap(), Err((3, None)));
     }
 
     #[test]
@@ -1026,6 +1292,104 @@ mod tests {
         assert_eq!(rec.purchase_trigger.as_deref(), Some("auto"));
     }
 
+    #[test]
+    fn 预定单认领幂等且按供应商隔离() {
+        let s = store();
+        s.track_reservation(
+            "kirored",
+            "700",
+            Some("202608110001"),
+            Some("55"),
+            Some("Kiro 拼车 纯APIKEY 双区混发"),
+            Some(15.0),
+            Some(1_786_400_000),
+        )
+        .unwrap();
+        // 列表每分钟都会看到同一单，重复认领不能多出记录。
+        s.track_reservation(
+            "kirored",
+            "700",
+            Some("202608110001"),
+            Some("55"),
+            None,
+            Some(15.0),
+            Some(1_786_400_000),
+        )
+        .unwrap();
+
+        let rows = s.active_reservations("kirored").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].order_id, "700");
+        assert_eq!(
+            rows[0].product_name.as_deref(),
+            Some("Kiro 拼车 纯APIKEY 双区混发")
+        );
+        assert!(s.active_reservations("other").unwrap().is_empty());
+    }
+
+    #[test]
+    fn 已关闭的待认领标记也能补预定成功事件() {
+        let s = store();
+        let marker_id = "awaiting:1786409514876";
+        s.track_reservation(
+            "kirored",
+            marker_id,
+            None,
+            Some("55"),
+            Some("Kiro 拼车 纯APIKEY 双区混发"),
+            Some(15.0),
+            None,
+        )
+        .unwrap();
+        s.close_reservation("kirored", marker_id).unwrap();
+
+        let missing = s
+            .reservation_markers_missing_created_event("kirored")
+            .unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].state, "closed");
+
+        let mut created = event(&format!("reservation-created:{marker_id}"));
+        created.vendor_id = "kirored".to_string();
+        created.kind = VendorEventKind::ReservationCreated;
+        s.record_local_event(&created).unwrap();
+        assert!(
+            s.reservation_markers_missing_created_event("kirored")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn 预定入库失败继续跟踪_成功或关闭后退出() {
+        let s = store();
+        s.track_reservation("kirored", "700", None, None, None, None, None)
+            .unwrap();
+        s.fail_reservation("kirored", "700", "详情暂未给卡密")
+            .unwrap();
+        let active = s.active_reservations("kirored").unwrap();
+        assert_eq!(active[0].state, "failed");
+        assert_eq!(active[0].last_error.as_deref(), Some("详情暂未给卡密"));
+
+        s.finish_reservation(
+            "kirored",
+            "700",
+            true,
+            &PurchaseOutcome {
+                purchased: 1,
+                imported: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s.active_reservations("kirored").unwrap().is_empty());
+
+        s.track_reservation("kirored", "701", None, None, None, None, None)
+            .unwrap();
+        s.close_reservation("kirored", "701").unwrap();
+        assert!(s.active_reservations("kirored").unwrap().is_empty());
+    }
+
     // ============ 多供应商隔离 ============
 
     /// 两家卖家的 event_id 撞车时必须各自独立成行，否则第二家的事件会被
@@ -1046,8 +1410,14 @@ mod tests {
         // 各自绑定不同数量，互不影响
         assert_eq!(s.bind_count("a", "same-id", 3).unwrap(), Ok(3));
         assert_eq!(s.bind_count("b", "same-id", 8).unwrap(), Ok(8));
-        assert_eq!(s.get_event("a", "same-id").unwrap().unwrap().bound_count, Some(3));
-        assert_eq!(s.get_event("b", "same-id").unwrap().unwrap().bound_count, Some(8));
+        assert_eq!(
+            s.get_event("a", "same-id").unwrap().unwrap().bound_count,
+            Some(3)
+        );
+        assert_eq!(
+            s.get_event("b", "same-id").unwrap().unwrap().bound_count,
+            Some(8)
+        );
     }
 
     #[test]
@@ -1176,18 +1546,31 @@ mod tests {
         // 迁移后可以接入第二家，且与存量行互不干扰
         s.record_event(&event_for("kiroapp", "old-1")).unwrap();
         assert_eq!(
-            s.get_event("kiroapp", "old-1").unwrap().unwrap().bound_count,
+            s.get_event("kiroapp", "old-1")
+                .unwrap()
+                .unwrap()
+                .bound_count,
             None,
             "新供应商的同名事件不该继承存量行的绑定数量"
         );
-        assert_eq!(s.get_event(V, "old-1").unwrap().unwrap().bound_count, Some(7));
+        assert_eq!(
+            s.get_event(V, "old-1").unwrap().unwrap().bound_count,
+            Some(7)
+        );
 
         // 重复打开（再跑一次迁移）不应报错或丢数据
         drop(s);
         let s = VendorStore::open(path.clone()).expect("二次打开失败");
-        assert_eq!(s.get_event(V, "old-1").unwrap().unwrap().bound_count, Some(7));
+        assert_eq!(
+            s.get_event(V, "old-1").unwrap().unwrap().bound_count,
+            Some(7)
+        );
         // 存量 old-1、本测试新写的 new-1、以及第二家的 old-1，共 3 行
-        assert_eq!(s.list_events(None, 100).unwrap().len(), 3, "二次迁移丢了数据");
+        assert_eq!(
+            s.list_events(None, 100).unwrap().len(),
+            3,
+            "二次迁移丢了数据"
+        );
         // 分区绑定要能跨重开存活
         assert_eq!(
             s.get_event(V, "new-1").unwrap().unwrap().bound_count,
