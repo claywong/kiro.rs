@@ -2,7 +2,7 @@ import { useState } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
-  Link2, Link2Off,
+  Link2, Link2Off, Power, PowerOff,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -22,6 +22,7 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
   useSelfHealConfig, useSetSelfHealConfig,
   useHealthGateState, useSetHealthGateEnabled,
+  useTrafficIngressState, useSetTrafficIngressEnabled,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
@@ -325,6 +326,8 @@ function StrategyMenu({ controls }: { controls: ToolControls }) {
         <DropdownMenuSeparator />
         <SelfHealPanels />
         <DropdownMenuSeparator />
+        <TrafficIngressPanels />
+        <DropdownMenuSeparator />
         <HealthGatePanels />
       </DropdownMenuContent>
     </DropdownMenu>
@@ -467,6 +470,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <SelfHealCompactItems />
+        <TrafficIngressCompactItems />
         <HealthGateCompactItems />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -820,6 +824,63 @@ function SelfHealPanels() {
   )
 }
 
+// ============ 流量入口 ============
+
+/** 独立控制 g7e6ai.com 指定账号的 schedulable，不参与健康判定。 */
+function TrafficIngressPanels() {
+  const { data: state, isLoading } = useTrafficIngressState()
+  const { mutate, isPending } = useSetTrafficIngressEnabled()
+
+  const configured = state?.configured ?? false
+  const enabled = state?.enabled ?? false
+  const busy = isLoading || isPending
+
+  const toggle = (next: boolean) => {
+    mutate(next, {
+      onSuccess: () =>
+        toast.success(next ? '流量入口已开启，正在同步外部账号' : '流量入口已关闭，正在同步外部账号'),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  return (
+    <>
+      <DropdownMenuLabel>流量入口</DropdownMenuLabel>
+      <div className="px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="min-w-0 text-xs">
+            <div className="font-medium">
+              {!configured ? '未配置' : enabled ? '已开启' : '已关闭'}
+            </div>
+            <div className="truncate text-muted-foreground">
+              {configured ? '手动控制指定外部账号接量' : '需配置 trafficIngress 的 token / 账号'}
+            </div>
+          </div>
+          <Switch
+            checked={enabled}
+            disabled={busy || !configured}
+            onCheckedChange={toggle}
+            aria-label="流量入口开关"
+          />
+        </div>
+
+        {configured && state && (
+          <div className="mt-2 space-y-1 rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate">{hostOf(state.baseUrl)}</span>
+              <span>{state.accountCount} 个账号</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span>期望：{enabled ? '可调度' : '不可调度'}</span>
+              <span>已同步：{appliedText(state.appliedSchedulable)}</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
 // ============ 健康联动 ============
 
 /**
@@ -829,10 +890,8 @@ function SelfHealPanels() {
  * 不是本地怎么调度请求。本地稳则关闭外部调度、不稳则打开（反向映射，因为
  * 外部账号是兜底池，平时闲着更好）。
  *
- * 关掉时后端**不改对方当前状态** —— 看门狗单向推送、不读对方，替用户决定
- * 对方该开还是该关比留在原处更容易出错。代价是残留值不确定，故这里把
- * 「已推送」显示出来：兜底池永久开着（计费）与永久关着（无兜底）后果完全不同，
- * 你关掉后至少能看到它停在哪一档。
+ * 关掉时后端停止健康判定，并把外部账号设为不可调度。推送异步执行，失败会按
+ * 检查周期重试；「已推送」展示最近一次成功值。
  *
  * 未配置与「配好了但关着」分开展示：前者改了也没用（没有循环在跑），
  * 故置灰并说明缺什么。
@@ -847,11 +906,11 @@ function HealthGatePanels() {
 
   const toggle = (v: boolean) => {
     mutate(v, {
-      onSuccess: (r) =>
+      onSuccess: () =>
         toast.success(
           v
             ? '已开启健康联动'
-            : `已关闭健康联动，外部调度保持${appliedText(r.appliedSchedulable)}`,
+            : '已关闭健康联动，正在将外部账号设为不可调度',
         ),
       onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
     })
@@ -893,10 +952,8 @@ function HealthGatePanels() {
               <span>已推送：{appliedText(state.appliedSchedulable)}</span>
             </div>
             {!enabled && (
-              // 关闭状态下这句是重点：对方停在上面那个「已推送」值不动，
-              // 需要改就得去对方后台。不说清楚会让人以为关掉=对方也停了。
               <div className="pt-0.5 text-[11px] leading-snug">
-                已停止判定与推送，外部调度保持上述状态不变。
+                已停止健康判定，外部账号将保持不可调度。
               </div>
             )}
           </div>
@@ -954,6 +1011,38 @@ function SelfHealCompactItems() {
   )
 }
 
+/** 紧凑模式的独立流量入口开关；未配置时不占菜单空间。 */
+function TrafficIngressCompactItems() {
+  const { data: state, isLoading } = useTrafficIngressState()
+  const { mutate, isPending } = useSetTrafficIngressEnabled()
+
+  if (!state?.configured) return null
+
+  const enabled = state.enabled
+  const busy = isLoading || isPending
+
+  return (
+    <>
+      <DropdownMenuLabel>流量入口</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={busy}
+        onSelect={() =>
+          mutate(!enabled, {
+            onSuccess: () =>
+              toast.success(!enabled ? '流量入口已开启，正在同步外部账号' : '流量入口已关闭，正在同步外部账号'),
+            onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+          })
+        }
+      >
+        {enabled ? <Power /> : <PowerOff />}
+        {enabled
+          ? `关闭入口（已同步${appliedText(state.appliedSchedulable)}）`
+          : `开启入口（已同步${appliedText(state.appliedSchedulable)}）`}
+      </DropdownMenuItem>
+    </>
+  )
+}
+
 /**
  * 紧凑模式（窄屏）的健康联动开关项。
  *
@@ -976,11 +1065,11 @@ function HealthGateCompactItems() {
         disabled={busy}
         onSelect={() =>
           mutate(!enabled, {
-            onSuccess: (r) =>
+            onSuccess: () =>
               toast.success(
                 !enabled
                   ? '已开启健康联动'
-                  : `已关闭健康联动，外部调度保持${appliedText(r.appliedSchedulable)}`,
+                  : '已关闭健康联动，正在将外部账号设为不可调度',
               ),
             onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
           })
@@ -989,7 +1078,7 @@ function HealthGateCompactItems() {
         {enabled ? <Link2 /> : <Link2Off />}
         {enabled
           ? `关闭联动（当前${state.verdict ?? '未判定'}）`
-          : `开启联动（外部停在${appliedText(state.appliedSchedulable)}）`}
+          : `开启联动（外部${appliedText(state.appliedSchedulable)}）`}
       </DropdownMenuItem>
     </>
   )

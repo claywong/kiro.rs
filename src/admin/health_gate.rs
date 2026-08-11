@@ -20,6 +20,8 @@
 //! - **翻转立刻推 + 定期重推兜底**。只在翻转时推会有个漏洞：本地记的「上次推成功的
 //!   值」若被人在对方后台手动改掉，本地会因为状态"没变"而永远不再推，一直错到下次
 //!   健康度翻转。故每 `reaffirmIntervalSecs` 按当前判定重推一次，让漂移自愈。
+//! - **手动关闭联动时关闭外部调度**。开关变化会立即唤醒看门狗并推
+//!   `schedulable=false`；失败则在后续周期继续重试，避免兜底池残留在接量状态。
 //! - **trace 关闭时跳过**：那时报错计数不再更新，按残留读数判定会得出错误结论，
 //!   宁可不动。
 //! - **单次推送内重试 `maxAttempts` 次**（退避 2s → 5s），只重试网络错误与 5xx；
@@ -31,10 +33,12 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
+use tokio::sync::Notify;
 
 use crate::model::config::HealthGateConfig;
 
 use super::trace_db::SharedTraceStore;
+use super::schedulable_client::{SchedulableTarget, push_all as push_schedulable_all};
 // 本地新增判据依赖单独成行，避免与上游对 use 块的重排相撞。
 use crate::kiro::token_manager::MultiTokenManager;
 
@@ -169,24 +173,25 @@ fn judge(r: Readings, config: &HealthGateConfig) -> Option<UnstableReason> {
 /// 看门狗的运行时状态，面板读写走这里。
 ///
 /// 为什么需要它：`enabled` 原本只在 spawn 时读一次，改配置要重启才生效。面板要
-/// 能随时停掉自动联动（例如手工接管期间），故把它提成原子位，循环每轮重新读。
+/// 能随时停掉自动联动，故把它提成原子位。切换时通过 `changed` 立即唤醒循环，避免
+/// 手动关闭后还要等一个检查周期才关闭外部调度。
 ///
-/// 同时暴露 `applied`（已推给对方的值）。这一项是刻意加的：关掉开关时我们**不动
-/// 对方状态**（单向推送、不读对方），于是对方残留的是上次推过去的值。不显示的话
-/// 你关掉之后无从知道现在停在哪一档 —— 兜底池永久开着（计费）和永久关着（无兜底）
-/// 是两个后果完全不同的残留。把它显示出来，不确定性至少是可见的。
+/// 同时暴露 `applied`（最近一次成功推给对方的值），让面板能区分关闭推送仍在重试、
+/// 已经成功设为不可调度等状态。
 /// 用原子量而非 `Mutex`：与 [`super::health_probe::ProbeState`] 同理，读侧（面板
 /// 按需查）与写侧（每轮一次）都是低频单值，没有需要保持一致的字段组合。
 ///
 /// 两个三态字段编码成 `u8`：0 = 未知 / 尚无，1 / 2 见各自常量。
 pub struct GateState {
-    /// 运行时总开关。false = 停止周期判定与推送，不改对方状态。
+    /// 运行时总开关。false = 停止健康判定，并把对方设为不可调度。
     enabled: AtomicBool,
     /// 最近一次**成功推给对方**的 `schedulable`。
     /// [`APPLIED_NONE`] = 本进程还没推过。
     applied: AtomicU8,
     /// 最近一轮判定结论。[`VERDICT_UNKNOWN`] = 还没判过。
     verdict: AtomicU8,
+    /// 总开关变化通知，用于立即唤醒后台循环。
+    changed: Notify,
 }
 
 /// 本进程尚未成功推送过
@@ -205,6 +210,7 @@ impl GateState {
             enabled: AtomicBool::new(enabled),
             applied: AtomicU8::new(APPLIED_NONE),
             verdict: AtomicU8::new(VERDICT_UNKNOWN),
+            changed: Notify::new(),
         })
     }
 
@@ -213,7 +219,9 @@ impl GateState {
     }
 
     pub fn set_enabled(&self, on: bool) {
-        self.enabled.store(on, Ordering::Relaxed);
+        if self.enabled.swap(on, Ordering::Relaxed) != on {
+            self.changed.notify_one();
+        }
     }
 
     /// 已推给对方的 `schedulable`。`None` = 本进程还没推过 —— 此时对方可能残留
@@ -326,25 +334,39 @@ async fn run(
     // trace 关闭的告警只打一次，避免每周期刷屏。
     let mut warned_trace_off = false;
     // 总开关的上一轮状态，用于只在切换时打日志。
-    let mut was_enabled = state.enabled();
+    let mut was_enabled = config.enabled;
+    // 关闭推送失败后保持为 true，每个检查周期继续尝试，直到全部账号成功关闭。
+    let mut disable_push_pending = !config.enabled;
+    // 配置本来就是关闭时，启动后也要立即对齐一次，不能等首个检查周期。
+    let mut first_iteration = true;
 
     loop {
-        tokio::time::sleep(interval).await;
+        if first_iteration && disable_push_pending {
+            first_iteration = false;
+        } else {
+            first_iteration = false;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = state.changed.notified() => {}
+            }
+        }
 
-        // 总开关：关着就什么都不做 —— 不判定、不推送，**也不改对方状态**。
-        // 对方会保持上次推过去的值，这是有意的（面板会把该值显示出来）：
-        // 关开关的动机通常是「我要手工接管」，此时替用户决定对方该开还是该关，
-        // 比留在原处更容易出错。
+        // 总开关关闭后停止健康判定，但要把外部账号明确设为不可调度。首次关闭立即推，
+        // 失败则每个检查周期重试；全部成功后不再周期重推。
         //
         // 防抖计数一并清掉：关掉期间本地状态可能已经变了，重新打开时应从头
         // 观察 confirmations 轮再推，而不是拿关闭前的半截 streak 直接翻转。
         if !state.enabled() {
             if was_enabled {
-                tracing::info!(
-                    applied = ?state.applied(),
-                    "健康联动：总开关已关闭，停止判定与推送（外部调度保持当前值不变）"
-                );
+                tracing::info!("健康联动：总开关已关闭，停止健康判定并关闭外部调度");
                 was_enabled = false;
+                disable_push_pending = true;
+            }
+            if disable_push_pending && push_all(&config, &client, false).await {
+                applied = Health::Stable;
+                last_push = std::time::Instant::now();
+                state.set_applied(false);
+                disable_push_pending = false;
             }
             candidate = Health::Unknown;
             streak = 0;
@@ -354,6 +376,7 @@ async fn run(
         if !was_enabled {
             tracing::info!("健康联动：总开关已开启，恢复周期判定");
             was_enabled = true;
+            disable_push_pending = false;
         }
 
         // trace 关闭时只失去「报错数」这一路判据，凭据池存量与主动探测都不依赖它，
@@ -469,131 +492,37 @@ async fn run(
 /// 部分成功也返回 false：那样下周期会对所有账号重推一遍。开关接口是幂等的
 /// （同值重推无副作用），用整体重试换实现简单，比逐账号记状态划算。
 async fn push_all(config: &HealthGateConfig, client: &Client, schedulable: bool) -> bool {
-    let mut all_ok = true;
-    for id in &config.account_ids {
-        if let Err(e) = push_one(config, client, *id, schedulable).await {
-            tracing::warn!(
-                account_id = id,
-                schedulable,
-                "健康联动：推送外部调度开关失败，下个周期重试: {}",
-                e
-            );
-            all_ok = false;
-        } else {
-            tracing::info!(
-                account_id = id,
-                schedulable,
-                "健康联动：外部调度开关已更新"
-            );
-        }
-    }
-    all_ok
-}
-
-/// 重试退避表。第 1 次失败等 2s，第 2 次等 5s。
-///
-/// 总等待 7s，压在 30s 轮询间隔内，不会让下个周期堆积。够覆盖对方重启 / 网络抖动
-/// 这类几秒级故障；更长的故障交给下个周期，没必要在这里死等。
-const RETRY_BACKOFF_SECS: [u64; 2] = [2, 5];
-
-/// 推一个账号的开关，失败按退避表重试到 `max_attempts` 次。
-///
-/// 只重试网络错误与对方 5xx。4xx 是 token 失效 / 账号不存在 / 请求格式不对这类
-/// 确定性错误，重试改变不了结果，只会白打三次。
-async fn push_one(
-    config: &HealthGateConfig,
-    client: &Client,
-    account_id: u64,
-    schedulable: bool,
-) -> anyhow::Result<()> {
-    let max_attempts = config.max_attempts.max(1);
-    let mut last_err = None;
-
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            let idx = (attempt as usize - 1).min(RETRY_BACKOFF_SECS.len() - 1);
-            tokio::time::sleep(Duration::from_secs(RETRY_BACKOFF_SECS[idx])).await;
-        }
-
-        match try_push_one(config, client, account_id, schedulable).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if !e.retryable {
-                    anyhow::bail!("{}（不重试）", e.message);
-                }
-                if attempt + 1 < max_attempts {
-                    tracing::debug!(
-                        account_id,
-                        attempt = attempt + 1,
-                        "健康联动：推送失败，将重试: {}",
-                        e.message
-                    );
-                }
-                last_err = Some(e.message);
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "{} 次尝试均失败，最后一次: {}",
-        max_attempts,
-        last_err.unwrap_or_else(|| "未知错误".into())
-    )
-}
-
-/// 单次尝试的错误：带上「是否值得重试」的判断。
-struct PushError {
-    message: String,
-    retryable: bool,
-}
-
-async fn try_push_one(
-    config: &HealthGateConfig,
-    client: &Client,
-    account_id: u64,
-    schedulable: bool,
-) -> Result<(), PushError> {
-    let url = format!(
-        "{}/api/v1/admin/accounts/{}/schedulable",
-        config.normalized_base_url(),
-        account_id
-    );
-    let resp = client
-        .post(&url)
-        // 实测认证走 `X-API-Key`，不是 Bearer：同一个 token 用
-        // `Authorization: Bearer` 会被回 401 `INVALID_TOKEN`（头识别了、token 被拒），
-        // 而 `X-API-Key` 直接 200。头名做成可配，换法时不用改代码。
-        .header(config.auth_header(), config.token.trim())
-        .json(&serde_json::json!({ "schedulable": schedulable }))
-        .send()
-        .await
-        .map_err(|e| PushError {
-            // 建连 / 超时 / DNS 一类，值得重试
-            message: format!("请求失败: {}", e),
-            retryable: true,
-        })?;
-
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(());
-    }
-    // 带上响应体开头一段，便于区分鉴权失败 / 账号不存在 / 对方 5xx。
-    let body = resp.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(200).collect();
-    Err(PushError {
-        message: format!("HTTP {}: {}", status, snippet),
-        retryable: is_retryable_status(status),
-    })
-}
-
-/// 5xx 与 429 值得重试，其余 4xx 不值得。
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    let target = SchedulableTarget {
+        label: "健康联动",
+        base_url: config.normalized_base_url(),
+        token: &config.token,
+        auth_header: config.auth_header(),
+        account_ids: &config.account_ids,
+        max_attempts: config.max_attempts,
+    };
+    push_schedulable_all(&target, client, schedulable).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn record_schedulable(
+        axum::extract::Path(account_id): axum::extract::Path<u64>,
+        axum::extract::State(sender): axum::extract::State<
+            tokio::sync::mpsc::UnboundedSender<(u64, bool)>,
+        >,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let schedulable = body
+            .get("schedulable")
+            .and_then(serde_json::Value::as_bool)
+            .expect("请求体应包含布尔值 schedulable");
+        sender
+            .send((account_id, schedulable))
+            .expect("测试接收端不应提前关闭");
+        axum::http::StatusCode::OK
+    }
 
     #[test]
     fn 反向映射_稳定关调度_不稳开调度() {
@@ -657,6 +586,74 @@ mod tests {
         assert!(!s.enabled());
     }
 
+    #[tokio::test]
+    async fn 手动关闭立即把外部账号设为不可调度() {
+        use axum::{Router, routing::post};
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route(
+                "/api/v1/admin/accounts/{id}/schedulable",
+                post(record_schedulable),
+            )
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = HealthGateConfig {
+            enabled: true,
+            base_url: format!("http://{address}"),
+            token: "test-token".into(),
+            account_ids: vec![42],
+            check_interval_secs: 60,
+            max_attempts: 1,
+            ..Default::default()
+        };
+        let trace_store = Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let state = spawn(
+            config,
+            trace_store,
+            Client::new(),
+            token_manager,
+            None,
+        )
+        .unwrap();
+
+        state.set_enabled(false);
+
+        let pushed = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("关闭操作应立即唤醒看门狗")
+            .expect("模拟第三方应收到推送");
+        assert_eq!(pushed, (42, false));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.applied() != Some(false) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("成功推送后应记录不可调度状态");
+
+        server.abort();
+    }
+
     /// 未推送过要照实返回 None：此时对方可能残留上次运行留下的值，
     /// 面板得显示「未知」而不是猜一个，否则会让人以为对方停在某个确定档位。
     #[test]
@@ -705,6 +702,7 @@ mod tests {
 
     #[test]
     fn 只重试5xx与429_其余4xx不重试() {
+        use crate::admin::schedulable_client::is_retryable_status;
         use reqwest::StatusCode;
         assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
@@ -719,6 +717,7 @@ mod tests {
 
     #[test]
     fn 退避总时长压在轮询间隔内() {
+        use crate::admin::schedulable_client::RETRY_BACKOFF_SECS;
         // 3 次尝试用掉 2 次退避，总等待须明显短于默认 30s 轮询间隔，
         // 否则重试会拖到下个周期、造成堆积。
         let total: u64 = RETRY_BACKOFF_SECS.iter().sum();

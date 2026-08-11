@@ -43,7 +43,7 @@ use super::types::{
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest, TrafficIngressStateResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -231,6 +231,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 健康联动看门狗句柄（总开关运行时可切）。None = 未配置
     health_gate: Option<crate::admin::health_gate::SharedGateState>,
+    /// 手动流量入口控制器。None = 未配置
+    traffic_ingress: Option<crate::admin::traffic_ingress::SharedTrafficIngressState>,
 }
 
 /// Social 登录会话状态
@@ -566,6 +568,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             health_gate: None,
+            traffic_ingress: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -622,6 +625,20 @@ impl AdminService {
     /// 健康联动运行时句柄。`None` = 未配置
     pub fn health_gate(&self) -> Option<&crate::admin::health_gate::SharedGateState> {
         self.health_gate.as_ref()
+    }
+
+    pub fn with_traffic_ingress(
+        mut self,
+        state: Option<crate::admin::traffic_ingress::SharedTrafficIngressState>,
+    ) -> Self {
+        self.traffic_ingress = state;
+        self
+    }
+
+    pub fn traffic_ingress(
+        &self,
+    ) -> Option<&crate::admin::traffic_ingress::SharedTrafficIngressState> {
+        self.traffic_ingress.as_ref()
     }
 
     /// 获取所有凭据状态
@@ -2159,8 +2176,8 @@ impl AdminService {
 
     /// 切健康联动总开关：运行时立即生效，并尽力写回 config.json。
     ///
-    /// 关掉时**不动对方状态** —— 看门狗是单向推送、不读对方，替用户决定对方该开
-    /// 还是该关比留在原处更容易出错。残留值由 `appliedSchedulable` 显示出来。
+    /// 关掉时会立即唤醒看门狗，把外部账号设为不可调度；失败会按检查周期重试。
+    /// 推送异步执行，返回值里的 `appliedSchedulable` 仍表示最近一次成功推送的状态。
     ///
     /// 持久化失败不算设置失败（运行时已生效），与卖家那边 `set_pool_target`
     /// 同一套取舍，由返回值里的状态告知面板。
@@ -2195,6 +2212,62 @@ impl AdminService {
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.health_gate.enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 读取手动流量入口状态。token 永不进入响应。
+    pub fn get_traffic_ingress_state(&self) -> TrafficIngressStateResponse {
+        let config = &self.token_manager.config().traffic_ingress;
+        match self.traffic_ingress() {
+            Some(state) => TrafficIngressStateResponse {
+                configured: true,
+                enabled: state.enabled(),
+                base_url: config.normalized_base_url().to_string(),
+                account_count: config.account_ids.len(),
+                applied_schedulable: state.applied(),
+            },
+            None => TrafficIngressStateResponse {
+                configured: false,
+                enabled: false,
+                base_url: config.normalized_base_url().to_string(),
+                account_count: config.account_ids.len(),
+                applied_schedulable: None,
+            },
+        }
+    }
+
+    /// 手动切换流量入口，并持久化期望状态。
+    pub fn set_traffic_ingress_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<TrafficIngressStateResponse, AdminServiceError> {
+        let Some(state) = self.traffic_ingress() else {
+            return Err(AdminServiceError::InvalidCredential(
+                "流量入口未配置（需填 trafficIngress 的 token / accountIds），无法切换"
+                    .to_string(),
+            ));
+        };
+        state.set_enabled(enabled);
+        if let Err(error) = self.persist_traffic_ingress_enabled(enabled) {
+            tracing::warn!("持久化流量入口开关失败（运行时已生效）: {}", error);
+        }
+        Ok(self.get_traffic_ingress_state())
+    }
+
+    fn persist_traffic_ingress_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|path| path.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，流量入口仅在当前进程生效"))?;
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.traffic_ingress.enabled = enabled;
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;

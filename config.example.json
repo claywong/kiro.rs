@@ -27,6 +27,15 @@
     "probeModel": "claude-opus-5",
     "probeFailures": 2
   },
+  "trafficIngress": {
+    "enabled": false,
+    "baseUrl": "https://g7e6ai.com",
+    "token": "替换为 g7e6ai.com 的 Admin Token",
+    "authHeader": "X-API-Key",
+    "accountIds": [],
+    "retryIntervalSecs": 30,
+    "maxAttempts": 3
+  },
   "vendors": [
     {
       "id": "kiroapp-io",

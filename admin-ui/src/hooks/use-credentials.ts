@@ -19,8 +19,10 @@ import {
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getHealthGateState,
+  getTrafficIngressState,
   getSelfHealConfig,
   setHealthGateEnabled,
+  setTrafficIngressEnabled,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
@@ -303,6 +305,26 @@ export function useSetHealthGateEnabled() {
     mutationFn: setHealthGateEnabled,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['healthGateState'] })
+    },
+  })
+}
+
+// 独立流量入口状态；轮询用于更新异步推送结果。
+export function useTrafficIngressState() {
+  return useQuery({
+    queryKey: ['trafficIngressState'],
+    queryFn: getTrafficIngressState,
+    refetchInterval: 10_000,
+  })
+}
+
+export function useSetTrafficIngressEnabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setTrafficIngressEnabled,
+    onSuccess: (state) => {
+      queryClient.setQueryData(['trafficIngressState'], state)
+      queryClient.invalidateQueries({ queryKey: ['trafficIngressState'] })
     },
   })
 }
