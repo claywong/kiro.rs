@@ -1089,10 +1089,17 @@ impl VendorService {
             }
         };
 
+        let manual_count = resp
+            .keys
+            .iter()
+            .filter(|key| super::import::parse_vendor_credentials(&key.key).is_none())
+            .count();
         let mut outcome = self.import_purchased(&resp, order_id).await;
         outcome.purchased = resp.purchased;
 
-        let status = if outcome.failed > 0 && outcome.imported == 0 {
+        let status = if manual_count > 0 {
+            PurchaseStatus::Manual
+        } else if outcome.failed > 0 && outcome.imported == 0 {
             PurchaseStatus::Failed
         } else {
             PurchaseStatus::Done
@@ -1666,8 +1673,33 @@ impl VendorService {
                 .as_deref()
                 .unwrap_or(&tracked.order_id)
                 .to_string();
+            let manual_count = response
+                .keys
+                .iter()
+                .filter(|key| super::import::parse_vendor_credentials(&key.key).is_none())
+                .count() as u32;
             let mut outcome = self.import_purchased(&response, &source_order).await;
             outcome.purchased = response.purchased;
+            if manual_count > 0 {
+                // import_purchased 会跳过所有无法识别的内容，因此这里不会为它们分配
+                // 凭据 ID。订单进入 manual 终态后也不会再被 active_reservations 取出。
+                if outcome.last_error.is_none() {
+                    outcome.last_error = Some(super::import::MANUAL_REVIEW_ERROR.to_string());
+                }
+                self.store
+                    .finish_reservation_manual(vid, &tracked.order_id, &outcome)
+                    .map_err(|e| {
+                        VendorServiceError::Storage(format!("写回预定单人工处理状态失败: {e}"))
+                    })?;
+                tracing::warn!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    manual = manual_count,
+                    imported = outcome.imported,
+                    "预定单含无法识别的凭证，已保存订单并转人工处理，停止自动重试"
+                );
+                continue;
+            }
             let success = outcome.failed == 0 && response.purchased > 0;
             self.store
                 .finish_reservation(vid, &tracked.order_id, success, &outcome)

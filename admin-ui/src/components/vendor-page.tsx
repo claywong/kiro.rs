@@ -127,6 +127,18 @@ function PurchaseStatusCell({ event }: { event: VendorEvent }) {
   if (event.eventType === 'reservation_created') {
     return <span className="text-xs text-muted-foreground">等待发货</span>
   }
+  if (event.purchaseStatus === 'manual') {
+    return (
+      <div className="text-xs">
+        <span className="font-medium text-amber-600 dark:text-amber-500">待人工处理</span>
+        <TriggerTag trigger={event.purchaseTrigger} />
+        {event.lastError && (
+          <div className="mt-0.5 break-all text-muted-foreground">{event.lastError}</div>
+        )}
+        <div className="mt-0.5 text-muted-foreground/80">订单已保存，自动重试已停止</div>
+      </div>
+    )
+  }
   if (event.eventType === 'reservation_delivered') {
     return <span className="text-xs font-medium text-emerald-600 dark:text-emerald-500">已发货</span>
   }

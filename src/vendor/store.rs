@@ -154,6 +154,8 @@ pub enum PurchaseStatus {
     Done,
     /// 提交过但失败（可用同一 bound_count 重试）
     Failed,
+    /// 已取到凭证，但格式不支持自动入库，保留订单等待人工处理
+    Manual,
     /// 自动模式主动放弃本次提取（未绑定数量，仍可手动提取）
     Skipped,
 }
@@ -163,6 +165,7 @@ impl PurchaseStatus {
         match self {
             Self::Done => "done",
             Self::Failed => "failed",
+            Self::Manual => "manual",
             Self::Skipped => "skipped",
         }
     }
@@ -329,7 +332,7 @@ pub struct TrackedReservation {
     pub product_id: Option<String>,
     pub product_name: Option<String>,
     pub point_cost: Option<f64>,
-    /// pending / failed。done / closed 不会由 active 查询返回。
+    /// pending / failed。done / manual / closed 不会由 active 查询返回。
     pub state: String,
     pub created_at: String,
     pub last_error: Option<String>,
@@ -890,6 +893,60 @@ impl VendorStore {
                 outcome.last_error,
             ],
         )?;
+        Ok(())
+    }
+
+    /// 订单已经发货并取到凭证，但凭证既不是 `ksk_`，也没有有效 refreshToken。
+    ///
+    /// `manual` 是终态，不会被 [`Self::active_reservations`] 再次取出。保留成交数与
+    /// 入库结果供页面对账，但不填写 `imported_at`，避免把“已提取待人工处理”误报成
+    /// “已成功入库”。
+    pub fn finish_reservation_manual(
+        &self,
+        vendor_id: &str,
+        order_id: &str,
+        outcome: &PurchaseOutcome,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE vendor_reservations SET
+                state = 'manual', updated_at = ?3,
+                purchased = ?4, imported = ?5, duplicated = ?6, failed = ?7,
+                last_error = ?8
+             WHERE vendor_id = ?1 AND order_id = ?2",
+            rusqlite::params![
+                vendor_id,
+                order_id,
+                now,
+                outcome.purchased,
+                outcome.imported,
+                outcome.duplicated,
+                outcome.failed,
+                outcome.last_error,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE vendor_events SET
+                purchase_status = ?3, purchased = ?4, imported = ?5,
+                duplicated = ?6, failed = ?7, last_error = ?8, processed_at = ?9,
+                purchase_trigger = ?10
+             WHERE vendor_id = ?1 AND event_id = ('reservation-delivered:' || ?2)",
+            rusqlite::params![
+                vendor_id,
+                order_id,
+                PurchaseStatus::Manual.as_str(),
+                outcome.purchased,
+                outcome.imported,
+                outcome.duplicated,
+                outcome.failed,
+                outcome.last_error,
+                now,
+                PurchaseTrigger::Auto.as_str(),
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1469,6 +1526,76 @@ mod tests {
             .unwrap();
         s.close_reservation("kirored", "701").unwrap();
         assert!(s.active_reservations("kirored").unwrap().is_empty());
+    }
+
+    #[test]
+    fn 无法识别的凭证转人工后退出活跃重试且不伪造入库时间() {
+        let s = store();
+        s.track_reservation(V, "702", None, None, None, None, None)
+            .unwrap();
+        let mut delivered = event("reservation-delivered:702");
+        delivered.kind = VendorEventKind::ReservationDelivered;
+        s.record_local_event(&delivered).unwrap();
+        s.finish_reservation_manual(
+            V,
+            "702",
+            &PurchaseOutcome {
+                purchased: 1,
+                failed: 1,
+                last_error: Some(
+                    "凭证既不是 ksk_ API Key，也不包含有效 refreshToken，已保存订单并转人工处理"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(s.active_reservations(V).unwrap().is_empty());
+        let conn = s.conn.lock();
+        let row: (
+            String,
+            Option<String>,
+            Option<u32>,
+            Option<u32>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT state, imported_at, imported, failed, last_error
+                 FROM vendor_reservations WHERE vendor_id = ?1 AND order_id = '702'",
+                [V],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "manual");
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, Some(0));
+        assert_eq!(row.3, Some(1));
+        assert!(row.4.as_deref().is_some_and(|v| v.contains("转人工")));
+        drop(conn);
+
+        let event = s
+            .get_event(V, "reservation-delivered:702")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.purchase_status.as_deref(), Some("manual"));
+        assert_eq!(event.purchase_trigger.as_deref(), Some("auto"));
+        assert_eq!(event.imported, Some(0));
+        assert_eq!(event.failed, Some(1));
+        assert!(
+            event
+                .last_error
+                .as_deref()
+                .is_some_and(|v| v.contains("转人工"))
+        );
     }
 
     // ============ 多供应商隔离 ============
