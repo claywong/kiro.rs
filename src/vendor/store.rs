@@ -661,6 +661,38 @@ impl VendorStore {
         }
     }
 
+    /// 在一次**明确未成交**的分区下单后，把绑定区域切到兜底区。
+    ///
+    /// 普通重试绝不能换区：同一订单号换区可能被卖家当成第二笔订单。唯一允许的
+    /// 例外是上一次请求已经收到权威的缺货响应，能够确定没有扣费。调用方必须先用
+    /// [`Self::finish_purchase`] 记成 failed；这里再用数量、原区域、失败状态和错误
+    /// 原文做 CAS，防止并发请求或不确定错误误改绑定。
+    pub fn rebind_zone_after_definitive_failure(
+        &self,
+        vendor_id: &str,
+        event_id: &str,
+        count: u32,
+        from_zone: &str,
+        to_zone: &str,
+        expected_error: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE vendor_events SET bound_zone = ?5
+             WHERE vendor_id = ?1 AND event_id = ?2 AND bound_count = ?3
+               AND bound_zone = ?4 AND purchase_status = 'failed' AND last_error = ?6",
+            rusqlite::params![
+                vendor_id,
+                event_id,
+                count,
+                from_zone,
+                to_zone,
+                expected_error
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// 写回提取结果
     pub fn finish_purchase(
         &self,
@@ -1141,6 +1173,55 @@ mod tests {
         assert_eq!(
             s.bind_count_zone(V, "e1", 9, Some("eu")).unwrap(),
             Err((5, Some("eu".to_string())))
+        );
+    }
+
+    #[test]
+    fn 只有明确失败后才能把绑定区域改到兜底区() {
+        let s = store();
+        s.record_event(&event("e1")).unwrap();
+        s.bind_count_zone(V, "e1", 1, Some("eu")).unwrap().unwrap();
+
+        assert!(
+            !s.rebind_zone_after_definitive_failure(V, "e1", 1, "eu", "us", "库存不足")
+                .unwrap(),
+            "请求尚未明确失败时绝不能换区"
+        );
+
+        s.finish_purchase(
+            V,
+            "e1",
+            PurchaseStatus::Failed,
+            PurchaseTrigger::Auto,
+            &PurchaseOutcome {
+                last_error: Some("库存不足".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !s.rebind_zone_after_definitive_failure(V, "e1", 2, "eu", "us", "库存不足")
+                .unwrap(),
+            "数量不一致不能换区"
+        );
+        assert!(
+            !s.rebind_zone_after_definitive_failure(V, "e1", 1, "eu", "us", "请求超时")
+                .unwrap(),
+            "数据库错误不是本次错误时不能换区"
+        );
+        assert!(
+            s.rebind_zone_after_definitive_failure(V, "e1", 1, "eu", "us", "库存不足")
+                .unwrap()
+        );
+        assert_eq!(
+            s.bind_count_zone(V, "e1", 1, Some("us")).unwrap(),
+            Err((1, Some("us".to_string())))
+        );
+        assert!(
+            !s.rebind_zone_after_definitive_failure(V, "e1", 1, "eu", "ap", "库存不足")
+                .unwrap(),
+            "原区域已经改变后不能再次改绑"
         );
     }
 
