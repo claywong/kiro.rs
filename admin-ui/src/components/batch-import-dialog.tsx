@@ -19,6 +19,13 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+// 本地新增：导入默认值字段单独成行，避免与上游的 import 块反复冲突。
+import {
+  ImportDefaultsFields,
+  EMPTY_IMPORT_DEFAULTS,
+  resolveImportDefaults,
+  type ImportDefaults,
+} from '@/components/import-defaults-fields'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -65,6 +72,7 @@ interface VerificationResult {
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [defaults, setDefaults] = useState<ImportDefaults>(EMPTY_IMPORT_DEFAULTS)
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -83,6 +91,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const resetForm = () => {
     setJsonInput('')
+    setDefaults(EMPTY_IMPORT_DEFAULTS)
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -110,6 +119,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
     if (credentials.length === 0) {
       toast.error('没有可导入的凭据')
+      return
+    }
+
+    // 数字填错就导入会静默落一批错配置进库，先拦下来。
+    const { resolved: defs, error: defsError } = resolveImportDefaults(defaults)
+    if (defsError) {
+      toast.error(defsError)
       return
     }
 
@@ -147,10 +163,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
 
-        // 若凭据未指定代理且代理池有可用代理，随机分配一个
-        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
-          const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
-          cred.proxyUrl = picked.url
+        // 代理来源优先级：单行 JSON 显式值 > 对话框默认值 > 代理池随机分配。
+        // 显式填了默认代理就不再随机，否则"指定代理"这个动作会被池覆盖掉。
+        if (!cred.proxyUrl?.trim()) {
+          if (defs.proxyUrl) {
+            cred.proxyUrl = defs.proxyUrl
+            cred.proxyUsername = cred.proxyUsername ?? defs.proxyUsername
+            cred.proxyPassword = cred.proxyPassword ?? defs.proxyPassword
+          } else if (enabledProxies.length > 0) {
+            const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
+            cred.proxyUrl = picked.url
+          }
         }
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
@@ -178,8 +201,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             req: {
               authMethod: 'api_key',
               kiroApiKey: apiKey,
-              priority: cred.priority || 0,
-              rpmLimit: cred.rpmLimit ?? 300,
+              // ?? 而非 ||：JSON 里显式写 0 应当保留，不该被对话框默认值顶掉。
+              priority: cred.priority ?? defs.priority ?? 0,
+              rpmLimit: cred.rpmLimit ?? defs.rpmLimit ?? 300,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -237,8 +261,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               tokenEndpoint,
               issuerUrl: cred.issuerUrl?.trim() || undefined,
               scopes: cred.scopes?.trim() || undefined,
-              priority: cred.priority || 0,
-              rpmLimit: cred.rpmLimit ?? 300,
+              // ?? 而非 ||：JSON 里显式写 0 应当保留，不该被对话框默认值顶掉。
+              priority: cred.priority ?? defs.priority ?? 0,
+              rpmLimit: cred.rpmLimit ?? defs.rpmLimit ?? 300,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
@@ -424,6 +449,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               💡 "开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
             </p>
           </div>
+
+          {/* 本地新增：三项默认值。JSON 里单行写了同名字段的以单行为准。 */}
+          <ImportDefaultsFields
+            value={defaults}
+            onChange={setDefaults}
+            disabled={importing}
+            enabledProxyCount={proxyPool?.proxies.filter(p => p.enabled).length ?? 0}
+          />
 
           {(importing || results.length > 0) && (
             <>

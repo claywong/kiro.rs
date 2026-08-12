@@ -19,6 +19,13 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+// 本地新增：导入默认值字段单独成行，避免与上游的 import 块反复冲突。
+import {
+  ImportDefaultsFields,
+  EMPTY_IMPORT_DEFAULTS,
+  resolveImportDefaults,
+  type ImportDefaults,
+} from '@/components/import-defaults-fields'
 
 interface KamImportDialogProps {
   open: boolean
@@ -195,6 +202,7 @@ function parseKamJson(raw: string): KamAccount[] {
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [defaults, setDefaults] = useState<ImportDefaults>(EMPTY_IMPORT_DEFAULTS)
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -215,6 +223,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const resetForm = () => {
     setJsonInput('')
+    setDefaults(EMPTY_IMPORT_DEFAULTS)
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -308,6 +317,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       return
     }
 
+    // 数字填错就导入会静默落一批错配置进库，先拦下来。
+    const { resolved: defs, error: defsError } = resolveImportDefaults(defaults)
+    if (defsError) {
+      toast.error(defsError)
+      return
+    }
+
     try {
       setImporting(true)
       setProgress({ current: 0, total: validAccounts.length })
@@ -380,10 +396,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           account.idp?.trim() ||
           (isExternalIdp ? 'AzureAD' : undefined)
 
-        // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
-        const proxyUrl = enabledProxies.length > 0
-          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
-          : undefined
+        // KAM 账号无 proxyUrl 字段。显式填了默认代理就全用它，
+        // 否则维持原行为：从代理池随机分配一个。
+        const proxyUrl = defs.proxyUrl
+          ?? (enabledProxies.length > 0
+            ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
+            : undefined)
 
         toImport.push({
           index: i,
@@ -405,6 +423,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,
+            // 未填时不传，沿用后端 serde 默认（RPM 300 / 优先级 0）。
+            proxyUsername: defs.proxyUsername,
+            proxyPassword: defs.proxyPassword,
+            rpmLimit: defs.rpmLimit,
+            priority: defs.priority,
           },
         })
       }
@@ -631,6 +654,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 </label>
               )}
             </div>
+          )}
+
+          {/* 本地新增：三项默认值。KAM 导出文件里没有这些字段，只能在此指定。 */}
+          {results.length === 0 && (
+            <ImportDefaultsFields
+              value={defaults}
+              onChange={setDefaults}
+              disabled={importing}
+              enabledProxyCount={proxyPool?.proxies.filter(p => p.enabled).length ?? 0}
+            />
           )}
 
           {/* 导入进度和结果 */}
