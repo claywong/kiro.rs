@@ -328,6 +328,17 @@ async fn main() {
             }
         };
 
+    // 手动流量入口：独立控制 g7e6ai.com 指定账号是否参与调度。
+    // 强制直连：对方按本机公网出口做 IP 白名单，复用全局代理会被 403 拒绝。
+    let traffic_ingress_state =
+        match http_client::build_client(None, 15, config.tls_backend) {
+            Ok(client) => admin::traffic_ingress::spawn(config.traffic_ingress.clone(), client),
+            Err(error) => {
+                tracing::warn!("流量入口：HTTP 客户端构建失败，控制器不启动: {}", error);
+                None
+            }
+        };
+
     // AdminService 在此统一构建（而非仅在 Admin API 分支内）：卖家 webhook 提取 Key 后
     // 要复用它的 import_one_credential 入库，而入站 webhook 不该依赖 adminApiKey 是否配置。
     // 后台调度器仍只在 Admin API 启用时才启动，不会多跑任务。
@@ -335,7 +346,8 @@ async fn main() {
         admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
             .with_kiro_provider(kiro_provider.clone())
             .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone()))
-            .with_health_gate(health_gate_state.clone()),
+            .with_health_gate(health_gate_state.clone())
+            .with_traffic_ingress(traffic_ingress_state.clone()),
     );
 
     // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。

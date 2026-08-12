@@ -204,6 +204,10 @@ fn dispatch_event(service: &std::sync::Arc<VendorService>, event: &IncomingEvent
                 event.event_id.clone(),
                 event.new_keys,
                 AutoPurchaseSource::Webhook,
+                (service.flavor() == super::protocol::VendorFlavor::Legacy)
+                    .then(|| super::service::legacy_zone_from_message(event.message.as_deref()))
+                    .flatten()
+                    .map(str::to_string),
             );
         }
         // 滥用回收要人工介入（换号、排查调用方），程序不自动补货

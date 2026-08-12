@@ -26,6 +26,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
+        SetTrafficIngressRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -592,7 +593,7 @@ pub async fn get_health_gate_state(State(state): State<AdminState>) -> impl Into
 }
 
 /// PUT /api/admin/config/health-gate
-/// 切健康联动总开关（运行时生效 + 持久化）。关闭时不改外部系统当前状态
+/// 切健康联动总开关（运行时生效 + 持久化）。关闭时把外部账号设为不可调度
 pub async fn set_health_gate_state(
     State(state): State<AdminState>,
     Json(payload): Json<SetHealthGateRequest>,
@@ -600,6 +601,22 @@ pub async fn set_health_gate_state(
     match state.service.set_health_gate_enabled(payload.enabled) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/traffic-ingress
+pub async fn get_traffic_ingress_state(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_traffic_ingress_state())
+}
+
+/// PUT /api/admin/config/traffic-ingress
+pub async fn set_traffic_ingress_state(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetTrafficIngressRequest>,
+) -> impl IntoResponse {
+    match state.service.set_traffic_ingress_enabled(payload.enabled) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

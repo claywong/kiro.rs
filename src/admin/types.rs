@@ -564,7 +564,29 @@ pub struct HealthGateStateResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetHealthGateRequest {
-    /// true = 恢复周期判定；false = 停止判定与推送（**不改对方当前状态**）
+    /// true = 恢复周期判定；false = 停止判定并把外部账号设为不可调度
+    pub enabled: bool,
+}
+
+/// 手动流量入口开关状态。响应不包含外部系统 token。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficIngressStateResponse {
+    /// baseUrl / token / accountIds 是否已经填全
+    pub configured: bool,
+    /// 当前期望状态。未配置时恒为 false
+    pub enabled: bool,
+    /// 外部系统基址
+    pub base_url: String,
+    /// 受控账号数
+    pub account_count: usize,
+    /// 最近一次成功推送的 schedulable；null 表示尚未成功同步
+    pub applied_schedulable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTrafficIngressRequest {
     pub enabled: bool,
 }
 

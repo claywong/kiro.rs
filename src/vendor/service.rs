@@ -283,6 +283,21 @@ impl PurchaseAuthorization {
     }
 }
 
+const LEGACY_EU_ZONE: &str = "eu";
+const LEGACY_US_ZONE: &str = "us";
+
+/// 从 kiro.ceo 到货通知里提取区域。两边关键词同时出现时视为歧义，不猜区域。
+pub(super) fn legacy_zone_from_message(message: Option<&str>) -> Option<&'static str> {
+    let message = message?.to_ascii_lowercase();
+    let is_eu = message.contains("欧洲区") || message.contains("eu-central-1");
+    let is_us = message.contains("美国区") || message.contains("us-east-1");
+    match (is_eu, is_us) {
+        (true, false) => Some(LEGACY_EU_ZONE),
+        (false, true) => Some(LEGACY_US_ZONE),
+        _ => None,
+    }
+}
+
 /// 单个卖家的对接服务
 pub struct VendorService {
     config: VendorConfig,
@@ -906,6 +921,26 @@ impl VendorService {
         zone: Option<&str>,
         trigger: PurchaseTrigger,
     ) -> Result<PurchaseImportResult, VendorServiceError> {
+        // 选区必须在绑定之前：绑定要把数量和区域一起写进去，
+        // 之后任何重试都只能按这一对值走。
+        let picked = self.resolve_zone(zone).await?;
+
+        self.purchase_for_event_resolved_zone(event_id, count, picked.as_deref(), trigger)
+            .await
+    }
+
+    /// 区域已经由同一轮库存快照选定的事件提取。
+    ///
+    /// 自动提取先查库存决定数量和区域，不能在这里再查一次：抢货窗口里第二次 GET
+    /// 既增加延迟，也只会得到一个更晚但仍无法为随后 POST 保证库存的快照。手动路径
+    /// 仍走 [`Self::purchase_for_event_zoned`]，由它负责校验用户给的区域。
+    async fn purchase_for_event_resolved_zone(
+        &self,
+        event_id: &str,
+        count: u32,
+        zone: Option<&str>,
+        trigger: PurchaseTrigger,
+    ) -> Result<PurchaseImportResult, VendorServiceError> {
         let client = self.client()?;
         let vid = self.vendor_id();
 
@@ -922,26 +957,22 @@ impl VendorService {
         // 有批次 id 的卖家可定向拉取，避免买到别的批次
         let batch = record.batch_order_id.clone();
 
-        // 选区必须在绑定之前：绑定要把数量和区域一起写进去，
-        // 之后任何重试都只能按这一对值走。
-        let picked = self.resolve_zone(zone).await?;
-
         // 抢占绑定：并发点击只有一个能拿到本次 (count, zone)，其余得到已绑定值
         let (effective, effective_zone) = match self
             .store
-            .bind_count_zone(vid, event_id, count, picked.as_deref())
+            .bind_count_zone(vid, event_id, count, zone)
             .map_err(|e| VendorServiceError::Storage(e.to_string()))?
         {
             Ok(v) => v,
             // 同数量重试，卖家侧幂等重放。区域一律用已绑定值 ——
             // 本次自动选区可能选到了另一个区（库存变了），换区就是第二笔单。
             Err((bound, bound_zone)) if bound == count => {
-                if bound_zone.as_deref() != picked.as_deref() {
+                if bound_zone.as_deref() != zone {
                     tracing::info!(
                         vendor_id = %vid,
                         event_id = %event_id,
                         bound_zone = ?bound_zone,
-                        this_time = ?picked,
+                        this_time = ?zone,
                         "重试沿用已绑定区域，忽略本次选区结果"
                     );
                 }
@@ -1025,10 +1056,17 @@ impl VendorService {
             }
         };
 
+        let manual_count = resp
+            .keys
+            .iter()
+            .filter(|key| super::import::parse_vendor_credentials(&key.key).is_none())
+            .count();
         let mut outcome = self.import_purchased(&resp, order_id).await;
         outcome.purchased = resp.purchased;
 
-        let status = if outcome.failed > 0 && outcome.imported == 0 {
+        let status = if manual_count > 0 {
+            PurchaseStatus::Manual
+        } else if outcome.failed > 0 && outcome.imported == 0 {
             PurchaseStatus::Failed
         } else {
             PurchaseStatus::Done
@@ -1602,8 +1640,33 @@ impl VendorService {
                 .as_deref()
                 .unwrap_or(&tracked.order_id)
                 .to_string();
+            let manual_count = response
+                .keys
+                .iter()
+                .filter(|key| super::import::parse_vendor_credentials(&key.key).is_none())
+                .count() as u32;
             let mut outcome = self.import_purchased(&response, &source_order).await;
             outcome.purchased = response.purchased;
+            if manual_count > 0 {
+                // import_purchased 会跳过所有无法识别的内容，因此这里不会为它们分配
+                // 凭据 ID。订单进入 manual 终态后也不会再被 active_reservations 取出。
+                if outcome.last_error.is_none() {
+                    outcome.last_error = Some(super::import::MANUAL_REVIEW_ERROR.to_string());
+                }
+                self.store
+                    .finish_reservation_manual(vid, &tracked.order_id, &outcome)
+                    .map_err(|e| {
+                        VendorServiceError::Storage(format!("写回预定单人工处理状态失败: {e}"))
+                    })?;
+                tracing::warn!(
+                    vendor_id = %vid,
+                    order_id = %tracked.order_id,
+                    manual = manual_count,
+                    imported = outcome.imported,
+                    "预定单含无法识别的凭证，已保存订单并转人工处理，停止自动重试"
+                );
+                continue;
+            }
             let success = outcome.failed == 0 && response.purchased > 0;
             self.store
                 .finish_reservation(vid, &tracked.order_id, success, &outcome)
@@ -1888,7 +1951,7 @@ impl VendorService {
         //
         // 传 StockPoll：本家关了 stockPollRespectGlobalGate 时，那一步会绕过总闸
         // 继续下单（该开关的字面语义）。池闸、授权判定、并发锁**都不绕**。
-        self.spawn_auto_purchase(event_id, None, AutoPurchaseSource::StockPoll);
+        self.spawn_auto_purchase(event_id, None, AutoPurchaseSource::StockPoll, None);
         Ok(())
     }
 
@@ -1904,10 +1967,14 @@ impl VendorService {
         event_id: String,
         new_keys: Option<u32>,
         source: AutoPurchaseSource,
+        notified_zone: Option<String>,
     ) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys, source).await {
+            if let Err(reason) = svc
+                .try_auto_purchase(&event_id, new_keys, source, notified_zone.as_deref())
+                .await
+            {
                 tracing::info!(
                     vendor_id = %svc.vendor_id(),
                     event_id = %event_id,
@@ -1970,6 +2037,23 @@ impl VendorService {
         }
     }
 
+    /// 消费卖家失效事件提供的一次性授权。就地盘点授权没有可消费额度，由池闸和
+    /// 全局锁约束，保持原有语义。
+    fn consume_authorization(&self, auth: &PurchaseAuthorization) -> Result<(), String> {
+        let PurchaseAuthorization::DeadEvent { event_id } = auth else {
+            return Ok(());
+        };
+        let consumed = self
+            .store
+            .consume_validation(self.vendor_id(), event_id)
+            .map_err(|e| format!("消费失效确认失败: {e}"))?;
+        if consumed {
+            Ok(())
+        } else {
+            Err("失效确认已被其他自动提取取用".to_string())
+        }
+    }
+
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     ///
     /// `source` 决定总闸能否被绕过，见 [`AutoPurchaseSource`] 与步骤 0。
@@ -1978,8 +2062,16 @@ impl VendorService {
         event_id: &str,
         new_keys: Option<u32>,
         source: AutoPurchaseSource,
+        notified_zone: Option<&str>,
     ) -> Result<(), String> {
         let vid = self.vendor_id();
+        // 防止将来其它调用方误传区域：消息选区严格限定在 kiro.ceo webhook。
+        let notified_zone =
+            if source == AutoPurchaseSource::Webhook && self.flavor() == VendorFlavor::Legacy {
+                notified_zone
+            } else {
+                None
+            };
 
         // 0. 自动提取总闸。排在授权判定之前 —— 它是最便宜的检查，且全局关闭时
         //    不该去消费卖家的失效确认额度。
@@ -2039,6 +2131,47 @@ impl VendorService {
                 .check(auto::pool_alive(&self.vendor_key_states()))?;
         }
 
+        // kiro.ceo 的抢货快路径。区域由 webhook 消息决定，不再固定先下 EU。
+        // 只在单次上限恰为 1 时跳过库存查询，避免在未核对库存上限时提交大单；
+        // new_keys=0 仍按普通路径给出完整的数量诊断。
+        let configured_max = self.auto_max_count();
+        let legacy_fast_path = source == AutoPurchaseSource::Webhook
+            && self.flavor() == VendorFlavor::Legacy
+            && configured_max == 1
+            && new_keys != Some(0)
+            && notified_zone.is_some();
+        if let (true, Some(zone)) = (legacy_fast_path, notified_zone) {
+            self.consume_authorization(&auth)?;
+            tracing::info!(
+                vendor_id = %vid,
+                event_id = %event_id,
+                count = 1,
+                zone = zone,
+                auth = auth.source(),
+                auth_detail = auth.detail(),
+                "自动提取开始（按 kiro.ceo 通知区域快速下单）"
+            );
+            match self
+                .purchase_for_event_resolved_zone(event_id, 1, Some(zone), PurchaseTrigger::Auto)
+                .await
+            {
+                Ok(r) => {
+                    tracing::info!(
+                        vendor_id = %vid,
+                        event_id = %event_id,
+                        purchased = r.purchased,
+                        imported = r.imported,
+                        zone = ?r.zone,
+                        total_debit = ?r.total_debit,
+                        "自动提取完成"
+                    );
+                }
+                // 失败已由 purchase_and_import 写回事件行，这里不覆盖为 skipped
+                Err(e) => tracing::warn!(event_id = %event_id, "自动提取失败: {}", e),
+            }
+            return Ok(());
+        }
+
         // 4. 数量：三者取最小，为 0 则无可提
         let stock = self
             .stock()
@@ -2046,13 +2179,31 @@ impl VendorService {
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
         // 分区卖家的 stock.available 是各区之和，拿它算数量会超出单区实际库存 ——
         // 下单只落在一个区，超出部分必然提不到。故按实际要用的那个区的量算。
-        let picked = stock.pick_zone();
+        let picked = match notified_zone {
+            // 只有 kiro.ceo webhook 会传该值。该供应商 purchase 的 zone 只接受
+            // `us` / `eu`，因此库存校验和随后下单都必须沿用这个短码。
+            Some(zone)
+                if source == AutoPurchaseSource::Webhook
+                    && self.flavor() == VendorFlavor::Legacy =>
+            {
+                stock.zones.iter().find(|z| {
+                    z.enabled
+                        && z.available > 0
+                        && z.zone.eq_ignore_ascii_case(zone)
+                })
+            }
+            _ => stock.pick_zone(),
+        };
         let zone_max = picked.map_or(stock.available, |z| z.available);
         if self.capabilities().zoned_purchase && picked.is_none() {
+            if let Some(zone) = notified_zone {
+                return Err(format!(
+                    "kiro.ceo 通知指定区域 {zone}，但该区当前无可提取库存"
+                ));
+            }
             return Err("各区均无库存，本轮不自动提取".to_string());
         }
         // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
-        let configured_max = self.auto_max_count();
         let count = auto::decide_count(new_keys, zone_max, configured_max);
         if count == 0 {
             return Err(format!(
@@ -2063,22 +2214,15 @@ impl VendorService {
                 configured_max
             ));
         }
-        // 选区结果不在这里传下去：purchase_for_event_zoned 会自己再选一次并把
-        // 结果与数量一起绑定。此处重选的意义只在于把数量算对。
-        let zone_hint = picked.map(|z| z.zone.clone());
+        // 同一份库存快照同时决定数量和区域，随后直接绑定并下单，不再重复查库存。
+        let zone_hint = notified_zone
+            .map(str::to_string)
+            .or_else(|| picked.map(|z| z.zone.clone()));
 
         // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取。
         //    仅卖家事件那条路有额度可消费；就地盘点不消费任何东西，
         //    它的上限由上一步的池闸负责（见 `resolve_authorization` 的联锁）。
-        if let PurchaseAuthorization::DeadEvent { event_id: dead_id } = &auth {
-            let consumed = self
-                .store
-                .consume_validation(vid, dead_id)
-                .map_err(|e| format!("消费失效确认失败: {e}"))?;
-            if !consumed {
-                return Err("失效确认已被其他自动提取取用".to_string());
-            }
-        }
+        self.consume_authorization(&auth)?;
 
         // 6. 下单。此处开始不可逆。`_gate` 持有到本函数结束，
         //    确保后来者盘点时能看到这批新导入的 Key。
@@ -2092,7 +2236,12 @@ impl VendorService {
             "自动提取开始"
         );
         match self
-            .purchase_for_event_zoned(event_id, count, zone_hint.as_deref(), PurchaseTrigger::Auto)
+            .purchase_for_event_resolved_zone(
+                event_id,
+                count,
+                zone_hint.as_deref(),
+                PurchaseTrigger::Auto,
+            )
             .await
         {
             Ok(r) => {
@@ -2687,6 +2836,31 @@ mod tests {
         let b = VendorService::parse_event("b", VendorFlavor::Legacy, raw).unwrap();
         assert_eq!(a.event_id, b.event_id);
         assert_ne!(a.vendor_id, b.vendor_id);
+    }
+
+    #[test]
+    fn kiroceo_按通知关键词选择下单短码() {
+        assert_eq!(
+            legacy_zone_from_message(Some("欧洲区新增 1 个 Key 已就绪")),
+            Some("eu")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("美国区新增 2 个 Key 已就绪")),
+            Some("us")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("US-EAST-1 新增 1 个 Key")),
+            Some("us")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("新增 1 个 Key 已就绪")),
+            None
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("欧洲区转移到美国区")),
+            None,
+            "同时出现两个区域时不能猜"
+        );
     }
 }
 

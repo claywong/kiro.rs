@@ -32,6 +32,8 @@ pub mod trace_db;
 pub mod recent_spend;
 pub mod health_gate;
 pub mod health_probe;
+pub mod traffic_ingress;
+mod schedulable_client;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;

@@ -1920,6 +1920,23 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 当前请求排除现用凭据后，是否还有另一个凭据可用于故障转移。
+    pub(crate) fn has_failover_target_for_request(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+    ) -> bool {
+        let now = Instant::now();
+        self.entries.lock().iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && !is_rpm_exceeded(entry, now)
+                && self.entry_available_for_request(entry, model, group, now)
+        })
+    }
+
     fn entry_available_for_request(
         &self,
         entry: &CredentialEntry,
@@ -7180,6 +7197,54 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_failover_target_ignores_disabled_credentials() {
+        let current = grouped_cred("current", &[]);
+        let mut disabled_a = grouped_cred("disabled-a", &[]);
+        disabled_a.disabled = true;
+        let mut disabled_b = grouped_cred("disabled-b", &[]);
+        disabled_b.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![current, disabled_a, disabled_b],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !manager.has_failover_target_for_request(None, None, &HashSet::new(), 1),
+            "多个凭据中只有当前凭据可用时应原地重试"
+        );
+    }
+
+    #[test]
+    fn test_failover_target_respects_request_exclusions() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("current", &[]), grouped_cred("other", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.has_failover_target_for_request(
+            None,
+            None,
+            &HashSet::new(),
+            1
+        ));
+        assert!(!manager.has_failover_target_for_request(
+            None,
+            None,
+            &HashSet::from([2]),
+            1
+        ));
     }
 
     #[test]

@@ -502,8 +502,7 @@ export interface HealthGateState {
   /**
    * 已推给对方的 `schedulable`。null = 本进程还没推过。
    *
-   * 关掉总开关时后端**不动对方状态**，对方保持这个值。显示它是为了让残留
-   * 可见 —— 兜底池永久开着（计费）与永久关着（无兜底）后果完全不同。
+   * 关掉总开关时后端会异步推送 `false`；推送完成前这里仍是最近一次成功值。
    */
   appliedSchedulable: boolean | null
 }
@@ -519,6 +518,34 @@ export async function setHealthGateEnabled(
   enabled: boolean,
 ): Promise<HealthGateState> {
   const { data } = await api.put<HealthGateState>('/config/health-gate', {
+    enabled,
+  })
+  return data
+}
+
+/** 独立流量入口开关状态。外部系统 token 不会返回前端。 */
+export interface TrafficIngressState {
+  /** baseUrl / token / accountIds 是否已经填全 */
+  configured: boolean
+  /** 期望的外部账号调度状态 */
+  enabled: boolean
+  /** 外部系统基址，如 `https://g7e6ai.com` */
+  baseUrl: string
+  /** 受控外部账号数 */
+  accountCount: number
+  /** 最近一次成功推送的 `schedulable`；null 表示尚未成功同步 */
+  appliedSchedulable: boolean | null
+}
+
+export async function getTrafficIngressState(): Promise<TrafficIngressState> {
+  const { data } = await api.get<TrafficIngressState>('/config/traffic-ingress')
+  return data
+}
+
+export async function setTrafficIngressEnabled(
+  enabled: boolean,
+): Promise<TrafficIngressState> {
+  const { data } = await api.put<TrafficIngressState>('/config/traffic-ingress', {
     enabled,
   })
   return data

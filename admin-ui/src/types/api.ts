@@ -898,7 +898,7 @@ export interface VendorEvent {
   boundCount?: number
   /** 首次提交时绑定的区域；与 boundCount 一起锁死，换区重试会再扣一次积分 */
   boundZone?: string
-  /** done / failed / skipped；未提取过则为空 */
+  /** done / failed / manual / skipped；未提取过则为空 */
   purchaseStatus?: string
   purchased?: number
   imported?: number

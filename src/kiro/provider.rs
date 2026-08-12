@@ -22,7 +22,7 @@ use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+const MAX_RETRIES_PER_CREDENTIAL: usize = 4;
 
 /// 总重试次数硬上限（避免无限重试）
 ///
@@ -779,8 +779,9 @@ impl KiroProvider {
             if status.as_u16() == 429 && endpoint.is_user_request_rate_exceeded(&body) {
                 // 无号可切时保留当前凭据原地重试，把重试预算用完；
                 // 否则排除当前凭据后下一轮必然取不到号，一次重试都跑不到。
-                let can_failover = has_failover_target(
-                    total_credentials,
+                let can_failover = self.token_manager.has_failover_target_for_request(
+                    model.as_deref(),
+                    group,
                     &request_excluded_credentials,
                     ctx.id,
                 );
@@ -1064,25 +1065,6 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
 }
 
-/// 判断把当前凭据也排除后，本次请求是否还有其它凭据可切。
-///
-/// 用户级限流（`USER_REQUEST_RATE_EXCEEDED`）的处理是「本次请求临时跳过当前凭据、
-/// 换号重试」。但单凭据（或组内其它号已全部被本次请求排除）时无号可切，排除后下一轮
-/// `acquire_context_excluding` 必然取不到凭据，重试预算一次都用不上就直接返回 429。
-/// 这种情况下应保留当前凭据、改为原地重试。
-fn has_failover_target(
-    total_credentials: usize,
-    excluded: &HashSet<u64>,
-    current_id: u64,
-) -> bool {
-    let excluded_after = if excluded.contains(&current_id) {
-        excluded.len()
-    } else {
-        excluded.len() + 1
-    };
-    total_credentials > excluded_after
-}
-
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
@@ -1129,34 +1111,6 @@ mod rate_limit_tests {
             .expect("应保留最初的类型化 429");
         assert_eq!(rate_limit.retry_after(), Some("45"));
         assert!(last_error.is_none());
-    }
-
-    #[test]
-    fn single_credential_has_no_user_rate_limit_failover_target() {
-        // 单凭据：排除唯一的号后无号可切，必须原地重试而不是直接返回 429。
-        assert!(!has_failover_target(1, &HashSet::new(), 7));
-    }
-
-    #[test]
-    fn multi_credential_keeps_failover_target_until_all_excluded() {
-        let mut excluded = HashSet::new();
-        assert!(has_failover_target(3, &excluded, 1), "3 号池首次撞限仍可换号");
-
-        excluded.insert(1);
-        assert!(has_failover_target(3, &excluded, 2), "还剩第 3 个号可切");
-
-        excluded.insert(2);
-        assert!(
-            !has_failover_target(3, &excluded, 3),
-            "最后一个号撞限时应转为原地重试"
-        );
-    }
-
-    #[test]
-    fn already_excluded_current_credential_does_not_double_count() {
-        // ctx.id 已在排除集合中时不应重复计数，否则会误判为无号可切。
-        let excluded = HashSet::from([1u64]);
-        assert!(has_failover_target(2, &excluded, 1));
     }
 
     #[test]
