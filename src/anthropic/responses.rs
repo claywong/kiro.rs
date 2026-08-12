@@ -860,7 +860,7 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
 
     let mut usage = json!({
         "input_tokens": p.prompt_tokens,
-        "input_tokens_details": { "cached_tokens": 0 },
+        "input_tokens_details": { "cached_tokens": p.cached_tokens },
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
         "total_tokens": p.prompt_tokens + p.completion_tokens,
@@ -1184,6 +1184,7 @@ mod tests {
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             completion_tokens: 5,
+            cached_tokens: 0,
             thinking: String::new(),
             web_searches: Vec::new(),
             credit_usage: None,
@@ -1740,5 +1741,49 @@ mod tests {
         assert!(sse.contains("\"credit_usage\":0.99"));
         assert!(sse.contains("\"credit_unit\":\"credit\""));
         assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
+    }
+}
+
+// 本地新增测试单独成块，避免与上游 mod tests 的增删相撞。
+#[cfg(test)]
+mod cache_usage_tests {
+    use super::*;
+
+    fn parsed_with_cache(prompt_tokens: i64, cached_tokens: i64) -> ParsedResponse {
+        ParsedResponse {
+            model: "gpt-5.6-sol".to_string(),
+            text: "hi".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            prompt_tokens,
+            completion_tokens: 11,
+            cached_tokens,
+            thinking: String::new(),
+            web_searches: Vec::new(),
+            credit_usage: None,
+            credit_unit: None,
+            credit_unit_plural: None,
+        }
+    }
+
+    #[test]
+    fn responses_usage_carries_cached_tokens() {
+        let p = parsed_with_cache(1000, 300);
+        let obj = build_responses_object(&p, &ToolKindMap::new());
+        let usage = &obj["usage"];
+        assert_eq!(usage["input_tokens"], json!(1000));
+        // 曾经这里恒为 0，导致 codex 侧看不到缓存命中。
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(300));
+        assert_eq!(usage["total_tokens"], json!(1011));
+    }
+
+    #[test]
+    fn responses_sse_carries_cached_tokens() {
+        let p = parsed_with_cache(1000, 300);
+        let sse = build_responses_sse(&p, &ToolKindMap::new());
+        assert!(
+            sse.contains("\"cached_tokens\":300"),
+            "response.completed 的 usage 应带 cached_tokens: {sse}"
+        );
     }
 }

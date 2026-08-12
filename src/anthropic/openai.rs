@@ -396,8 +396,20 @@ pub(super) struct ParsedResponse {
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
     pub(super) finish_reason: String,
+    /// OpenAI 口径的输入总量：**含**缓存部分。
+    ///
+    /// Anthropic 的 `input_tokens` 是互斥分摊后的余量（见
+    /// [`super::cache_metering::CacheUsage::split_against_total`]），
+    /// 三项相加才等于真实输入总量，因此这里回填 input + cache_creation + cache_read。
     pub(super) prompt_tokens: i64,
     pub(super) completion_tokens: i64,
+    /// `prompt_tokens` 中命中缓存（cache_read）的部分，对应 OpenAI 的
+    /// `prompt_tokens_details.cached_tokens` / Responses 的
+    /// `input_tokens_details.cached_tokens`。
+    ///
+    /// 只算 cache_read：cache_creation 属于首次写入、不享受缓存折扣，
+    /// 在 OpenAI 口径里并不算 cached。
+    pub(super) cached_tokens: i64,
     /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
     /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
     /// Responses 路径渲染为 reasoning summary item。
@@ -491,14 +503,17 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
 
     let usage = anthropic.get("usage");
-    let prompt_tokens = usage
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let field = |name: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(name))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    // Anthropic 的三项是互斥分摊的（input + creation + read == 真实总量），
+    // OpenAI 的 prompt_tokens 是含缓存的总量，因此这里相加还原。
+    let cached_tokens = field("cache_read_input_tokens");
+    let prompt_tokens = field("input_tokens") + field("cache_creation_input_tokens") + cached_tokens;
+    let completion_tokens = field("output_tokens");
 
     let credit_usage = usage
         .and_then(|u| u.get("credit_usage"))
@@ -519,6 +534,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         finish_reason,
         prompt_tokens,
         completion_tokens,
+        cached_tokens,
         thinking,
         web_searches,
         credit_usage,
@@ -638,10 +654,13 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
 /// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
 /// credit_usage / credit_unit / credit_unit_plural 字段。
 fn build_usage_json(p: &ParsedResponse) -> Value {
+    // prompt_tokens 已含缓存部分，cached_tokens 是其中命中缓存的子集，
+    // 因此 total 不再额外加 cached_tokens（否则重复计数）。
     let mut usage = json!({
         "prompt_tokens": p.prompt_tokens,
         "completion_tokens": p.completion_tokens,
         "total_tokens": p.prompt_tokens + p.completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
     });
     if let Some(credit_usage) = p.credit_usage {
         usage["credit_usage"] = json!(credit_usage);
@@ -677,6 +696,7 @@ mod tests {
             finish_reason: "stop".to_string(),
             prompt_tokens: 7,
             completion_tokens: 11,
+            cached_tokens: 0,
             thinking: String::new(),
             web_searches: Vec::new(),
             credit_usage: None,
@@ -784,5 +804,76 @@ mod tests {
         assert!(p.credit_usage.is_none());
         assert!(p.credit_unit.is_none());
         assert!(p.credit_unit_plural.is_none());
+    }
+}
+
+// 本地新增测试单独成块，避免与上游 mod tests 的增删相撞。
+#[cfg(test)]
+mod cache_usage_tests {
+    use super::*;
+
+    /// 造一个带缓存分摊的 Anthropic 响应体。Anthropic 三项互斥，
+    /// 真实输入总量 = input + creation + read。
+    fn anthropic_with_cache(input: i64, creation: i64, read: i64) -> Value {
+        json!({
+            "id": "msg_x",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": 11,
+                "cache_creation_input_tokens": creation,
+                "cache_read_input_tokens": read,
+            }
+        })
+    }
+
+    #[test]
+    fn prompt_tokens_includes_cache_portions() {
+        // 缓存覆盖 80%：Anthropic 只在 input_tokens 里给出未缓存的 200。
+        let p = parse_anthropic_message(&anthropic_with_cache(200, 500, 300), "claude-opus-4-7");
+        // OpenAI 口径要还原成含缓存的总量，而不是只报剩下的 200。
+        assert_eq!(p.prompt_tokens, 1000);
+        // cached 只算 read，不含 creation（creation 不享受缓存折扣）。
+        assert_eq!(p.cached_tokens, 300);
+    }
+
+    #[test]
+    fn prompt_tokens_without_cache_equals_input() {
+        let p = parse_anthropic_message(&anthropic_with_cache(42, 0, 0), "claude-opus-4-7");
+        assert_eq!(p.prompt_tokens, 42);
+        assert_eq!(p.cached_tokens, 0);
+    }
+
+    #[test]
+    fn missing_cache_fields_default_to_zero() {
+        // 老响应体 / websearch 路径可能不带 cache_* 字段，需退化为纯 input。
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": { "input_tokens": 9, "output_tokens": 2 }
+        });
+        let p = parse_anthropic_message(&anthropic, "claude-opus-4-7");
+        assert_eq!(p.prompt_tokens, 9);
+        assert_eq!(p.cached_tokens, 0);
+    }
+
+    #[test]
+    fn usage_json_carries_cached_tokens_and_total_does_not_double_count() {
+        let p = parse_anthropic_message(&anthropic_with_cache(200, 500, 300), "claude-opus-4-7");
+        let usage = build_usage_json(&p);
+        assert_eq!(usage["prompt_tokens"], json!(1000));
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(300));
+        // cached 是 prompt 的子集，total 不能重复累加。
+        assert_eq!(usage["total_tokens"], json!(1011));
+    }
+
+    #[test]
+    fn stream_sse_carries_cached_tokens() {
+        let p = parse_anthropic_message(&anthropic_with_cache(200, 500, 300), "claude-opus-4-7");
+        let sse = build_stream_sse(&p);
+        assert!(sse.contains("\"cached_tokens\":300"), "SSE 结束帧应带 cached_tokens: {sse}");
     }
 }
