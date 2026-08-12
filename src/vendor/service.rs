@@ -283,52 +283,19 @@ impl PurchaseAuthorization {
     }
 }
 
-/// kiro.ceo webhook 自动提取的首选区域。到货时先抢 EU；库存查询与这笔请求
-/// 并发进行，只在 EU 明确缺货时用于兜底。
-const LEGACY_FAST_ZONE: &str = "eu";
+const LEGACY_EU_ZONE: &str = "eu";
+const LEGACY_US_ZONE: &str = "us";
 
-/// 只有权威的缺货响应才允许换区。超时、断连、5xx 或普通 409 都可能发生在卖家
-/// 已经扣费之后，继续用同一订单号换区有重复购买风险。
-fn is_definitive_zone_stock_miss(error: &VendorServiceError) -> bool {
-    let VendorServiceError::Upstream(upstream) = error else {
-        return false;
-    };
-    // kiro.ceo 的 purchase 端点用 404 表示「无可用 Key」；该状态即使响应体为空
-    // 也能确定未成交。409 还可能是订单参数冲突，必须再核对错误语义。
-    if upstream.status == Some(404) {
-        return true;
+/// 从 kiro.ceo 到货通知里提取区域。两边关键词同时出现时视为歧义，不猜区域。
+pub(super) fn legacy_zone_from_message(message: Option<&str>) -> Option<&'static str> {
+    let message = message?.to_ascii_lowercase();
+    let is_eu = message.contains("欧洲区") || message.contains("eu-central-1");
+    let is_us = message.contains("美国区") || message.contains("us-east-1");
+    match (is_eu, is_us) {
+        (true, false) => Some(LEGACY_EU_ZONE),
+        (false, true) => Some(LEGACY_US_ZONE),
+        _ => None,
     }
-    if upstream.status != Some(409) {
-        return false;
-    }
-    let message = upstream.message.to_ascii_lowercase();
-    [
-        "库存不足",
-        "无可售库存",
-        "暂无可用 key",
-        "out of stock",
-        "insufficient stock",
-        "no available key",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-/// 从并发拿到的库存快照选一个非首选区。数量已经随 EU 请求绑定，故兜底区必须
-/// 能完整满足同一数量，不能为了迁就库存修改 count。
-fn pick_fallback_zone(stock: &StockInfo, excluded: &str, count: u32) -> Option<String> {
-    stock
-        .zones
-        .iter()
-        .filter(|z| z.zone != excluded && z.enabled && z.available >= count)
-        .min_by(|a, b| {
-            let pa = a.unit_price.unwrap_or(f64::INFINITY);
-            let pb = b.unit_price.unwrap_or(f64::INFINITY);
-            pa.total_cmp(&pb)
-                .then(b.available.cmp(&a.available))
-                .then_with(|| a.zone.cmp(&b.zone))
-        })
-        .map(|z| z.zone.clone())
 }
 
 /// 单个卖家的对接服务
@@ -1984,7 +1951,7 @@ impl VendorService {
         //
         // 传 StockPoll：本家关了 stockPollRespectGlobalGate 时，那一步会绕过总闸
         // 继续下单（该开关的字面语义）。池闸、授权判定、并发锁**都不绕**。
-        self.spawn_auto_purchase(event_id, None, AutoPurchaseSource::StockPoll);
+        self.spawn_auto_purchase(event_id, None, AutoPurchaseSource::StockPoll, None);
         Ok(())
     }
 
@@ -2000,10 +1967,14 @@ impl VendorService {
         event_id: String,
         new_keys: Option<u32>,
         source: AutoPurchaseSource,
+        notified_zone: Option<String>,
     ) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(reason) = svc.try_auto_purchase(&event_id, new_keys, source).await {
+            if let Err(reason) = svc
+                .try_auto_purchase(&event_id, new_keys, source, notified_zone.as_deref())
+                .await
+            {
                 tracing::info!(
                     vendor_id = %svc.vendor_id(),
                     event_id = %event_id,
@@ -2083,98 +2054,6 @@ impl VendorService {
         }
     }
 
-    /// kiro.ceo 抢货路径：EU 下单与库存查询同时启动。
-    ///
-    /// EU 成功时库存 future 直接丢弃；EU 明确缺货时才等待/使用库存结果，并只向
-    /// 其它能满足已绑定数量的区域回退。`biased` 保证同一轮 poll 先推进下单 future。
-    async fn purchase_legacy_eu_with_stock_fallback(
-        &self,
-        event_id: &str,
-        count: u32,
-    ) -> Result<PurchaseImportResult, VendorServiceError> {
-        let eu_purchase = self.purchase_for_event_resolved_zone(
-            event_id,
-            count,
-            Some(LEGACY_FAST_ZONE),
-            PurchaseTrigger::Auto,
-        );
-        let stock_lookup = self.stock();
-        tokio::pin!(eu_purchase);
-        tokio::pin!(stock_lookup);
-
-        let (eu_result, completed_stock) = tokio::select! {
-            biased;
-            result = &mut eu_purchase => (result, None),
-            stock = &mut stock_lookup => {
-                let result = eu_purchase.await;
-                (result, Some(stock))
-            }
-        };
-
-        let eu_error = match eu_result {
-            Ok(result) => return Ok(result),
-            Err(error) if is_definitive_zone_stock_miss(&error) => error,
-            Err(error) => return Err(error),
-        };
-
-        let stock = match completed_stock {
-            Some(result) => result,
-            None => stock_lookup.await,
-        };
-        let stock = match stock {
-            Ok(stock) => stock,
-            Err(error) => {
-                tracing::warn!(
-                    vendor_id = %self.vendor_id(),
-                    event_id = %event_id,
-                    "EU 快速下单明确缺货，且并发库存查询失败，停止换区: {}",
-                    error
-                );
-                return Err(eu_error);
-            }
-        };
-
-        let Some(fallback) = pick_fallback_zone(&stock, LEGACY_FAST_ZONE, count) else {
-            tracing::info!(
-                vendor_id = %self.vendor_id(),
-                event_id = %event_id,
-                "EU 快速下单明确缺货，并发库存快照也没有其它可用区域"
-            );
-            return Err(eu_error);
-        };
-
-        let rebound = self
-            .store
-            .rebind_zone_after_definitive_failure(
-                self.vendor_id(),
-                event_id,
-                count,
-                LEGACY_FAST_ZONE,
-                &fallback,
-                &eu_error.to_string(),
-            )
-            .map_err(|e| VendorServiceError::Storage(e.to_string()))?;
-        if !rebound {
-            return Err(VendorServiceError::Storage(format!(
-                "EU 明确缺货后无法把事件区域安全改绑到 {fallback}"
-            )));
-        }
-
-        tracing::info!(
-            vendor_id = %self.vendor_id(),
-            event_id = %event_id,
-            zone = %fallback,
-            "EU 快速下单明确缺货，按并发库存快照回退其它区域"
-        );
-        self.purchase_for_event_resolved_zone(
-            event_id,
-            count,
-            Some(&fallback),
-            PurchaseTrigger::Auto,
-        )
-        .await
-    }
-
     /// 自动提取的实际流程。`Err(原因)` 表示本次不提取，原因会写回事件行。
     ///
     /// `source` 决定总闸能否被绕过，见 [`AutoPurchaseSource`] 与步骤 0。
@@ -2183,8 +2062,16 @@ impl VendorService {
         event_id: &str,
         new_keys: Option<u32>,
         source: AutoPurchaseSource,
+        notified_zone: Option<&str>,
     ) -> Result<(), String> {
         let vid = self.vendor_id();
+        // 防止将来其它调用方误传区域：消息选区严格限定在 kiro.ceo webhook。
+        let notified_zone =
+            if source == AutoPurchaseSource::Webhook && self.flavor() == VendorFlavor::Legacy {
+                notified_zone
+            } else {
+                None
+            };
 
         // 0. 自动提取总闸。排在授权判定之前 —— 它是最便宜的检查，且全局关闭时
         //    不该去消费卖家的失效确认额度。
@@ -2244,26 +2131,28 @@ impl VendorService {
                 .check(auto::pool_alive(&self.vendor_key_states()))?;
         }
 
-        // kiro.ceo 的抢货快路径。只在单次上限恰为 1 时启用，避免跳过库存上限后
-        // 一次提交过大的 count；new_keys=0 仍按普通路径给出完整的数量诊断。
+        // kiro.ceo 的抢货快路径。区域由 webhook 消息决定，不再固定先下 EU。
+        // 只在单次上限恰为 1 时跳过库存查询，避免在未核对库存上限时提交大单；
+        // new_keys=0 仍按普通路径给出完整的数量诊断。
         let configured_max = self.auto_max_count();
         let legacy_fast_path = source == AutoPurchaseSource::Webhook
             && self.flavor() == VendorFlavor::Legacy
             && configured_max == 1
-            && new_keys != Some(0);
-        if legacy_fast_path {
+            && new_keys != Some(0)
+            && notified_zone.is_some();
+        if let (true, Some(zone)) = (legacy_fast_path, notified_zone) {
             self.consume_authorization(&auth)?;
             tracing::info!(
                 vendor_id = %vid,
                 event_id = %event_id,
                 count = 1,
-                zone = LEGACY_FAST_ZONE,
+                zone = zone,
                 auth = auth.source(),
                 auth_detail = auth.detail(),
-                "自动提取开始（EU 下单与库存查询并发）"
+                "自动提取开始（按 kiro.ceo 通知区域快速下单）"
             );
             match self
-                .purchase_legacy_eu_with_stock_fallback(event_id, 1)
+                .purchase_for_event_resolved_zone(event_id, 1, Some(zone), PurchaseTrigger::Auto)
                 .await
             {
                 Ok(r) => {
@@ -2290,9 +2179,28 @@ impl VendorService {
             .map_err(|e| format!("查询可提取上限失败: {e}"))?;
         // 分区卖家的 stock.available 是各区之和，拿它算数量会超出单区实际库存 ——
         // 下单只落在一个区，超出部分必然提不到。故按实际要用的那个区的量算。
-        let picked = stock.pick_zone();
+        let picked = match notified_zone {
+            // 只有 kiro.ceo webhook 会传该值。该供应商 purchase 的 zone 只接受
+            // `us` / `eu`，因此库存校验和随后下单都必须沿用这个短码。
+            Some(zone)
+                if source == AutoPurchaseSource::Webhook
+                    && self.flavor() == VendorFlavor::Legacy =>
+            {
+                stock.zones.iter().find(|z| {
+                    z.enabled
+                        && z.available > 0
+                        && z.zone.eq_ignore_ascii_case(zone)
+                })
+            }
+            _ => stock.pick_zone(),
+        };
         let zone_max = picked.map_or(stock.available, |z| z.available);
         if self.capabilities().zoned_purchase && picked.is_none() {
+            if let Some(zone) = notified_zone {
+                return Err(format!(
+                    "kiro.ceo 通知指定区域 {zone}，但该区当前无可提取库存"
+                ));
+            }
             return Err("各区均无库存，本轮不自动提取".to_string());
         }
         // 只读一次：时段边界附近两次调用可能拿到不同值，会让判定与文案对不上
@@ -2307,7 +2215,9 @@ impl VendorService {
             ));
         }
         // 同一份库存快照同时决定数量和区域，随后直接绑定并下单，不再重复查库存。
-        let zone_hint = picked.map(|z| z.zone.clone());
+        let zone_hint = notified_zone
+            .map(str::to_string)
+            .or_else(|| picked.map(|z| z.zone.clone()));
 
         // 5. 消费确认额度。抢占式，确保一次确认只授权一轮提取。
         //    仅卖家事件那条路有额度可消费；就地盘点不消费任何东西，
@@ -2928,72 +2838,29 @@ mod tests {
         assert_ne!(a.vendor_id, b.vendor_id);
     }
 
-    fn upstream_error(status: Option<u16>, message: &str) -> VendorServiceError {
-        VendorServiceError::Upstream(VendorApiError {
-            status,
-            message: message.to_string(),
-        })
-    }
-
     #[test]
-    fn 只有明确缺货响应才允许eu失败后换区() {
-        assert!(is_definitive_zone_stock_miss(&upstream_error(
-            Some(409),
-            "库存不足：欧洲区当前无可售库存"
-        )));
-        assert!(is_definitive_zone_stock_miss(&upstream_error(
-            Some(404),
-            ""
-        )));
-
-        assert!(!is_definitive_zone_stock_miss(&upstream_error(
-            Some(409),
-            "client_order_id 已绑定其它参数"
-        )));
-        assert!(!is_definitive_zone_stock_miss(&upstream_error(
-            Some(500),
-            "库存不足"
-        )));
-        assert!(!is_definitive_zone_stock_miss(&upstream_error(
+    fn kiroceo_按通知关键词选择下单短码() {
+        assert_eq!(
+            legacy_zone_from_message(Some("欧洲区新增 1 个 Key 已就绪")),
+            Some("eu")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("美国区新增 2 个 Key 已就绪")),
+            Some("us")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("US-EAST-1 新增 1 个 Key")),
+            Some("us")
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("新增 1 个 Key 已就绪")),
+            None
+        );
+        assert_eq!(
+            legacy_zone_from_message(Some("欧洲区转移到美国区")),
             None,
-            "request timed out"
-        )));
-    }
-
-    #[test]
-    fn eu缺货后的兜底区必须满足已绑定数量() {
-        use crate::vendor::protocol::ZoneStock;
-
-        let stock = StockInfo {
-            zones: vec![
-                ZoneStock {
-                    zone: "eu".to_string(),
-                    available: 10,
-                    unit_price: Some(10.0),
-                    enabled: true,
-                    ..Default::default()
-                },
-                ZoneStock {
-                    zone: "us".to_string(),
-                    available: 1,
-                    unit_price: Some(80.0),
-                    enabled: true,
-                    ..Default::default()
-                },
-                ZoneStock {
-                    zone: "ap".to_string(),
-                    available: 2,
-                    unit_price: Some(70.0),
-                    enabled: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
-        assert_eq!(pick_fallback_zone(&stock, "eu", 1).as_deref(), Some("ap"));
-        assert_eq!(pick_fallback_zone(&stock, "eu", 2).as_deref(), Some("ap"));
-        assert_eq!(pick_fallback_zone(&stock, "eu", 3), None);
+            "同时出现两个区域时不能猜"
+        );
     }
 }
 
