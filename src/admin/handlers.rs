@@ -26,7 +26,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
-        SetTrafficIngressRequest,
+        SetConcurrencyGateRequest, SetTrafficIngressRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -615,6 +615,22 @@ pub async fn set_traffic_ingress_state(
     Json(payload): Json<SetTrafficIngressRequest>,
 ) -> impl IntoResponse {
     match state.service.set_traffic_ingress_enabled(payload.enabled) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/concurrency-gate
+pub async fn get_concurrency_gate_state(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_concurrency_gate_state())
+}
+
+/// PUT /api/admin/config/concurrency-gate
+pub async fn set_concurrency_gate_state(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetConcurrencyGateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_concurrency_gate_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

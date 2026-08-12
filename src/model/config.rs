@@ -744,6 +744,151 @@ fn default_traffic_ingress_base_url() -> String {
     "https://g7e6ai.com".to_string()
 }
 
+/// 并发联动：把本地有效凭证的 RPM 总量按固定除数换算成外部账号的并发上限。
+///
+/// 与健康联动（推 `schedulable`）、流量入口（推 `schedulable`）是三件独立的事：
+/// 这里推的是 `concurrency`，即「能接多少」而非「要不要接」。同一个外部账号被
+/// 两个模块分别写这两个字段不冲突。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyGateConfig {
+    /// 是否启用联动。关闭时不再推送，外部账号保留最后推上去的值。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 外部系统基址。默认 4code.us —— 它的上游正是本机，容量口径才对得上。
+    #[serde(default = "default_concurrency_gate_base_url")]
+    pub base_url: String,
+
+    /// 外部系统的 Admin Token。
+    #[serde(default)]
+    pub token: String,
+
+    /// 传 token 用的请求头名，协议与健康联动一致。
+    #[serde(default = "default_health_gate_auth_header")]
+    pub auth_header: String,
+
+    /// 需要同步并发上限的外部账号 ID。
+    #[serde(default)]
+    pub account_ids: Vec<u64>,
+
+    /// 换算除数：并发 = 有效 RPM 总量 / divisor，向下取整。
+    #[serde(default = "default_concurrency_gate_divisor")]
+    pub divisor: u32,
+
+    /// 手动覆盖并发值。`Some(n)` 时直接推 n，忽略换算结果；`None` 走自动换算。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_concurrency: Option<u32>,
+
+    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值。
+    #[serde(default = "default_concurrency_gate_unlimited_rpm")]
+    pub unlimited_rpm: u32,
+
+    /// 推上去的并发下限，避免算出 0 导致外部账号完全停摆。
+    #[serde(default = "default_concurrency_gate_min")]
+    pub min_concurrency: u32,
+
+    /// 推上去的并发上限，兜住换算异常放大。
+    #[serde(default = "default_concurrency_gate_max")]
+    pub max_concurrency: u32,
+
+    /// 重算周期。RPM 总量只随凭证增删/启停变化，不必太密。
+    #[serde(default = "default_concurrency_gate_interval_secs")]
+    pub check_interval_secs: u64,
+
+    /// 即使目标值没变也定期重推一次，用于纠正对方后台被手动改动造成的漂移。
+    #[serde(default = "default_health_gate_reaffirm_interval_secs")]
+    pub reaffirm_interval_secs: u64,
+
+    /// 单个账号一次推送最多尝试次数，含首发。
+    #[serde(default = "default_health_gate_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for ConcurrencyGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_concurrency_gate_base_url(),
+            token: String::new(),
+            auth_header: default_health_gate_auth_header(),
+            account_ids: Vec::new(),
+            divisor: default_concurrency_gate_divisor(),
+            manual_concurrency: None,
+            unlimited_rpm: default_concurrency_gate_unlimited_rpm(),
+            min_concurrency: default_concurrency_gate_min(),
+            max_concurrency: default_concurrency_gate_max(),
+            check_interval_secs: default_concurrency_gate_interval_secs(),
+            reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
+            max_attempts: default_health_gate_max_attempts(),
+        }
+    }
+}
+
+impl ConcurrencyGateConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
+            && !self.token.trim().is_empty()
+            && !self.account_ids.is_empty()
+    }
+
+    pub fn normalized_base_url(&self) -> &str {
+        self.base_url.trim().trim_end_matches('/')
+    }
+
+    pub fn auth_header(&self) -> &str {
+        let header = self.auth_header.trim();
+        if header.is_empty() { "X-API-Key" } else { header }
+    }
+
+    /// 除数为 0 时按默认值处理，避免配置写错导致除零。
+    pub fn effective_divisor(&self) -> u32 {
+        if self.divisor == 0 {
+            default_concurrency_gate_divisor()
+        } else {
+            self.divisor
+        }
+    }
+
+    /// 把有效 RPM 总量换算为要推送的并发值，并夹到 [min, max]。
+    ///
+    /// 手动值同样受夹取约束：它是「跳过换算」，不是「跳过安全边界」。
+    pub fn resolve_concurrency(&self, total_rpm: u32) -> u32 {
+        let raw = match self.manual_concurrency {
+            Some(manual) => manual,
+            None => total_rpm / self.effective_divisor(),
+        };
+        let high = self.max_concurrency.max(self.min_concurrency);
+        raw.clamp(self.min_concurrency, high)
+    }
+}
+
+fn default_concurrency_gate_base_url() -> String {
+    "https://4code.us".to_string()
+}
+
+fn default_concurrency_gate_divisor() -> u32 {
+    6
+}
+
+/// 与被禁用凭证上常见的 `rpmLimit: 300` 对齐，作为不限速凭证的折算口径。
+fn default_concurrency_gate_unlimited_rpm() -> u32 {
+    300
+}
+
+fn default_concurrency_gate_min() -> u32 {
+    1
+}
+
+fn default_concurrency_gate_max() -> u32 {
+    200
+}
+
+fn default_concurrency_gate_interval_secs() -> u64 {
+    60
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -931,6 +1076,10 @@ pub struct Config {
     /// 手动流量入口：控制 g7e6ai.com 指定账号的 schedulable 开关。
     #[serde(default)]
     pub traffic_ingress: TrafficIngressConfig,
+
+    /// 并发联动：把本地有效凭证的 RPM 总量换算成外部账号的并发上限。默认关闭。
+    #[serde(default)]
+    pub concurrency_gate: ConcurrencyGateConfig,
 
     /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
     /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
@@ -1145,6 +1294,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             health_gate: HealthGateConfig::default(),
             traffic_ingress: TrafficIngressConfig::default(),
+            concurrency_gate: ConcurrencyGateConfig::default(),
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,

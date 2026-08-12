@@ -1920,6 +1920,34 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 可用凭据的 `rpm_limit` 总量，口径与 [`Self::available_count`] 完全一致。
+    ///
+    /// `rpm_limit == 0` 在本地表示不限速（见 `is_rpm_exceeded`），直接求和会把它算成
+    /// 0，反而低估容量。故按 `unlimited_rpm` 折算计入——它是个估值，不是真实上限。
+    ///
+    /// 返回 `(总量, 其中按不限速折算的凭据数)`。后者供调用方决定是否要提示这次总量
+    /// 掺了估值。
+    pub fn available_rpm_total(&self, unlimited_rpm: u32) -> (u32, usize) {
+        let now = Instant::now();
+        let mut total: u32 = 0;
+        let mut unlimited = 0usize;
+        for entry in self
+            .entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+        {
+            let limit = entry.credentials.rpm_limit;
+            if limit == 0 {
+                unlimited += 1;
+                total = total.saturating_add(unlimited_rpm);
+            } else {
+                total = total.saturating_add(limit);
+            }
+        }
+        (total, unlimited)
+    }
+
     /// 当前请求排除现用凭据后，是否还有另一个凭据可用于故障转移。
     pub(crate) fn has_failover_target_for_request(
         &self,
@@ -7197,6 +7225,61 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    /// 并发联动的分母：口径必须与 available_count 完全一致，否则面板显示的可用数
+    /// 与推给外部的并发对不上账。
+    #[test]
+    fn test_available_rpm_total_skips_disabled_and_folds_unlimited() {
+        let mut a = grouped_cred("a", &[]);
+        a.rpm_limit = 15;
+        let mut b = grouped_cred("b", &[]);
+        b.rpm_limit = 12;
+        // 被禁用的即使 rpm_limit 很大也不计入。
+        let mut disabled = grouped_cred("disabled", &[]);
+        disabled.rpm_limit = 300;
+        disabled.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![a, b, disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (total, unlimited) = manager.available_rpm_total(300);
+        assert_eq!(total, 27, "只累加未禁用的 15 + 12");
+        assert_eq!(unlimited, 0);
+        assert_eq!(
+            manager.available_count(),
+            2,
+            "求和口径应与 available_count 一致"
+        );
+    }
+
+    /// rpm_limit=0 本地表示不限速，直接求和会算成 0 反而低估容量，
+    /// 故按折算值计入并回报命中数量。
+    #[test]
+    fn test_available_rpm_total_counts_unlimited_credentials() {
+        let mut limited = grouped_cred("limited", &[]);
+        limited.rpm_limit = 12;
+        let mut unlimited_cred = grouped_cred("unlimited", &[]);
+        unlimited_cred.rpm_limit = 0;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![limited, unlimited_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (total, unlimited) = manager.available_rpm_total(300);
+        assert_eq!(total, 312, "12 + 折算的 300");
+        assert_eq!(unlimited, 1, "应回报有 1 条按折算值计入");
     }
 
     #[test]

@@ -33,7 +33,9 @@ pub mod recent_spend;
 pub mod health_gate;
 pub mod health_probe;
 pub mod traffic_ingress;
+pub mod concurrency_gate;
 mod schedulable_client;
+mod concurrency_client;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;

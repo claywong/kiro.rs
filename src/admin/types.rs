@@ -590,6 +590,56 @@ pub struct SetTrafficIngressRequest {
     pub enabled: bool,
 }
 
+/// 并发联动状态。响应不包含外部系统 token。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyGateStateResponse {
+    /// baseUrl / token / accountIds 是否已经填全
+    pub configured: bool,
+    /// 联动是否启用。未配置时恒为 false
+    pub enabled: bool,
+    /// 外部系统基址
+    pub base_url: String,
+    /// 受控账号数
+    pub account_count: usize,
+    /// 当前换算除数
+    pub divisor: u32,
+    /// 手动并发值；null 表示走自动换算
+    pub manual_concurrency: Option<u32>,
+    /// 有效凭证的 rpmLimit 总量（不限速项按 unlimitedRpm 折算）
+    pub rpm_total: u32,
+    /// 上述总量里按不限速折算的凭证数；> 0 说明总量掺了估值
+    pub unlimited_credentials: usize,
+    /// 当前该推的并发值（已含夹取），面板据此预览
+    pub resolved_concurrency: u32,
+    /// 最近一次成功推送的并发值；null 表示尚未成功同步
+    pub applied_concurrency: Option<u32>,
+    pub min_concurrency: u32,
+    pub max_concurrency: u32,
+}
+
+/// 并发联动更新请求。三个字段都是可选的，各自独立提交。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyGateRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub divisor: Option<u32>,
+    /// 双层 Option：外层 None = 未提交该字段，内层 None = 显式传 null 清除手动值。
+    #[serde(default, deserialize_with = "deserialize_optional_option")]
+    pub manual_concurrency: Option<Option<u32>>,
+}
+
+/// 让 `{"manualConcurrency": null}` 反序列化成 `Some(None)`，而字段缺省为 `None`。
+/// serde 默认会把两者都变成 `None`，那就无法表达「清除手动值」。
+fn deserialize_optional_option<'de, D>(deserializer: D) -> Result<Option<Option<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u32>::deserialize(deserializer).map(Some)
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1244,6 +1294,41 @@ mod rpm_tests {
         let request: UpdateCredentialRequest =
             serde_json::from_str(r#"{"rpmLimit":0}"#).unwrap();
         assert_eq!(request.rpm_limit, Some(0));
+    }
+}
+
+/// 并发联动请求的三态语义：字段缺省 / 显式 null / 具体值，必须能区分开。
+/// 缺省与 null 若都塌成 None，「清除手动值回到自动换算」就没法表达。
+#[cfg(test)]
+mod concurrency_gate_request_tests {
+    use super::SetConcurrencyGateRequest;
+
+    #[test]
+    fn 手动值字段缺省与显式null可区分() {
+        let omitted: SetConcurrencyGateRequest =
+            serde_json::from_str(r#"{"divisor":6}"#).unwrap();
+        assert_eq!(omitted.manual_concurrency, None, "缺省应为未提交");
+
+        let cleared: SetConcurrencyGateRequest =
+            serde_json::from_str(r#"{"manualConcurrency":null}"#).unwrap();
+        assert_eq!(
+            cleared.manual_concurrency,
+            Some(None),
+            "显式 null 应为清除手动值"
+        );
+
+        let set: SetConcurrencyGateRequest =
+            serde_json::from_str(r#"{"manualConcurrency":50}"#).unwrap();
+        assert_eq!(set.manual_concurrency, Some(Some(50)));
+    }
+
+    #[test]
+    fn 三个字段均可单独提交() {
+        let only_enabled: SetConcurrencyGateRequest =
+            serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(only_enabled.enabled, Some(true));
+        assert_eq!(only_enabled.divisor, None);
+        assert_eq!(only_enabled.manual_concurrency, None);
     }
 }
 
