@@ -302,7 +302,8 @@ function StrategyMenu({ controls }: { controls: ToolControls }) {
           )}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-[80vh] w-72 overflow-y-auto">
+      {/* w-80：流量入口/健康联动那几行是左右对开的键值，w-72 下右侧数值容易被挤断 */}
+      <DropdownMenuContent align="end" className="max-h-[80vh] w-80 overflow-y-auto">
         <DropdownMenuLabel>负载均衡</DropdownMenuLabel>
         <DropdownMenuItem
           disabled={controls.isLoadingMode || controls.isSettingMode}
