@@ -2582,9 +2582,10 @@ mod thinking_override_tests {
     fn adaptive_only_models_get_adaptive_with_effort() {
         // 旧逻辑只认 opus 4.6 / sonnet-5，这批会被漏判成 enabled。
         for model in [
-            // opus 4.6 是 Kiro 侧约束（只在 adaptive 下接受 output_config），
-            // 上游原本就这样判，保持不变。
+            // 4.6 两款按 Kiro per-model 表只列 adaptive/disabled；opus 4.6 另有
+            // Kiro 侧约束（只在 adaptive 下接受 output_config）。
             "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6-thinking",
             "claude-opus-4-7-thinking",
             "claude-opus-4-8-thinking",
             "claude-opus-5-thinking",
@@ -2609,8 +2610,8 @@ mod thinking_override_tests {
 
     #[test]
     fn fixed_budget_models_stay_enabled() {
-        // Sonnet 4.6 在 enabled 下即可带 output_config，维持 enabled + budget_tokens。
-        for model in ["claude-sonnet-4-6-thinking", "claude-sonnet-4-5-thinking"] {
+        // 4.5 及更早只支持固定预算，维持 enabled + budget_tokens。
+        for model in ["claude-sonnet-4-5-thinking", "claude-opus-4-5-thinking"] {
             let mut payload = request_with_model(model);
             override_thinking_from_model_name(&mut payload);
 

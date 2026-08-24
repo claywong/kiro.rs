@@ -1,4 +1,8 @@
-//! Anthropic adaptive thinking 模型判定（本地特性）。
+//! 按模型的 reasoning 能力判定（本地特性）。
+//!
+//! 收拢两件按 backend_id 分模型的判定：thinking 模式（adaptive vs 固定预算）与
+//! effort 阶梯是否含 `xhigh`。二者依据不同来源——前者主要看 Anthropic 官方语义与
+//! Kiro 侧约束，后者看 Kiro 官方 per-model 表，故分别在各函数文档中注明。
 //!
 //! 官方规则（`code.claude.com/docs/en/model-config`）：**Fable 5、Sonnet 5、
 //! Opus 4.7 及更新的模型一律使用 adaptive reasoning，固定思考预算模式不适用**。
@@ -26,17 +30,19 @@
 /// 判定规则刻意贴着**枚举**，不做跨族的版本外推：
 ///
 /// - Claude 5 代全系（主版本 >= 5）→ true。整代都只有 adaptive。
-/// - `opus` 主版本 4 且次版本 >= 6 → true。这里 4.6 与 4.7+ 的理由不同但结论一致：
+/// - `opus` / `sonnet` 主版本 4 且次版本 >= 6 → true。这里 4.6 与 4.7+ 的理由不同但结论一致：
 ///   - 4.7+ 是官方 adaptive-only（发 `budget_tokens` 会 400）；
 ///   - **4.6 是 Kiro 侧约束**——上游只在 adaptive 下接受 `output_config`，普通
 ///     `enabled` 会 400，故 `native_reasoning_requested` 对它硬要求 adaptive
 ///     （见 `converter.rs` 同名函数与 `test_enabled_thinking_does_not_emit_output_config_for_opus_4_6`）。
 ///     若这里把 4.6 判成 enabled，它的 effort 字段会彻底不下发，是功能回退。
+///   - **Sonnet 4.6** 技术上在 `enabled` 下也能带 `output_config`（见 converter 的
+///     `enabled_thinking_emits_output_config_for_sonnet_4_6`），但 Kiro 官方
+///     per-model 表（<https://kiro.dev/docs/models/effort>）对它只列
+///     `thinking.type: adaptive | disabled`，无 `enabled`；Anthropic 侧也建议
+///     两种模式都可用时用 adaptive。故与 Opus 4.6 统一走 adaptive。
 /// - `fable` / `mythos` → true。这两族自 5 起才存在。
-/// - 其余一律 false，典型：
-///   - **Sonnet 4.6** 在 `enabled` 下就能带 `output_config`（见 converter 的
-///     `enabled_thinking_emits_output_config_for_sonnet_4_6`），无须转 adaptive；
-///   - 4.5 及更早只支持固定预算。
+/// - 其余一律 false：4.5 及更早只支持固定预算。
 ///
 /// 无法解析的形态按 false 处理：宁可多注一个无用标签，也不要把本该带预算的模型
 /// 误判成 adaptive。
@@ -56,16 +62,13 @@ pub fn backend_requires_adaptive_thinking(backend_id: &str) -> bool {
     for family in ["opus", "sonnet"] {
         if let Some(rest) = body.strip_prefix(family) {
             let (major, minor) = parse_version(rest.trim_start_matches(['-', '.']));
-            let Some(major) = major else {
-                return false;
+            return match (major, minor) {
+                // Claude 5 代全系只有 adaptive。
+                (Some(major), _) if major >= 5 => true,
+                // 4.6 起走 adaptive；取 >= 4.6 而非 4.7，见函数文档。
+                (Some(4), Some(minor)) => minor >= 6,
+                _ => false,
             };
-            // Claude 5 代全系只有 adaptive，与族无关。
-            if major >= 5 {
-                return true;
-            }
-            // 门槛只对 opus 成立；sonnet 4.x 一律走固定预算（4.6 在 enabled 下即可
-            // 带 output_config）。opus 取 >= 4.6 而非 4.7，见函数文档。
-            return family == "opus" && major == 4 && minor.is_some_and(|m| m >= 6);
         }
     }
 
@@ -80,6 +83,41 @@ fn parse_version(version: &str) -> (Option<u32>, Option<u32>) {
     (major, minor)
 }
 
+/// 该 backend 是否接受 `xhigh` effort 档位。
+///
+/// 依据 Kiro 官方文档 <https://kiro.dev/docs/models/effort> 的 per-model 表
+/// （页面更新于 2026-08-04）：**Opus 4.6 与 Sonnet 4.6 只接受
+/// `low / medium / high / max`，没有 `xhigh`**；Opus 4.7 / 4.8 / Opus 5 /
+/// Sonnet 5 与 GPT-5.6 三款则含 `xhigh`。
+///
+/// 注意 `max` 这两个模型是支持的，缺的只有 `xhigh`——xhigh 档位晚于 max 引入，
+/// 故存在「支持 max 但不支持 xhigh」的空洞，不能按阶梯高低推断。
+///
+/// 表中未列出的模型（Fable 5 / Mythos 5 / 自定义模型等）按原样放行，不做保守降级：
+/// 无依据的降级会静默削弱请求，比撞一次 400 更难发现。
+///
+/// 与本仓库历史决策的关系：`a50c2fc` 曾依实测「上游各档位均已受支持」删除整套降级
+/// 名单。本函数按 Kiro 文档重新引入，但只针对文档明确列出缺 `xhigh` 的两个模型，
+/// 不恢复原先覆盖 4.5 系 / haiku 的大名单——那部分模型本就不在
+/// `model_reasoning_field_style` 白名单内，走不到这里。
+pub fn backend_supports_xhigh_effort(backend_id: &str) -> bool {
+    let id = backend_id.trim().to_ascii_lowercase();
+    let Some(body) = id.strip_prefix("claude-") else {
+        // 非 Claude（GPT-5.6 等）按文档均支持 xhigh。
+        return true;
+    };
+
+    for family in ["opus", "sonnet"] {
+        if let Some(rest) = body.strip_prefix(family) {
+            let (major, minor) = parse_version(rest.trim_start_matches(['-', '.']));
+            // 仅 4.6 两款缺 xhigh；其余（含未知版本）放行。
+            return !(major == Some(4) && minor == Some(6));
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +125,7 @@ mod tests {
     #[test]
     fn adaptive_only_models_are_detected() {
         for id in [
+            "claude-sonnet-4.6",
             "claude-opus-4.7",
             "claude-opus-4.8",
             "claude-opus-5",
@@ -103,14 +142,8 @@ mod tests {
 
     #[test]
     fn fixed_budget_models_are_excluded() {
-        // Sonnet 4.6 在 enabled 下即可带 output_config，无须转 adaptive；
-        // 4.5 及更早只支持固定预算。
-        for id in [
-            "claude-sonnet-4.6",
-            "claude-opus-4.5",
-            "claude-sonnet-4.5",
-            "claude-haiku-4.5",
-        ] {
+        // 4.5 及更早只支持固定预算（发 adaptive 会 400）。
+        for id in ["claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5"] {
             assert!(
                 !backend_requires_adaptive_thinking(id),
                 "{id} 不应判定为仅支持 adaptive"
@@ -141,23 +174,68 @@ mod tests {
         }
     }
 
-    /// 4.x 的版本门槛只对 opus 成立，不可外推到 sonnet。
-    ///
-    /// 同为 4.6：opus 必须 adaptive（Kiro 侧只在 adaptive 下接受 output_config），
-    /// sonnet 则在 enabled 下就能带 output_config，两者结论相反。
+    /// 4.6 是分界线，且对 opus / sonnet 一视同仁。
     #[test]
-    fn version_threshold_does_not_generalize_across_families() {
-        assert!(
-            backend_requires_adaptive_thinking("claude-opus-4.6"),
-            "opus 4.6 应判为 adaptive"
-        );
-        assert!(
-            !backend_requires_adaptive_thinking("claude-sonnet-4.6"),
-            "同为 4.6，sonnet 不应跟着 opus 判为 adaptive"
-        );
-        // 但 5 代全系与族无关，一律 adaptive。
-        assert!(backend_requires_adaptive_thinking("claude-sonnet-5"));
-        assert!(backend_requires_adaptive_thinking("claude-opus-5"));
+    fn boundary_sits_at_4_6_for_both_families() {
+        for id in ["claude-opus-4.6", "claude-sonnet-4.6"] {
+            assert!(
+                backend_requires_adaptive_thinking(id),
+                "{id} 应判为 adaptive"
+            );
+        }
+        for id in ["claude-opus-4.5", "claude-sonnet-4.5"] {
+            assert!(
+                !backend_requires_adaptive_thinking(id),
+                "{id} 在分界线以下，不应判为 adaptive"
+            );
+        }
+    }
+
+    /// Kiro per-model 表：仅 Opus 4.6 / Sonnet 4.6 缺 xhigh。
+    #[test]
+    fn only_4_6_models_lack_xhigh() {
+        for id in ["claude-opus-4.6", "claude-sonnet-4.6", "claude-opus-4-6"] {
+            assert!(
+                !backend_supports_xhigh_effort(id),
+                "{id} 按 Kiro 表不接受 xhigh"
+            );
+        }
+        for id in [
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(backend_supports_xhigh_effort(id), "{id} 应接受 xhigh");
+        }
+    }
+
+    /// 表中未列出的模型按原样放行，不做无依据的保守降级。
+    #[test]
+    fn undocumented_models_pass_xhigh_through() {
+        for id in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-unknown-9",
+            "my-custom-model",
+        ] {
+            assert!(
+                backend_supports_xhigh_effort(id),
+                "{id} 未在 Kiro 表中，应原样放行而非降级"
+            );
+        }
+    }
+
+    /// max 与 xhigh 是两个独立档位：4.6 两款支持 max 但不支持 xhigh，
+    /// 不能按「档位越高越不支持」推断。
+    #[test]
+    fn xhigh_gap_does_not_imply_max_gap() {
+        assert!(!backend_supports_xhigh_effort("claude-opus-4.6"));
+        // max 的支持性不由本函数表达，此处仅锁定语义边界：本函数只回答 xhigh。
+        assert!(backend_supports_xhigh_effort("claude-opus-4.7"));
     }
 
     #[test]
