@@ -732,7 +732,7 @@ mod tests {
             self_heal_consecutive_rounds: 3,
             self_heal_total_count: 8,
             last_self_heal_at: Some("2026-07-29T00:00:00Z".to_string()),
-            self_heal_model: Some("claude-sonnet-4.8".to_string()),
+            self_heal_model: Some("claude-sonnet-4.6".to_string()),
             ..KiroCredentials::default()
         };
 
@@ -746,7 +746,7 @@ mod tests {
             parsed.last_self_heal_at.as_deref(),
             Some("2026-07-29T00:00:00Z")
         );
-        assert_eq!(parsed.self_heal_model.as_deref(), Some("claude-sonnet-4.8"));
+        assert_eq!(parsed.self_heal_model.as_deref(), Some("claude-sonnet-4.6"));
     }
 
     #[test]

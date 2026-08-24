@@ -311,7 +311,6 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -370,7 +369,7 @@ fn reasoning_field_key(model_id: &str) -> ReasoningFieldStyle {
 /// bool 两态，「支持」与「output_config」同义），导致自定义模型指向 gpt-5.x 时下发
 /// `output_config` 撞上述 400，而直连同一后端却正常。
 ///
-/// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
+/// 其余（4.5 系、haiku，以及 deepseek / minimax / glm / qwen 等
 /// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
 /// （`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
@@ -1920,19 +1919,6 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_sonnet_4_8() {
-        assert_eq!(
-            map_model("claude-sonnet-4-8"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.8-thinking"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
-    }
-
-    #[test]
     fn test_map_model_opus_5() {
         assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
         assert_eq!(
@@ -2148,12 +2134,12 @@ mod tests {
 
     #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
-        let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
+        let req = minimal_request_with_output_config("claude-sonnet-4-5-20250929-thinking");
         let result = convert_request(&req).unwrap();
 
         assert!(
             result.additional_model_request_fields.is_none(),
-            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+            "sonnet 4.5 rejects additionalModelRequestFields even when the client sends output_config"
         );
     }
 
@@ -2544,7 +2530,6 @@ mod tests {
         }
         // 未确认的模型 → 不下发
         for m in [
-            "claude-sonnet-4.8",
             "claude-sonnet-4.5",
             "claude-opus-4.5",
             "claude-haiku-4.5",
