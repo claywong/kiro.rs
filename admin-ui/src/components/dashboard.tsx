@@ -54,6 +54,7 @@ import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -136,6 +137,7 @@ import {
   parseError,
   generateApiKey,
   formatNumber,
+  formatCredits,
   overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
@@ -427,6 +429,80 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   })();
   const overageEnableableCount = overageStats.disabledOff;
   const overageRetryableCount = overageStats.disabledOff + overageStats.unknown;
+
+  /**
+   * 汇总条数据：额度池 / RPM 水位 / 近 1 分钟消耗。
+   *
+   * 三项都只统计「未禁用」凭据——禁用账号的额度和限速进不了调度，
+   * 计进来会让容量虚高，反而误导扩容判断。
+   *
+   * 额度池的分母只累加「已拿到余额」的凭据（余额是后端 5 分钟缓存 + 懒加载，
+   * 未查询过的凭据没有 balance），所以额外暴露 covered/total 让人知道这个
+   * 百分比的采样覆盖率；覆盖不全时百分比仍然可用，但绝对值偏小。
+   */
+  const poolStats = (() => {
+    const creds = data?.credentials ?? [];
+    let remaining = 0;
+    let limit = 0;
+    let covered = 0;
+    let active = 0;
+    let rpmLimit = 0;
+    let rpmCurrent = 0;
+    let unlimitedRpm = 0;
+    for (const c of creds) {
+      if (c.disabled) continue;
+      active += 1;
+      const b = balanceMap.get(c.id) || c.balance;
+      if (b && b.usageLimit > 0) {
+        covered += 1;
+        limit += b.usageLimit;
+        remaining += Math.max(b.remaining, 0);
+      }
+      rpmCurrent += c.rpmCurrent;
+      // rpmLimit === 0 表示不限速，累加会把总量算成 0 上限，单独计数
+      if (c.rpmLimit > 0) rpmLimit += c.rpmLimit;
+      else unlimitedRpm += 1;
+    }
+    const used = Math.max(limit - remaining, 0);
+    return {
+      remaining,
+      limit,
+      used,
+      usedPct: limit > 0 ? (used / limit) * 100 : 0,
+      covered,
+      active,
+      rpmLimit,
+      rpmCurrent,
+      unlimitedRpm,
+      rpmPct: rpmLimit > 0 ? (rpmCurrent / rpmLimit) * 100 : 0,
+    };
+  })();
+
+  /** 近 windowSecs 秒内的额度消耗汇总；activeCount = 该窗口内真正出过量的凭据数 */
+  const recentSpendStats = (() => {
+    const spend = recentSpendData?.spend ?? {};
+    let total = 0;
+    let activeCount = 0;
+    let topId: number | null = null;
+    let topValue = 0;
+    for (const [id, v] of Object.entries(spend)) {
+      if (!Number.isFinite(v) || v <= 0) continue;
+      total += v;
+      activeCount += 1;
+      if (v > topValue) {
+        topValue = v;
+        topId = Number(id);
+      }
+    }
+    return {
+      total,
+      activeCount,
+      topId,
+      topValue,
+      windowSecs: recentSpendData?.windowSecs ?? 60,
+      hasData: recentSpendData != null,
+    };
+  })();
 
   useEffect(() => {
     setCurrentPage(1);
@@ -1276,6 +1352,126 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 ) : (
                   data?.currentId && <Badge variant="success">当前优先</Badge>
                 )}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* 汇总条：额度池 / RPM 水位 / 近 1 分钟消耗 */}
+        <div className="mb-5 grid grid-cols-1 gap-2 sm:mb-6 sm:grid-cols-3 sm:gap-4">
+          {/* 额度池总览 */}
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="flex items-baseline justify-between gap-2">
+                <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                  额度池剩余
+                </div>
+                <div
+                  className="text-[10px] tabular-nums text-muted-foreground"
+                  title={`已采到余额的未禁用凭据 ${poolStats.covered} / ${poolStats.active}；未查询余额的凭据不计入总量`}
+                >
+                  采样 {poolStats.covered}/{poolStats.active}
+                </div>
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1.5 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {formatCredits(poolStats.remaining)}
+                </span>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  / {formatCredits(poolStats.limit)}
+                </span>
+              </div>
+              <Progress
+                className="mt-2"
+                value={poolStats.usedPct}
+                max={100}
+                title={`已用 ${formatCredits(poolStats.used)} credits（${poolStats.usedPct.toFixed(1)}%）`}
+              />
+              <div className="mt-1.5 text-[11px] tabular-nums text-muted-foreground">
+                已用 {poolStats.usedPct.toFixed(1)}%
+                {quotaExceededCount > 0 && (
+                  <span className="ml-2 text-rose-600 dark:text-rose-400">
+                    {quotaExceededCount} 个已枯竭
+                  </span>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* RPM 水位 */}
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="flex items-baseline justify-between gap-2">
+                <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                  RPM 水位
+                </div>
+                {poolStats.unlimitedRpm > 0 && (
+                  <div
+                    className="text-[10px] tabular-nums text-muted-foreground"
+                    title="rpmLimit = 0 表示该凭据不限速，不计入上限总量"
+                  >
+                    {poolStats.unlimitedRpm} 个不限速
+                  </div>
+                )}
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1.5 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {formatNumber(poolStats.rpmCurrent)}
+                </span>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  / {poolStats.rpmLimit > 0 ? formatNumber(poolStats.rpmLimit) : "∞"}
+                </span>
+              </div>
+              <Progress
+                className="mt-2"
+                value={poolStats.rpmPct}
+                max={100}
+                title={`近 60 秒滑动窗口内已用 ${poolStats.rpmCurrent} 次请求，占本地 RPM 上限 ${poolStats.rpmPct.toFixed(1)}%`}
+              />
+              <div className="mt-1.5 text-[11px] tabular-nums text-muted-foreground">
+                {poolStats.rpmLimit > 0
+                  ? `占用 ${poolStats.rpmPct.toFixed(1)}%`
+                  : "未设限速"}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* 近 1 分钟消耗 */}
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="flex items-baseline justify-between gap-2">
+                <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                  近 {recentSpendStats.windowSecs} 秒消耗
+                </div>
+                <div className="text-[10px] tabular-nums text-muted-foreground">
+                  {recentSpendStats.activeCount} 个活跃
+                </div>
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1.5 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {recentSpendStats.hasData
+                    ? formatCredits(recentSpendStats.total)
+                    : "—"}
+                </span>
+                <span className="text-xs text-muted-foreground">credits</span>
+              </div>
+              <div
+                className="mt-2 text-[11px] tabular-nums text-muted-foreground"
+                title="按当前窗口消耗线性外推，仅供粗略参考"
+              >
+                折算 ≈{" "}
+                {recentSpendStats.hasData
+                  ? formatCredits(
+                      (recentSpendStats.total / recentSpendStats.windowSecs) *
+                        3600,
+                    )
+                  : "—"}{" "}
+                credits/时
+              </div>
+              <div className="mt-1.5 text-[11px] tabular-nums text-muted-foreground">
+                {recentSpendStats.topId != null
+                  ? `峰值 #${recentSpendStats.topId} · ${formatCredits(recentSpendStats.topValue)}`
+                  : "窗口内无消耗"}
               </div>
             </CardContent>
           </Card>
