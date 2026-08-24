@@ -18,6 +18,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   useVendorStatus, useRedeemVendorCode, useTestVendorWebhook,
   useSetVendorWebhookUrl, usePurchaseAdHoc, useSetVendorMode, useSetVendorPerChannel,
+  useSetStockPollEnabled,
   useSetStockPollRespectGate, useSetVendorAutoReserve,
 } from '@/hooks/use-vendor'
 import { isRateLimited, vendorErrorMessage } from '@/api/vendor'
@@ -221,6 +222,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
   const setAutoReserve = useSetVendorAutoReserve(vendorId)
   const setPerChannel = useSetVendorPerChannel(vendorId)
   const setStockPollRespectGate = useSetStockPollRespectGate(vendorId)
+  const setStockPollEnabled = useSetStockPollEnabled(vendorId)
   const confirm = useConfirm()
 
   const [redeemOpen, setRedeemOpen] = useState(false)
@@ -405,6 +407,49 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
       toast.success(what)
     } catch (e) {
       toast.error(vendorErrorMessage(e, '切换逐渠道补货失败'))
+    }
+  }
+
+  /**
+   * 开关库存轮询。
+   *
+   * **开启要二次确认**：轮询本身不扣费，但它是自动提取的触发源 —— 本家处于自动
+   * 提取模式时，发现到货就会真实下单。关闭不确认：只会少买。
+   */
+  const handleToggleStockPollEnabled = async (next: boolean) => {
+    if (next) {
+      const interval = status?.stockPollIntervalSecs ?? 0
+      const ok = await confirm({
+        title: '开启库存轮询？',
+        description:
+          `开启后每 ${interval} 秒查一次卖家库存。` +
+          '本家处于自动提取模式时，发现到货会立即走自动提取并真实扣费；' +
+          '手动提取模式下不查库存。' +
+          (status?.stockPollRespectGlobalGate === false
+            ? '当前轮询已越过全局总闸，总闸关闭时仍会自动下单。'
+            : '当前轮询遵循全局总闸，总闸关闭时不查库存。') +
+          '开启后的第一轮只记录库存基线、不判到货，避免把已摆着的存货当成新到货。',
+        confirmText: '开启轮询',
+        destructive: true,
+      })
+      if (!ok) return
+    }
+    try {
+      const r = await setStockPollEnabled.mutateAsync(next)
+      const what = next ? '库存轮询已开启' : '库存轮询已关闭'
+      if (!r.persisted) {
+        toast.warning(`${what}（仅本次运行）`, {
+          description: `配置未能写回文件，重启后会回退。${r.warning ?? ''}`,
+        })
+        return
+      }
+      toast.success(what, {
+        description: next
+          ? '最迟一个周期后开始查库存，首轮只记录基线'
+          : '轮询转入待机，不再查库存；重新打开最迟一个周期恢复',
+      })
+    } catch (e) {
+      toast.error(vendorErrorMessage(e, '切换库存轮询失败'))
     }
   }
 
@@ -608,7 +653,33 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
 
             手动提取时轮询整轮不查库存，此时讲「遵循/越过总闸」是误导 —— 那个开关
             要到切回自动才有意义。故先按提取模式分出待机态，再谈总闸。 */}
+        {/* 库存轮询开关。与下面的「遵循总闸」是两回事：这个管开不开，那个管认不认总闸。
+            只在配了间隔（轮询器起得来）的家显示 —— 间隔为 0 时轮询器根本没起，
+            摆一个点了不动的开关比不摆更糟。 */}
         {status?.stockPollIntervalSecs && status.stockPollIntervalSecs > 0 && (
+          <div className="flex items-center gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-1.5">
+            <div className="text-xs">
+              <span className="font-medium">
+                {status.stockPollEnabled === false ? '库存轮询已关闭' : '库存轮询已开启'}
+              </span>
+              <span className="ml-1.5 text-muted-foreground">
+                {status.stockPollEnabled === false
+                  ? '不查库存，卖家到货不会被发现；打开后最迟一个周期恢复'
+                  : `每 ${status.stockPollIntervalSecs} 秒查一次库存，发现到货走自动提取`}
+              </span>
+            </div>
+            <Switch
+              checked={status.stockPollEnabled ?? true}
+              onCheckedChange={handleToggleStockPollEnabled}
+              disabled={setStockPollEnabled.isPending}
+              aria-label="开关库存轮询"
+            />
+          </div>
+        )}
+
+        {status?.stockPollIntervalSecs &&
+          status.stockPollIntervalSecs > 0 &&
+          status.stockPollEnabled !== false && (
           <div
             className={`flex items-center gap-2.5 rounded-md border px-3 py-1.5 ${
               !status.autoPurchase
@@ -641,7 +712,7 @@ export function VendorStatusBar({ vendorId }: { vendorId?: string }) {
               aria-label="切换轮询是否遵循全局总闸"
             />
           </div>
-        )}
+          )}
 
         <div className="flex flex-wrap items-center gap-2">
         {/* 测试推送与写入地址都走卖家的 webhook 管理 API，没这能力的家一律隐藏 */}

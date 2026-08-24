@@ -2245,6 +2245,7 @@ impl AdminService {
                 base_url: config.normalized_base_url().to_string(),
                 account_count: config.account_ids.len(),
                 applied_schedulable: state.applied(),
+                rpm_ok: state.rpm_ok(),
             },
             None => TrafficIngressStateResponse {
                 configured: false,
@@ -2252,6 +2253,7 @@ impl AdminService {
                 base_url: config.normalized_base_url().to_string(),
                 account_count: config.account_ids.len(),
                 applied_schedulable: None,
+                rpm_ok: None,
             },
         }
     }

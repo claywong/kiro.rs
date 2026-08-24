@@ -11,6 +11,7 @@ import type {
   VendorAutoEnabledChange,
   VendorAutoReserveChange,
   VendorPerChannelChange,
+  VendorStockPollEnabledChange,
   VendorStockPollGateChange,
   VendorPoolTargetChange,
 } from '@/types/api'
@@ -243,6 +244,24 @@ export async function setStockPollRespectGate(
   const { data } = await api.put<VendorStockPollGateChange>(
     '/stock-poll-respect-gate',
     { respect },
+    { params: vendorId ? { vendorId } : {} }
+  )
+  return data
+}
+
+/**
+ * 开关库存轮询。运行时立即生效（最迟一个周期），并写回 config.json。
+ *
+ * 与「轮询间隔」不同：间隔改了要重启进程，本开关随时可切 —— 关掉后轮询器仍在，
+ * 只是每轮整轮跳过。
+ */
+export async function setStockPollEnabled(
+  enabled: boolean,
+  vendorId?: string
+): Promise<VendorStockPollEnabledChange> {
+  const { data } = await api.put<VendorStockPollEnabledChange>(
+    '/stock-poll-enabled',
+    { enabled },
     { params: vendorId ? { vendorId } : {} }
   )
   return data

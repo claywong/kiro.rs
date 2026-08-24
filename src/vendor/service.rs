@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::admin::AdminService;
 use crate::http_client::ProxyConfig;
-use crate::model::config::{MIN_STOCK_POLL_INTERVAL_SECS, TlsBackend, VendorConfig};
+use crate::model::config::{TlsBackend, VendorConfig};
 
 use super::auto;
 use super::client::VendorClient;
@@ -200,6 +200,20 @@ pub struct StockPollGateChange {
     pub warning: Option<String>,
 }
 
+/// 切库存轮询开关的结果。单独成类型的理由同 [`StockPollGateChange`] ——
+/// 复用那个会让响应 JSON 里出现语义对不上的 `respect` 键。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockPollEnabledChange {
+    /// 设置后的值（运行时已生效）
+    pub enabled: bool,
+    /// 是否已写回 config.json。false 表示重启后会回退
+    pub persisted: bool,
+    /// 持久化失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// 服务层错误
 #[derive(Debug)]
 pub enum VendorServiceError {
@@ -314,6 +328,17 @@ pub struct VendorService {
     per_channel: AtomicBool,
     /// 库存轮询是否遵循全局总闸的运行时值。同上，面板切换后以本字段为准。
     stock_poll_respect_gate: AtomicBool,
+    /// 库存轮询开关的运行时值。同上，面板切换后以本字段为准。
+    ///
+    /// 与 `stock_poll_interval_secs` 的分工见
+    /// [`VendorConfig::stock_poll_enabled`](crate::model::config::VendorConfig::stock_poll_enabled)：
+    /// 间隔管节奏且要重启，本字段管开关且随时可切。
+    stock_poll_enabled: AtomicBool,
+    /// 上一轮各区库存，用于无车次概念的家判「0 → 正」的到货边沿。
+    ///
+    /// `None` 表示还没有基线（进程刚起）。放进程内而不落库：重启后重建基线只是
+    /// 漏掉一次判定，而落库反而会让「重启前摆着的存货」在重启后被当成新到货。
+    last_zone_stock: parking_lot::Mutex<Option<auto::ZoneStockSnapshot>>,
     /// 跨供应商共享的全局提取闸门。各家持有同一个 Arc。
     pool_gate: Arc<PoolGate>,
 }
@@ -331,6 +356,7 @@ impl VendorService {
         let auto_reserve = config.auto_reserve;
         let per_channel = config.auto_purchase_per_channel;
         let respect_gate = config.stock_poll_respect_global_gate;
+        let poll_enabled = config.stock_poll_enabled_or_default();
         Self {
             config,
             proxy,
@@ -341,6 +367,8 @@ impl VendorService {
             auto_reserve: AtomicBool::new(auto_reserve),
             per_channel: AtomicBool::new(per_channel),
             stock_poll_respect_gate: AtomicBool::new(respect_gate),
+            stock_poll_enabled: AtomicBool::new(poll_enabled),
+            last_zone_stock: parking_lot::Mutex::new(None),
             pool_gate,
         }
     }
@@ -584,6 +612,85 @@ impl VendorService {
                 }
             }
         }
+    }
+
+    /// 库存轮询开关的**运行时值**。
+    ///
+    /// 面板与轮询循环都必须用它，不能用 `config.stock_poll_enabled` —— 那是启动
+    /// 快照，面板切换后不会变，会让开关点了就弹回去（同 `stock_poll_respect_gate`）。
+    pub fn stock_poll_enabled(&self) -> bool {
+        self.stock_poll_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 切库存轮询开关。运行时立即生效（最迟下一个周期），并写回 config.json。
+    ///
+    /// 关掉后轮询器仍在，只是每轮读到 false 就整轮跳过、连库存都不查 —— 与手动
+    /// 提取模式下的待机同一形态。故切回来最迟一个周期就恢复，不必重启。
+    pub fn set_stock_poll_enabled(&self, enabled: bool) -> StockPollEnabledChange {
+        self.stock_poll_enabled.store(enabled, Ordering::Relaxed);
+        // 关掉时清掉库存基线：停用期间卖家的货可能来了又走了，留着旧基线会让
+        // 重新开启后的第一轮拿一个过期的「上一轮」去比，把陈货判成新到货。
+        // 清掉后重新开启的首轮只建基线（见 `decide_restock`），最保守。
+        if !enabled {
+            *self.last_zone_stock.lock() = None;
+        }
+        match self.persist_stock_poll_enabled(enabled) {
+            Ok(()) => StockPollEnabledChange {
+                enabled,
+                persisted: true,
+                warning: None,
+            },
+            Err(e) => {
+                // 持久化失败不算设置失败：运行时已生效，重启才回退。
+                // 与 set_stock_poll_respect_gate 同一取舍。
+                tracing::warn!("持久化库存轮询开关失败（运行时已生效）: {}", e);
+                StockPollEnabledChange {
+                    enabled,
+                    persisted: false,
+                    warning: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    fn persist_stock_poll_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .admin
+            .token_manager()
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，库存轮询开关仅在当前进程生效"))?;
+
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+
+        let target = self.vendor_id();
+        let mut hit = false;
+        if let Some(v) = config.vendor.as_mut()
+            && v.vendor_id() == target
+        {
+            v.stock_poll_enabled = Some(enabled);
+            hit = true;
+        }
+        if !hit {
+            for v in config.vendors.iter_mut() {
+                if v.vendor_id() == target {
+                    v.stock_poll_enabled = Some(enabled);
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            anyhow::bail!("config.json 里找不到 id 为 {target} 的卖家配置，无法持久化库存轮询开关");
+        }
+
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 写回 config.json 里**本供应商那一项**的 `autoPurchase`。
@@ -1276,22 +1383,26 @@ impl VendorService {
         // 抬到下限时告警一次。抬而不是拒绝启动：用户意图明确是「要轮询」，
         // 配小了是不知道代价，按下限跑起来比不跑更符合意图。
         let configured = self.config.stock_poll_interval_secs;
-        if configured < MIN_STOCK_POLL_INTERVAL_SECS {
+        let min = self.config.min_stock_poll_interval();
+        if configured < min {
             tracing::warn!(
                 vendor_id = %self.vendor_id(),
                 configured,
-                min = MIN_STOCK_POLL_INTERVAL_SECS,
+                min,
                 "轮询间隔小于下限，已抬到下限"
             );
         }
 
-        // 入站可用的家不该靠轮询 —— 卖家推送比我们轮询更及时也更省。配了就提醒，
-        // 但不拒绝：两者并存不会重复下单（合成事件的 id 带 `poll:` 前缀，与卖家
-        // 事件天然不同名；真撞上同一趟车，池闸与本家盘点会挡住第二单）。
+        // 入站与轮询并存是**允许且有用**的组合，故只记 info 不告警：卖家停推之后
+        // 轮询是唯一触发源（kiro.ceo 就是这个情况），而入站端点留着不占成本，卖家
+        // 哪天恢复推送就自动是更及时的那条路。
+        //
+        // 两者并存不会重复下单：合成事件的 id 带 `poll:` 前缀，与卖家事件天然不
+        // 同名；真撞上同一批货，池闸与本家盘点会挡住第二单。
         if self.config.inbound_enabled() {
-            tracing::warn!(
+            tracing::info!(
                 vendor_id = %self.vendor_id(),
-                "本家已启用入站 webhook，仍配了库存轮询；卖家推送更及时，通常不必两者并存"
+                "本家同时启用了入站 webhook 与库存轮询；卖家恢复推送时以推送为更及时的那条路，两者并存不会重复下单"
             );
         }
 
@@ -1299,16 +1410,19 @@ impl VendorService {
         tokio::spawn(async move {
             let period = Duration::from_secs(interval);
             let auto = svc.auto_purchase();
+            let poll_on = svc.stock_poll_enabled();
             tracing::info!(
                 vendor_id = %svc.vendor_id(),
                 interval_secs = interval,
+                poll_enabled = poll_on,
                 auto_purchase = auto,
                 auto_reserve = svc.auto_reserve(),
                 "库存轮询已启动{}",
-                if auto {
-                    ""
-                } else {
-                    "（本家当前为手动提取，先转入待机，不查库存；面板上切到自动后自动恢复）"
+                match (poll_on, auto) {
+                    (false, _) => "（轮询开关当前关闭，先转入待机，不查库存；面板上打开后自动恢复）",
+                    (true, false) =>
+                        "（本家当前为手动提取，先转入待机，不查库存；面板上切到自动后自动恢复）",
+                    (true, true) => "",
                 }
             );
             // 连续失败计数，用于指数退避。查库存对 kirored 是登录+签名+解密，
@@ -1321,6 +1435,9 @@ impl VendorService {
             // 按分钟刷屏，故只报变化。初值取启动时的模式，与上面那条启动日志一致，
             // 避免第一轮就重复报一次「已切换」。
             let mut last_auto = svc.auto_purchase();
+            // 轮询开关的上一轮值，同理只在翻转时打一条 info。关闭期间 `poll_stock_once`
+            // 整轮只有 debug，不留痕的话排障时分不清「开关关着」与「卖家接口挂了」。
+            let mut last_poll_on = poll_on;
             loop {
                 // 先睡后查：启动瞬间往往还没加载完凭据池，此时盘点结果不可信，
                 // 会让第一轮基于「池是空的」误判为该补货。
@@ -1341,6 +1458,21 @@ impl VendorService {
                         if now_auto { "恢复查库存" } else { "转入待机（手动模式不查库存）" }
                     );
                     last_auto = now_auto;
+                }
+
+                let now_poll_on = svc.stock_poll_enabled();
+                if now_poll_on != last_poll_on {
+                    tracing::info!(
+                        vendor_id = %svc.vendor_id(),
+                        poll_enabled = now_poll_on,
+                        "库存轮询开关已切换，{}",
+                        if now_poll_on {
+                            "恢复查库存（首轮仅重建库存基线）"
+                        } else {
+                            "转入待机（不查库存）"
+                        }
+                    );
+                    last_poll_on = now_poll_on;
                 }
 
                 match svc.poll_stock_once().await {
@@ -1826,6 +1958,18 @@ impl VendorService {
         //
         // 判在**循环里而非启动时**：`auto_purchase` 是运行时可变的（面板随时能切），
         // 启动时手动就不 spawn 会导致切到自动后没人叫醒轮询，那才是真的静默无效。
+        // 轮询开关。刻意排在**预定之后**：本开关管的是现货这一支，而预定是另一条
+        // 扣费路径、有自己的 `autoReserve`（理由同上面那段注释 —— 拦在预定之前会
+        // 静默废掉它）。故「关掉轮询开关」不停自动预定，那要关 `autoReserve`。
+        //
+        // 关着时整轮跳过、连库存都不查。它与手动提取的区别是**语义**而非行为：
+        // 手动模式说的是「发现了也别自动买」，本开关说的是「别再去发现」。两者
+        // 各自可切，任一为假都不查库存。
+        if !self.stock_poll_enabled() {
+            tracing::debug!(vendor_id = %vid, "库存轮询跳过：本家轮询开关已关闭");
+            return Ok(());
+        }
+
         if !self.auto_purchase() {
             tracing::debug!(vendor_id = %vid, "库存轮询跳过：本家为手动提取模式");
             return Ok(());
@@ -1848,7 +1992,29 @@ impl VendorService {
         }
 
         let stock = self.stock().await?;
-        let batch = match auto::decide_poll(&stock) {
+
+        // 判据按「卖家给不给发车时刻」分两条：
+        //
+        // - 给（kiro.red / kiro.ooo 等有车次概念的家）→ `decide_poll`，批次身份就是
+        //   发车时刻，最准
+        // - 不给（`legacy`，即 kiro.ceo）→ `decide_restock`，靠「库存 0 → 正」的边沿
+        //
+        // 为什么必须分：`decide_poll` 拿不到 `departed_at` 就返回 Idle，而 legacy 的
+        // 库存转换里那一项恒为 None（该家无车次概念）。只用前者的话，给 kiro.ceo 配
+        // 上轮询会是**静默无效**的 —— 轮询器起来了、每轮如约查库存，却永远判不出
+        // 到货。这与「配了轮询但没生效」的现象完全一样，极难分辨。
+        let decision = if self.flavor() == VendorFlavor::Legacy {
+            let last = self.last_zone_stock.lock().clone();
+            let now = chrono::Utc::now().timestamp();
+            let decision = auto::decide_restock(&stock, last.as_ref(), now);
+            // 基线**无条件**更新，包括判出到货的那一轮 —— 不更新会让下一轮拿同一个
+            // 「上一轮为 0」再判一次到货，靠事件表去重挡住，但每轮白撞一次。
+            *self.last_zone_stock.lock() = Some(auto::zone_snapshot(&stock));
+            decision
+        } else {
+            auto::decide_poll(&stock)
+        };
+        let batch = match decision {
             auto::PollDecision::Found(b) => b,
             auto::PollDecision::Idle(reason) => {
                 tracing::debug!(vendor_id = %vid, "库存轮询本轮无事: {}", reason);
@@ -2990,6 +3156,8 @@ mod local_tests {
 
     // ============ 库存轮询的生效间隔 ============
 
+    use crate::model::config::{MIN_STOCK_POLL_INTERVAL_SECS, MIN_STOCK_POLL_INTERVAL_SECS_CHEAP};
+
     /// 只给 `baseUrl` / `apiKey` 的最小配置，其余走 serde 默认 —— 这正好锁住
     /// 「用户不写这些字段时的缺省行为」，比手写全字段更贴近真实配置文件。
     fn cfg_json(extra: &str) -> VendorConfig {
@@ -3012,12 +3180,59 @@ mod local_tests {
     }
 
     /// 配小于下限的值要抬到下限。面板与轮询器都读这个值，
-    /// 否则面板显示 10 秒而实际按 60 秒跑，会让人误判「怎么没按我配的频率查」
+    /// 否则面板显示 3 秒而实际按 5 秒跑，会让人误判「怎么没按我配的频率查」
     #[test]
     fn 轮询间隔抬到下限() {
+        // cfg_json 缺省 flavor 是 legacy，走廉价档
         assert_eq!(
-            cfg_json(r#","stockPollIntervalSecs":10"#).effective_stock_poll_interval(),
+            cfg_json(r#","stockPollIntervalSecs":1"#).effective_stock_poll_interval(),
+            MIN_STOCK_POLL_INTERVAL_SECS_CHEAP
+        );
+        // 贵的家仍是 1 分钟下限
+        assert_eq!(
+            cfg_json(r#","flavor":"kirored","stockPollIntervalSecs":10"#)
+                .effective_stock_poll_interval(),
             MIN_STOCK_POLL_INTERVAL_SECS
+        );
+    }
+
+    /// kiro.ceo（legacy）要能真按 10 秒跑 —— 它现在不推 webhook 了，轮询是唯一
+    /// 触发源，被抬到 60 秒会让先到的人把货买空。这条用例钉住那个诉求。
+    #[test]
+    fn legacy十秒轮询不被抬到一分钟() {
+        assert_eq!(
+            cfg_json(r#","flavor":"legacy","stockPollIntervalSecs":10"#)
+                .effective_stock_poll_interval(),
+            10,
+            "legacy 查库存是一次裸 GET，10 秒必须原样生效"
+        );
+    }
+
+    /// 显式开了开关却没配间隔：按下限跑，不能当成关闭。
+    /// 返回 0 会让轮询器不 spawn，开关就成了点得动却永远不动的死开关。
+    #[test]
+    fn 显式开启轮询但缺间隔时按下限跑() {
+        assert_eq!(
+            cfg_json(r#","stockPollEnabled":true"#).effective_stock_poll_interval(),
+            MIN_STOCK_POLL_INTERVAL_SECS_CHEAP
+        );
+    }
+
+    /// 轮询开关缺省按间隔推导，故老配置不写它行为不变
+    #[test]
+    fn 轮询开关缺省按间隔推导() {
+        assert!(
+            !cfg_json("").stock_poll_enabled_or_default(),
+            "间隔为 0 时缺省关闭"
+        );
+        assert!(
+            cfg_json(r#","stockPollIntervalSecs":10"#).stock_poll_enabled_or_default(),
+            "老配置只写了间隔，要视为开启"
+        );
+        assert!(
+            !cfg_json(r#","stockPollIntervalSecs":10,"stockPollEnabled":false"#)
+                .stock_poll_enabled_or_default(),
+            "显式关闭要盖过间隔推导"
         );
     }
 

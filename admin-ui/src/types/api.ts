@@ -754,6 +754,12 @@ export interface VendorStatus {
   stockPollIntervalSecs?: number
   /** 轮询是否遵循全局总闸。false 时现货自动提取与自动预定都可越过总闸扣费 */
   stockPollRespectGlobalGate?: boolean
+  /**
+   * 库存轮询开关（运行时值，面板可切）。与 stockPollIntervalSecs 的分工：
+   * 间隔管节奏、改了要重启；本项管开不开、随时可切。关掉后轮询器仍在，
+   * 只是每轮整轮跳过（连库存都不查），打开后最迟一个周期恢复。
+   */
+  stockPollEnabled?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
@@ -835,6 +841,16 @@ export interface VendorPerChannelChange {
 export interface VendorStockPollGateChange {
   /** 设置后的值（运行时已生效） */
   respect: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 开关库存轮询的结果 */
+export interface VendorStockPollEnabledChange {
+  /** 设置后的值（运行时已生效，最迟下一个周期） */
+  enabled: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */

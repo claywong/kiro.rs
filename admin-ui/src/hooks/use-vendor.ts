@@ -12,6 +12,7 @@ import {
   setVendorAutoReserve,
   setVendorMode,
   setVendorPerChannel,
+  setStockPollEnabled,
   setStockPollRespectGate,
   setVendorPoolTarget,
   testVendorWebhook,
@@ -182,6 +183,17 @@ export function useSetStockPollRespectGate(vendorId?: string) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (respect: boolean) => setStockPollRespectGate(respect, vendorId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
+      qc.invalidateQueries({ queryKey: ['vendor-list'] })
+    },
+  })
+}
+
+export function useSetStockPollEnabled(vendorId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (enabled: boolean) => setStockPollEnabled(enabled, vendorId),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['vendor-status', vendorId] })
       qc.invalidateQueries({ queryKey: ['vendor-list'] })

@@ -395,6 +395,68 @@ pub fn decide_poll(stock: &super::protocol::StockInfo) -> PollDecision {
     })
 }
 
+/// 上一轮看到的每区可提数量。key 是区代码，value 是当轮 `available`。
+pub type ZoneStockSnapshot = std::collections::HashMap<String, u32>;
+
+/// 无「车次」概念的家怎么判到货：**看库存从 0 变正的那个边沿**。
+///
+/// 为什么 [`decide_poll`] 对这些家不适用：它拿 `departed_at`（发车时刻）当批次
+/// 身份，而 `legacy`（kiro.ceo）的库存是「某区当前还剩几个」这种连续量，卖家压根
+/// 不给发车时刻（见 `flavor_legacy` 里 `departed_at: None`）。于是那条路对该家
+/// 永远返回 Idle —— 轮询器起得来、每轮都查库存，却一次都不会提。
+///
+/// 边沿是这里唯一能取到的批次身份，也正是 webhook 时代 `new_keys_available` 的
+/// 语义：**补货这件事发生了一次**。取「0 → 正」而不是「有货就提」是因为后者没有
+/// 稳定 id —— 每轮都是新事件，事件表被刷满、`get_event` 去重失效，等于每个周期
+/// 对同一批货撞一次授权判定。
+///
+/// 代价说清楚：**库存持续为正时不会再触发**。卖家常备库存不清零的话，只有进程
+/// 启动后的第一次补货能被发现。这是刻意的保守取向 —— 宁可漏一趟，不可每轮下单。
+/// 真需要在有货时补，那条路是 webhook 或人工在面板上提。
+///
+/// `last` 为空（进程刚起、还没有基线）时**只建基线不触发**：此刻分不出「刚补的货」
+/// 与「早就摆在那儿的存货」，把后者当到货会让每次重启都下一单。这与轮询器
+/// 「先睡后查」是同一个理由。
+pub fn decide_restock(
+    stock: &super::protocol::StockInfo,
+    last: Option<&ZoneStockSnapshot>,
+    now: i64,
+) -> PollDecision {
+    let Some(zone) = stock.pick_zone() else {
+        return PollDecision::Idle(if stock.zones.is_empty() {
+            "库存未给出任何分区".to_string()
+        } else {
+            "各区均无可提库存".to_string()
+        });
+    };
+    let Some(last) = last else {
+        return PollDecision::Idle("首轮仅记录库存基线，不判到货".to_string());
+    };
+    let label = zone.label.as_deref().unwrap_or(&zone.zone);
+    // 上一轮没见过这个区，与「首轮」同理：分不出是新开区还是一直存在，不猜。
+    let Some(&before) = last.get(&zone.zone) else {
+        return PollDecision::Idle(format!("{label} 首次出现，仅记录基线"));
+    };
+    if before > 0 {
+        return PollDecision::Idle(format!("{label} 上一轮已有货（{before}），非新到货"));
+    }
+    PollDecision::Found(BatchIdentity {
+        zone: zone.zone.clone(),
+        // 借用 `departed_at` 这一槽位放**发现时刻**。该家没有真实发车时刻，而边沿
+        // 保证同一批货只会取到一个值 —— 用它当 id 的一半不会每轮变。
+        departed_at: now,
+    })
+}
+
+/// 把当轮库存折成快照，供下一轮比对。
+pub fn zone_snapshot(stock: &super::protocol::StockInfo) -> ZoneStockSnapshot {
+    stock
+        .zones
+        .iter()
+        .map(|z| (z.zone.clone(), if z.enabled { z.available } else { 0 }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +955,117 @@ mod tests {
         let second = decide_poll(&s);
         assert_eq!(first, second);
         assert!(matches!(first, PollDecision::Found(_)));
+    }
+
+    // ============ 到货边沿判定（无车次概念的家，如 kiro.ceo） ============
+
+    /// kiro.ceo 的库存里 `departed_at` 恒为 None，故 `decide_poll` 对它永远 Idle。
+    /// 这条用例把那个前提钉住 —— 它正是 `decide_restock` 存在的全部理由。
+    #[test]
+    fn 无发车时刻时decide_poll永远不发现() {
+        let s = stock_with(vec![zone("eu", 17, None, 15.0)]);
+        match decide_poll(&s) {
+            PollDecision::Idle(reason) => assert!(
+                reason.contains("发车时刻"),
+                "原因要指向缺发车时刻，实际: {reason}"
+            ),
+            other => panic!("有货但无发车时刻不该发现，实际: {other:?}"),
+        }
+    }
+
+    fn snap(pairs: &[(&str, u32)]) -> ZoneStockSnapshot {
+        pairs.iter().map(|(z, n)| (z.to_string(), *n)).collect()
+    }
+
+    /// 0 → 正是唯一的到货信号
+    #[test]
+    fn 库存从零变正判为到货() {
+        let s = stock_with(vec![zone("eu", 17, None, 15.0)]);
+        let last = snap(&[("eu", 0)]);
+        match decide_restock(&s, Some(&last), 1786337683) {
+            PollDecision::Found(b) => {
+                assert_eq!(b.zone, "eu");
+                assert_eq!(b.departed_at, 1786337683, "无真实发车时刻时放发现时刻");
+            }
+            other => panic!("应判为到货，实际: {other:?}"),
+        }
+    }
+
+    /// 上一轮就有货 → 不是新到货。这条防的是「每轮都下一单」。
+    #[test]
+    fn 库存持续有货不重复判到货() {
+        let s = stock_with(vec![zone("eu", 17, None, 15.0)]);
+        let last = snap(&[("eu", 12)]);
+        match decide_restock(&s, Some(&last), 1786337683) {
+            PollDecision::Idle(reason) => assert!(
+                reason.contains("上一轮已有货"),
+                "原因要说清不是新到货，实际: {reason}"
+            ),
+            other => panic!("持续有货不该判到货，实际: {other:?}"),
+        }
+    }
+
+    /// 没有基线时只建基线不触发 —— 否则每次重启都会把摆着的存货当成新到货下一单。
+    #[test]
+    fn 首轮无基线只建基线不触发() {
+        let s = stock_with(vec![zone("eu", 17, None, 15.0)]);
+        match decide_restock(&s, None, 1786337683) {
+            PollDecision::Idle(reason) => {
+                assert!(reason.contains("基线"), "实际: {reason}")
+            }
+            other => panic!("首轮不该触发，实际: {other:?}"),
+        }
+    }
+
+    /// 上一轮没见过这个区，与首轮同理 —— 分不出是新开区还是一直存在，不猜。
+    #[test]
+    fn 新出现的区只建基线不触发() {
+        let s = stock_with(vec![zone("eu", 17, None, 15.0)]);
+        let last = snap(&[("us", 0)]);
+        match decide_restock(&s, Some(&last), 1786337683) {
+            PollDecision::Idle(reason) => {
+                assert!(reason.contains("首次出现"), "实际: {reason}")
+            }
+            other => panic!("新区不该直接触发，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 无货时不判到货() {
+        let s = stock_with(vec![zone("eu", 0, None, 15.0)]);
+        let last = snap(&[("eu", 0)]);
+        assert!(matches!(
+            decide_restock(&s, Some(&last), 1786337683),
+            PollDecision::Idle(_)
+        ));
+    }
+
+    /// 选区必须与 `pick_zone` 同口径（同 decide_poll 那条用例的理由）
+    #[test]
+    fn 到货判定选区与pick_zone同口径() {
+        let s = stock_with(vec![zone("us", 5, None, 20.0), zone("eu", 5, None, 15.0)]);
+        let picked = s.pick_zone().unwrap().zone.clone();
+        let last = snap(&[("us", 0), ("eu", 0)]);
+        match decide_restock(&s, Some(&last), 1786337683) {
+            PollDecision::Found(b) => assert_eq!(b.zone, picked),
+            other => panic!("实际: {other:?}"),
+        }
+    }
+
+    /// 关闭的区按 0 记：卖家把某区关掉再打开，应能作为一次到货被发现
+    #[test]
+    fn 快照把关闭的区记为零() {
+        let mut z = zone("eu", 17, None, 15.0);
+        z.enabled = false;
+        let s = stock_with(vec![z]);
+        assert_eq!(zone_snapshot(&s).get("eu"), Some(&0));
+    }
+
+    #[test]
+    fn 快照记录各区可提量() {
+        let s = stock_with(vec![zone("us", 0, None, 20.0), zone("eu", 17, None, 15.0)]);
+        let got = zone_snapshot(&s);
+        assert_eq!(got.get("us"), Some(&0));
+        assert_eq!(got.get("eu"), Some(&17));
     }
 }
