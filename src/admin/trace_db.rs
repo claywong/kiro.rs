@@ -125,19 +125,19 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
-    /// 首个正文 Token 延迟（毫秒，仅流式有值）
+    /// 首个产出 Token 延迟（毫秒，仅流式有值）；产出含正文与工具调用
     ///
     /// 与 [`Self::first_token_ms`] 的区别：后者是首个上游 chunk（带思考时通常就是
     /// 思考的第一个字），本字段是首个 `assistantResponseEvent`，即真正开始产出
     /// 正文的时刻。无思考时二者接近；思考越久差距越大。
     #[serde(default)]
     pub first_answer_ms: Option<u64>,
-    /// 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个正文帧
+    /// 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个产出帧（正文或工具调用）
     ///
     /// 只覆盖**首段**。带工具调用时上游可能 reasoning → 正文 → reasoning → 正文
     /// 交替，后续几段不计入（字符数则是全量累加的）。
     ///
-    /// None 的三种情形：非流式（帧同时到达，无从测量）、只有思考没有正文
+    /// None 的三种情形：非流式（帧同时到达，无从测量）、只有思考没有产出
     /// （中途断流）、本次真的没思考。展示层靠 `is_stream` + `thinking_chars` 区分。
     ///
     /// 重试时只保留最后一跳：换跳会清空观测，口径与 `final_credential_id` 一致。
@@ -292,7 +292,7 @@ impl TraceStore {
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
             ("effort", "TEXT"),
-            // 思考观测（首个正文帧延迟 / 思考耗时 / 思考字符数）。前两者可空：
+            // 思考观测（首个产出帧延迟 / 思考耗时 / 思考字符数）。前两者可空：
             // 老行与无思考请求都没有值，展示层显示占位符。
             ("first_answer_ms", "INTEGER"),
             ("thinking_ms", "INTEGER"),

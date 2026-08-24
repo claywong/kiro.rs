@@ -120,9 +120,10 @@ function formatTokenFull(n: number): string {
 
 /**
  * 输出速率 OTPS（output tokens / second）。
- * - 流式：分母取「耗时 - 首个正文 Token 延迟」（即真正产出正文的时间）。
+ * - 流式：分母取「耗时 - 首个产出帧延迟」（即真正产出内容的时间）。
  *   优先用 firstAnswerMs：思考发生在它之前，若用 firstTokenMs 作分母起点，
  *   整段思考会被算进「产出内容的时间」，带思考的请求 OTPS 被系统性低估。
+ *   「产出」含正文与工具调用两种，所以思考后直接发工具调用的请求同样命中。
  *   老记录没有 firstAnswerMs，回退到 firstTokenMs 维持原行为。
  * - 非流式：无首 Token 概念，分母取整段耗时
  * 分母 <= 0 或无输出时返回 null（不展示）。
@@ -352,8 +353,8 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
 /**
  * 首段思考列：耗时为主，思考占总输出的比例为辅。
  *
- * 「首段」是字面意思：只覆盖首个 reasoning 帧 → 首个正文帧。带工具调用时上游
- * 可能 reasoning → 正文 → reasoning → 正文 交替，后续几段不计入时长（但字符数
+ * 「首段」是字面意思：只覆盖首个 reasoning 帧 → 首个产出帧（正文或工具调用）。
+ * 上游可能 reasoning → 产出 → reasoning → 产出 交替，后续几段不计入时长（但字符数
  * 是全量累加的，所以占比可能超过时长所对应的比例）。
  *
  * 占比分母用 outputTokens（思考+正文的合计估算），分子由 thinkingChars 按
@@ -366,7 +367,7 @@ function ThinkingCell({ rec }: { rec: TraceRecord }) {
 
   // 没有时长有三种情况，显示要能区分，否则「非流式」会和「没思考」长得一样：
   // 1. 非流式：帧全在同一瞬间到达，时长无从测量，但字符数是真的
-  // 2. 流式且有思考文本但没时长：只有思考没有正文，通常是中途断流
+  // 2. 流式且有思考文本但没时长：只有思考没有产出，通常是中途断流
   // 3. 流式且完全没有思考文本：本次请求真的没思考
   if (ms == null) {
     if (!rec.isStream) {
@@ -450,7 +451,7 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
       )}
       {rec.firstAnswerMs != null && (
         <div className="text-[12px] text-muted-foreground">
-          首个正文 Token {formatDuration(rec.firstAnswerMs)}
+          首个产出 Token {formatDuration(rec.firstAnswerMs)}
           {rec.firstTokenMs != null && `（首个上游 chunk ${formatDuration(rec.firstTokenMs)}）`}
         </div>
       )}
@@ -714,7 +715,7 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">首Token</th>
                     <th
                       className="py-2 pr-3 font-medium"
-                      title="首个 reasoning 帧 → 首个正文帧。带工具调用时上游可能思考/正文交替，此列只覆盖首段"
+                      title="首个 reasoning 帧 → 首个产出帧（正文或工具调用）。上游可能思考/产出交替，此列只覆盖首段"
                     >
                       首段思考
                     </th>

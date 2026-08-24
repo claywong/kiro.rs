@@ -544,9 +544,9 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值）。带思考时首个 chunk 往往就是思考的第一个字 */
   firstTokenMs?: number | null
-  /** 首个正文 Token 延迟（毫秒，仅流式有值）——真正开始产出正文的时刻 */
+  /** 首个产出 Token 延迟（毫秒，仅流式有值）——真正开始产出正文或工具调用的时刻 */
   firstAnswerMs?: number | null
-  /** 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个正文帧。只覆盖首段；null 见 ThinkingCell 注释 */
+  /** 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个产出帧（正文或工具调用）。只覆盖首段；null 见 ThinkingCell 注释 */
   thinkingMs?: number | null
   /** 思考文本字符数（原始值，非 token）。上游可能只下发摘要，故为实际推理量的下限 */
   thinkingChars?: number

@@ -196,7 +196,10 @@ pub(crate) struct RequestTracer {
     /// 语义不变（TTFT EWMA 调度依赖它）；带思考的请求里首个 chunk 往往就是思考，
     /// 但非思考请求、或上游先发 contextUsageEvent 时二者并不相等。
     first_reasoning_at: parking_lot::Mutex<Option<Instant>>,
-    /// 首个 assistantResponseEvent 到达时刻（开始产出正文；取第一次）
+    /// 首个产出帧到达时刻（开始产出正文 **或** 工具调用；取第一次）
+    ///
+    /// 「产出」含 assistantResponseEvent 与 toolUseEvent 两种 —— 详见
+    /// [`Self::observe_event`] 里的说明。
     first_answer_at: parking_lot::Mutex<Option<Instant>>,
     /// 思考文本累计字符数（reasoningContentEvent 的 text 字段）
     ///
@@ -295,7 +298,14 @@ impl RequestTracer {
                     );
                 }
             }
-            Event::AssistantResponse(_) => {
+            // 正文与工具调用都算「思考结束、开始产出」。
+            //
+            // Kiro 上游的产出终点有两种：assistantResponseEvent（文本）和
+            // toolUseEvent（工具调用）。agent 类流量大量是「想一会儿 → 直接发工具
+            // 调用」，整条流里没有一个 assistantResponseEvent。只认前者会让
+            // first_answer_at 永远为 None，thinking_ms 退化成 None —— 思考数据在
+            // 最需要它的那批请求上恰好全部缺失。
+            Event::AssistantResponse(_) | Event::ToolUse(_) => {
                 let mut slot = self.first_answer_at.lock();
                 if slot.is_none() {
                     *slot = Some(Instant::now());
@@ -328,7 +338,7 @@ impl RequestTracer {
         {
             tm.report_ttft(final_credential_id, &self.model, ttft);
         }
-        // 思考观测：首个 reasoning 帧 → 首个 assistant 帧的间隔即思考耗时。
+        // 思考观测：首个 reasoning 帧 → 首个产出帧（正文或工具调用）的间隔即思考耗时。
         // 只在两个时刻都有、且顺序正常时给值；上游若不发思考（或只发思考没发
         // 正文，例如中途断流）则为 None，展示层显示占位符。
         let first_reasoning_at = *self.first_reasoning_at.lock();
@@ -2381,8 +2391,53 @@ mod tests {
         assert_eq!(rec.thinking_chars, 11);
         let thinking_ms = rec.thinking_ms.expect("有 reasoning 和正文时应有思考耗时");
         assert!(thinking_ms >= 10, "思考耗时应覆盖两帧间隔，实际 {thinking_ms}ms");
-        assert!(rec.first_answer_ms.is_some(), "应记录首个正文帧时刻");
+        assert!(rec.first_answer_ms.is_some(), "应记录首个产出帧时刻");
         assert!(rec.first_token_ms.is_some(), "首 Token 语义不变，仍应有值");
+    }
+
+    /// 思考 → 工具调用（无正文）：toolUseEvent 同样是产出起点，thinking_ms 要有值。
+    ///
+    /// agent 类流量大量是这个形状（想一会儿直接发工具调用，整条流没有一个
+    /// assistantResponseEvent）。曾经只认 assistantResponseEvent，导致思考数据
+    /// 在最需要它的那批请求上恰好全部缺失。
+    #[test]
+    fn observe_event_treats_tool_use_as_answer_start() {
+        use crate::kiro::model::events::{ReasoningContentEvent, ToolUseEvent};
+
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, tracer) = hook_with_tracer(store.clone(), true);
+
+        tracer.mark_first_token();
+        tracer.observe_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("先看下文件".to_string()),
+            ..Default::default()
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        tracer.observe_event(&Event::ToolUse(ToolUseEvent {
+            name: "read_file".to_string(),
+            tool_use_id: "tu_1".to_string(),
+            input: r#"{"path":"a.rs"}"#.to_string(),
+            stop: true,
+        }));
+
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let rec = &rows[0];
+        assert_eq!(rec.thinking_chars, 5);
+        let thinking_ms = rec
+            .thinking_ms
+            .expect("思考后接工具调用也应有思考耗时（工具调用即产出起点）");
+        assert!(thinking_ms >= 10, "思考耗时应覆盖两帧间隔，实际 {thinking_ms}ms");
+        assert!(
+            rec.first_answer_ms.is_some(),
+            "工具调用应置位首个产出帧时刻"
+        );
     }
 
     /// 非流式：字符数照常累加，但不产生时长（帧全在同一瞬间到达）。

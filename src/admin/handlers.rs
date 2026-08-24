@@ -1460,6 +1460,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "firstAnswerMs": r.first_answer_ms,
+                "thinkingMs": r.thinking_ms,
+                "thinkingChars": r.thinking_chars,
                 "effort": r.effort,
                 "attempts": attempts,
             })
