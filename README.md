@@ -197,7 +197,7 @@ curl http://127.0.0.1:8990/cc/v1/messages \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-kiro-rs-..." \
   -d '{
-    "model": "claude-sonnet-4-8",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 1024,
     "stream": true,
     "messages": [
@@ -528,7 +528,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 上下文窗口估算：
 
 - `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -571,7 +571,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 ```json
 {
-  "model": "claude-sonnet-4-8-thinking",
+  "model": "claude-sonnet-4-6-thinking",
   "max_tokens": 4096,
   "thinking": {
     "type": "enabled",
@@ -633,7 +633,7 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 ```json
 {
-  "model": "claude-sonnet-4-8",
+  "model": "claude-sonnet-4-6",
   "max_tokens": 2048,
   "stream": true,
   "tools": [

@@ -22,6 +22,8 @@ use crate::model::config::ToolCompatibilityMode;
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
+// 本地新增导入单独成行，避免上游按字母重排 use 块时反复冲突。
+use super::thinking_mode::backend_supports_xhigh_effort;
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
@@ -311,7 +313,6 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -370,7 +371,7 @@ fn reasoning_field_key(model_id: &str) -> ReasoningFieldStyle {
 /// bool 两态，「支持」与「output_config」同义），导致自定义模型指向 gpt-5.x 时下发
 /// `output_config` 撞上述 400，而直连同一后端却正常。
 ///
-/// 其余（4.5 系、haiku、sonnet-4.8，以及 deepseek / minimax / glm / qwen 等
+/// 其余（4.5 系、haiku，以及 deepseek / minimax / glm / qwen 等
 /// 非 Claude 模型）保守视为不支持——向它们下发会触发上游 400
 /// （`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
@@ -495,7 +496,20 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
         }
     };
 
-    // 上游各档位（含 xhigh）均已受支持，识别到的档位一律原样下发，不再按模型降级。
+    // 按 Kiro 官方 per-model 表，Opus 4.6 / Sonnet 4.6 缺 xhigh 档位（max 仍支持），
+    // 对这两个模型降一档到 high；其余模型原样下发。判定见 thinking_mode 模块。
+    let requested = if requested == EffortTier::XHigh && !backend_supports_xhigh_effort(model_id) {
+        tracing::debug!(
+            model_id = %model_id,
+            effort = %trimmed,
+            downgraded_effort = EffortTier::High.as_str(),
+            "model does not accept xhigh effort, downgrading"
+        );
+        EffortTier::High
+    } else {
+        requested
+    };
+
     if requested.as_str() != trimmed {
         tracing::debug!(
             model_id = %model_id,
@@ -1920,19 +1934,6 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_sonnet_4_8() {
-        assert_eq!(
-            map_model("claude-sonnet-4-8"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.8-thinking"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
-    }
-
-    #[test]
     fn test_map_model_opus_5() {
         assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
         assert_eq!(
@@ -2148,12 +2149,12 @@ mod tests {
 
     #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
-        let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
+        let req = minimal_request_with_output_config("claude-sonnet-4-5-20250929-thinking");
         let result = convert_request(&req).unwrap();
 
         assert!(
             result.additional_model_request_fields.is_none(),
-            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+            "sonnet 4.5 rejects additionalModelRequestFields even when the client sends output_config"
         );
     }
 
@@ -2412,8 +2413,9 @@ mod tests {
         }
     }
 
+    /// Opus 4.6 按 Kiro per-model 表不接受 xhigh，降一档到 high。
     #[test]
-    fn test_output_config_preserves_xhigh_for_opus_4_6() {
+    fn test_output_config_downgrades_xhigh_for_opus_4_6() {
         let req =
             minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "xhigh");
         let result = convert_request(&req).unwrap();
@@ -2423,31 +2425,47 @@ mod tests {
             .expect("opus 4.6 adaptive thinking should keep output_config");
         assert_eq!(
             fields.output_config.unwrap().effort,
-            "xhigh",
-            "上游已支持 xhigh，不再按模型降级"
+            "high",
+            "opus 4.6 不接受 xhigh（Kiro per-model 表），应降级为 high"
         );
     }
 
-    /// xhigh 对所有模型一律原样下发，不再有降级名单。
+    /// xhigh 的下发按 Kiro per-model 表分两类：4.6 两款降级，其余原样。
     #[test]
-    fn test_output_config_preserves_xhigh_for_all_models() {
+    fn test_xhigh_downgrades_only_for_4_6_models() {
+        for model in ["claude-opus-4.6", "claude-sonnet-4.6"] {
+            assert_eq!(
+                normalize_effort_for_model(model, "xhigh").as_deref(),
+                Some("high"),
+                "{model} 不接受 xhigh，应降级"
+            );
+        }
         for model in [
-            "claude-opus-4.6",
-            "claude-sonnet-4.6",
-            "claude-opus-4.5",
-            "claude-sonnet-4.5",
-            "claude-haiku-4.5",
             "claude-opus-4.7",
             "claude-opus-4.8",
             "claude-opus-5",
+            "claude-sonnet-5",
             "claude-5",
             "claude-sonnet-5.1",
             "claude-unknown-9",
+            "gpt-5.6-sol",
         ] {
             assert_eq!(
                 normalize_effort_for_model(model, "xhigh").as_deref(),
                 Some("xhigh"),
                 "{model} 应原样下发 xhigh"
+            );
+        }
+    }
+
+    /// max 不受 xhigh 降级影响：4.6 两款按表是支持 max 的。
+    #[test]
+    fn test_max_effort_survives_on_4_6_models() {
+        for model in ["claude-opus-4.6", "claude-sonnet-4.6"] {
+            assert_eq!(
+                normalize_effort_for_model(model, "max").as_deref(),
+                Some("max"),
+                "{model} 按 Kiro 表支持 max，不应被降级"
             );
         }
     }
@@ -2544,7 +2562,6 @@ mod tests {
         }
         // 未确认的模型 → 不下发
         for m in [
-            "claude-sonnet-4.8",
             "claude-sonnet-4.5",
             "claude-opus-4.5",
             "claude-haiku-4.5",

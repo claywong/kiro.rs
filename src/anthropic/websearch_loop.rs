@@ -1387,7 +1387,7 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, None);
+        let events = build_sse_events("claude-sonnet-4-6", content, "tool_use", 10, 5, None);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
