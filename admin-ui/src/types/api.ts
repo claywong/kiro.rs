@@ -542,8 +542,14 @@ export interface TraceRecord {
   totalTokens?: number
   /** 费用（credits） */
   credits?: number
-  /** 首 Token 延迟（毫秒，仅流式有值） */
+  /** 首 Token 延迟（毫秒，仅流式有值）。带思考时首个 chunk 往往就是思考的第一个字 */
   firstTokenMs?: number | null
+  /** 首个正文 Token 延迟（毫秒，仅流式有值）——真正开始产出正文的时刻 */
+  firstAnswerMs?: number | null
+  /** 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个正文帧。只覆盖首段；null 见 ThinkingCell 注释 */
+  thinkingMs?: number | null
+  /** 思考文本字符数（原始值，非 token）。上游可能只下发摘要，故为实际推理量的下限 */
+  thinkingChars?: number
   /** 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值） */
   effort?: string | null
   attempts: TraceAttempt[]

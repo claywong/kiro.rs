@@ -190,6 +190,19 @@ pub(crate) struct RequestTracer {
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
+    /// 首个 reasoningContentEvent 到达时刻（思考开始；取第一次）
+    ///
+    /// 与 [`Self::first_token_at`] 分开记：`first_token_at` 是「首个上游 chunk」，
+    /// 语义不变（TTFT EWMA 调度依赖它）；带思考的请求里首个 chunk 往往就是思考，
+    /// 但非思考请求、或上游先发 contextUsageEvent 时二者并不相等。
+    first_reasoning_at: parking_lot::Mutex<Option<Instant>>,
+    /// 首个 assistantResponseEvent 到达时刻（开始产出正文；取第一次）
+    first_answer_at: parking_lot::Mutex<Option<Instant>>,
+    /// 思考文本累计字符数（reasoningContentEvent 的 text 字段）
+    ///
+    /// 用字符数而非 token：token 只能按 `字符/4` 估，落库存原始字符数，
+    /// 换算留给展示层，避免把估算误差固化进历史数据。
+    thinking_chars: std::sync::atomic::AtomicU64,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
     /// Token 管理器句柄，用于结束时上报 TTFT EWMA（可选）
     token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
@@ -233,6 +246,9 @@ impl RequestTracer {
             effort: options.effort,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
+            first_reasoning_at: parking_lot::Mutex::new(None),
+            first_answer_at: parking_lot::Mutex::new(None),
+            thinking_chars: std::sync::atomic::AtomicU64::new(0),
             attempts: parking_lot::Mutex::new(Vec::new()),
             token_manager: state.kiro_provider.as_ref().map(|p| p.token_manager().clone()),
         }
@@ -243,6 +259,49 @@ impl RequestTracer {
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
+        }
+    }
+
+    /// 非流式路径的思考观测：只累加字符数，不记时间戳
+    ///
+    /// 非流式是拿到完整响应体后一次性喂入解码器再遍历，所有帧的"到达时刻"都是
+    /// 同一瞬间，思考时长无从测量。但思考的**文本量**依然是真实的，照常累加。
+    ///
+    /// 与 [`Self::observe_event`] 分开命名，避免调用方误以为非流式也能拿到时长。
+    pub fn observe_reasoning_chars(&self, text: &str) {
+        self.thinking_chars.fetch_add(
+            text.chars().count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// 观测一个已解码的上游事件：记录思考 / 正文的首帧时刻与思考文本量
+    ///
+    /// 只读事件、不改写，与 `process_kiro_event` 的转换逻辑解耦；trace 未启用时
+    /// 由调用方跳过。仅用于流式路径——非流式整体喂入解码器，时间戳无意义，
+    /// 那条路走 [`Self::observe_reasoning_chars`]。
+    pub fn observe_event(&self, event: &Event) {
+        match event {
+            Event::ReasoningContent(reasoning) => {
+                let mut slot = self.first_reasoning_at.lock();
+                if slot.is_none() {
+                    *slot = Some(Instant::now());
+                }
+                drop(slot);
+                if let Some(text) = reasoning.text.as_deref() {
+                    self.thinking_chars.fetch_add(
+                        text.chars().count() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
+            Event::AssistantResponse(_) => {
+                let mut slot = self.first_answer_at.lock();
+                if slot.is_none() {
+                    *slot = Some(Instant::now());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -269,6 +328,18 @@ impl RequestTracer {
         {
             tm.report_ttft(final_credential_id, &self.model, ttft);
         }
+        // 思考观测：首个 reasoning 帧 → 首个 assistant 帧的间隔即思考耗时。
+        // 只在两个时刻都有、且顺序正常时给值；上游若不发思考（或只发思考没发
+        // 正文，例如中途断流）则为 None，展示层显示占位符。
+        let first_reasoning_at = *self.first_reasoning_at.lock();
+        let first_answer_at = *self.first_answer_at.lock();
+        let first_answer_ms =
+            first_answer_at.map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let thinking_ms = match (first_reasoning_at, first_answer_at) {
+            (Some(r), Some(a)) if a >= r => Some(a.duration_since(r).as_millis() as u64),
+            _ => None,
+        };
+        let thinking_chars = self.thinking_chars.load(std::sync::atomic::Ordering::Relaxed);
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -289,6 +360,9 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            first_answer_ms,
+            thinking_ms,
+            thinking_chars,
             effort: self.effort.clone(),
             attempts,
         };
@@ -298,6 +372,19 @@ impl RequestTracer {
 
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
+        // 换跳即丢弃上一跳的思考观测。
+        //
+        // provider 在拿到响应头时就上报本跳（见 `emit_attempt` 的 SUCCESS 分支：
+        // 上报后才 return response，流尚未消费），所以这里重置只会清掉**失败跳**
+        // 的残留，成功跳的 reasoning / assistant 帧都发生在重置之后。
+        //
+        // 不重置的后果：first_reasoning_at 幂等只记第一次，thinking_ms 会变成
+        // 「第 0 跳思考开始 → 最后一跳正文开始」，把失败、退避、换号全算进思考时长。
+        // 口径与 final_credential_id 一致 —— 都只描述最后一跳。
+        *self.first_reasoning_at.lock() = None;
+        *self.first_answer_at.lock() = None;
+        self.thinking_chars
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.attempts.lock().push(attempt);
     }
 }
@@ -1012,6 +1099,7 @@ fn create_sse_stream(
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            tracer.observe_event(&event);
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -1289,6 +1377,7 @@ async fn handle_non_stream_request(
                             if let Some(text) = reasoning.text
                                 && !text.is_empty()
                             {
+                                tracer.observe_reasoning_chars(&text);
                                 native_thinking.push_str(&text);
                             }
                             if let Some(signature) = reasoning.signature
@@ -2156,6 +2245,9 @@ mod tests {
             effort: None,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
+            first_reasoning_at: parking_lot::Mutex::new(None),
+            first_answer_at: parking_lot::Mutex::new(None),
+            thinking_chars: std::sync::atomic::AtomicU64::new(0),
             attempts: parking_lot::Mutex::new(Vec::new()),
             token_manager: None,
         });
@@ -2194,6 +2286,225 @@ mod tests {
         assert_eq!(rows[0].input_tokens, 1000);
         assert_eq!(rows[0].output_tokens, 200);
         assert!(rows[0].error_type.is_none());
+    }
+
+    /// 老库（缺思考三列）迁移后要能正常读写，且历史行不丢。
+    ///
+    /// 用真实文件库而非内存库：内存库每次都按最新 SCHEMA 建表，走不到
+    /// `migrate` 的 ALTER 分支，正是这个分支决定现网 db 能否平滑升级。
+    #[test]
+    fn legacy_db_without_thinking_columns_migrates_and_keeps_rows() {
+        let dir = std::env::temp_dir().join(format!("kiro-trace-mig-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("traces.db");
+
+        // 造一个"老版本"库：字段停在加思考列之前
+        {
+            let conn = rusqlite::Connection::open(&path).expect("建老库");
+            conn.execute_batch(
+                "CREATE TABLE traces (
+                    trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL,
+                    key_id INTEGER NOT NULL, key_source TEXT, model TEXT NOT NULL,
+                    is_stream INTEGER NOT NULL, final_status TEXT NOT NULL,
+                    final_credential_id INTEGER NOT NULL, error_type TEXT, error_message TEXT,
+                    total_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+                    interrupted_after_bytes INTEGER,
+                    input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    credits REAL NOT NULL DEFAULT 0, first_token_ms INTEGER, effort TEXT
+                 );
+                 CREATE TABLE trace_attempts (
+                    trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, credential_id INTEGER NOT NULL,
+                    endpoint TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                    error_snippet TEXT, duration_ms INTEGER NOT NULL,
+                    PRIMARY KEY (trace_id, attempt)
+                 );
+                 INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream,
+                    final_status, final_credential_id, total_attempts, duration_ms)
+                 VALUES ('legacy-1', '2026-08-01T00:00:00+00:00', 1785500000, 3, 'clientKey',
+                    'claude-opus-4-6', 1, 'success', 9, 1, 4200);",
+            )
+            .expect("建老表并插历史行");
+        }
+
+        let store = crate::admin::trace_db::TraceStore::open(path.clone(), true, 7)
+            .expect("打开老库应触发迁移");
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1, "历史行不能丢");
+        assert_eq!(rows[0].trace_id, "legacy-1");
+        // 老行没有思考数据：可空列为 None，NOT NULL 列取默认 0
+        assert!(rows[0].thinking_ms.is_none());
+        assert!(rows[0].first_answer_ms.is_none());
+        assert_eq!(rows[0].thinking_chars, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 思考观测：reasoning → assistant 的间隔落成 thinking_ms，字符数累计，
+    /// 且 first_token_ms 语义不受影响（仍是首个上游 chunk，由 mark_first_token 决定）。
+    #[test]
+    fn observe_event_records_thinking_span_and_chars() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, tracer) = hook_with_tracer(store.clone(), true);
+
+        // 首个上游 chunk 与首个 reasoning 是两个独立标记
+        tracer.mark_first_token();
+        for frag in ["推演中", "continue"] {
+            tracer.observe_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: Some(frag.to_string()),
+                ..Default::default()
+            }));
+        }
+        // 思考与正文之间留出可测量的间隔
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        tracer.observe_event(&Event::AssistantResponse(
+            serde_json::from_value(serde_json::json!({ "content": "answer" }))
+                .expect("构造 assistantResponseEvent"),
+        ));
+
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let rec = &rows[0];
+        // "推演中" 3 字符 + "continue" 8 字符，按字符计不按字节
+        assert_eq!(rec.thinking_chars, 11);
+        let thinking_ms = rec.thinking_ms.expect("有 reasoning 和正文时应有思考耗时");
+        assert!(thinking_ms >= 10, "思考耗时应覆盖两帧间隔，实际 {thinking_ms}ms");
+        assert!(rec.first_answer_ms.is_some(), "应记录首个正文帧时刻");
+        assert!(rec.first_token_ms.is_some(), "首 Token 语义不变，仍应有值");
+    }
+
+    /// 非流式：字符数照常累加，但不产生时长（帧全在同一瞬间到达）。
+    ///
+    /// 展示层靠「有字符数但没时长」把非流式和「真的没思考」区分开。
+    #[test]
+    fn non_stream_collects_chars_without_duration() {
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        // is_stream = false
+        let (hook, tracer) = hook_with_tracer(store.clone(), false);
+
+        tracer.observe_reasoning_chars("非流式的思考文本");
+        tracer.observe_reasoning_chars("continue");
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let rec = &rows[0];
+        assert!(!rec.is_stream);
+        // 8 字 + 8 字母
+        assert_eq!(rec.thinking_chars, 16, "非流式也要累加思考字符数");
+        assert!(rec.thinking_ms.is_none(), "非流式测不出时长");
+        assert!(rec.first_answer_ms.is_none(), "非流式没有首帧概念");
+    }
+
+    /// 重试污染：失败跳的思考观测不能算进最终结果。
+    ///
+    /// 模拟第 0 跳思考后断流、第 1 跳换号重来的时序。若不在 on_attempt 里重置，
+    /// thinking_ms 会把第 0 跳的思考起点当基准，把断流 + 退避 + 换号全算进思考时长。
+    #[test]
+    fn retry_discards_failed_hop_thinking_observation() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, tracer) = hook_with_tracer(store.clone(), true);
+
+        // 第 0 跳：provider 拿到响应头即上报，随后流里出现思考，然后断流
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 11,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 30,
+        });
+        tracer.mark_first_token();
+        tracer.observe_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("第 0 跳的思考，共十二字".to_string()),
+            ..Default::default()
+        }));
+        // 断流 + 退避：这段时间不该被算作思考
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        // 第 1 跳：换号重来
+        tracer.on_attempt(TraceAttempt {
+            attempt: 1,
+            credential_id: 22,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 40,
+        });
+        tracer.observe_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("重来".to_string()),
+            ..Default::default()
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tracer.observe_event(&Event::AssistantResponse(
+            serde_json::from_value(serde_json::json!({ "content": "answer" }))
+                .expect("构造 assistantResponseEvent"),
+        ));
+
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let rec = &rows[0];
+        // 只剩第 1 跳的 "重来" 两字，第 0 跳那十二字被丢弃
+        assert_eq!(rec.thinking_chars, 2, "失败跳的思考字符数不该累积");
+        let thinking_ms = rec.thinking_ms.expect("最后一跳有思考和正文");
+        assert!(
+            thinking_ms < 25,
+            "思考时长不该包含第 0 跳的断流与退避，实际 {thinking_ms}ms"
+        );
+        // 最终凭据取最后一跳，与思考观测同口径
+        assert_eq!(rec.final_credential_id, 22);
+    }
+
+    /// 没有 reasoning 帧时 thinking_ms 为 None（而不是 0），避免把"无思考"
+    /// 和"思考了 0 毫秒"混为一谈。
+    #[test]
+    fn observe_event_without_reasoning_leaves_thinking_none() {
+
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().expect("open in-memory trace db"),
+        );
+        let (hook, tracer) = hook_with_tracer(store.clone(), true);
+
+        tracer.mark_first_token();
+        tracer.observe_event(&Event::AssistantResponse(
+            serde_json::from_value(serde_json::json!({ "content": "answer" }))
+                .expect("构造 assistantResponseEvent"),
+        ));
+        hook.record(42, 1000, 200, 0, 0, 1.5, "success");
+
+        let (rows, _total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert!(rows[0].thinking_ms.is_none(), "无思考时不应有思考耗时");
+        assert_eq!(rows[0].thinking_chars, 0);
+        assert!(rows[0].first_answer_ms.is_some());
     }
 
     /// 失败时 error_type 取最后一跳的 outcome，且 attempt 要跟着落库
