@@ -39,6 +39,8 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
+// 本地新增导入单独成行，避免上游按字母重排 use 块时反复冲突。
+use super::thinking_mode::backend_requires_adaptive_thinking;
 
 /// 请求结束时记录用量的钩子
 ///
@@ -1601,8 +1603,10 @@ fn extract_effort(fields: Option<&AdditionalModelRequestFields>) -> Option<Strin
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6 / Sonnet 5：覆写为 adaptive 类型，并附带 `output_config.effort=high`
-/// - 其他模型：覆写为 enabled 类型
+/// - 仅支持 adaptive 的模型（Opus 4.7+ / Sonnet 5 / Fable 5 / Mythos 5，判定见
+///   [`backend_requires_adaptive_thinking`]）：覆写为 adaptive 类型，并附带
+///   `output_config.effort=high`
+/// - Opus 4.6 / Sonnet 4.6 等仍保留固定预算模式的模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
@@ -1610,9 +1614,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_adaptive_thinking = (model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || model_lower.contains("sonnet-5");
+    // 先映射成 backend_id 再判定：客户端原始名形态太多（4-6/4.6/-thinking 后缀/
+    // 自定义别名），直接在原始名上匹配会漏模型。映射失败时回退原始名，保持旧行为。
+    let backend_id =
+        super::converter::map_model(&payload.model).unwrap_or_else(|| payload.model.clone());
+    let is_adaptive_thinking = backend_requires_adaptive_thinking(&backend_id);
 
     let thinking_type = if is_adaptive_thinking {
         "adaptive"
@@ -2553,5 +2559,76 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+}
+
+/// 本地测试单独成块，不插进上游 `mod tests` 中间（见 CLAUDE.md 第二条）。
+///
+/// 覆盖 `-thinking` 后缀模型的 thinking 模式覆写：判定改为基于 backend_id 后，
+/// Opus 4.7+ / 5 代模型应走 adaptive，而非旧逻辑漏判成 enabled。
+#[cfg(test)]
+mod thinking_override_tests {
+    use super::*;
+
+    fn request_with_model(model: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("构造 MessagesRequest 失败")
+    }
+
+    #[test]
+    fn adaptive_only_models_get_adaptive_with_effort() {
+        // 旧逻辑只认 opus 4.6 / sonnet-5，这批会被漏判成 enabled。
+        for model in [
+            // opus 4.6 是 Kiro 侧约束（只在 adaptive 下接受 output_config），
+            // 上游原本就这样判，保持不变。
+            "claude-opus-4-6-thinking",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8-thinking",
+            "claude-opus-5-thinking",
+            "claude-sonnet-5-thinking",
+            "claude-fable-5-thinking",
+        ] {
+            let mut payload = request_with_model(model);
+            override_thinking_from_model_name(&mut payload);
+
+            let thinking = payload.thinking.as_ref().expect("应写入 thinking");
+            assert_eq!(
+                thinking.thinking_type, "adaptive",
+                "{model} 应覆写为 adaptive"
+            );
+            assert_eq!(
+                payload.output_config.as_ref().map(|oc| oc.effort.as_str()),
+                Some("high"),
+                "{model} 应附带 effort=high"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_budget_models_stay_enabled() {
+        // Sonnet 4.6 在 enabled 下即可带 output_config，维持 enabled + budget_tokens。
+        for model in ["claude-sonnet-4-6-thinking", "claude-sonnet-4-5-thinking"] {
+            let mut payload = request_with_model(model);
+            override_thinking_from_model_name(&mut payload);
+
+            let thinking = payload.thinking.as_ref().expect("应写入 thinking");
+            assert_eq!(thinking.thinking_type, "enabled", "{model} 应保持 enabled");
+            assert_eq!(thinking.budget_tokens, 20000);
+            assert!(
+                payload.output_config.is_none(),
+                "{model} 不应附带 output_config"
+            );
+        }
+    }
+
+    #[test]
+    fn models_without_thinking_suffix_are_untouched() {
+        let mut payload = request_with_model("claude-opus-4-7");
+        override_thinking_from_model_name(&mut payload);
+        assert!(payload.thinking.is_none(), "无 thinking 后缀不应覆写");
+        assert!(payload.output_config.is_none());
     }
 }
