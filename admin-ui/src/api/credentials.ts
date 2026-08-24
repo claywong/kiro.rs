@@ -535,6 +535,9 @@ export interface TrafficIngressState {
   accountCount: number
   /** 最近一次成功推送的 `schedulable`；null 表示尚未成功同步 */
   appliedSchedulable: boolean | null
+  /** 最近一轮 RPM 判据结论：false = 容量不足、被强制关闭；true = 容量足、不拦；
+   *  null = 还没判过或判据已停用（`minRpm = 0`）。 */
+  rpmOk: boolean | null
 }
 
 export async function getTrafficIngressState(): Promise<TrafficIngressState> {

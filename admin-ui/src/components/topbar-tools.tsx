@@ -838,6 +838,7 @@ function TrafficIngressPanels() {
 
   const configured = state?.configured ?? false
   const enabled = state?.enabled ?? false
+  const rpmOk = state?.rpmOk ?? null
   const busy = isLoading || isPending
 
   const toggle = (next: boolean) => {
@@ -848,17 +849,27 @@ function TrafficIngressPanels() {
     })
   }
 
+  // 标题逻辑：未配 > 手动关 > RPM 不够自动关 > 开
+  let statusLabel = '未配置'
+  if (configured) {
+    if (!enabled) {
+      statusLabel = '已关闭'
+    } else if (rpmOk === false) {
+      statusLabel = '已关闭（容量不足）'
+    } else {
+      statusLabel = '已开启'
+    }
+  }
+
   return (
     <>
       <DropdownMenuLabel>流量入口</DropdownMenuLabel>
       <div className="px-2 pb-2">
         <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="min-w-0 text-xs">
-            <div className="font-medium">
-              {!configured ? '未配置' : enabled ? '已开启' : '已关闭'}
-            </div>
+            <div className="font-medium">{statusLabel}</div>
             <div className="truncate text-muted-foreground">
-              {configured ? '手动控制指定外部账号接量' : '需配置 trafficIngress 的 token / 账号'}
+              {configured ? '手动开关 + RPM 容量闸门' : '需配置 trafficIngress 的 token / 账号'}
             </div>
           </div>
           <Switch
@@ -879,6 +890,14 @@ function TrafficIngressPanels() {
               <span>期望：{enabled ? '可调度' : '不可调度'}</span>
               <span>已同步：{appliedText(state.appliedSchedulable)}</span>
             </div>
+            {rpmOk !== null && (
+              <div className="flex items-center justify-between gap-2">
+                <span>RPM 容量</span>
+                <span className={rpmOk ? 'text-green-600' : 'text-amber-600'}>
+                  {rpmOk ? '充足' : '不足'}
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1258,7 +1277,13 @@ function TrafficIngressCompactItems() {
   if (!state?.configured) return null
 
   const enabled = state.enabled
+  const rpmOk = state.rpmOk ?? null
   const busy = isLoading || isPending
+
+  let label = enabled ? '关闭入口' : '开启入口'
+  if (enabled && rpmOk === false) {
+    label = '入口关闭（容量不足）'
+  }
 
   return (
     <>
@@ -1274,9 +1299,7 @@ function TrafficIngressCompactItems() {
         }
       >
         {enabled ? <Power /> : <PowerOff />}
-        {enabled
-          ? `关闭入口（已同步${appliedText(state.appliedSchedulable)}）`
-          : `开启入口（已同步${appliedText(state.appliedSchedulable)}）`}
+        {label}（已同步{appliedText(state.appliedSchedulable)}）
       </DropdownMenuItem>
     </>
   )

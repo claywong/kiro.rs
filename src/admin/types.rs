@@ -582,6 +582,9 @@ pub struct TrafficIngressStateResponse {
     pub account_count: usize,
     /// 最近一次成功推送的 schedulable；null 表示尚未成功同步
     pub applied_schedulable: Option<bool>,
+    /// 最近一轮 RPM 判据结论：false = 容量不足、被强制关闭；true = 容量足、不拦；
+    /// null = 还没判过或判据已停用（`minRpm = 0`）。
+    pub rpm_ok: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

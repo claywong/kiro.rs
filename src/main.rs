@@ -332,7 +332,11 @@ async fn main() {
     // 强制直连：对方按本机公网出口做 IP 白名单，复用全局代理会被 403 拒绝。
     let traffic_ingress_state =
         match http_client::build_client(None, 15, config.tls_backend) {
-            Ok(client) => admin::traffic_ingress::spawn(config.traffic_ingress.clone(), client),
+            Ok(client) => admin::traffic_ingress::spawn(
+                config.traffic_ingress.clone(),
+                client,
+                token_manager.clone(),
+            ),
             Err(error) => {
                 tracing::warn!("流量入口：HTTP 客户端构建失败，控制器不启动: {}", error);
                 None
