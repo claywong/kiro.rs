@@ -43,6 +43,19 @@ const CLIENT_CACHE_CAP: usize = 64;
 /// 兜住。
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
 
+/// 首字节（响应头）守卫：单次尝试从发起请求到拿到上游响应头的最长等待。
+///
+/// 与 `STREAM_READ_TIMEOUT_SECS`（reqwest `read_timeout`）分工：后者是「相邻两次读
+/// 之间」的空闲超时，但它在等响应头阶段同样生效且此前不会重置，因此响应头迟迟不到时
+/// 要烧满 120s 才失败 —— 客户端 50s 就断了，重试根本没机会出场。
+///
+/// 链路数据（12h，35k 请求）：1524 次 network_error 中 567 次（37%）精确聚集在
+/// 120002ms，即被 read_timeout 兜底；而重试后成功尝试的首字节 p50 仅 4.4s、p90 11.6s。
+/// 把等响应头单独限到 25s，失败后仍有约 25s 预算给重试，绝大多数能在客户端超时前拿到
+/// 首字节。拿到响应头之后的流中途空闲仍由 `STREAM_READ_TIMEOUT_SECS` 兜住，长 thinking
+/// 不受影响。
+const RESPONSE_HEADER_TIMEOUT_SECS: u64 = 25;
+
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
@@ -596,7 +609,22 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            // 首字节守卫：只限「等响应头」这一段。超时按网络错误处理，走下面同一个
+            // 重试分支（不禁用、不切换凭据），把一次 120s 的干等换成一次快速重试。
+            let send_result = match tokio::time::timeout(
+                Duration::from_secs(RESPONSE_HEADER_TIMEOUT_SECS),
+                self.client_for(&ctx.credentials)?.execute(request),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow::anyhow!(
+                    "等待上游响应头超过 {}s（首字节守卫）",
+                    RESPONSE_HEADER_TIMEOUT_SECS
+                )),
+            };
+
+            let response = match send_result {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
