@@ -681,6 +681,23 @@ pub(crate) async fn get_available_models(
     );
 }
 
+/// 上游是否明确表示「该账号类型没有 profile 概念」。
+///
+/// BuilderID 账号调 `ListAvailableProfiles` 会稳定收到：
+/// `403 {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+///       "message":"AWS Builder ID is not supported for this operation."}`
+///
+/// 这是**账号属性**（BuilderID 天生无 profile），不是查询故障 —— 重试一万次也是同样
+/// 结果。必须与网络抖动、限流、5xx 区分开：那些重试有意义，而这个不该让调用方
+/// 反复重查。此前它被归入通用 `Err`，导致每个 BuilderID 凭据的每次流式请求都白跑
+/// 一次上游往返并打一条 WARN（实测近 1 小时 1065 条）。
+///
+/// 刻意只认这一种确定性否定，不采用「非 200 一律当作没有 profile」的粗口径：后者会
+/// 让 Enterprise 账号在一次网络抖动后错用占位符 ARN，请求全数被拒。
+fn is_no_profile_concept_response(status: u16, body: &str) -> bool {
+    status == 403 && body.contains("Builder ID is not supported for this operation")
+}
+
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
 ///
 /// Enterprise / IAM Identity Center (IdC) 账号必须用真实 profileArn 调用流式端点；
@@ -751,6 +768,12 @@ pub(crate) async fn list_available_profiles(
         let body_text = response.text().await.unwrap_or_default();
         if let Some(error) = rate_limit_error {
             return Err(error.into());
+        }
+        // 上游明确回「BuilderID 不支持此操作」= 该账号没有 profile 概念，是账号属性而非
+        // 查询故障。视同「成功但为空」，让调用方标记已尝试、回退占位符，不再每请求重查。
+        if is_no_profile_concept_response(status.as_u16(), &body_text) {
+            empty_seen = true;
+            continue;
         }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
@@ -6409,6 +6432,41 @@ mod tests {
             available_models_url("q.us-east-1.amazonaws.com", &credentials),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
+    }
+
+    /// BuilderID 的「不支持此操作」是账号属性，必须识别为确定性否定。
+    #[test]
+    fn no_profile_concept_recognizes_builder_id_403() {
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        assert!(is_no_profile_concept_response(403, body));
+    }
+
+    /// 其余失败都必须保持可重试 —— 误判成「无 profile」会让 Enterprise 账号错用
+    /// 占位符 ARN，请求全数被拒。这是不采用「非 200 一律当空」粗口径的原因。
+    #[test]
+    fn no_profile_concept_rejects_retryable_failures() {
+        let builder_id_body =
+            r#"{"message":"AWS Builder ID is not supported for this operation."}"#;
+
+        // 同样文案但非 403：不认
+        assert!(!is_no_profile_concept_response(500, builder_id_body));
+        assert!(!is_no_profile_concept_response(429, builder_id_body));
+
+        // 403 但是别的原因：不认（Enterprise 的 ARN 不对、token 失效等都是 403）
+        for body in [
+            r#"{"message":"Invalid token."}"#,
+            r#"{"message":"User is not authorized to make this call."}"#,
+            r#"{"message":"The bearer token included in the request is invalid."}"#,
+            "",
+        ] {
+            assert!(
+                !is_no_profile_concept_response(403, body),
+                "不该把这个 403 当作确定性否定: {body}"
+            );
+        }
+
+        // 网络层失败（无响应体）：不认
+        assert!(!is_no_profile_concept_response(502, ""));
     }
 
     /// 用量类接口的 UA 版本号被上游当准入条件，四个接口必须一致。
