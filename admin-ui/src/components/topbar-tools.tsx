@@ -2,7 +2,7 @@ import { useState } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
-  Link2, Link2Off, Power, PowerOff,
+  Link2, Link2Off, Power, PowerOff, Gauge, GaugeCircle,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -23,6 +23,7 @@ import {
   useSelfHealConfig, useSetSelfHealConfig,
   useHealthGateState, useSetHealthGateEnabled,
   useTrafficIngressState, useSetTrafficIngressEnabled,
+  useConcurrencyGateState, useSetConcurrencyGateConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
@@ -329,6 +330,8 @@ function StrategyMenu({ controls }: { controls: ToolControls }) {
         <DropdownMenuSeparator />
         <TrafficIngressPanels />
         <DropdownMenuSeparator />
+        <ConcurrencyGatePanels />
+        <DropdownMenuSeparator />
         <HealthGatePanels />
       </DropdownMenuContent>
     </DropdownMenu>
@@ -472,6 +475,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <ThrottleCompactItems {...throttleProps} />
         <SelfHealCompactItems />
         <TrafficIngressCompactItems />
+        <ConcurrencyGateCompactItems />
         <HealthGateCompactItems />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -834,6 +838,7 @@ function TrafficIngressPanels() {
 
   const configured = state?.configured ?? false
   const enabled = state?.enabled ?? false
+  const rpmOk = state?.rpmOk ?? null
   const busy = isLoading || isPending
 
   const toggle = (next: boolean) => {
@@ -844,17 +849,27 @@ function TrafficIngressPanels() {
     })
   }
 
+  // 标题逻辑：未配 > 手动关 > RPM 不够自动关 > 开
+  let statusLabel = '未配置'
+  if (configured) {
+    if (!enabled) {
+      statusLabel = '已关闭'
+    } else if (rpmOk === false) {
+      statusLabel = '已关闭（容量不足）'
+    } else {
+      statusLabel = '已开启'
+    }
+  }
+
   return (
     <>
       <DropdownMenuLabel>流量入口</DropdownMenuLabel>
       <div className="px-2 pb-2">
         <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="min-w-0 text-xs">
-            <div className="font-medium">
-              {!configured ? '未配置' : enabled ? '已开启' : '已关闭'}
-            </div>
+            <div className="font-medium">{statusLabel}</div>
             <div className="truncate text-muted-foreground">
-              {configured ? '手动控制指定外部账号接量' : '需配置 trafficIngress 的 token / 账号'}
+              {configured ? '手动开关 + RPM 容量闸门' : '需配置 trafficIngress 的 token / 账号'}
             </div>
           </div>
           <Switch
@@ -875,6 +890,14 @@ function TrafficIngressPanels() {
               <span>期望：{enabled ? '可调度' : '不可调度'}</span>
               <span>已同步：{appliedText(state.appliedSchedulable)}</span>
             </div>
+            {rpmOk !== null && (
+              <div className="flex items-center justify-between gap-2">
+                <span>RPM 容量</span>
+                <span className={rpmOk ? 'text-green-600' : 'text-amber-600'}>
+                  {rpmOk ? '充足' : '不足'}
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -964,6 +987,240 @@ function HealthGatePanels() {
   )
 }
 
+/**
+ * 并发联动面板：把本地有效凭证的 RPM 总量按除数换算成外部账号并发上限。
+ *
+ * 两个输入框语义不同，别混：
+ * - 除数：改换算比例，并发仍随 RPM 总量自动浮动。
+ * - 手动并发：直接钉死一个值，忽略换算；清空即回到自动。
+ */
+function ConcurrencyGatePanels() {
+  const { data: state, isLoading } = useConcurrencyGateState()
+  const { mutate, isPending } = useSetConcurrencyGateConfig()
+  const [divisorInput, setDivisorInput] = useState('')
+  const [manualInput, setManualInput] = useState('')
+
+  const configured = state?.configured ?? false
+  const enabled = state?.enabled ?? false
+  const busy = isLoading || isPending
+
+  const toggle = (v: boolean) => {
+    mutate(
+      { enabled: v },
+      {
+        onSuccess: () =>
+          toast.success(
+            v ? '已开启并发联动，正在同步外部账号' : '已关闭并发联动，外部账号保留当前并发',
+          ),
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      },
+    )
+  }
+
+  const submitDivisor = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(divisorInput, 10)
+    if (!Number.isFinite(n) || n < 1) {
+      toast.error('除数需为不小于 1 的整数')
+      return
+    }
+    mutate(
+      { divisor: n },
+      {
+        onSuccess: (next) => {
+          setDivisorInput('')
+          toast.success(`除数已改为 ${n}，换算并发 ${next.resolvedConcurrency}`)
+        },
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      },
+    )
+  }
+
+  const submitManual = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(manualInput, 10)
+    if (!Number.isFinite(n) || n < 0) {
+      toast.error('并发需为不小于 0 的整数')
+      return
+    }
+    mutate(
+      { manualConcurrency: n },
+      {
+        onSuccess: (next) => {
+          setManualInput('')
+          toast.success(`已钉死并发 ${next.resolvedConcurrency}`)
+        },
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      },
+    )
+  }
+
+  const clearManual = () => {
+    mutate(
+      { manualConcurrency: null },
+      {
+        onSuccess: (next) =>
+          toast.success(`已回到自动换算，当前 ${next.resolvedConcurrency}`),
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      },
+    )
+  }
+
+  const manual = state?.manualConcurrency ?? null
+
+  return (
+    <>
+      <DropdownMenuLabel>并发联动</DropdownMenuLabel>
+      <div className="px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="min-w-0 text-xs">
+            <div className="font-medium">
+              {!configured ? '未配置' : enabled ? '已启用' : '已关闭'}
+            </div>
+            <div className="truncate text-muted-foreground">
+              {configured ? (
+                <>有效凭证 RPM 换算外部并发</>
+              ) : (
+                <>需先配 concurrencyGate 的地址 / token / 账号</>
+              )}
+            </div>
+          </div>
+          <Switch
+            checked={enabled}
+            disabled={busy || !configured}
+            onCheckedChange={toggle}
+            aria-label="并发联动总开关"
+          />
+        </div>
+
+        {configured && state && (
+          <>
+            <div className="mt-2 space-y-1 rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate">{hostOf(state.baseUrl)}</span>
+                <span>{state.accountCount} 个账号</span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span>
+                  RPM {state.rpmTotal} ÷ {state.divisor}
+                </span>
+                <span>
+                  期望 {state.resolvedConcurrency} · 已推{' '}
+                  {state.appliedConcurrency ?? '—'}
+                </span>
+              </div>
+              {manual !== null && (
+                <div className="flex items-center justify-between gap-2 pt-0.5">
+                  <span className="text-[11px]">已钉死 {manual}，忽略换算</span>
+                  <button
+                    type="button"
+                    className="text-[11px] underline disabled:opacity-50"
+                    disabled={busy}
+                    onClick={clearManual}
+                  >
+                    回到自动
+                  </button>
+                </div>
+              )}
+              {state.unlimitedCredentials > 0 && (
+                <div className="pt-0.5 text-[11px] leading-snug">
+                  含 {state.unlimitedCredentials} 条不限速凭证，总量为折算估值。
+                </div>
+              )}
+              {!enabled && (
+                <div className="pt-0.5 text-[11px] leading-snug">
+                  已停止同步，外部账号保留最后推上去的并发值。
+                </div>
+              )}
+            </div>
+
+            <form onSubmit={submitDivisor} className="mt-2 flex items-center gap-1.5">
+              <Input
+                type="number"
+                min={1}
+                placeholder={`除数（当前 ${state.divisor}）`}
+                value={divisorInput}
+                onChange={(e) => setDivisorInput(e.target.value)}
+                disabled={busy}
+                className="h-7 text-xs"
+              />
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                className="h-7 shrink-0 text-xs"
+                disabled={busy || !divisorInput.trim()}
+              >
+                保存
+              </Button>
+            </form>
+
+            <form onSubmit={submitManual} className="mt-1.5 flex items-center gap-1.5">
+              <Input
+                type="number"
+                min={0}
+                placeholder={manual === null ? '手动并发（留空=自动）' : `手动（当前 ${manual}）`}
+                value={manualInput}
+                onChange={(e) => setManualInput(e.target.value)}
+                disabled={busy}
+                className="h-7 text-xs"
+              />
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                className="h-7 shrink-0 text-xs"
+                disabled={busy || !manualInput.trim()}
+              >
+                钉死
+              </Button>
+            </form>
+          </>
+        )}
+      </div>
+    </>
+  )
+}
+
+/** 紧凑模式的并发联动开关；未配置时不占菜单空间。数值调整请用宽屏面板。 */
+function ConcurrencyGateCompactItems() {
+  const { data: state, isLoading } = useConcurrencyGateState()
+  const { mutate, isPending } = useSetConcurrencyGateConfig()
+
+  if (!state?.configured) return null
+
+  const enabled = state.enabled
+  const busy = isLoading || isPending
+
+  return (
+    <>
+      <DropdownMenuLabel>并发联动</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={busy}
+        onSelect={() =>
+          mutate(
+            { enabled: !enabled },
+            {
+              onSuccess: () =>
+                toast.success(
+                  !enabled
+                    ? '已开启并发联动，正在同步外部账号'
+                    : '已关闭并发联动，外部账号保留当前并发',
+                ),
+              onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+            },
+          )
+        }
+      >
+        {enabled ? <Gauge /> : <GaugeCircle />}
+        {enabled
+          ? `关闭并发联动（期望 ${state.resolvedConcurrency}）`
+          : `开启并发联动（期望 ${state.resolvedConcurrency}）`}
+      </DropdownMenuItem>
+    </>
+  )
+}
+
 /** 已推送值的中文说明。null = 本进程还没推过，对方可能残留上次运行的值 */
 function appliedText(applied: boolean | null | undefined): string {
   if (applied === null || applied === undefined) return '未知'
@@ -1020,7 +1277,13 @@ function TrafficIngressCompactItems() {
   if (!state?.configured) return null
 
   const enabled = state.enabled
+  const rpmOk = state.rpmOk ?? null
   const busy = isLoading || isPending
+
+  let label = enabled ? '关闭入口' : '开启入口'
+  if (enabled && rpmOk === false) {
+    label = '入口关闭（容量不足）'
+  }
 
   return (
     <>
@@ -1036,9 +1299,7 @@ function TrafficIngressCompactItems() {
         }
       >
         {enabled ? <Power /> : <PowerOff />}
-        {enabled
-          ? `关闭入口（已同步${appliedText(state.appliedSchedulable)}）`
-          : `开启入口（已同步${appliedText(state.appliedSchedulable)}）`}
+        {label}（已同步{appliedText(state.appliedSchedulable)}）
       </DropdownMenuItem>
     </>
   )

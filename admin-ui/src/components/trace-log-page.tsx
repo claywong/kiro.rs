@@ -120,14 +120,19 @@ function formatTokenFull(n: number): string {
 
 /**
  * 输出速率 OTPS（output tokens / second）。
- * - 流式：分母取「耗时 - 首 Token 延迟」（即真正产出内容的时间）
+ * - 流式：分母取「耗时 - 首个产出帧延迟」（即真正产出内容的时间）。
+ *   优先用 firstAnswerMs：思考发生在它之前，若用 firstTokenMs 作分母起点，
+ *   整段思考会被算进「产出内容的时间」，带思考的请求 OTPS 被系统性低估。
+ *   「产出」含正文与工具调用两种，所以思考后直接发工具调用的请求同样命中。
+ *   老记录没有 firstAnswerMs，回退到 firstTokenMs 维持原行为。
  * - 非流式：无首 Token 概念，分母取整段耗时
  * 分母 <= 0 或无输出时返回 null（不展示）。
  */
 function computeOtps(rec: TraceRecord): number | null {
   const output = rec.outputTokens ?? 0
   if (output <= 0) return null
-  const ttft = rec.isStream && rec.firstTokenMs != null ? rec.firstTokenMs : 0
+  const start = rec.firstAnswerMs ?? rec.firstTokenMs
+  const ttft = rec.isStream && start != null ? start : 0
   const genMs = rec.durationMs - ttft
   if (genMs <= 0) return null
   return (output / genMs) * 1000
@@ -327,6 +332,9 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
           {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
         </td>
+        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
+          <ThinkingCell rec={rec} />
+        </td>
         <td className="py-2.5 pr-3">
           {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
         </td>
@@ -339,6 +347,71 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
       </tr>
       {open && <ExpandedTraceRow rec={rec} />}
     </>
+  )
+}
+
+/**
+ * 首段思考列：耗时为主，思考占总输出的比例为辅。
+ *
+ * 「首段」是字面意思：只覆盖首个 reasoning 帧 → 首个产出帧（正文或工具调用）。
+ * 上游可能 reasoning → 产出 → reasoning → 产出 交替，后续几段不计入时长（但字符数
+ * 是全量累加的，所以占比可能超过时长所对应的比例）。
+ *
+ * 占比分母用 outputTokens（思考+正文的合计估算），分子由 thinkingChars 按
+ * 与后端一致的「字符/4」换算。上游 thinking.display 默认 summarized，下发的
+ * 可能是摘要而非完整思考，故这个比例是下限，不能当计费依据。
+ */
+function ThinkingCell({ rec }: { rec: TraceRecord }) {
+  const ms = rec.thinkingMs
+  const chars = rec.thinkingChars ?? 0
+
+  // 没有时长有三种情况，显示要能区分，否则「非流式」会和「没思考」长得一样：
+  // 1. 非流式：帧全在同一瞬间到达，时长无从测量，但字符数是真的
+  // 2. 流式且有思考文本但没时长：只有思考没有产出，通常是中途断流
+  // 3. 流式且完全没有思考文本：本次请求真的没思考
+  if (ms == null) {
+    if (!rec.isStream) {
+      return (
+        <span
+          className="text-muted-foreground"
+          title={
+            chars > 0
+              ? `非流式请求无法测量思考时长（所有帧同时到达）\n思考 ${formatTokenFull(chars)} 字符`
+              : '非流式请求无法测量思考时长（所有帧同时到达）'
+          }
+        >
+          {chars > 0 ? `${formatTokenFull(chars)} 字符` : '不适用'}
+        </span>
+      )
+    }
+    if (chars > 0) {
+      return (
+        <span
+          className="text-muted-foreground"
+          title={`只收到思考、未收到正文（通常是中途断流）\n思考 ${formatTokenFull(chars)} 字符`}
+        >
+          {formatTokenFull(chars)} 字符
+        </span>
+      )
+    }
+    return <span className="text-muted-foreground">—</span>
+  }
+
+  const output = rec.outputTokens ?? 0
+  const thinkTokens = Math.round(chars / 4)
+  const ratio = output > 0 ? Math.min(1, thinkTokens / output) : null
+
+  return (
+    <span
+      title={`思考 ${formatDuration(ms)}，${formatTokenFull(chars)} 字符（约 ${formatTokenFull(thinkTokens)} token）\n上游可能只下发思考摘要，此为实际推理量下限`}
+    >
+      {formatDuration(ms)}
+      {ratio != null && (
+        <span className="ml-1 text-[11px] text-muted-foreground">
+          {(ratio * 100).toFixed(0)}%
+        </span>
+      )}
+    </span>
   )
 }
 
@@ -355,7 +428,7 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
 function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={12} className="px-3 py-3">
+      <td colSpan={13} className="px-3 py-3">
         <ExpandedDetail rec={rec} />
       </td>
     </tr>
@@ -374,6 +447,12 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
       {rec.interruptedAfterBytes != null && (
         <div className="text-[12px] text-muted-foreground">
           中断前已发送 {rec.interruptedAfterBytes} 字节
+        </div>
+      )}
+      {rec.firstAnswerMs != null && (
+        <div className="text-[12px] text-muted-foreground">
+          首个产出 Token {formatDuration(rec.firstAnswerMs)}
+          {rec.firstTokenMs != null && `（首个上游 chunk ${formatDuration(rec.firstTokenMs)}）`}
         </div>
       )}
       <div className="text-[12px] font-medium text-muted-foreground">
@@ -634,6 +713,12 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">Token</th>
                     <th className="py-2 pr-3 font-medium">费用</th>
                     <th className="py-2 pr-3 font-medium">首Token</th>
+                    <th
+                      className="py-2 pr-3 font-medium"
+                      title="首个 reasoning 帧 → 首个产出帧（正文或工具调用）。上游可能思考/产出交替，此列只覆盖首段"
+                    >
+                      首段思考
+                    </th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
                     <th className="py-2 pr-3 font-medium">重试</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>

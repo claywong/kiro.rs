@@ -182,6 +182,7 @@ mod tests {
             auto_reserve: false,
             vendor_password: String::new(),
             stock_poll_interval_secs: 0,
+            stock_poll_enabled: None,
             stock_poll_respect_global_gate: true,
         }
     }

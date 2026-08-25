@@ -26,7 +26,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
-        SetTrafficIngressRequest,
+        SetConcurrencyGateRequest, SetTrafficIngressRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -615,6 +615,22 @@ pub async fn set_traffic_ingress_state(
     Json(payload): Json<SetTrafficIngressRequest>,
 ) -> impl IntoResponse {
     match state.service.set_traffic_ingress_enabled(payload.enabled) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/concurrency-gate
+pub async fn get_concurrency_gate_state(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_concurrency_gate_state())
+}
+
+/// PUT /api/admin/config/concurrency-gate
+pub async fn set_concurrency_gate_state(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetConcurrencyGateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_concurrency_gate_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
@@ -1444,6 +1460,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "firstAnswerMs": r.first_answer_ms,
+                "thinkingMs": r.thinking_ms,
+                "thinkingChars": r.thinking_chars,
                 "effort": r.effort,
                 "attempts": attempts,
             })

@@ -20,9 +20,11 @@ import {
   setAccountThrottleConfig,
   getHealthGateState,
   getTrafficIngressState,
+  getConcurrencyGateState,
   getSelfHealConfig,
   setHealthGateEnabled,
   setTrafficIngressEnabled,
+  setConcurrencyGateConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
@@ -325,6 +327,27 @@ export function useSetTrafficIngressEnabled() {
     onSuccess: (state) => {
       queryClient.setQueryData(['trafficIngressState'], state)
       queryClient.invalidateQueries({ queryKey: ['trafficIngressState'] })
+    },
+  })
+}
+
+// 并发联动状态。轮询间隔与流量入口一致：后端每 60 秒重算一次，
+// 10 秒轮询能较快看到 RPM 总量变化和异步推送结果。
+export function useConcurrencyGateState() {
+  return useQuery({
+    queryKey: ['concurrencyGateState'],
+    queryFn: getConcurrencyGateState,
+    refetchInterval: 10_000,
+  })
+}
+
+export function useSetConcurrencyGateConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setConcurrencyGateConfig,
+    onSuccess: (state) => {
+      queryClient.setQueryData(['concurrencyGateState'], state)
+      queryClient.invalidateQueries({ queryKey: ['concurrencyGateState'] })
     },
   })
 }

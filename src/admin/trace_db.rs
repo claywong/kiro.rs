@@ -125,6 +125,30 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 首个产出 Token 延迟（毫秒，仅流式有值）；产出含正文与工具调用
+    ///
+    /// 与 [`Self::first_token_ms`] 的区别：后者是首个上游 chunk（带思考时通常就是
+    /// 思考的第一个字），本字段是首个 `assistantResponseEvent`，即真正开始产出
+    /// 正文的时刻。无思考时二者接近；思考越久差距越大。
+    #[serde(default)]
+    pub first_answer_ms: Option<u64>,
+    /// 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个产出帧（正文或工具调用）
+    ///
+    /// 只覆盖**首段**。带工具调用时上游可能 reasoning → 正文 → reasoning → 正文
+    /// 交替，后续几段不计入（字符数则是全量累加的）。
+    ///
+    /// None 的三种情形：非流式（帧同时到达，无从测量）、只有思考没有产出
+    /// （中途断流）、本次真的没思考。展示层靠 `is_stream` + `thinking_chars` 区分。
+    ///
+    /// 重试时只保留最后一跳：换跳会清空观测，口径与 `final_credential_id` 一致。
+    #[serde(default)]
+    pub thinking_ms: Option<u64>,
+    /// 思考文本字符数（原始值，不是 token）
+    ///
+    /// 上游 `thinking.display` 默认 `summarized`，下发的可能是思考摘要而非全文，
+    /// 故此值只能视为实际推理量的下限。算成本请用 [`Self::credits`]。
+    #[serde(default)]
+    pub thinking_chars: u64,
     /// 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值）
     #[serde(default)]
     pub effort: Option<String>,
@@ -259,7 +283,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 8] = [
+        let columns: [(&str, &str); 11] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -268,6 +292,11 @@ impl TraceStore {
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
             ("effort", "TEXT"),
+            // 思考观测（首个产出帧延迟 / 思考耗时 / 思考字符数）。前两者可空：
+            // 老行与无思考请求都没有值，展示层显示占位符。
+            ("first_answer_ms", "INTEGER"),
+            ("thinking_ms", "INTEGER"),
+            ("thinking_chars", "INTEGER NOT NULL DEFAULT 0"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -332,8 +361,9 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, effort) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 credits, first_token_ms, effort, first_answer_ms, thinking_ms, thinking_chars) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
+                 ?21,?22,?23,?24)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -356,6 +386,9 @@ impl TraceStore {
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
                     rec.effort,
+                    rec.first_answer_ms.map(|v| v as i64),
+                    rec.thinking_ms.map(|v| v as i64),
+                    rec.thinking_chars as i64,
                 ],
             )?;
             for a in &rec.attempts {
@@ -486,7 +519,8 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, effort \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, effort, \
+             first_answer_ms, thinking_ms, thinking_chars \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -514,6 +548,9 @@ impl TraceStore {
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 effort: row.get::<_, Option<String>>(19)?,
+                first_answer_ms: row.get::<_, Option<i64>>(20)?.map(|v| v as u64),
+                thinking_ms: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
+                thinking_chars: row.get::<_, i64>(22)? as u64,
                 attempts: Vec::new(),
             })
         })?;
@@ -789,7 +826,10 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
     first_token_ms    INTEGER,
-    effort            TEXT
+    effort            TEXT,
+    first_answer_ms   INTEGER,
+    thinking_ms       INTEGER,
+    thinking_chars    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -850,6 +890,9 @@ mod tests {
             credits: 0.0,
             first_token_ms: None,
             effort: None,
+            first_answer_ms: None,
+            thinking_ms: None,
+            thinking_chars: 0,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,

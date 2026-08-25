@@ -44,6 +44,7 @@ use super::types::{
     SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest, TrafficIngressStateResponse,
+    ConcurrencyGateStateResponse, SetConcurrencyGateRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -233,6 +234,7 @@ pub struct AdminService {
     health_gate: Option<crate::admin::health_gate::SharedGateState>,
     /// 手动流量入口控制器。None = 未配置
     traffic_ingress: Option<crate::admin::traffic_ingress::SharedTrafficIngressState>,
+    concurrency_gate: Option<crate::admin::concurrency_gate::SharedConcurrencyGateState>,
 }
 
 /// Social 登录会话状态
@@ -569,6 +571,7 @@ impl AdminService {
             usage_recorder: None,
             health_gate: None,
             traffic_ingress: None,
+            concurrency_gate: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -639,6 +642,20 @@ impl AdminService {
         &self,
     ) -> Option<&crate::admin::traffic_ingress::SharedTrafficIngressState> {
         self.traffic_ingress.as_ref()
+    }
+
+    pub fn with_concurrency_gate(
+        mut self,
+        state: Option<crate::admin::concurrency_gate::SharedConcurrencyGateState>,
+    ) -> Self {
+        self.concurrency_gate = state;
+        self
+    }
+
+    pub fn concurrency_gate(
+        &self,
+    ) -> Option<&crate::admin::concurrency_gate::SharedConcurrencyGateState> {
+        self.concurrency_gate.as_ref()
     }
 
     /// 获取所有凭据状态
@@ -2228,6 +2245,7 @@ impl AdminService {
                 base_url: config.normalized_base_url().to_string(),
                 account_count: config.account_ids.len(),
                 applied_schedulable: state.applied(),
+                rpm_ok: state.rpm_ok(),
             },
             None => TrafficIngressStateResponse {
                 configured: false,
@@ -2235,6 +2253,7 @@ impl AdminService {
                 base_url: config.normalized_base_url().to_string(),
                 account_count: config.account_ids.len(),
                 applied_schedulable: None,
+                rpm_ok: None,
             },
         }
     }
@@ -2268,6 +2287,125 @@ impl AdminService {
         let mut config = crate::model::config::Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.traffic_ingress.enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 读取并发联动状态。token 永不进入响应。
+    ///
+    /// `rpmTotal` / `resolvedConcurrency` 是每次请求实时算的，不依赖看门狗那轮的缓存，
+    /// 这样面板改完除数能立刻看到新的换算结果，不用等下一个周期。
+    pub fn get_concurrency_gate_state(&self) -> ConcurrencyGateStateResponse {
+        let config = &self.token_manager.config().concurrency_gate;
+        let (rpm_total, unlimited) = self
+            .token_manager
+            .available_rpm_total(config.unlimited_rpm);
+
+        match self.concurrency_gate() {
+            Some(state) => {
+                let effective = crate::model::config::ConcurrencyGateConfig {
+                    divisor: state.divisor(),
+                    manual_concurrency: state.manual_concurrency(),
+                    ..config.clone()
+                };
+                ConcurrencyGateStateResponse {
+                    configured: true,
+                    enabled: state.enabled(),
+                    base_url: config.normalized_base_url().to_string(),
+                    account_count: config.account_ids.len(),
+                    divisor: state.divisor(),
+                    manual_concurrency: state.manual_concurrency(),
+                    rpm_total,
+                    unlimited_credentials: unlimited,
+                    resolved_concurrency: effective.resolve_concurrency(rpm_total),
+                    applied_concurrency: state.applied(),
+                    min_concurrency: config.min_concurrency,
+                    max_concurrency: config.max_concurrency,
+                }
+            }
+            None => ConcurrencyGateStateResponse {
+                configured: false,
+                enabled: false,
+                base_url: config.normalized_base_url().to_string(),
+                account_count: config.account_ids.len(),
+                divisor: config.effective_divisor(),
+                manual_concurrency: config.manual_concurrency,
+                rpm_total,
+                unlimited_credentials: unlimited,
+                resolved_concurrency: config.resolve_concurrency(rpm_total),
+                applied_concurrency: None,
+                min_concurrency: config.min_concurrency,
+                max_concurrency: config.max_concurrency,
+            },
+        }
+    }
+
+    /// 更新并发联动：开关 / 除数 / 手动并发值，三者均可单独提交。
+    ///
+    /// `manualConcurrency` 显式传 `null` 表示清除手动值回到自动换算，故用
+    /// `Option<Option<u32>>` 区分「没提交这个字段」与「提交了 null」。
+    pub fn set_concurrency_gate_config(
+        &self,
+        req: SetConcurrencyGateRequest,
+    ) -> Result<ConcurrencyGateStateResponse, AdminServiceError> {
+        let Some(state) = self.concurrency_gate() else {
+            return Err(AdminServiceError::InvalidCredential(
+                "并发联动未配置（需填 concurrencyGate 的 token / accountIds），无法修改"
+                    .to_string(),
+            ));
+        };
+
+        if req.enabled.is_none() && req.divisor.is_none() && req.manual_concurrency.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled / divisor / manualConcurrency 一个字段".to_string(),
+            ));
+        }
+
+        if let Some(divisor) = req.divisor {
+            if divisor == 0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "divisor 必须大于 0".to_string(),
+                ));
+            }
+            state.set_divisor(divisor);
+        }
+
+        // 内层 None 是「清除手动值」，不是「未提交」——未提交由外层 None 表示。
+        if let Some(manual) = req.manual_concurrency {
+            state.set_manual_concurrency(manual);
+        }
+
+        if let Some(enabled) = req.enabled {
+            state.set_enabled(enabled);
+        }
+
+        if let Err(error) = self.persist_concurrency_gate(&req) {
+            tracing::warn!("持久化并发联动配置失败（运行时已生效）: {}", error);
+        }
+        Ok(self.get_concurrency_gate_state())
+    }
+
+    fn persist_concurrency_gate(&self, req: &SetConcurrencyGateRequest) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|path| path.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，并发联动仅在当前进程生效"))?;
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        if let Some(enabled) = req.enabled {
+            config.concurrency_gate.enabled = enabled;
+        }
+        if let Some(divisor) = req.divisor {
+            config.concurrency_gate.divisor = divisor;
+        }
+        if let Some(manual) = req.manual_concurrency {
+            config.concurrency_gate.manual_concurrency = manual;
+        }
         config
             .save()
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;

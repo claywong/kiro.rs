@@ -362,6 +362,9 @@ pub async fn get_status(
         // 都已更新，但 cfg 是进程启动时那份，永远返回旧值 —— 症状是开关点了就弹回去，
         // 看着像「关闭失败」，而请求其实全成功了。同 autoPurchase / perChannel。
         "stockPollRespectGlobalGate": service.stock_poll_respect_gate(),
+        // 轮询开关（运行时值，同上必须读运行时而非 cfg 快照）。它与
+        // stockPollIntervalSecs 的分工：间隔管节奏且改了要重启，本项管开关且随时可切。
+        "stockPollEnabled": service.stock_poll_enabled(),
     });
 
     // 库存与档案两家都有；其余按能力集选择性发起
@@ -801,6 +804,35 @@ pub async fn set_stock_poll_respect_gate(
         respect = result.respect,
         persisted = result.persisted,
         "库存轮询总闸遵循已更新"
+    );
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetStockPollEnabledRequest {
+    pub enabled: bool,
+}
+
+/// `PUT /api/admin/vendor/stock-poll-enabled?vendorId=xxx` —— 开关库存轮询
+///
+/// 逐家设置。关掉后轮询器仍在，只是每轮整轮跳过（连库存都不查），故切回来最迟
+/// 一个周期就恢复，不必重启 —— 这正是它与「把 stockPollIntervalSecs 改成 0」的区别。
+pub async fn set_stock_poll_enabled(
+    State(state): State<VendorState>,
+    Query(sel): Query<VendorSelector>,
+    Json(req): Json<SetStockPollEnabledRequest>,
+) -> Response {
+    let service = match pick(&state, &sel) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let result = service.set_stock_poll_enabled(req.enabled);
+    tracing::info!(
+        vendor_id = %service.vendor_id(),
+        enabled = result.enabled,
+        persisted = result.persisted,
+        "库存轮询开关已更新"
     );
     Json(result).into_response()
 }

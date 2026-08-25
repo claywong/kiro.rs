@@ -251,11 +251,27 @@ pub struct VendorConfig {
     /// 于是「停掉本家的轮询」有两种粒度：关 `autoPurchase`（轮询器仍在，转入待机，
     /// 切回自动后最迟一个周期恢复），或把本项改成 0（轮询器根本不起，改回要重启）。
     ///
-    /// **有下限**：小于 [`MIN_STOCK_POLL_INTERVAL_SECS`] 的非 0 值会被抬到该值并
-    /// 告警。kiro.red 查一次库存要登录 + 签名 + 解密，间隔太密等于持续压卖家接口，
-    /// 且我方每一轮都要走一遍授权判定。
+    /// **有下限，且下限按 flavor 分档**：小于 [`VendorConfig::min_stock_poll_interval`]
+    /// 的非 0 值会被抬到该值并告警。查一次库存的代价各家差很多 —— kiro.red 要
+    /// 登录换 JWT + 请求签名 + 响应解密，间隔太密等于持续压卖家接口；`legacy`
+    /// 只是一次带 `X-API-Key` 的裸 `GET /api/my/stock`，秒级也扛得住。
     #[serde(default)]
     pub stock_poll_interval_secs: u64,
+
+    /// 库存轮询的**运行时开关**。缺省时按 `stockPollIntervalSecs > 0` 推导，
+    /// 故老配置不写它行为不变。
+    ///
+    /// 与 [`Self::stock_poll_interval_secs`] 的分工：间隔决定**节奏**，本项决定
+    /// **开不开**。早先只有间隔一个旋钮，「停掉轮询」得把它改成 0，而那会让轮询器
+    /// 根本不起，改回来必须重启进程 —— 面板上没法停、也没法恢复。本项补上这一环：
+    /// 轮询器只要间隔非 0 就起，每轮读本项决定要不要真查库存，面板随时可切。
+    ///
+    /// 本项管的**只是现货这一支**。两条路不受它影响：卖家 webhook 推送触发的自动
+    /// 提取；以及 kiro.red 自动预定 —— 后者在 `poll_stock_once` 里排在本开关的判定
+    /// **之前**，由 [`Self::auto_reserve`] 单独管。想整家停掉自动扣费仍是关
+    /// `auto_purchase`（现货）与 `auto_reserve`（预定）。
+    #[serde(default)]
+    pub stock_poll_enabled: Option<bool>,
 
     /// 轮询是否遵循**全局自动提取总闸**（顶层 `autoPurchaseEnabled`）。默认 `true`。
     ///
@@ -288,16 +304,49 @@ fn default_true() -> bool {
 impl VendorConfig {
     /// 库存轮询的**实际生效间隔**（秒），0 表示未启用。
     ///
-    /// 与配置原值的区别是已抬过下限（见 [`MIN_STOCK_POLL_INTERVAL_SECS`]）。
+    /// 与配置原值的区别是已抬过下限（见 [`Self::min_stock_poll_interval`]）。
     /// 轮询器与面板都必须用这个值，否则面板显示 10 秒而实际按 60 秒跑，
     /// 会让人误判「怎么没按我配的频率查」。
     ///
-    /// **0 不受下限影响** —— 0 是「关闭」，被抬成 60 等于替用户开了一条扣费路径。
+    /// **0 不受下限影响** —— 0 是「关闭」，被抬成下限等于替用户开了一条扣费路径。
     pub fn effective_stock_poll_interval(&self) -> u64 {
         match self.stock_poll_interval_secs {
+            // 显式开了轮询却没给间隔：按下限跑，而不是当成关闭。
+            //
+            // 返回 0 会让轮询器根本不 spawn，于是 `stockPollEnabled: true` 变成一个
+            // 点得动、也写回了文件、却永远不动的开关 —— 与「配了轮询但没生效」现象
+            // 完全一样。用户显式开了开关，意图明确是「要轮询」，缺间隔是没填而非
+            // 想关闭；关闭有它自己的表达（`stockPollEnabled: false`）。
+            0 if self.stock_poll_enabled == Some(true) => self.min_stock_poll_interval(),
             0 => 0,
-            v => v.max(MIN_STOCK_POLL_INTERVAL_SECS),
+            v => v.max(self.min_stock_poll_interval()),
         }
+    }
+
+    /// 本家的轮询间隔下限（秒）。按查一次库存的**真实代价**分档。
+    ///
+    /// `legacy`（kiro.ceo）走 [`MIN_STOCK_POLL_INTERVAL_SECS_CHEAP`]：它查库存就是
+    /// 一次带 `X-API-Key` 的 `GET /api/my/stock`，没有登录、签名、解密，秒级轮询的
+    /// 出站开销与 60 秒时同一量级的小。而该家现在不推 webhook 了，轮询是它**唯一**
+    /// 的到货触发源，分辨率直接决定抢不抢得到 —— 60 秒的下限会让先到的人买空。
+    ///
+    /// 其余家仍走 [`MIN_STOCK_POLL_INTERVAL_SECS`]。不给它们放宽是因为代价不同
+    /// （kiro.red 一轮要登录换 JWT + 签名 + 解密），且它们的车次以十分钟计，
+    /// 1 分钟的分辨率本就够。
+    pub fn min_stock_poll_interval(&self) -> u64 {
+        match self.flavor {
+            crate::vendor::protocol::VendorFlavor::Legacy => MIN_STOCK_POLL_INTERVAL_SECS_CHEAP,
+            _ => MIN_STOCK_POLL_INTERVAL_SECS,
+        }
+    }
+
+    /// 库存轮询是否启用。缺省按间隔非 0 推导（老配置行为不变）。
+    ///
+    /// 注意这只是**启动快照**。面板可切，运行时值在
+    /// [`VendorService::stock_poll_enabled`](crate::vendor::service::VendorService::stock_poll_enabled)。
+    pub fn stock_poll_enabled_or_default(&self) -> bool {
+        self.stock_poll_enabled
+            .unwrap_or(self.stock_poll_interval_secs > 0)
     }
 }
 
@@ -307,6 +356,12 @@ impl VendorConfig {
 /// 1 分钟的分辨率足够抢到刚发的车。再密就没有意义了 —— kiro.red 查一次库存要
 /// 登录换 JWT + 请求签名 + 响应解密，秒级轮询等于持续压卖家接口。
 pub const MIN_STOCK_POLL_INTERVAL_SECS: u64 = 60;
+
+/// 廉价库存接口的轮询间隔下限（秒）。见 [`VendorConfig::min_stock_poll_interval`]。
+///
+/// 定在 5 秒而不是 1 秒：留一档给「卖家接口比预期敏感」的余地，同时 10 秒这个
+/// 常用值不会被抬。真按 5 秒跑也只是每分钟 12 次裸 GET。
+pub const MIN_STOCK_POLL_INTERVAL_SECS_CHEAP: u64 = 5;
 
 fn default_vendor_auto_max_count() -> u32 {
     1
@@ -401,6 +456,7 @@ impl LegacyKiroappCcConfig {
             vendor_password: String::new(),
             // 存量配置不擅自开轮询：那会带来扣费行为，必须用户显式配
             stock_poll_interval_secs: 0,
+            stock_poll_enabled: None,
             stock_poll_respect_global_gate: true,
         }
     }
@@ -707,6 +763,25 @@ pub struct TrafficIngressConfig {
     /// 单个账号一次推送最多尝试次数，含首发。
     #[serde(default = "default_health_gate_max_attempts")]
     pub max_attempts: u32,
+
+    /// RPM 容量下限。本地可用凭证 RPM 总量低于此值时强制关闭入口，
+    /// 回到此值及以上再自动开回来（仍需手动开关为开）。
+    ///
+    /// `0` = 停用该判据，入口只受手动开关控制。
+    #[serde(default = "default_traffic_ingress_min_rpm")]
+    pub min_rpm: u32,
+
+    /// RPM 判据的检查周期。
+    #[serde(default = "default_traffic_ingress_check_interval_secs")]
+    pub check_interval_secs: u64,
+
+    /// 连续多少轮判定一致才真正切换，用于 RPM 在阈值上下抖动时防抖。
+    #[serde(default = "default_traffic_ingress_confirmations")]
+    pub confirmations: u32,
+
+    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值，口径与并发联动一致。
+    #[serde(default = "default_concurrency_gate_unlimited_rpm")]
+    pub unlimited_rpm: u32,
 }
 
 impl Default for TrafficIngressConfig {
@@ -719,6 +794,10 @@ impl Default for TrafficIngressConfig {
             account_ids: Vec::new(),
             retry_interval_secs: default_health_gate_interval_secs(),
             max_attempts: default_health_gate_max_attempts(),
+            min_rpm: default_traffic_ingress_min_rpm(),
+            check_interval_secs: default_traffic_ingress_check_interval_secs(),
+            confirmations: default_traffic_ingress_confirmations(),
+            unlimited_rpm: default_concurrency_gate_unlimited_rpm(),
         }
     }
 }
@@ -738,10 +817,179 @@ impl TrafficIngressConfig {
         let header = self.auth_header.trim();
         if header.is_empty() { "X-API-Key" } else { header }
     }
+
+    /// RPM 判据是否参与决策。`min_rpm = 0` 表示停用。
+    pub fn rpm_gate_active(&self) -> bool {
+        self.min_rpm > 0
+    }
+
+    /// 给定 RPM 总量，判断该判据是否放行。停用时恒为 true。
+    pub fn rpm_allows(&self, total_rpm: u32) -> bool {
+        !self.rpm_gate_active() || total_rpm >= self.min_rpm
+    }
 }
 
 fn default_traffic_ingress_base_url() -> String {
     "https://g7e6ai.com".to_string()
+}
+
+/// 低于这个 RPM 总量就认为本地容量不足以对外接量。
+fn default_traffic_ingress_min_rpm() -> u32 {
+    200
+}
+
+fn default_traffic_ingress_check_interval_secs() -> u64 {
+    30
+}
+
+/// 两轮一致才切换：30s 周期下最多晚 30s 生效，换掉阈值抖动时的来回推送。
+fn default_traffic_ingress_confirmations() -> u32 {
+    2
+}
+
+/// 并发联动：把本地有效凭证的 RPM 总量按固定除数换算成外部账号的并发上限。
+///
+/// 与健康联动（推 `schedulable`）、流量入口（推 `schedulable`）是三件独立的事：
+/// 这里推的是 `concurrency`，即「能接多少」而非「要不要接」。同一个外部账号被
+/// 两个模块分别写这两个字段不冲突。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyGateConfig {
+    /// 是否启用联动。关闭时不再推送，外部账号保留最后推上去的值。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 外部系统基址。默认 4code.us —— 它的上游正是本机，容量口径才对得上。
+    #[serde(default = "default_concurrency_gate_base_url")]
+    pub base_url: String,
+
+    /// 外部系统的 Admin Token。
+    #[serde(default)]
+    pub token: String,
+
+    /// 传 token 用的请求头名，协议与健康联动一致。
+    #[serde(default = "default_health_gate_auth_header")]
+    pub auth_header: String,
+
+    /// 需要同步并发上限的外部账号 ID。
+    #[serde(default)]
+    pub account_ids: Vec<u64>,
+
+    /// 换算除数：并发 = 有效 RPM 总量 / divisor，向下取整。
+    #[serde(default = "default_concurrency_gate_divisor")]
+    pub divisor: u32,
+
+    /// 手动覆盖并发值。`Some(n)` 时直接推 n，忽略换算结果；`None` 走自动换算。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_concurrency: Option<u32>,
+
+    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值。
+    #[serde(default = "default_concurrency_gate_unlimited_rpm")]
+    pub unlimited_rpm: u32,
+
+    /// 推上去的并发下限，避免算出 0 导致外部账号完全停摆。
+    #[serde(default = "default_concurrency_gate_min")]
+    pub min_concurrency: u32,
+
+    /// 推上去的并发上限，兜住换算异常放大。
+    #[serde(default = "default_concurrency_gate_max")]
+    pub max_concurrency: u32,
+
+    /// 重算周期。RPM 总量只随凭证增删/启停变化，不必太密。
+    #[serde(default = "default_concurrency_gate_interval_secs")]
+    pub check_interval_secs: u64,
+
+    /// 即使目标值没变也定期重推一次，用于纠正对方后台被手动改动造成的漂移。
+    #[serde(default = "default_health_gate_reaffirm_interval_secs")]
+    pub reaffirm_interval_secs: u64,
+
+    /// 单个账号一次推送最多尝试次数，含首发。
+    #[serde(default = "default_health_gate_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for ConcurrencyGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_concurrency_gate_base_url(),
+            token: String::new(),
+            auth_header: default_health_gate_auth_header(),
+            account_ids: Vec::new(),
+            divisor: default_concurrency_gate_divisor(),
+            manual_concurrency: None,
+            unlimited_rpm: default_concurrency_gate_unlimited_rpm(),
+            min_concurrency: default_concurrency_gate_min(),
+            max_concurrency: default_concurrency_gate_max(),
+            check_interval_secs: default_concurrency_gate_interval_secs(),
+            reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
+            max_attempts: default_health_gate_max_attempts(),
+        }
+    }
+}
+
+impl ConcurrencyGateConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
+            && !self.token.trim().is_empty()
+            && !self.account_ids.is_empty()
+    }
+
+    pub fn normalized_base_url(&self) -> &str {
+        self.base_url.trim().trim_end_matches('/')
+    }
+
+    pub fn auth_header(&self) -> &str {
+        let header = self.auth_header.trim();
+        if header.is_empty() { "X-API-Key" } else { header }
+    }
+
+    /// 除数为 0 时按默认值处理，避免配置写错导致除零。
+    pub fn effective_divisor(&self) -> u32 {
+        if self.divisor == 0 {
+            default_concurrency_gate_divisor()
+        } else {
+            self.divisor
+        }
+    }
+
+    /// 把有效 RPM 总量换算为要推送的并发值，并夹到 [min, max]。
+    ///
+    /// 手动值同样受夹取约束：它是「跳过换算」，不是「跳过安全边界」。
+    pub fn resolve_concurrency(&self, total_rpm: u32) -> u32 {
+        let raw = match self.manual_concurrency {
+            Some(manual) => manual,
+            None => total_rpm / self.effective_divisor(),
+        };
+        let high = self.max_concurrency.max(self.min_concurrency);
+        raw.clamp(self.min_concurrency, high)
+    }
+}
+
+fn default_concurrency_gate_base_url() -> String {
+    "https://4code.us".to_string()
+}
+
+fn default_concurrency_gate_divisor() -> u32 {
+    6
+}
+
+/// 与被禁用凭证上常见的 `rpmLimit: 300` 对齐，作为不限速凭证的折算口径。
+fn default_concurrency_gate_unlimited_rpm() -> u32 {
+    300
+}
+
+fn default_concurrency_gate_min() -> u32 {
+    1
+}
+
+fn default_concurrency_gate_max() -> u32 {
+    200
+}
+
+fn default_concurrency_gate_interval_secs() -> u64 {
+    60
 }
 
 /// KNA 应用配置
@@ -931,6 +1179,10 @@ pub struct Config {
     /// 手动流量入口：控制 g7e6ai.com 指定账号的 schedulable 开关。
     #[serde(default)]
     pub traffic_ingress: TrafficIngressConfig,
+
+    /// 并发联动：把本地有效凭证的 RPM 总量换算成外部账号的并发上限。默认关闭。
+    #[serde(default)]
+    pub concurrency_gate: ConcurrencyGateConfig,
 
     /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
     /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
@@ -1145,6 +1397,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             health_gate: HealthGateConfig::default(),
             traffic_ingress: TrafficIngressConfig::default(),
+            concurrency_gate: ConcurrencyGateConfig::default(),
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,

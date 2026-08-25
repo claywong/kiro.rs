@@ -542,8 +542,14 @@ export interface TraceRecord {
   totalTokens?: number
   /** 费用（credits） */
   credits?: number
-  /** 首 Token 延迟（毫秒，仅流式有值） */
+  /** 首 Token 延迟（毫秒，仅流式有值）。带思考时首个 chunk 往往就是思考的第一个字 */
   firstTokenMs?: number | null
+  /** 首个产出 Token 延迟（毫秒，仅流式有值）——真正开始产出正文或工具调用的时刻 */
+  firstAnswerMs?: number | null
+  /** 首段思考耗时（毫秒）：首个 reasoning 帧 → 首个产出帧（正文或工具调用）。只覆盖首段；null 见 ThinkingCell 注释 */
+  thinkingMs?: number | null
+  /** 思考文本字符数（原始值，非 token）。上游可能只下发摘要，故为实际推理量的下限 */
+  thinkingChars?: number
   /** 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值） */
   effort?: string | null
   attempts: TraceAttempt[]
@@ -754,6 +760,12 @@ export interface VendorStatus {
   stockPollIntervalSecs?: number
   /** 轮询是否遵循全局总闸。false 时现货自动提取与自动预定都可越过总闸扣费 */
   stockPollRespectGlobalGate?: boolean
+  /**
+   * 库存轮询开关（运行时值，面板可切）。与 stockPollIntervalSecs 的分工：
+   * 间隔管节奏、改了要重启；本项管开不开、随时可切。关掉后轮询器仍在，
+   * 只是每轮整轮跳过（连库存都不查），打开后最迟一个周期恢复。
+   */
+  stockPollEnabled?: boolean
   profile?: VendorProfile
   /** 拉余额失败时的原因（不影响其余字段） */
   profileError?: string
@@ -835,6 +847,16 @@ export interface VendorPerChannelChange {
 export interface VendorStockPollGateChange {
   /** 设置后的值（运行时已生效） */
   respect: boolean
+  /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
+  persisted: boolean
+  /** 持久化失败原因 */
+  warning?: string
+}
+
+/** 开关库存轮询的结果 */
+export interface VendorStockPollEnabledChange {
+  /** 设置后的值（运行时已生效，最迟下一个周期） */
+  enabled: boolean
   /** 是否已写回 config.json；false 表示重启后会回退到文件里的值 */
   persisted: boolean
   /** 持久化失败原因 */

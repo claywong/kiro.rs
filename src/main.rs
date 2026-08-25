@@ -332,9 +332,29 @@ async fn main() {
     // 强制直连：对方按本机公网出口做 IP 白名单，复用全局代理会被 403 拒绝。
     let traffic_ingress_state =
         match http_client::build_client(None, 15, config.tls_backend) {
-            Ok(client) => admin::traffic_ingress::spawn(config.traffic_ingress.clone(), client),
+            Ok(client) => admin::traffic_ingress::spawn(
+                config.traffic_ingress.clone(),
+                client,
+                token_manager.clone(),
+            ),
             Err(error) => {
                 tracing::warn!("流量入口：HTTP 客户端构建失败，控制器不启动: {}", error);
+                None
+            }
+        };
+
+    // 并发联动：把本地有效凭证的 RPM 总量换算成 4code.us 指定账号的并发上限。
+    // 客户端沿用健康联动那套（同一站点，走 proxy_config_for_vendor），不用流量入口的
+    // 强制直连——那是 g7e6ai.com 的 IP 白名单要求，与本目标无关。
+    let concurrency_gate_state =
+        match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
+            Ok(client) => admin::concurrency_gate::spawn(
+                config.concurrency_gate.clone(),
+                client,
+                token_manager.clone(),
+            ),
+            Err(error) => {
+                tracing::warn!("并发联动：HTTP 客户端构建失败，控制器不启动: {}", error);
                 None
             }
         };
@@ -347,7 +367,8 @@ async fn main() {
             .with_kiro_provider(kiro_provider.clone())
             .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone()))
             .with_health_gate(health_gate_state.clone())
-            .with_traffic_ingress(traffic_ingress_state.clone()),
+            .with_traffic_ingress(traffic_ingress_state.clone())
+            .with_concurrency_gate(concurrency_gate_state.clone()),
     );
 
     // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。

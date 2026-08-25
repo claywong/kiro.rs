@@ -535,6 +535,9 @@ export interface TrafficIngressState {
   accountCount: number
   /** 最近一次成功推送的 `schedulable`；null 表示尚未成功同步 */
   appliedSchedulable: boolean | null
+  /** 最近一轮 RPM 判据结论：false = 容量不足、被强制关闭；true = 容量足、不拦；
+   *  null = 还没判过或判据已停用（`minRpm = 0`）。 */
+  rpmOk: boolean | null
 }
 
 export async function getTrafficIngressState(): Promise<TrafficIngressState> {
@@ -548,6 +551,54 @@ export async function setTrafficIngressEnabled(
   const { data } = await api.put<TrafficIngressState>('/config/traffic-ingress', {
     enabled,
   })
+  return data
+}
+
+/** 并发联动状态：本地有效凭证 RPM 总量按除数换算成外部账号并发上限。 */
+export interface ConcurrencyGateState {
+  /** baseUrl / token / accountIds 是否已经填全 */
+  configured: boolean
+  /** 联动是否启用 */
+  enabled: boolean
+  /** 外部系统基址，如 `https://4code.us` */
+  baseUrl: string
+  /** 受控外部账号数 */
+  accountCount: number
+  /** 当前换算除数 */
+  divisor: number
+  /** 手动并发值；null = 走自动换算 */
+  manualConcurrency: number | null
+  /** 有效凭证 rpmLimit 总量（不限速项已按 unlimitedRpm 折算） */
+  rpmTotal: number
+  /** 上述总量里按不限速折算的凭证数；> 0 说明总量掺了估值 */
+  unlimitedCredentials: number
+  /** 当前该推的并发值（含夹取），用于预览 */
+  resolvedConcurrency: number
+  /** 最近一次成功推送的并发值；null = 尚未成功同步 */
+  appliedConcurrency: number | null
+  minConcurrency: number
+  maxConcurrency: number
+}
+
+export async function getConcurrencyGateState(): Promise<ConcurrencyGateState> {
+  const { data } = await api.get<ConcurrencyGateState>('/config/concurrency-gate')
+  return data
+}
+
+/**
+ * 更新并发联动。三个字段各自独立，只传要改的。
+ *
+ * `manualConcurrency` 传 `null` 表示清除手动值回到自动换算；不传该键则保持原值。
+ */
+export async function setConcurrencyGateConfig(payload: {
+  enabled?: boolean
+  divisor?: number
+  manualConcurrency?: number | null
+}): Promise<ConcurrencyGateState> {
+  const { data } = await api.put<ConcurrencyGateState>(
+    '/config/concurrency-gate',
+    payload,
+  )
   return data
 }
 
