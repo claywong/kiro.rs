@@ -65,10 +65,15 @@ pub struct TrafficIngressState {
 }
 
 impl TrafficIngressState {
+    /// 启动即关闭时假定外部已是 `schedulable=false`，跳过启动对齐推送——
+    /// 否则每次重启都会对外部账号推一遍 `false`，只刷对方审计日志。
+    /// 若外部侧被人为改回 true，面板上重新开关一次即可重新对齐。
+    /// 面板「开→关」仍会正常推一次 false（用户主动操作，应该同步）。
     fn new(enabled: bool) -> Arc<Self> {
+        let initial_applied = if enabled { APPLIED_NONE } else { APPLIED_FALSE };
         Arc::new(Self {
             enabled: AtomicBool::new(enabled),
-            applied: AtomicU8::new(APPLIED_NONE),
+            applied: AtomicU8::new(initial_applied),
             rpm_ok: AtomicU8::new(APPLIED_NONE),
             changed: Notify::new(),
         })
