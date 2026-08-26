@@ -44,6 +44,8 @@ pub use middleware::AdminState;
 pub use middleware::admin_auth_middleware;
 pub use router::create_admin_router;
 pub use service::AdminService;
+/// 余额后台刷新周期，main 启动调度器时使用
+pub use service::BALANCE_REFRESH_INTERVAL_SECS;
 /// 供卖家对接模块复用凭据入库（去重 / 验活 / 回滚）的结果分类
 pub(crate) use service::ImportStatus;
 pub use usage_stats::{UsageAggregator, UsageRecorder};

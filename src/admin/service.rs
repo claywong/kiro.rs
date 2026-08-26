@@ -47,8 +47,21 @@ use super::types::{
     ConcurrencyGateStateResponse, SetConcurrencyGateRequest,
 };
 
-/// 余额缓存过期时间（秒），5 分钟
-const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 余额缓存过期时间（秒），7.5 分钟。
+///
+/// 刻意比后台刷新周期（`BALANCE_REFRESH_INTERVAL_SECS`，5 分钟）宽一轮半。
+///
+/// 早先 TTL 与刷新周期同为 300s，看着「对齐」，实际每轮末尾必然空窗：刷新是串行的
+/// （每个凭据之间还有 400ms 节流），16 个活跃凭据一轮要 26～66s，而读取侧严格按 300s
+/// 判过期，于是条目按上轮被刷的顺序依次过期、又按同样顺序被回填，缺失集合像波一样扫过
+/// 整个列表。实测谷底时 16 个活跃凭据里 13 个显示「余额未查询」，面板几乎是空的。
+///
+/// 宽限一轮后，即使某轮刷新慢（撞上游限流重试）也不会把面板打空。代价是展示的余额最旧
+/// 可能是 7.5 分钟前的 —— 余额本就是分钟级粒度的参考值，宽限一轮不影响扩容判断。
+const BALANCE_CACHE_TTL_SECS: i64 = 450;
+
+/// 余额后台刷新周期（秒），5 分钟。TTL 必须比它宽，理由见 [`BALANCE_CACHE_TTL_SECS`]。
+pub const BALANCE_REFRESH_INTERVAL_SECS: u64 = 300;
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
@@ -1122,7 +1135,18 @@ impl AdminService {
         tokio::spawn(async move {
             // 启动后稍等片刻，让上游/Token Manager 准备就绪
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // 用 interval 而非「刷完再 sleep」：tick 从周期起点计时，不叠加本轮执行耗时。
+            // 早先是 sleep(interval)，真实周期变成 300s + 本轮耗时（实测 326～366s），
+            // 比 TTL 还长，每轮末尾必然空窗。
+            //
+            // Delay 突发策略：某轮耗时超过一个周期时（撞上游限流重试），落后的 tick 顺延
+            // 而不是连续补发 —— 默认的 Burst 会立刻连打几轮，反而加重上游压力。
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
+                ticker.tick().await;
                 let started = std::time::Instant::now();
                 let (ok, err) = svc.refresh_all_balances().await;
                 tracing::info!(
@@ -1131,7 +1155,6 @@ impl AdminService {
                     err,
                     started.elapsed().as_secs_f32()
                 );
-                tokio::time::sleep(interval).await;
             }
         });
     }
@@ -3858,5 +3881,28 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    /// 余额缓存 TTL 必须显著宽于后台刷新周期，否则每轮末尾必然空窗。
+    ///
+    /// 刷新是串行的（凭据之间 400ms 节流），十几个凭据一轮要几十秒；若 TTL 与周期相等，
+    /// 条目会按上轮被刷的顺序依次过期，面板出现「余额未查询」的滚动缺失带。
+    /// 这里要求至少留出一轮刷新耗时的余量。
+    #[test]
+    fn balance_cache_ttl_exceeds_refresh_interval() {
+        let ttl = BALANCE_CACHE_TTL_SECS;
+        let interval = BALANCE_REFRESH_INTERVAL_SECS as i64;
+
+        assert!(
+            ttl > interval,
+            "TTL({ttl}s) 必须大于刷新周期({interval}s)，否则每轮末尾必然空窗"
+        );
+
+        // 余量需覆盖一轮刷新耗时。实测 16 个活跃凭据一轮 26～66s，取 90s 作下限门槛。
+        let headroom = ttl - interval;
+        assert!(
+            headroom >= 90,
+            "TTL 余量仅 {headroom}s，不足以覆盖一轮刷新耗时（实测可达 66s）"
+        );
     }
 }

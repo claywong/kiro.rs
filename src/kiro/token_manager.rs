@@ -19,7 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::error::UpstreamRateLimitError;
-use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
+use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
@@ -470,17 +470,53 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+/// 构造用量类 REST 接口（getUsageLimits / ListAvailableModels / ListAvailableProfiles /
+/// setUserPreference）的 UA 对：`(user-agent, x-amz-user-agent)`。
+///
+/// 版本号被上游当作准入条件，四个接口必须用同一组值，所以集中在这里构造，
+/// 避免各调用点各写一份导致漂移。详见 [`USAGE_API_KIRO_VERSION`]。
+fn usage_api_user_agents(credentials: &KiroCredentials, config: &Config) -> (String, String) {
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let sdk = USAGE_API_AWS_SDK_VERSION;
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let user_agent = format!(
+        "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#{} m/N,E KiroIDE-{}-{}",
+        sdk, config.system_version, config.node_version, sdk, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/{} KiroIDE-{}-{}", sdk, kiro_version, machine_id);
+    (user_agent, amz_user_agent)
+}
+
+/// 用量类 REST 接口的 `profileArn` 查询参数（含前导 `&`），不需要时为空串。
+///
+/// 上游已把 profileArn 改为必填：不带会被拒（旧版 UA 回 403 "User is not authorized
+/// to make this call."，新版 UA 回 400 "Invalid profileArn."）。这里用
+/// [`KiroCredentials::streaming_profile_arn`] 而非 `effective_profile_arn`——后者会剥掉
+/// BuilderID 占位符，而 BuilderID 账号恰恰要原样带上占位符才回 200。
+///
+/// API Key 凭据没有 profileArn 概念，`streaming_profile_arn` 对它返回 `None`，
+/// 靠 `tokentype: API_KEY` 头即可通过，带不带 ARN 都不影响。
+fn profile_arn_query(credentials: &KiroCredentials) -> String {
+    match credentials.streaming_profile_arn() {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(&arn)),
+        None => String::new(),
+    }
+}
+
+fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(credentials)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, credentials: &KiroCredentials) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(credentials)
+    )
 }
 
 /// 获取使用额度信息
@@ -496,19 +532,7 @@ pub(crate) async fn get_usage_limits(
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -591,17 +615,7 @@ pub(crate) async fn get_available_models(
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 User-Agent headers（与 get_usage_limits 保持一致）
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -667,6 +681,23 @@ pub(crate) async fn get_available_models(
     );
 }
 
+/// 上游是否明确表示「该账号类型没有 profile 概念」。
+///
+/// BuilderID 账号调 `ListAvailableProfiles` 会稳定收到：
+/// `403 {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+///       "message":"AWS Builder ID is not supported for this operation."}`
+///
+/// 这是**账号属性**（BuilderID 天生无 profile），不是查询故障 —— 重试一万次也是同样
+/// 结果。必须与网络抖动、限流、5xx 区分开：那些重试有意义，而这个不该让调用方
+/// 反复重查。此前它被归入通用 `Err`，导致每个 BuilderID 凭据的每次流式请求都白跑
+/// 一次上游往返并打一条 WARN（实测近 1 小时 1065 条）。
+///
+/// 刻意只认这一种确定性否定，不采用「非 200 一律当作没有 profile」的粗口径：后者会
+/// 让 Enterprise 账号在一次网络抖动后错用占位符 ARN，请求全数被拒。
+fn is_no_profile_concept_response(status: u16, body: &str) -> bool {
+    status == 403 && body.contains("Builder ID is not supported for this operation")
+}
+
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
 ///
 /// Enterprise / IAM Identity Center (IdC) 账号必须用真实 profileArn 调用流式端点；
@@ -689,16 +720,7 @@ pub(crate) async fn list_available_profiles(
 
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -747,6 +769,12 @@ pub(crate) async fn list_available_profiles(
         if let Some(error) = rate_limit_error {
             return Err(error.into());
         }
+        // 上游明确回「BuilderID 不支持此操作」= 该账号没有 profile 概念，是账号属性而非
+        // 查询故障。视同「成功但为空」，让调用方标记已尝试、回退占位符，不再每请求重查。
+        if is_no_profile_concept_response(status.as_u16(), &body_text) {
+            empty_seen = true;
+            continue;
+        }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -780,21 +808,13 @@ pub(crate) async fn set_user_preference(
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
-    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
+    // 构建 body：profileArn 已是必填，BuilderID 要原样发占位符（同 profile_arn_query 的理由）。
+    // API Key 凭据无此概念，streaming_profile_arn 返回 None 时不发该字段。
+    let body = if let Some(profile_arn) = credentials.streaming_profile_arn() {
         serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
             "profileArn": profile_arn,
@@ -4893,6 +4913,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
     use std::sync::Arc;
 
     #[test]
@@ -6325,8 +6346,9 @@ mod tests {
         );
     }
 
+    /// 真实 ARN（Enterprise/IdC 解析回填的）必须原样带上：上游已把 profileArn 改为必填。
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_send_resolved_profile_arn() {
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -6334,15 +6356,136 @@ mod tests {
             ..Default::default()
         };
         let host = "q.us-east-1.amazonaws.com";
+        let encoded = "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
 
         assert_eq!(
             usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={}",
+                encoded
+            )
         );
         assert_eq!(
             available_models_url(host, &credentials),
+            format!(
+                "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn={}",
+                encoded
+            )
+        );
+    }
+
+    /// BuilderID 账号没有真实 profile，必须原样发占位符 ARN 才回 200；
+    /// 剥掉它（`effective_profile_arn` 的语义）会被拒 403 / 400。
+    #[test]
+    fn test_usage_rest_urls_send_builder_id_placeholder() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+
+        let url = usage_limits_url("q.us-east-1.amazonaws.com", &credentials);
+        assert!(
+            url.contains(&format!(
+                "profileArn={}",
+                urlencoding::encode(BUILDER_ID_PROFILE_ARN)
+            )),
+            "BuilderID 占位符必须原样发送，实际 URL: {url}"
+        );
+    }
+
+    /// 未显式配置 profileArn 的 Social 凭据按登录方式补 Social 共享 ARN。
+    #[test]
+    fn test_usage_rest_urls_fill_social_arn_when_absent() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Google".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+
+        let url = usage_limits_url("q.us-east-1.amazonaws.com", &credentials);
+        assert!(
+            url.contains(&format!(
+                "profileArn={}",
+                urlencoding::encode(SOCIAL_PROFILE_ARN)
+            )),
+            "Social 凭据应补共享 ARN，实际 URL: {url}"
+        );
+    }
+
+    /// API Key 凭据没有 profileArn 概念，靠 `tokentype: API_KEY` 头通过，不应带该参数。
+    #[test]
+    fn test_usage_rest_urls_omit_arn_for_api_key() {
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            usage_limits_url("q.us-east-1.amazonaws.com", &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url("q.us-east-1.amazonaws.com", &credentials),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
+    }
+
+    /// BuilderID 的「不支持此操作」是账号属性，必须识别为确定性否定。
+    #[test]
+    fn no_profile_concept_recognizes_builder_id_403() {
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        assert!(is_no_profile_concept_response(403, body));
+    }
+
+    /// 其余失败都必须保持可重试 —— 误判成「无 profile」会让 Enterprise 账号错用
+    /// 占位符 ARN，请求全数被拒。这是不采用「非 200 一律当空」粗口径的原因。
+    #[test]
+    fn no_profile_concept_rejects_retryable_failures() {
+        let builder_id_body =
+            r#"{"message":"AWS Builder ID is not supported for this operation."}"#;
+
+        // 同样文案但非 403：不认
+        assert!(!is_no_profile_concept_response(500, builder_id_body));
+        assert!(!is_no_profile_concept_response(429, builder_id_body));
+
+        // 403 但是别的原因：不认（Enterprise 的 ARN 不对、token 失效等都是 403）
+        for body in [
+            r#"{"message":"Invalid token."}"#,
+            r#"{"message":"User is not authorized to make this call."}"#,
+            r#"{"message":"The bearer token included in the request is invalid."}"#,
+            "",
+        ] {
+            assert!(
+                !is_no_profile_concept_response(403, body),
+                "不该把这个 403 当作确定性否定: {body}"
+            );
+        }
+
+        // 网络层失败（无响应体）：不认
+        assert!(!is_no_profile_concept_response(502, ""));
+    }
+
+    /// 用量类接口的 UA 版本号被上游当准入条件，四个接口必须一致。
+    #[test]
+    fn test_usage_api_user_agent_pins_version() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let (ua, amz_ua) = usage_api_user_agents(&credentials, &config);
+
+        for s in [&ua, &amz_ua] {
+            assert!(
+                s.contains(&format!("KiroIDE-{}", USAGE_API_KIRO_VERSION)),
+                "UA 应固定 KiroIDE 版本: {s}"
+            );
+            assert!(
+                s.contains(&format!("aws-sdk-js/{}", USAGE_API_AWS_SDK_VERSION)),
+                "UA 应固定 SDK 版本: {s}"
+            );
+        }
     }
 
     #[test]

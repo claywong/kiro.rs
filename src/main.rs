@@ -430,10 +430,13 @@ async fn main() {
                 group_manager.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
+            // 启动余额后台刷新调度器（每 5 分钟一次；缓存 TTL 刻意比它宽一轮半，
+            // 详见 BALANCE_CACHE_TTL_SECS）
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+                .start_balance_refresher(std::time::Duration::from_secs(
+                    admin::BALANCE_REFRESH_INTERVAL_SECS,
+                ));
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state
