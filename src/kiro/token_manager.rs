@@ -1404,17 +1404,14 @@ fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)
     Some((entry.id, entry.credentials.clone()))
 }
 
-/// priority 模式选号：三级排序 —— 发现档 → 优先级层 → 同层 TTFT 最快。
+/// priority 模式选号：三级排序 —— 发现档 → 优先级层 → 同层成功次数最少。
 ///
-/// 前两级取最优层后，同层内按该模型的 TTFT EWMA 最小（响应最快）调度。
-/// 无样本或样本已过期（超过 `ttft_ttl`，即风控冷却时长）的账号视为最优（0），
-/// 优先被选中跑一笔校准，以此打破赢家通吃、让长期落选凭据的陈旧估计自愈。
-/// 未指定模型时回退到 success_count（least-used）。平局按 id 保证确定性。
-fn pick_by_discovery_priority_ttft(
+/// 前两级取最优层（发现档最优、priority 最小）后，同层内按 `success_count`
+/// 最少（least-used）调度，与 balanced 模式同一「按消耗均衡」的语义，只是
+/// balanced 把 priority 当次级 tie-break，而 priority 模式严格分层——高优先级层
+/// 未耗尽绝不降级，仅在层内做均衡。平局按 id 保证确定性。
+fn pick_by_discovery_priority_least_used(
     available: &[Candidate<'_>],
-    model: Option<&str>,
-    now: Instant,
-    ttft_ttl: StdDuration,
 ) -> Option<(u64, KiroCredentials)> {
     let min_rank = available
         .iter()
@@ -1426,25 +1423,14 @@ fn pick_by_discovery_priority_ttft(
         .map(|(e, _)| e.credentials.priority)
         .min()?;
 
-    let ttft_key = |e: &CredentialEntry| match model {
-        Some(m) => e
-            .ttft_ewma
-            .get(m)
-            .filter(|s| now.duration_since(s.updated_at) < ttft_ttl)
-            .map(|s| s.ewma)
-            .unwrap_or(0.0),
-        None => e.success_count as f64,
-    };
-
     let (entry, _) = available
         .iter()
         .filter(|(e, support)| {
             discovery_rank(*support) == min_rank && e.credentials.priority == min_priority
         })
         .min_by(|(a, _), (b, _)| {
-            ttft_key(a)
-                .partial_cmp(&ttft_key(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            a.success_count
+                .cmp(&b.success_count)
                 .then(a.id.cmp(&b.id))
         })?;
     Some((entry.id, entry.credentials.clone()))
@@ -2256,10 +2242,10 @@ impl MultiTokenManager {
         match mode {
             "balanced" => pick_least_used(&available),
             _ => {
-                // priority 模式（默认）：发现档 → 优先级层 → 同层 TTFT 最快。
-                // TTFT 样本新鲜期取账号级风控冷却时长（运行时可改）。
-                let ttft_ttl = StdDuration::from_secs(self.get_account_throttle_cooldown_secs());
-                pick_by_discovery_priority_ttft(&available, model, now, ttft_ttl)
+                // priority 模式（默认）：发现档 → 优先级层 → 同层成功次数最少。
+                // 同层内按 success_count 做 least-used 均衡，与 balanced 同一消耗语义，
+                // 区别是 priority 严格分层（高优先级层未耗尽不降级）。
+                pick_by_discovery_priority_least_used(&available)
             }
         }
     }
@@ -3025,17 +3011,6 @@ impl MultiTokenManager {
                         },
                     );
                 }
-            }
-        }
-    }
-
-    /// 测试专用：把某凭据某模型的 TTFT 样本时间戳往前拨 `age`，用于模拟样本陈旧。
-    #[cfg(test)]
-    fn age_ttft_sample(&self, id: u64, model: &str, age: StdDuration) {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            if let Some(s) = entry.ttft_ewma.get_mut(model) {
-                s.updated_at -= age;
             }
         }
     }
@@ -8125,96 +8100,6 @@ mod tests {
                 .map(|(id, _)| id),
             Some(2),
             "priority 模式应在同优先级层内选 success_count 最小的凭据"
-        );
-    }
-
-    #[test]
-    fn test_priority_mode_schedules_by_fastest_ttft() {
-        // priority 模式同层：按该模型的 TTFT EWMA 最小（响应最快）调度。
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        // A(id1) 首字慢、B(id2) 首字快
-        manager.report_ttft(1, "claude-sonnet-5", 800);
-        manager.report_ttft(2, "claude-sonnet-5", 200);
-        assert_eq!(
-            manager
-                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(2),
-            "同层应选 TTFT 更小的 B"
-        );
-
-        // 换 B 变慢后应回选 A（EWMA α=0.3，一次大样本足以反超）
-        manager.report_ttft(2, "claude-sonnet-5", 5000);
-        assert_eq!(
-            manager
-                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(1),
-            "B 变慢后应回选 A"
-        );
-
-        // 无样本的模型：两者都视为 0，平局按 id 取靠前的 A
-        assert_eq!(
-            manager
-                .select_next_credential(Some("other-model"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(1),
-            "无 TTFT 样本时平局按 id 取靠前"
-        );
-    }
-
-    #[test]
-    fn test_priority_mode_ttft_sample_expires_triggers_reprobe() {
-        // 陈旧样本自愈：赢家长期占用后，落选者样本过期应触发重探，打破赢家通吃。
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        // A(id1) 慢、B(id2) 快：稳态选 B
-        manager.report_ttft(1, "claude-sonnet-5", 3000);
-        manager.report_ttft(2, "claude-sonnet-5", 500);
-        assert_eq!(
-            manager
-                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(2),
-            "稳态应选更快的 B"
-        );
-
-        // A 的样本超过 TTL 未刷新 → 视为陈旧（当作 0），应被重探选中，
-        // 即便它历史 EWMA(3000) 远慢于新鲜的 B(500)。
-        // TTL 取账号级风控冷却时长（Config::default 下为默认值）。
-        let ttl = StdDuration::from_secs(manager.get_account_throttle_cooldown_secs());
-        manager.age_ttft_sample(1, "claude-sonnet-5", ttl + StdDuration::from_secs(1));
-        assert_eq!(
-            manager
-                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(1),
-            "A 样本过期应触发重探（陈旧估计不再永久压制该凭据）"
-        );
-
-        // 重探后 A 实测其实很快(400 < 500)：刷新为新鲜样本，稳态回到择快，选 A
-        manager.report_ttft(1, "claude-sonnet-5", 400);
-        assert_eq!(
-            manager
-                .select_next_credential(Some("claude-sonnet-5"), Some("g1"))
-                .map(|(id, _)| id),
-            Some(1),
-            "重探校准后 A 实际更快，应稳态选 A"
         );
     }
 
