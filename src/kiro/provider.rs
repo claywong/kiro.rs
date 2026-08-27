@@ -51,10 +51,10 @@ const STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
 ///
 /// 链路数据（12h，35k 请求）：1524 次 network_error 中 567 次（37%）精确聚集在
 /// 120002ms，即被 read_timeout 兜底；而重试后成功尝试的首字节 p50 仅 4.4s、p90 11.6s。
-/// 把等响应头单独限到 25s，失败后仍有约 25s 预算给重试，绝大多数能在客户端超时前拿到
+/// 把等响应头单独限到 35s，失败后仍有预算给重试，绝大多数能在客户端超时前拿到
 /// 首字节。拿到响应头之后的流中途空闲仍由 `STREAM_READ_TIMEOUT_SECS` 兜住，长 thinking
 /// 不受影响。
-const RESPONSE_HEADER_TIMEOUT_SECS: u64 = 25;
+const RESPONSE_HEADER_TIMEOUT_SECS: u64 = 35;
 
 /// 带容量上限的 HTTP Client 缓存。
 ///
@@ -863,6 +863,7 @@ impl KiroProvider {
             }
             // 首字节守卫：只限「等响应头」这一段。超时按网络错误处理，走下面同一个
             // 重试分支（不禁用、不切换凭据），把一次 120s 的干等换成一次快速重试。
+            let mut header_timeout = false;
             let send_result = match tokio::time::timeout(
                 Duration::from_secs(RESPONSE_HEADER_TIMEOUT_SECS),
                 self.client_for(&ctx.credentials)?.execute(request),
@@ -870,10 +871,13 @@ impl KiroProvider {
             .await
             {
                 Ok(result) => result.map_err(anyhow::Error::from),
-                Err(_) => Err(anyhow::anyhow!(
-                    "等待上游响应头超过 {}s（首字节守卫）",
-                    RESPONSE_HEADER_TIMEOUT_SECS
-                )),
+                Err(_) => {
+                    header_timeout = true;
+                    Err(anyhow::anyhow!(
+                        "等待上游响应头超过 {}s（首字节守卫）",
+                        RESPONSE_HEADER_TIMEOUT_SECS
+                    ))
+                }
             };
 
             let response = match send_result {
@@ -891,9 +895,11 @@ impl KiroProvider {
                     );
                     // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
                     // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
+                    // 例外：首字节守卫超时不代表凭据/代理坏了（可能只是上游慢），
+                    // 不计入失败计数，直接快速重试，避免误伤凭据触发 TooManyFailures。
                     let has_own_proxy = ctx.credentials.proxy_url.as_deref()
                         .map_or(false, |u| !u.trim().is_empty());
-                    if has_own_proxy {
+                    if has_own_proxy && !header_timeout {
                         tracing::warn!(
                             "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
                             ctx.id
