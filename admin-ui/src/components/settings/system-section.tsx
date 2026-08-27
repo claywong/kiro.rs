@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { UploadCloud, Eye, EyeOff } from 'lucide-react'
+import { UploadCloud, Eye, EyeOff, ExternalLink, GitFork, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -29,7 +29,7 @@ export function SystemSection() {
   const { data, isLoading } = useUpdateConfig()
   const { mutate } = useSetUpdateConfig()
   const saver = useFieldSaver(mutate, reportSaveError)
-  const { data: check } = useUpdateCheck()
+  const { data: check, isFetching: checking, refetch: checkNow } = useUpdateCheck()
   const [dialogOpen, setDialogOpen] = useState(false)
 
   const autoApply = data?.autoApply ?? false
@@ -39,7 +39,7 @@ export function SystemSection() {
       <div className="space-y-6">
         <SettingGroup
           title="版本"
-          description="镜像更新的执行入口在更新面板里；这里只配自动化策略"
+          description="检查版本、执行镜像在线更新或查看项目仓库"
         >
           <SettingRow
             label="当前版本"
@@ -53,11 +53,33 @@ export function SystemSection() {
               <span className="console-num text-[13px]">
                 v{check?.currentVersion ?? '—'}
               </span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void checkNow()}
+                disabled={checking}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${checking ? 'animate-spin' : ''}`} />
+                {checking ? '检查中' : '检查更新'}
+              </Button>
               <Button size="sm" variant="outline" onClick={() => setDialogOpen(true)}>
                 <UploadCloud className="h-3.5 w-3.5" />
-                更新面板
+                镜像在线更新
               </Button>
             </div>
+          </SettingRow>
+          <SettingRow label="GitHub 仓库" hint="查看源码、发布记录和问题追踪">
+            <Button size="sm" variant="outline" asChild>
+              <a
+                href="https://github.com/ZyphrZero/kiro.rs"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <GitFork className="h-3.5 w-3.5" />
+                打开仓库
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </Button>
           </SettingRow>
         </SettingGroup>
 

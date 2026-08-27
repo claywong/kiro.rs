@@ -54,6 +54,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [rpmLimit, setRpmLimit] = useState('300')
   const [metadata, setMetadata] = useState<CredentialMetadata>({
     type: 'normal',
     saleStatus: 'not_for_sale',
@@ -87,6 +88,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setRpmLimit('300')
     setMetadata(metadataDefaults(metadataSchema))
   }
 
@@ -95,6 +97,12 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+
+    const parsedRpmLimit = Number(rpmLimit)
+    if (!Number.isInteger(parsedRpmLimit) || parsedRpmLimit < 0) {
+      toast.error('RPM 必须是大于等于 0 的整数')
+      return
+    }
 
     // 验证必填字段
     if (isApiKey) {
@@ -139,6 +147,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        rpmLimit: parsedRpmLimit,
         metadata,
       },
       {
@@ -405,6 +414,23 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="rpmLimit" className="text-sm font-medium">
+                每分钟请求上限（RPM）
+              </label>
+              <Input
+                id="rpmLimit"
+                type="number"
+                min={0}
+                step={1}
+                value={rpmLimit}
+                onChange={(e) => setRpmLimit(e.target.value)}
+                disabled={isPending}
+                required
+              />
+              <p className="text-xs text-muted-foreground">0 表示不限速</p>
             </div>
 
             <CredentialMetadataEditor

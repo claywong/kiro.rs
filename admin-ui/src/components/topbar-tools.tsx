@@ -2,13 +2,8 @@ import { useState } from 'react'
 import {
   Activity,
   RefreshCw,
-  UploadCloud,
   MoreHorizontal,
-  ShieldAlert,
-  ShieldCheck,
   Boxes,
-  HeartPulse,
-  HeartCrack,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -23,26 +18,13 @@ import {
 import {
   useLoadBalancingMode,
   useSetLoadBalancingMode,
-  useAccountThrottleConfig,
-  useSetAccountThrottleConfig,
-  useSelfHealConfig,
-  useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
-import { useUpdateCheck } from '@/hooks/use-update-check'
 import { extractErrorMessage } from '@/lib/utils'
-import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
- * 顶栏工具区：三个调度开关 + 三个动作按钮。
- *
- * 这里此前塞了完整的配置面板 —— 冷却时长的 5 个预设按钮、自定义分钟输入、自愈连续
- * 上限输入、登录密钥表单，还各写了 compact / full 两套。下拉菜单里放数字输入框本来
- * 就不是它该干的事：菜单是"选一个动作"的容器，不是表单容器。
- *
- * 现在的分工：**顶栏只放一次点击就能完成的开关**（这三个是运维高频动作，不该退化成
- * "进设置页找"），所有参数调整归「设置」Tab。compact 与 full 因此收敛成同一份
- * 开关定义，窄屏只是把它们折进一个菜单。
+ * 顶栏只保留负载均衡、模型和刷新三个高频入口。
+ * 故障转移、自愈和在线更新统一归「设置」Tab，避免同一配置出现两套入口。
  */
 interface TopbarToolsProps {
   compact?: boolean
@@ -80,13 +62,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const queryClient = useQueryClient()
   const { data: lbData, isLoading: lbLoading } = useLoadBalancingMode()
   const { mutate: setLb, isPending: lbSaving } = useSetLoadBalancingMode()
-  const { data: throttle, isLoading: thLoading } = useAccountThrottleConfig()
-  const { mutate: setThrottle, isPending: thSaving } = useSetAccountThrottleConfig()
-  const { data: selfHeal, isLoading: shLoading } = useSelfHealConfig()
-  const { mutate: setSelfHeal, isPending: shSaving } = useSetSelfHealConfig()
-  const { data: updateCheck } = useUpdateCheck()
 
-  const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
 
   const handleRefresh = () => {
@@ -104,9 +80,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     toast.error('切换失败：' + extractErrorMessage(err))
 
   const balanced = lbData?.mode === 'balanced'
-  const failover = throttle?.failover ?? true
-  const healing = selfHeal?.enabled ?? true
-  const cooldownMin = Math.round((throttle?.cooldownSecs ?? 1800) / 60)
 
   const toggles: ToggleSpec[] = [
     {
@@ -128,54 +101,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
           onError,
         }),
     },
-    {
-      key: 'failover',
-      on: failover,
-      busy: thLoading || thSaving,
-      label: thLoading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换',
-      menuLabel: failover ? '关闭故障转移' : '开启故障转移',
-      title: failover
-        ? `账号级风控故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
-        : '账号级风控故障转移：关闭',
-      icon: failover ? (
-        <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-      ) : (
-        <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
-      ),
-      onToggle: () =>
-        setThrottle(
-          { failover: !failover },
-          {
-            onSuccess: () =>
-              toast.success(failover ? '已关闭故障转移' : '已开启故障转移'),
-            onError,
-          },
-        ),
-    },
-    {
-      key: 'selfheal',
-      on: healing,
-      busy: shLoading || shSaving,
-      label: shLoading ? '加载中…' : healing ? '自愈开' : '自愈关',
-      menuLabel: healing ? '关闭凭据自愈' : '开启凭据自愈',
-      title: healing
-        ? `凭据自愈：已启用（当前连续 ${selfHeal?.consecutiveRounds ?? 0} 轮，参数见设置页）`
-        : '凭据自愈：已关闭',
-      icon: healing ? (
-        <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
-      ) : (
-        <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
-      ),
-      onToggle: () =>
-        setSelfHeal(
-          { enabled: !healing },
-          {
-            onSuccess: () =>
-              toast.success(healing ? '已关闭凭据自愈' : '已开启凭据自愈'),
-            onError,
-          },
-        ),
-    },
   ]
 
   return (
@@ -183,21 +108,16 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       {compact ? (
         <CompactTools
           toggles={toggles}
-          hasUpdate={!!updateCheck?.hasUpdate}
           onRefresh={handleRefresh}
           onOpenModels={() => setModelsOpen(true)}
-          onOpenImageUpdate={() => setImageUpdateOpen(true)}
         />
       ) : (
         <FullTools
           toggles={toggles}
-          updateCheck={updateCheck}
           onRefresh={handleRefresh}
           onOpenModels={() => setModelsOpen(true)}
-          onOpenImageUpdate={() => setImageUpdateOpen(true)}
         />
       )}
-      <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <AvailableModelsDialog open={modelsOpen} onOpenChange={setModelsOpen} />
     </>
   )
@@ -207,18 +127,13 @@ interface ToolsProps {
   toggles: ToggleSpec[]
   onRefresh: () => void
   onOpenModels: () => void
-  onOpenImageUpdate: () => void
 }
 
 function FullTools({
   toggles,
-  updateCheck,
   onRefresh,
   onOpenModels,
-  onOpenImageUpdate,
-}: ToolsProps & {
-  updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
-}) {
+}: ToolsProps) {
   return (
     <>
       {toggles.map((t) => (
@@ -240,37 +155,20 @@ function FullTools({
       <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新数据">
         <RefreshCw className="h-4 w-4" />
       </Button>
-      <Button
-        variant="ghost"
-        size="icon"
-        onClick={onOpenImageUpdate}
-        title={
-          updateCheck?.hasUpdate
-            ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
-            : '镜像在线更新'
-        }
-        className="relative"
-      >
-        <UploadCloud className="h-4 w-4" />
-        {updateCheck?.hasUpdate && <UpdateDot />}
-      </Button>
     </>
   )
 }
 
 function CompactTools({
   toggles,
-  hasUpdate,
   onRefresh,
   onOpenModels,
-  onOpenImageUpdate,
-}: ToolsProps & { hasUpdate: boolean }) {
+}: ToolsProps) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="更多操作" className="relative">
+        <Button variant="ghost" size="icon" title="更多操作">
           <MoreHorizontal className="h-4 w-4" />
-          {hasUpdate && <UpdateDot />}
         </Button>
       </DropdownMenuTrigger>
       {/* 窄屏兜底：菜单项随调度开关增加时不撑出视口，超出即在菜单内滚动 */}
@@ -294,20 +192,7 @@ function CompactTools({
           <Boxes />
           可用模型
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onOpenImageUpdate}>
-          <UploadCloud />
-          镜像在线更新
-        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-  )
-}
-
-function UpdateDot() {
-  return (
-    <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
-      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-      <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
-    </span>
   )
 }

@@ -63,6 +63,7 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [rpmLimit, setRpmLimit] = useState(String(credential.rpmLimit))
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
@@ -86,6 +87,7 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setRpmLimit(String(credential.rpmLimit))
       setMetadata({
         ...metadataDefaults(metadataSchema),
         ...metadataValues(credential.metadata),
@@ -99,6 +101,12 @@ export function EditCredentialDialog({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
 
+    const parsedRpmLimit = Number(rpmLimit)
+    if (!Number.isInteger(parsedRpmLimit) || parsedRpmLimit < 0) {
+      toast.error('RPM 必须是大于等于 0 的整数')
+      return
+    }
+
     mutate(
       {
         id: credential.id,
@@ -109,6 +117,7 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          rpmLimit: parsedRpmLimit,
           metadata,
         },
       },
@@ -219,6 +228,23 @@ export function EditCredentialDialog({
                   <p className="text-xs text-muted-foreground">
                     纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
                   </p>
+                </div>
+
+                <div className="space-y-2">
+                  <label htmlFor="rpmLimit" className="text-sm font-medium">
+                    每分钟请求上限（RPM）
+                  </label>
+                  <Input
+                    id="rpmLimit"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={rpmLimit}
+                    onChange={(e) => setRpmLimit(e.target.value)}
+                    disabled={isPending}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">0 表示不限速</p>
                 </div>
 
                 {/* 代理配置 */}

@@ -166,6 +166,75 @@ function formatOtps(v: number): string {
   return v.toFixed(1)
 }
 
+function effortVariant(
+  effort: string,
+): 'default' | 'secondary' | 'outline' | 'success' | 'warning' {
+  switch (effort) {
+    case 'low':
+      return 'secondary'
+    case 'medium':
+      return 'outline'
+    case 'high':
+      return 'default'
+    case 'max':
+    case 'xhigh':
+      return 'warning'
+    default:
+      return 'secondary'
+  }
+}
+
+function ThinkingCell({ rec }: { rec: TraceRecord }) {
+  const ms = rec.thinkingMs
+  const chars = rec.thinkingChars ?? 0
+
+  if (ms == null) {
+    if (!rec.isStream) {
+      return (
+        <span
+          className="text-muted-foreground"
+          title={
+            chars > 0
+              ? `非流式请求无法测量思考时长\n思考 ${formatTokenFull(chars)} 字符`
+              : '非流式请求无法测量思考时长'
+          }
+        >
+          {chars > 0 ? `${formatTokenFull(chars)} 字符` : '不适用'}
+        </span>
+      )
+    }
+    if (chars > 0) {
+      return (
+        <span
+          className="text-muted-foreground"
+          title={`只收到思考、未收到正文\n思考 ${formatTokenFull(chars)} 字符`}
+        >
+          {formatTokenFull(chars)} 字符
+        </span>
+      )
+    }
+    return <span className="text-muted-foreground">—</span>
+  }
+
+  const output = rec.outputTokens ?? 0
+  const thinkingTokens = Math.round(chars / 4)
+  const ratio = output > 0 ? Math.min(1, thinkingTokens / output) : null
+
+  return (
+    <span
+      className="console-num"
+      title={`思考 ${formatDuration(ms)}，${formatTokenFull(chars)} 字符（约 ${formatTokenFull(thinkingTokens)} token）`}
+    >
+      {formatDuration(ms)}
+      {ratio != null && (
+        <span className="ml-1 text-[11px] text-muted-foreground">
+          {(ratio * 100).toFixed(0)}%
+        </span>
+      )}
+    </span>
+  )
+}
+
 
 function credLabel(id: number, email?: string | null): string {
   if (id === 0) return '—'
@@ -518,7 +587,7 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         id: 'model',
         header: '模型',
         cell: (r) => (
-          <span className="inline-flex max-w-[200px] items-center gap-1.5">
+          <span className="inline-flex max-w-[240px] items-center gap-1.5">
             <span className="truncate">{r.model}</span>
             {r.isStream && (
               <span
@@ -527,6 +596,11 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
               >
                 流
               </span>
+            )}
+            {r.effort && (
+              <Badge variant={effortVariant(r.effort)} className="shrink-0 px-1.5 py-0 text-[10px]">
+                {r.effort}
+              </Badge>
             )}
           </span>
         ),
@@ -566,6 +640,13 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
             {r.credits != null && r.credits > 0 ? r.credits.toFixed(4) : '—'}
           </span>
         ),
+      },
+      {
+        id: 'thinking',
+        header: '首段思考',
+        align: 'right',
+        hint: '首个 reasoning 帧到首个正文或工具调用帧；比例为思考字符估算 token 占输出 token 的比例',
+        cell: (r) => <ThinkingCell rec={r} />,
       },
       {
         id: 'duration',
@@ -874,6 +955,16 @@ function TraceDetailDrawer({
             {rec.firstTokenMs != null && (
               <DrawerField label="首 Token" mono>
                 {formatDuration(rec.firstTokenMs)}
+              </DrawerField>
+            )}
+            {rec.effort && (
+              <DrawerField label="推理级别">
+                <Badge variant={effortVariant(rec.effort)}>{rec.effort}</Badge>
+              </DrawerField>
+            )}
+            {(rec.thinkingMs != null || (rec.thinkingChars ?? 0) > 0) && (
+              <DrawerField label="首段思考">
+                <ThinkingCell rec={rec} />
               </DrawerField>
             )}
             {rec.interruptedAfterBytes != null && (

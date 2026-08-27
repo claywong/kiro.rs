@@ -191,10 +191,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           saleStatus: saleStatus as CredentialSaleStatus,
         }
 
-        // 若凭据未指定代理且代理池有可用代理，随机分配一个
-        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
+        // 代理优先级：单行显式值 > 本次导入默认值 > 代理池随机分配。
+        let effectiveProxyUrl = cred.proxyUrl?.trim() || undefined
+        let effectiveProxyUsername = cred.proxyUsername?.trim() || undefined
+        let effectiveProxyPassword = cred.proxyPassword?.trim() || undefined
+        if (!effectiveProxyUrl && defs.proxyUrl) {
+          effectiveProxyUrl = defs.proxyUrl
+          effectiveProxyUsername = effectiveProxyUsername ?? defs.proxyUsername
+          effectiveProxyPassword = effectiveProxyPassword ?? defs.proxyPassword
+        } else if (!effectiveProxyUrl && enabledProxies.length > 0) {
           const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
-          cred.proxyUrl = picked.url
+          effectiveProxyUrl = picked.url
         }
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
@@ -230,9 +237,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              proxyUrl: effectiveProxyUrl,
+              proxyUsername: effectiveProxyUsername,
+              proxyPassword: effectiveProxyPassword,
               metadata,
             },
           })
@@ -288,9 +295,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              proxyUrl: effectiveProxyUrl,
+              proxyUsername: effectiveProxyUsername,
+              proxyPassword: effectiveProxyPassword,
               metadata,
             },
           })

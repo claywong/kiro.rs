@@ -7,6 +7,12 @@ import {
   useSetLoadBalancingMode,
   useSelfHealConfig,
   useSetSelfHealConfig,
+  useHealthGateState,
+  useSetHealthGateEnabled,
+  useTrafficIngressState,
+  useSetTrafficIngressEnabled,
+  useConcurrencyGateState,
+  useSetConcurrencyGateConfig,
 } from '@/hooks/use-credentials'
 import {
   SettingGroup,
@@ -37,8 +43,25 @@ export function DispatchSection() {
       <ThrottleGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
+      <TrafficIngressGroup />
+      <HealthGateGroup />
+      <ConcurrencyGateGroup />
     </div>
   )
+}
+
+function appliedText(value: boolean | null | undefined) {
+  if (value == null) return '尚未同步'
+  return value ? '可调度' : '不可调度'
+}
+
+function hostOf(url: string | undefined) {
+  if (!url) return '未配置'
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
 }
 
 function LoadBalancingGroup() {
@@ -226,6 +249,167 @@ function SelfHealGroup() {
       >
         连续 {data?.consecutiveRounds ?? 0} 轮 · 累计恢复 {data?.totalCount ?? 0} 次
       </SettingReadout>
+    </SettingGroup>
+  )
+}
+
+function TrafficIngressGroup() {
+  const { data, isLoading } = useTrafficIngressState()
+  const { mutate } = useSetTrafficIngressEnabled()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const configured = data?.configured ?? false
+  const enabled = data?.enabled ?? false
+
+  return (
+    <SettingGroup
+      title="流量入口"
+      description="独立控制外部账号是否可调度，并受本地 RPM 容量判据约束"
+    >
+      <SettingSwitch
+        label="启用流量入口"
+        hint={
+          configured
+            ? enabled && data?.rpmOk === false
+              ? '入口已开启，但当前 RPM 容量不足，外部账号会保持不可调度'
+              : '切换后异步同步到受控外部账号'
+            : '需先在 config.json 配置 trafficIngress 的地址、令牌和账号'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', next)}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading || !configured}
+      />
+      <SettingReadout label="运行状态" hint="目标系统 / 账号数 / 最近一次成功同步值">
+        {hostOf(data?.baseUrl)} · {data?.accountCount ?? 0} 个账号 · 已同步{' '}
+        {appliedText(data?.appliedSchedulable)}
+      </SettingReadout>
+      <SettingReadout label="RPM 容量判据">
+        {data?.rpmOk == null ? '未判定' : data.rpmOk ? '充足' : '不足'}
+      </SettingReadout>
+    </SettingGroup>
+  )
+}
+
+function HealthGateGroup() {
+  const { data, isLoading } = useHealthGateState()
+  const { mutate } = useSetHealthGateEnabled()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const configured = data?.configured ?? false
+  const enabled = data?.enabled ?? false
+
+  return (
+    <SettingGroup
+      title="健康联动"
+      description="本地不稳定时放外部兜底池接量；关闭后外部账号保持不可调度"
+    >
+      <SettingSwitch
+        label="启用健康联动"
+        hint={
+          configured
+            ? '持续判定本地健康度，并把反向调度状态同步到外部账号'
+            : '需先在 config.json 配置 healthGate 的地址、令牌和账号'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', next)}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading || !configured}
+      />
+      <SettingReadout label="运行状态" hint="目标系统 / 账号数 / 最近一次健康判定">
+        {hostOf(data?.baseUrl)} · {data?.accountCount ?? 0} 个账号 ·{' '}
+        {data?.verdict ?? '未判定'}
+      </SettingReadout>
+      <SettingReadout label="外部账号状态">
+        {appliedText(data?.appliedSchedulable)}
+      </SettingReadout>
+    </SettingGroup>
+  )
+}
+
+function ConcurrencyGateGroup() {
+  const { data, isLoading } = useConcurrencyGateState()
+  const { mutate } = useSetConcurrencyGateConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const configured = data?.configured ?? false
+  const enabled = data?.enabled ?? false
+  const manual = data?.manualConcurrency ?? null
+  const mode = manual == null ? 'auto' : 'manual'
+
+  return (
+    <SettingGroup
+      title="并发联动"
+      description="把本地有效凭据的 RPM 总量换算成外部账号并发上限"
+    >
+      <SettingSwitch
+        label="启用并发联动"
+        hint={
+          configured
+            ? '启用后持续把期望并发同步到受控外部账号'
+            : '需先在 config.json 配置 concurrencyGate 的地址、令牌和账号'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading || !configured}
+      />
+      <SettingSegments
+        label="并发计算模式"
+        hint={
+          mode === 'auto'
+            ? '按 RPM 总量除以换算除数自动计算'
+            : '使用固定并发值，忽略 RPM 换算结果'
+        }
+        value={mode}
+        options={[
+          { value: 'auto', label: '自动换算' },
+          { value: 'manual', label: '手动固定' },
+        ]}
+        onChange={(next) =>
+          saver.save('mode', {
+            manualConcurrency:
+              next === 'auto' ? null : (data?.resolvedConcurrency ?? 0),
+          })
+        }
+        pending={saver.isSaving('mode')}
+        saved={saver.isSaved('mode')}
+        disabled={isLoading || !configured}
+      />
+      <SettingNumber
+        label="RPM 换算除数"
+        hint={`当前 RPM 总量 ${data?.rpmTotal ?? 0}，自动模式下向下取整后再夹到配置范围`}
+        value={data?.divisor ?? 6}
+        onCommit={(next) => saver.save('divisor', { divisor: next })}
+        min={1}
+        max={100000}
+        presets={[3, 6, 10, 20]}
+        pending={saver.isSaving('divisor')}
+        saved={saver.isSaved('divisor')}
+        disabled={isLoading || !configured || mode !== 'auto'}
+      />
+      <SettingNumber
+        label="手动并发"
+        hint="仅手动固定模式生效，最终值仍受后端 min/max 范围约束"
+        value={manual ?? data?.resolvedConcurrency ?? 0}
+        onCommit={(next) =>
+          saver.save('manualConcurrency', { manualConcurrency: next })
+        }
+        min={0}
+        max={1000000}
+        pending={saver.isSaving('manualConcurrency')}
+        saved={saver.isSaved('manualConcurrency')}
+        disabled={isLoading || !configured || mode !== 'manual'}
+      />
+      <SettingReadout label="同步状态" hint="目标系统 / 账号数 / 期望值 / 最近已推送值">
+        {hostOf(data?.baseUrl)} · {data?.accountCount ?? 0} 个账号 · 期望{' '}
+        {data?.resolvedConcurrency ?? 0} · 已推送 {data?.appliedConcurrency ?? '未知'}
+      </SettingReadout>
+      {(data?.unlimitedCredentials ?? 0) > 0 && (
+        <SettingReadout label="不限速凭据">
+          {data?.unlimitedCredentials} 个，RPM 总量包含折算估值
+        </SettingReadout>
+      )}
     </SettingGroup>
   )
 }

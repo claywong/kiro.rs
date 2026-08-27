@@ -2312,6 +2312,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      recentSpend={
+                        recentSpendData?.spend?.[String(credential.id)]
+                      }
                       dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       metadataSchema={data?.metadataSchema}
