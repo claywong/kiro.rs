@@ -55,6 +55,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
   const [rpmLimit, setRpmLimit] = useState('300')
+  const [priority, setPriority] = useState('0')
   const [metadata, setMetadata] = useState<CredentialMetadata>({
     type: 'normal',
     saleStatus: 'not_for_sale',
@@ -89,6 +90,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     setGroups([])
     setSourceChannel('')
     setRpmLimit('300')
+    setPriority('0')
     setMetadata(metadataDefaults(metadataSchema))
   }
 
@@ -101,6 +103,12 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     const parsedRpmLimit = Number(rpmLimit)
     if (!Number.isInteger(parsedRpmLimit) || parsedRpmLimit < 0) {
       toast.error('RPM 必须是大于等于 0 的整数')
+      return
+    }
+
+    const parsedPriority = Number(priority)
+    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
+      toast.error('优先级必须是大于等于 0 的整数')
       return
     }
 
@@ -148,6 +156,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
         rpmLimit: parsedRpmLimit,
+        priority: parsedPriority,
         metadata,
       },
       {
@@ -431,6 +440,26 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 required
               />
               <p className="text-xs text-muted-foreground">0 表示不限速</p>
+            </div>
+
+            {/* 优先级 */}
+            <div className="space-y-2">
+              <label htmlFor="priority" className="text-sm font-medium">
+                优先级
+              </label>
+              <Input
+                id="priority"
+                type="number"
+                min={0}
+                step={1}
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                disabled={isPending}
+                required
+              />
+              <p className="text-xs text-muted-foreground">
+                数值越小越优先被调度，0 为最高优先级
+              </p>
             </div>
 
             <CredentialMetadataEditor
