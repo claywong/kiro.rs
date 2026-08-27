@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
+import { Tags, Settings2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -20,7 +21,7 @@ import {
 } from '@/components/ui/select'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
-import { extractErrorMessage } from '@/lib/utils'
+import { extractErrorMessage, cn } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
 import {
   CredentialMetadataEditor,
@@ -36,7 +37,15 @@ interface AddCredentialDialogProps {
 
 type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
+type TabKey = 'general' | 'metadata'
+
+const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
+  { key: 'general', label: '基本', icon: <Settings2 className="h-3.5 w-3.5" /> },
+  { key: 'metadata', label: 'Metadata', icon: <Tags className="h-3.5 w-3.5" /> },
+]
+
 export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
+  const [activeTab, setActiveTab] = useState<TabKey>('general')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -67,6 +76,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
 
   useEffect(() => {
     if (open) {
+      setActiveTab('general')
       setMetadata((current) => ({ ...metadataDefaults(metadataSchema), ...current }))
     }
   }, [open, metadataSchema])
@@ -182,8 +192,30 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
           </DialogDescription>
         </DialogHeader>
 
+        {/* 标签导航 */}
+        <nav className="-mx-1 flex gap-0.5" aria-label="添加分区">
+          {TABS.map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              onClick={() => setActiveTab(tab.key)}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
+                activeTab === tab.key
+                  ? 'bg-primary/12 font-medium text-foreground'
+                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
+              )}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            {activeTab === 'general' && (<>
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
@@ -462,13 +494,6 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
               </p>
             </div>
 
-            <CredentialMetadataEditor
-              schema={metadataSchema}
-              value={metadata}
-              onChange={setMetadata}
-              disabled={isPending}
-            />
-
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
@@ -500,6 +525,16 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 留空使用全局代理。输入 "direct" 可显式不使用代理
               </p>
             </div>
+            </>)}
+
+            {activeTab === 'metadata' && (
+              <CredentialMetadataEditor
+                schema={metadataSchema}
+                value={metadata}
+                onChange={setMetadata}
+                disabled={isPending}
+              />
+            )}
           </div>
 
           <DialogFooter>
