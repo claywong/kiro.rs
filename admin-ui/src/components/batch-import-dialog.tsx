@@ -17,15 +17,23 @@ import {
   type BatchImportItemEvent,
   type BatchImportSummary,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CredentialMetadata,
+  CredentialSaleStatus,
+  CredentialType,
+} from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
-// 本地新增：导入默认值字段单独成行，避免与上游的 import 块反复冲突。
+import {
+  metadataFieldDefault,
+  metadataFieldValues,
+} from '@/components/credential-metadata-field'
 import {
   ImportDefaultsFields,
   EMPTY_IMPORT_DEFAULTS,
   resolveImportDefaults,
   type ImportDefaults,
-} from '@/components/import-defaults-fields'
+} from "@/components/import-defaults-fields"
 
 interface BatchImportDialogProps {
   open: boolean
@@ -53,8 +61,7 @@ interface CredentialInput {
   tokenEndpoint?: string
   issuerUrl?: string
   scopes?: string
-  // 运营元数据
-  sourceChannel?: string
+  metadata?: Partial<CredentialMetadata>
 }
 
 interface VerificationResult {
@@ -163,17 +170,31 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
 
-        // 代理来源优先级：单行 JSON 显式值 > 对话框默认值 > 代理池随机分配。
-        // 显式填了默认代理就不再随机，否则"指定代理"这个动作会被池覆盖掉。
-        if (!cred.proxyUrl?.trim()) {
-          if (defs.proxyUrl) {
-            cred.proxyUrl = defs.proxyUrl
-            cred.proxyUsername = cred.proxyUsername ?? defs.proxyUsername
-            cred.proxyPassword = cred.proxyPassword ?? defs.proxyPassword
-          } else if (enabledProxies.length > 0) {
-            const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
-            cred.proxyUrl = picked.url
-          }
+        const metadataSchema = existingCredentials?.metadataSchema
+        const metadataType = cred.metadata?.type
+          ?? metadataFieldDefault(metadataSchema, 'type', 'normal')
+        const typeValues = metadataFieldValues(metadataSchema, 'type')
+        if (typeValues.length > 0 && !typeValues.includes(metadataType)) {
+          updateResult(i, { status: 'failed', error: 'metadata.type 不符合当前 schema' })
+          continue
+        }
+        const saleStatus = cred.metadata?.saleStatus
+          ?? metadataFieldDefault(metadataSchema, 'saleStatus', 'not_for_sale')
+        const saleStatusValues = metadataFieldValues(metadataSchema, 'saleStatus')
+        if (saleStatusValues.length > 0 && !saleStatusValues.includes(saleStatus)) {
+          updateResult(i, { status: 'failed', error: 'metadata.saleStatus 不符合当前 schema' })
+          continue
+        }
+        const metadata: CredentialMetadata = {
+          ...cred.metadata,
+          type: metadataType as CredentialType,
+          saleStatus: saleStatus as CredentialSaleStatus,
+        }
+
+        // 若凭据未指定代理且代理池有可用代理，随机分配一个
+        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
+          const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
+          cred.proxyUrl = picked.url
         }
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
@@ -212,7 +233,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
-              sourceChannel: cred.sourceChannel?.trim() || undefined,
+              metadata,
             },
           })
         } else {
@@ -270,7 +291,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
-              sourceChannel: cred.sourceChannel?.trim() || undefined,
+              metadata,
             },
           })
         }

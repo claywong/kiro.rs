@@ -288,7 +288,7 @@ pub fn map_model(model: &str) -> Option<String> {
 
     // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
-        return Some(custom.backend_id.clone());
+        return Some(custom.backend_id);
     }
 
     normalize_claude_model(model).or_else(|| Some(model.to_string()))
@@ -298,8 +298,13 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M。
+/// 4.7 / 4.8、Sonnet 5 / Opus 5 同 1M。
 /// 非 Claude 模型：gpt-5.6 系为 272k，其余（deepseek/minimax/glm/qwen）为 200k。
+///
+/// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
+/// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
+/// 发往上游的请求，但会让该模型的 usage 上报缩小 5 倍，进而使客户端的
+/// 上下文进度条与自动压缩阈值全部失准。新增 1M 模型时务必同步此处。
 pub fn get_context_window_size(model: &str) -> i32 {
     // 自定义模型若显式声明了上下文窗口，优先返回。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
@@ -447,6 +452,7 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    None,
     Low,
     Medium,
     High,
@@ -457,6 +463,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -468,6 +475,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -496,9 +504,15 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
         }
     };
 
-    // 按 Kiro 官方 per-model 表，Opus 4.6 / Sonnet 4.6 缺 xhigh 档位（max 仍支持），
+    // 客户端显式 `none`（非 gpt-reasoning 族）视为「未指定」，归一到 high，与上游一致。
+    // gpt 族的键名判定用本地宽松的 reasoning_field_key（任何 gpt-5*），与放行范围一致。
+    // 其后按 Kiro 官方 per-model 表：Opus 4.6 / Sonnet 4.6 缺 xhigh 档位（max 仍支持），
     // 对这两个模型降一档到 high；其余模型原样下发。判定见 thinking_mode 模块。
-    let requested = if requested == EffortTier::XHigh && !backend_supports_xhigh_effort(model_id) {
+    let requested = if requested == EffortTier::None
+        && reasoning_field_key(model_id) != ReasoningFieldStyle::Reasoning
+    {
+        EffortTier::High
+    } else if requested == EffortTier::XHigh && !backend_supports_xhigh_effort(model_id) {
         tracing::debug!(
             model_id = %model_id,
             effort = %trimmed,
@@ -542,7 +556,7 @@ fn build_additional_model_request_fields(
         {
             tracing::debug!(
                 model_id = %model_id,
-                "skipping unsupported additionalModelRequestFields.output_config for model"
+                "skipping unsupported reasoning effort for model"
             );
         }
         return None;
@@ -2042,6 +2056,52 @@ mod tests {
         );
     }
 
+    /// Opus 5 的上下文窗口回归测试。
+    ///
+    /// 该模型曾被漏配在 1M 名单之外，导致 `Event::ContextUsage` 把上游回报的
+    /// 百分比乘以 200_000，usage 上报缩小 5 倍。
+    #[test]
+    fn test_context_window_opus_5() {
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // 别名/后缀变体经 map_model 归一化后同样落在 1M
+        assert_eq!(get_context_window_size("claude-opus-5-latest"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-opus-5-20270101-thinking"),
+            1_000_000
+        );
+        assert_eq!(get_context_window_size("claude-opus.5"), 1_000_000);
+        // opus-4-5 不得被误匹配为 opus-5
+        assert_eq!(get_context_window_size("claude-opus-4-5"), 200_000);
+    }
+
+    /// 1M 名单的整体校验：新增 1M 模型时应同步此处，避免再次漏配。
+    #[test]
+    fn test_context_window_1m_family() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-fable-5",
+        ] {
+            assert_eq!(
+                get_context_window_size(model),
+                1_000_000,
+                "{model} 应为 1M 上下文窗口"
+            );
+        }
+        // 未纳入 1M 的模型仍回退 200k
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"] {
+            assert_eq!(
+                get_context_window_size(model),
+                200_000,
+                "{model} 应回退 200k"
+            );
+        }
+    }
+
     #[test]
     fn test_map_model_rejects_invalid_ids() {
         assert!(map_model("").is_none());
@@ -2574,6 +2634,29 @@ mod tests {
                 "{m} 未确认支持，不应下发任何 effort 字段"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_effort_uses_reasoning_wire_field() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                let req = minimal_request_with_effort(model, effort);
+                let fields = convert_request(&req)
+                    .unwrap()
+                    .additional_model_request_fields
+                    .expect("GPT-5.6 effort should be forwarded");
+                assert!(fields.output_config.is_none());
+                assert_eq!(fields.reasoning.unwrap().effort, effort);
+            }
+        }
+    }
+
+    #[test]
+    fn none_effort_falls_back_for_claude() {
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.7", "none").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

@@ -160,6 +160,7 @@ pub async fn import_keys(
                     endpoint: None,
                     groups: groups.clone(),
                     source_channel: Some(source_channel.to_string()),
+                    metadata: Default::default(),
                 },
                 ParsedVendorCredential::Social {
                     refresh_token,
@@ -198,6 +199,7 @@ pub async fn import_keys(
                     endpoint: None,
                     groups: groups.clone(),
                     source_channel: Some(source_channel.to_string()),
+                    metadata: Default::default(),
                 },
             };
 

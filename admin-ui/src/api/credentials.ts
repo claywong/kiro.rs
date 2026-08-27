@@ -10,6 +10,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CustomModelItem,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
@@ -36,6 +37,7 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  CredentialMetadataSchemaConfig,
 } from '@/types/api'
 // 本地新增类型单独成行，不并入上游的 import 块，避免上游改动时反复冲突。
 import type { RecentSpendResponse } from '@/types/api'
@@ -61,6 +63,23 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+export async function getCredentialMetadataSchema(): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.get<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+  )
+  return data
+}
+
+export async function setCredentialMetadataSchema(
+  config: CredentialMetadataSchemaConfig,
+): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.put<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+    config,
+  )
   return data
 }
 
@@ -454,6 +473,25 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface AccountRpmLimitConfig {
+  enabled: boolean
+  limit: number
+}
+
+// 获取单账号 RPM 限流配置
+export async function getAccountRpmLimitConfig(): Promise<AccountRpmLimitConfig> {
+  const { data } = await api.get<AccountRpmLimitConfig>('/config/account-rpm-limit')
+  return data
+}
+
+// 更新单账号 RPM 限流配置
+export async function setAccountRpmLimitConfig(
+  patch: Partial<AccountRpmLimitConfig>,
+): Promise<AccountRpmLimitConfig> {
+  const { data } = await api.put<AccountRpmLimitConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
 // 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
 // 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {
@@ -645,6 +683,23 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 获取自定义模型配置
+export async function getCustomModels(): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.get<{ models: CustomModelItem[] }>('/config/custom-models')
+  return data
+}
+
+// 批量替换自定义模型配置
+export async function setCustomModels(
+  req: { models: CustomModelItem[] },
+): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.put<{ models: CustomModelItem[] }>(
+    '/config/custom-models',
+    req,
+  )
   return data
 }
 

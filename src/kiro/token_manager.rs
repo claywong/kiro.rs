@@ -918,6 +918,10 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// RPM 主动限流的滑动窗口：最近 60 秒内被选中发起请求的时间戳队列。
+    /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
+    /// 不持久化，进程重启后清空；限流关闭时始终为空。
+    rpm_window: VecDeque<Instant>,
     /// 当前凭据连续执行自愈的轮数。同一凭据成功后清零。
     self_heal_consecutive_rounds: u32,
     /// 当前凭据累计被自愈恢复的次数。
@@ -943,6 +947,7 @@ impl CredentialEntry {
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
+        self.rpm_window.clear();
         self.clear_self_heal_streak();
     }
 
@@ -1108,6 +1113,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；凭据禁用后也应保留展示。
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1137,6 +1144,11 @@ pub struct CredentialEntrySnapshot {
     /// 各模型 TTFT EWMA 的均值（毫秒）；无样本时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ewma_ms: Option<u64>,
+    /// 凭据扩展元数据
+    pub metadata: crate::kiro::model::credentials::CredentialMetadata,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1208,6 +1220,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 单账号 RPM 主动限流开关（运行时可修改）
+    account_rpm_limit_enabled: AtomicBool,
+    /// 单账号每分钟请求次数上限（运行时可修改）
+    account_rpm_limit: AtomicU32,
     /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
     /// 全账号自愈总开关（运行时可修改）
@@ -1237,6 +1253,9 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
+const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1510,6 +1529,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    rpm_window: VecDeque::new(),
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
@@ -1556,13 +1576,15 @@ impl MultiTokenManager {
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let rpm_limit_enabled = config.account_rpm_limit_enabled;
+        let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
@@ -1582,6 +1604,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
+            account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
@@ -1697,7 +1721,7 @@ impl MultiTokenManager {
         self.model_refresh_locks.lock().remove(&id);
     }
 
-    fn invalidate_all_model_caches(&self) {
+    pub fn invalidate_all_model_caches(&self) {
         self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.model_cache.lock().clear();
     }
@@ -1754,7 +1778,17 @@ impl MultiTokenManager {
         let generation = self.model_cache_generation(id);
         let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
         let _permit = self.model_refresh_semaphore.acquire().await?;
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // 同 get_usage_limits_for：先解析回填真实 profileArn。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询模型列表前解析 profileArn 失败: {}", id, error)
+            }
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let response =
@@ -2019,6 +2053,127 @@ impl MultiTokenManager {
         true
     }
 
+    /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
+    ///
+    /// 限流未开启时恒为 `false`（不参与调度判断）。只读判断，不修改窗口；
+    /// 过期时间戳的实际清理发生在 [`Self::record_request`]。
+    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            return false;
+        }
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let fresh = entry
+            .rpm_window
+            .iter()
+            .filter(|&&ts| now.duration_since(ts) < window)
+            .count();
+        fresh as u32 >= limit
+    }
+
+    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
+        if limit == 0 {
+            return None;
+        }
+
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut earliest_retry_after = None;
+
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && !entry
+                    .throttled_until
+                    .map(|until| until > now)
+                    .unwrap_or(false)
+                && credential_matches_request(&entry.credentials, model, group)
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+        }) {
+            let fresh_count = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .count();
+            if fresh_count < limit {
+                return None;
+            }
+
+            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh_count - limit;
+            let release_at = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .nth(release_index)
+                .copied()
+                .expect("fresh_count 与窗口迭代结果应一致")
+                + window;
+            let remaining = release_at.saturating_duration_since(now);
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest_retry_after = Some(
+                earliest_retry_after
+                    .map(|current: u64| current.min(retry_after))
+                    .unwrap_or(retry_after),
+            );
+        }
+
+        earliest_retry_after
+    }
+
+    /// 尝试为一次真实业务请求预留 RPM 额度。
+    ///
+    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
+    /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
+    /// 抢先占用，调用方应重新选择凭据。
+    fn record_request(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            if !entry.rpm_window.is_empty() {
+                entry.rpm_window.clear();
+            }
+            return true;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            entry.rpm_window.clear();
+            return true;
+        }
+        while let Some(&front) = entry.rpm_window.front() {
+            if now.duration_since(front) >= window {
+                entry.rpm_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.rpm_window.len() >= limit as usize {
+            return false;
+        }
+        entry.rpm_window.push_back(now);
+        true
+    }
+
     fn has_available_for_request(
         &self,
         entries: &[CredentialEntry],
@@ -2072,7 +2227,10 @@ impl MultiTokenManager {
                 // 不并入上游 `entry_available_for_request`——后者还被
                 // `has_available_for_request`（判断「是否还有号可用」）复用，
                 // 那里不该受单次重试的排除集与瞬时 RPM 影响。
-                if excluded_ids.contains(&e.id) || is_rpm_exceeded(e, now) {
+                if excluded_ids.contains(&e.id)
+                    || is_rpm_exceeded(e, now)
+                    || self.rpm_exceeded(e, now)
+                {
                     return None;
                 }
                 if !self.entry_available_for_request(e, model, group, now) {
@@ -2196,6 +2354,7 @@ impl MultiTokenManager {
                             && !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !is_rpm_exceeded(e, now)
+                            && !self.rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
                             && model_support != CachedModelSupport::Unsupported
                             && (!confirmed_available
@@ -2266,6 +2425,7 @@ impl MultiTokenManager {
                     } else {
                         let entries = self.entries.lock();
                         let now = Instant::now();
+                        // 凭据级 RPM 重试(各凭据独立限速)
                         let retry_after = entries
                             .iter()
                             .filter(|e| {
@@ -2279,6 +2439,14 @@ impl MultiTokenManager {
                         if let Some(retry_after) = retry_after {
                             return Err(anyhow::Error::new(UpstreamRateLimitError::new(Some(
                                 retry_after.max(1).to_string(),
+                            ))));
+                        }
+                        // 账号级 RPM 重试(整池共用限额)
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, now)
+                        {
+                            return Err(anyhow::Error::new(UpstreamRateLimitError::new(Some(
+                                retry_after.to_string(),
                             ))));
                         }
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -2295,6 +2463,11 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
+                    if update_current && !self.record_request(id) {
+                        // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
+                        continue;
+                    }
                     return Ok((ctx, is_balanced));
                 }
                 Err(e) => {
@@ -2350,7 +2523,7 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -2924,7 +3097,7 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3001,7 +3174,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3171,7 +3344,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3239,7 +3412,7 @@ impl MultiTokenManager {
                 let has_available = if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3297,7 +3470,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3329,7 +3502,7 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             *current_id = next.id;
             tracing::info!(
@@ -3431,6 +3604,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -3453,6 +3627,8 @@ impl MultiTokenManager {
                         let sum: f64 = e.ttft_ewma.values().map(|s| s.ewma).sum();
                         Some((sum / e.ttft_ewma.len() as f64).round() as u64)
                     },
+                    metadata: e.credentials.metadata.clone(),
+                    created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -3781,7 +3957,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3789,6 +3965,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 失败不阻断查询，由 get_usage_limits 内部按候选表回退。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询用量前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -4088,7 +4274,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -4096,6 +4282,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置用户偏好前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -4235,6 +4431,14 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.metadata = new_cred.metadata;
+        // 记录添加时间：保留导入时携带的原值（如 KAM 迁移），否则以当前时间入库。
+        // 此处为所有添加路径（单条添加 / 批量导入 / 登录回调）的唯一收口。
+        if validated_cred.created_at.is_none() {
+            validated_cred.created_at = new_cred
+                .created_at
+                .or_else(|| Some(Utc::now().to_rfc3339()));
+        }
 
         {
             let mut entries = self.entries.lock();
@@ -4271,6 +4475,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                rpm_window: VecDeque::new(),
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -4303,6 +4508,7 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         rpm_limit: Option<u32>,
+        metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -4338,6 +4544,9 @@ impl MultiTokenManager {
             }
             if let Some(rpm_limit) = rpm_limit {
                 entry.credentials.rpm_limit = rpm_limit;
+            }
+            if let Some(v) = metadata {
+                entry.credentials.metadata = v;
             }
         }
         if invalidate_models {
@@ -4758,6 +4967,74 @@ impl MultiTokenManager {
         })
     }
 
+    /// 获取单账号 RPM 限流配置（Admin API）。返回：(是否启用, 每分钟上限)。
+    pub fn get_account_rpm_limit_config(&self) -> (bool, u32) {
+        (
+            self.account_rpm_limit_enabled.load(Ordering::Relaxed),
+            self.account_rpm_limit.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置单账号 RPM 限流配置（Admin API）。
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。关闭限流时会清空所有凭据的窗口计数，
+    /// 避免下次开启时残留旧时间戳造成误判。
+    pub fn set_account_rpm_limit_config(
+        &self,
+        enabled: Option<bool>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(value) = limit {
+            // 限定合理范围：1..=100000。0 会被视为"不限"，故不接受，避免与关闭开关语义混淆。
+            if !(1..=100_000).contains(&value) {
+                anyhow::bail!("RPM 上限必须在 1..=100000 内: {}", value);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_enabled, prev_limit) = self.get_account_rpm_limit_config();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_limit = limit.unwrap_or(prev_limit);
+
+        if new_enabled == prev_enabled && new_limit == prev_limit {
+            return Ok(());
+        }
+
+        self.account_rpm_limit_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.account_rpm_limit.store(new_limit, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_account_rpm_limit_config(new_enabled, new_limit) {
+            // 回滚内存值
+            self.account_rpm_limit_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.account_rpm_limit.store(prev_limit, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        // 关闭限流时清空窗口，避免重新开启后残留旧计数误判。
+        if !new_enabled {
+            for entry in self.entries.lock().iter_mut() {
+                entry.rpm_window.clear();
+            }
+        }
+
+        tracing::info!(
+            "单账号 RPM 限流配置已更新: enabled={}, limit={}",
+            new_enabled,
+            new_limit
+        );
+        Ok(())
+    }
+
+    fn persist_account_rpm_limit_config(&self, enabled: bool, limit: u32) -> anyhow::Result<()> {
+        self.update_config_file(move |config| {
+            config.account_rpm_limit_enabled = enabled;
+            config.account_rpm_limit = limit;
+        })
+    }
+
     /// 获取自愈治理配置（Admin API）。
     ///
     /// 返回：(封禁识别开关, 自愈开关, 自愈冷却秒, 连续自愈上限, 当前连续自愈轮数,
@@ -4915,6 +5192,109 @@ mod tests {
     use super::*;
     use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
     use std::sync::Arc;
+
+    /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
+    fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = enabled;
+        config.account_rpm_limit = limit;
+        let cred = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("refresh-token-".repeat(4)),
+            access_token: Some("access-token".to_string()),
+            ..KiroCredentials::default()
+        };
+        MultiTokenManager::new(config, vec![cred], None, None, true).unwrap()
+    }
+
+    #[test]
+    fn rpm_disabled_never_exceeds() {
+        let mgr = rpm_test_manager(false, 1);
+        // 即使反复记录也不应触发限流（关闭时 record 直接清空窗口）
+        for _ in 0..10 {
+            mgr.record_request(1);
+        }
+        let entries = mgr.entries.lock();
+        let entry = &entries[0];
+        assert!(!mgr.rpm_exceeded(entry, Instant::now()));
+        assert!(entry.rpm_window.is_empty());
+    }
+
+    #[test]
+    fn rpm_blocks_at_limit_and_recovers_after_window() {
+        let limit = 3;
+        let mgr = rpm_test_manager(true, limit);
+
+        // 恰好未达上限：limit-1 次后仍可用
+        for _ in 0..(limit - 1) {
+            mgr.record_request(1);
+        }
+        {
+            let entries = mgr.entries.lock();
+            assert!(!mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+
+        // 第 limit 次后达到上限：应拦截
+        mgr.record_request(1);
+        {
+            let entries = mgr.entries.lock();
+            assert!(mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+
+        // 手动把窗口内时间戳伪造成 61 秒前，模拟窗口滑出 → 恢复可用
+        {
+            let mut entries = mgr.entries.lock();
+            let old = Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 1);
+            for ts in entries[0].rpm_window.iter_mut() {
+                *ts = old;
+            }
+            assert!(!mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+    }
+
+    #[test]
+    fn rpm_record_prunes_expired_timestamps() {
+        let mgr = rpm_test_manager(true, 100);
+        // 注入一个过期时间戳，record 时应被剔除，只留新压入的一个
+        {
+            let mut entries = mgr.entries.lock();
+            entries[0]
+                .rpm_window
+                .push_back(Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 5));
+        }
+        mgr.record_request(1);
+        let entries = mgr.entries.lock();
+        assert_eq!(entries[0].rpm_window.len(), 1);
+    }
+
+    #[test]
+    fn rpm_record_never_reserves_beyond_limit() {
+        let mgr = rpm_test_manager(true, 2);
+
+        // 多个请求可能在任一请求记账前都已通过选择阶段。最终记账必须再次校验
+        // 上限，确保这些并发预选请求中最多只有 limit 个获得额度。
+        for _ in 0..8 {
+            mgr.record_request(1);
+        }
+
+        let entries = mgr.entries.lock();
+        assert_eq!(entries[0].rpm_window.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rpm_exhaustion_returns_typed_rate_limit_error() {
+        let mgr = rpm_test_manager(true, 1);
+        mgr.record_request(1);
+
+        let error = match mgr.acquire_context(None, None).await {
+            Ok(_) => panic!("RPM 已耗尽时不应返回调用上下文"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("RPM 已耗尽应返回类型化限流错误，以便 HTTP 层映射为 429");
+        assert!(rate_limit.retry_after().is_some());
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -5155,6 +5535,31 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
+    /// 且值可被解析。旧凭据（未携带该字段）由调用方决定是否补齐。
+    #[tokio::test]
+    async fn test_add_credential_sets_created_at() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut api_key_cred = KiroCredentials::default();
+        api_key_cred.kiro_api_key = Some("ksk_created_at_probe".to_string());
+        api_key_cred.auth_method = Some("api_key".to_string());
+
+        manager.add_credential(api_key_cred).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.first().expect("凭据应已入库");
+        let created_at = entry
+            .created_at
+            .as_deref()
+            .expect("新凭据应写入 created_at");
+        assert!(
+            DateTime::parse_from_rfc3339(created_at).is_ok(),
+            "created_at 应为合法 RFC3339: {created_at}"
+        );
     }
 
     #[tokio::test]
@@ -6964,6 +7369,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -6973,8 +7379,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_update_credential_preserves_extensible_metadata() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let metadata = crate::kiro::model::credentials::CredentialMetadata {
+            kind: crate::kiro::model::credentials::CredentialType::Boom,
+            sale_status: crate::kiro::model::credentials::CredentialSaleStatus::ForSale,
+            extra: std::collections::BTreeMap::from([(
+                "supplier".to_string(),
+                serde_json::Value::String("vendor-a".to_string()),
+            )]),
+        };
+
+        manager
+            .update_credential(1, None, None, None, None, None, None, None, Some(metadata))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries[0].metadata.kind,
+            crate::kiro::model::credentials::CredentialType::Boom
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.sale_status,
+            crate::kiro::model::credentials::CredentialSaleStatus::ForSale
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.extra.get("supplier"),
+            Some(&serde_json::Value::String("vendor-a".to_string()))
+        );
+    }
+
     #[tokio::test]
-    async fn test_model_routing_prefers_confirmed_cache_over_unknown_current() {
+    async fn test_priority_routing_prefers_priority_over_unknown_model_cache() {
         let mut confirmed = grouped_cred("confirmed", &[]);
         confirmed.priority = 10;
         let manager = MultiTokenManager::new(
@@ -6991,6 +7435,8 @@ mod tests {
             .acquire_context(Some("minimax-m2.5"), None)
             .await
             .unwrap();
+        // 本地三级排序：发现档优先(Confirmed > Unknown) → 优先级 → TTFT。
+        // Confirmed 凭据(id=2)在发现档上胜出，即使 priority 值更大。
         assert_eq!(context.id, 2);
     }
 
@@ -7280,6 +7726,113 @@ mod tests {
             Some(1),
             "未指定模型时不做模型过滤"
         );
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_ignores_stale_current_id() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_selects_smallest_priority_in_request_group() {
+        let mut other_group = grouped_cred("other", &["g2"]);
+        other_group.priority = 0;
+        let mut later_in_group = grouped_cred("later", &["g1"]);
+        later_in_group.priority = 20;
+        let mut first_in_group = grouped_cred("first", &["g1"]);
+        first_in_group.priority = 10;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![other_group, later_in_group, first_in_group],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let context = manager.acquire_context(None, Some("g1")).await.unwrap();
+        assert_eq!(context.id, 3);
+        assert_eq!(manager.snapshot().current_id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_falls_through_at_rpm_limit_and_switches_back() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        let first_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first_context.id, 1);
+
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        {
+            let mut entries = manager.entries.lock();
+            let expired = Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 1);
+            for timestamp in entries[0].rpm_window.iter_mut() {
+                *timestamp = expired;
+            }
+        }
+
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_switches_back_after_higher_priority_is_enabled() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_id_to_break_equal_priority_ties() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
     }
 
     #[tokio::test]

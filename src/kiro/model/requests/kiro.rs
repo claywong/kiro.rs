@@ -75,15 +75,7 @@ pub struct AdditionalModelRequestFields {
     pub reasoning: Option<KiroReasoningConfig>,
 }
 
-/// The effort control field recognized by the AWS Q backend
-///
-/// Accepted tiers are model-dependent. Older 4.5/4.6 models accept
-/// `low / medium / high / max`; newer effort-capable models may also accept
-/// `xhigh`.
-///
-/// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
-/// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,
-/// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
+/// Claude effort control accepted by the AWS Q backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroOutputConfig {
     pub effort: String,
@@ -145,6 +137,7 @@ mod tests {
         };
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");
+        assert!(v.get("reasoning").is_none());
         assert!(
             v.get("outputConfig").is_none(),
             "inner key must stay snake_case output_config, got {v}"
@@ -170,5 +163,18 @@ mod tests {
         };
         let json = serde_json::to_string(&fields).unwrap();
         assert_eq!(json, r#"{"reasoning":{"effort":"xhigh"}}"#);
+    }
+
+    #[test]
+    fn test_gpt_reasoning_effort_wire_format() {
+        let fields = AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig {
+                effort: "xhigh".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&fields).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "xhigh");
+        assert!(v.get("output_config").is_none());
     }
 }
