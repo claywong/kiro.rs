@@ -1074,35 +1074,36 @@ impl KiroProvider {
             // 用户级请求速率限制只在本次调用中临时跳过当前凭据。
             // 不禁用、不冷却，也不改变全局 current_id；下一次新请求仍按原调度选择。
             if status.as_u16() == 429 && endpoint.is_user_request_rate_exceeded(&body) {
-                // 无号可切时保留当前凭据原地重试，把重试预算用完；
-                // 否则排除当前凭据后下一轮必然取不到号，一次重试都跑不到。
+                // 有其它可用号则排除当前凭据换号重试；无号可切时直接返回限流错误，
+                // 不在同一凭据上原地反复重试（同一请求不应把预算烧在一个已限流的号上）。
                 let can_failover = self.token_manager.has_failover_target_for_request(
                     model.as_deref(),
                     group,
                     &request_excluded_credentials,
                     ctx.id,
                 );
-                if can_failover {
-                    request_excluded_credentials.insert(ctx.id);
-                    tracing::warn!(
-                        "API 请求失败（用户级限流，本次请求临时跳过凭据 #{}，尝试 {}/{}）: {}",
-                        ctx.id,
-                        attempt + 1,
-                        max_retries,
-                        body
-                    );
-                } else {
-                    tracing::warn!(
-                        "API 请求失败（用户级限流，无其它可用凭据，原地重试凭据 #{}，尝试 {}/{}）: {}",
-                        ctx.id,
-                        attempt + 1,
-                        max_retries,
-                        body
-                    );
-                }
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),
                     outcome::TRANSIENT, Some(&body), attempt_start,
+                );
+                if !can_failover {
+                    tracing::warn!(
+                        "API 请求失败（用户级限流，无其它可用凭据，直接返回，尝试 {}/{}）: {}",
+                        attempt + 1,
+                        max_retries,
+                        body
+                    );
+                    return Err(rate_limit_error
+                        .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                        .into());
+                }
+                request_excluded_credentials.insert(ctx.id);
+                tracing::warn!(
+                    "API 请求失败（用户级限流，本次请求临时跳过凭据 #{}，尝试 {}/{}）: {}",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries,
+                    body
                 );
                 last_error = Some(
                     rate_limit_error
