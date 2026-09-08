@@ -325,7 +325,9 @@ pub async fn exchange_code_for_token(
         invitation_code: None,
     };
 
-    let kiro_version = &config.kiro_version;
+    // 走 effective_ide 而非裸 config.kiro_version：后者默认值是 kiro-cli 的 2.3.0，
+    // 直接发出去就是不存在的 KiroIDE-2.3.0。详见 kiro_version::IDE_UA_KIRO_VERSION。
+    let kiro_version = crate::kiro::kiro_version::effective_ide(&config.kiro_version);
     let user_agent = format!("KiroIDE-{}", kiro_version);
 
     let resp = client
