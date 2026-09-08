@@ -1092,6 +1092,8 @@ pub struct StartIdcLoginRequest {
     #[serde(default)]
     pub priority: u32,
     #[serde(default)]
+    pub rpm_limit: u32,
+    #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
     pub proxy_url: Option<String>,

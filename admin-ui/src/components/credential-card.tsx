@@ -359,45 +359,6 @@ function getDisabledReasonStyle(reason?: string | null): {
   }
 }
 
-function MetadataSummary({
-  credential,
-  scrollable = false,
-}: {
-  credential: CredentialStatusItem;
-  scrollable?: boolean;
-}) {
-  const entries = metadataEntries(credential);
-  if (entries.length === 0) return null;
-
-  return (
-    <div
-      className={cn(
-        "mt-1 flex min-w-0 items-center gap-1",
-        scrollable
-          ? "select-none overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          : "overflow-hidden",
-      )}
-      aria-label="凭据 Metadata"
-    >
-      {entries.map((entry) => (
-        <span
-          key={entry.key}
-          className={`inline-flex min-w-0 max-w-full shrink-0 items-center overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px] ${
-            entry.emphasized
-              ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-              : "border-border/60 bg-muted/45 text-foreground"
-          }`}
-          title={entry.description || `${entry.label}: ${entry.value}`}
-        >
-          <span className="shrink-0 text-muted-foreground">{entry.label}</span>
-          <span className="mx-1 text-border">·</span>
-          <span className="max-w-40 truncate font-medium">{entry.value}</span>
-        </span>
-      ))}
-    </div>
-  );
-}
-
 export function CredentialCard({
   credential,
   selected,
@@ -868,7 +829,20 @@ export function CredentialCard({
           <CredentialLabel id={credential.id} email={credential.email} />
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden [&>*]:shrink-0">
+          {subscriptionBadge}
           {statusBadges}
+          {typeof credential.metadata?.salePrice?.value === "number" && (
+            <span
+              title="销售价格（CNY）"
+              className="inline-flex items-center rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+            >
+              ¥
+              {(credential.metadata.salePrice.value as number).toLocaleString(
+                "zh-CN",
+                { minimumFractionDigits: 0, maximumFractionDigits: 2 },
+              )}
+            </span>
+          )}
           {groups.map((g) => (
             <span
               key={g}
@@ -887,7 +861,6 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} scrollable />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">

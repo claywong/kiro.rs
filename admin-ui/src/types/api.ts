@@ -405,6 +405,7 @@ export interface StartIdcLoginRequest {
   region: string
   startUrl?: string
   priority?: number
+  rpmLimit?: number
   email?: string
   proxyUrl?: string
 }

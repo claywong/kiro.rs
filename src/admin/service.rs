@@ -3683,6 +3683,7 @@ impl AdminService {
         // 新建凭据独有的字段，其余由设备授权流程统一填充
         let cred_template = KiroCredentials {
             priority: req.priority,
+            rpm_limit: req.rpm_limit,
             email: req.email,
             proxy_url: req.proxy_url,
             ..Default::default()
