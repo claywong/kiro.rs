@@ -1287,6 +1287,11 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
+/// `kiroVersion` 的默认值。
+///
+/// 历史原因这里是 kiro-cli 的产品版本。IDE 类 UA（IDE 端点、Social token 刷新）
+/// 不会直接用它兜底——那会发出不存在的 `KiroIDE-2.3.0` 而被上游按准入条件拒掉；
+/// 详见 `kiro::kiro_version::effective_ide`。CLI 端点的 appVersion 已改用自己的常量。
 fn default_kiro_version() -> String {
     "2.3.0".to_string()
 }

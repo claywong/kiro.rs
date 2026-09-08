@@ -247,6 +247,96 @@
 验证：`cargo build` 通过，`cargo test` 693 passed，`npx tsc --noEmit` 无输出。
 上游 `test_default_is_account_suspended` 等新测试原样保留、未改断言。
 
+### 2026-09-08 Kiro 上游接口口径变更（UA 版本准入 + profileArn 必填）
+
+来源不是 ZyphrZero，而是对照 `lucks-cloud/kiro-manager-lite` 的 v1.0.17 / 1.0.18 / 1.0.19。
+Kiro 服务端在 2026-08 改了两处口径，**本地已按新口径改完，上游至今未跟**——这块是
+「本地领先上游」，合并时冲突要取本地，别回退成上游版本。
+
+**变更本身**（v1.0.17 实测，BuilderID 账号）：UA 里的客户端版本号被当作准入条件，
+且 `profileArn` 从可选变为必填。两者是 AND 关系，只满足一个都不行：
+
+| | 不带 profileArn | 带 profileArn |
+|---|---|---|
+| `KiroIDE-0.9.2` / sdk 1.0.0 | 403 not authorized | getUsageLimits 200 / ListAvailableModels **403** |
+| `KiroIDE-0.12.155` / sdk 1.0.34 | 400 Invalid profileArn | 两个接口均 200 |
+
+该门槛只作用于 BuilderID / IdC；Social（Github / Google）与 API Key 凭据两组 UA 都通，
+所以升级前一直没暴露。
+
+#### 五处本地偏离，逐条说明取舍
+
+1. **版本对升到 `0.12.155` + `1.0.34`**（`kiro_version.rs`）。上游仍是 `USAGE_API_KIRO_VERSION
+   = "0.9.2"`，且**没有** `USAGE_API_AWS_SDK_VERSION` 这个常量。两个常量必须成对升级并重新实测，
+   混搭（新版本号 + 旧 SDK）未验证过。
+
+2. **受限接口一律发 `streaming_profile_arn()`，不发 `effective_profile_arn()`**
+   （`profile_arn_query` 签名从上游的 `Option<&str>` 改成 `&KiroCredentials`）。
+   这**反转了上游的假设**：上游注释写「占位符对 IDE 有意义，对接口无意义」所以剥掉，
+   而新口径下 BuilderID 恰恰要原样带占位符才回 200——它没有 profile 概念，
+   `ListAvailableProfiles` 对它明确返回「不支持」，剥掉后候选里只剩「不带」，必然被拒。
+   `effective_profile_arn()` 仍保留，但仅用于 MCP 的 `x-amzn-kiro-profile-arn` 头与导出凭据。
+
+3. **合并 `9cde3a2` 时丢掉了上游的 `usage_api_attempts`**（上游 `20161ae` 引入的
+   `区域 × (真实ARN, 不带ARN)` 矩阵）。**这是有意的**：该矩阵用 `effective_profile_arn()` 取 ARN，
+   对 BuilderID 候选里只剩「不带」，在新口径下必然 400——即它的回退对 BuilderID 无效；
+   而「不带」这条候选在 profileArn 已必填后只会换来 400。上游若日后改这块，
+   先确认它是否已改用不剥占位符的取值，再决定取谁。
+
+4. **IDE 类 UA 的版本号钉死，不跟随自动获取**（`IDE_UA_KIRO_VERSION` + `effective_ide`）。
+   **这与上游 `kiro_version.rs` 的设计意图明确分歧**：上游那套 `spawn_refresher` /
+   `METADATA_URL` 就是为了跟版，本地把它降级成「仅观测」——官方发版时只打一条日志提示
+   钉死值已落后。理由是自动获取只给出 IDE 版本，拿不到它配套的 SDK 版本，跟版就会发出
+   未验证的混搭；钉死还让所有部署的 UA 确定可复现，不会因官方发版而在无代码变更时改变行为。
+   参照点：2026-09-08 官方 `currentRelease` 已是 `1.0.437`，本地仍发 `0.12.155`。
+   `config.kiroVersion` 显式配置仍可覆盖，作为不改代码的逃生口。
+
+5. **CLI 与 IDE 的版本语义解耦**（`cli.rs` 的 `AMAZON_Q_CLI_VERSION`）。
+   `config.kiro_version` 的默认值 `2.3.0` 是**kiro-cli 的产品版本**（上游 `cfd132e` 随 CLI 端点
+   引入时从 `0.11.107` 改的），但 IDE 端点和 Social 登录/刷新拿它当 `KiroIDE-<版本>` 用——
+   不存在名为 `KiroIDE-2.3.0` 的发布，发出去即 403。现 CLI 的 `md/appVersion-` 用自己的常量，
+   IDE 侧走 `effective_ide`（识别出「用户没配过」时落到钉死值）。
+   修的四个 IDE UA 构造点：`ide.rs` 两处、`token_manager.rs` Social 刷新、`social.rs` Social 登录换 token
+   （最后一处原先连自动获取都没走，直接发裸 config 值）。
+
+#### 从 manager 侧**不要**抄的
+
+- **Enterprise 兜底 ARN**。manager 的 `ENTERPRISE_FALLBACK`（`610548660232:profile/VNECVYCYYAWN`）
+  属于另一个组织，v1.0.18 的 changelog 亲口承认它就是 `403 Invalid token` 的元凶，
+  但只从用量链路撤了，写盘用的 `profileArnCandidates` 里至今还留着。
+  本地 `default_profile_arn()` 只返回 Social ARN 或 BuilderID 占位符，**从不构造别家组织的 ARN**——
+  抄过来等于引入 1.0.18 的 bug。
+- **os / node 指纹取宿主真值**。manager 是单机桌面应用，取真值最自然；kiro.rs 是服务端代理，
+  一个进程扛几十个凭据，取宿主真值的结果是 Docker 里全报 Linux，且几十个凭据 os/node 全同、
+  只有 machineId 不同——那个组合本身就是特征。真要改，方向是按凭据派生（像 machineId 那样），
+  不是取宿主真值。且 1.0.17 用排除法确认过版本号是唯一变量，这条不是 403 的成因。
+- **UA 不带 machineId**。manager 是唯一不带的；Kiro-Go / kirogo-api / kiro-login-helper 三家全带
+  `KiroIDE-<版本>-<machineId>`。本地带，保持。
+- **api 段与 `m/` 标志不分链路**。manager 对用量 REST 复用了 streaming 口味的 UA。
+  本地按链路分（流式 `codewhispererstreaming` + `m/E`，用量 `codewhispererruntime` + `m/N,E`），
+  与 Kiro-Go 的 `buildStreamingHeaderValues` / `buildRuntimeHeaderValues` 一致，保持。
+
+#### 无落点的部分
+
+v1.0.19 的两条修复在 kiro.rs 没有对应物，不必跟进：控制面三接口
+（`CreateApiKey` / `ListApiKeys` / `DeleteApiKey`，本地一个都没有，kiro.rs 只消费 API Key 作
+Bearer token）、门户 `ProfileArn` cookie 注入（本地 `KIRO_PORTAL_URL` 只用于拼 OAuth `/signin` 跳转）。
+v1.0.17 点名修的「添加账号验活传 undefined」也无对应物：本地 `add_credential` 只刷 token、不查用量。
+
+#### 已知缺口（未修，需要时再评估）
+
+Enterprise 凭据 + `ListAvailableProfiles` **瞬时失败**时，本地会带着 `fill_default_profile_arn`
+写入的 BuilderID 占位符把该次请求发出去吃一个 403。因未标记「已尝试」，下次请求会重新解析，
+**是自愈的，只损失一次请求**。v1.0.18 的做法是在同一次请求内逐个换候选 ARN。
+本地已有 1.0.18 最要紧的那条判别（`is_no_profile_concept_response` 只认
+`Builder ID is not supported for this operation` 这一种确定性否定，不用「非 200 一律当无 profile」
+的粗口径，避免 Enterprise 在网络抖动后错用占位符），所以差距比看起来小。
+若要补候选链，按第四节约定单独成文件，别内联进 `token_manager.rs`（6000+ 行，冲突重灾区）。
+
+验证：`cargo build` 警告数维持基线 14，`cargo test` 1196 passed。
+钉死语义有专门测试锁住（往全局缓存塞 `1.0.437` 后断言 UA 仍发钉死值），
+IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。
@@ -260,3 +350,12 @@
 4. **勤拉上游**。这次 base 是 v0.7.2，本地 41 个提交 vs 上游 3 个，提交数比例越悬殊越难解。
 5. **不要与上游并行实现同一件事**。判据：如果上游也在解决这个问题，就等上游的方案；本地只做上游
    明确不管的事（vendor 对接、本地运维便利接口）。第一节那几条全是违反此判据的代价。
+6. **新增任何 Kiro 上游接口调用，默认带 `streaming_profile_arn()`**，不要用
+   `effective_profile_arn()`（后者剥 BuilderID 占位符）。profileArn 在 Kiro 受限接口上已是必填，
+   且 BuilderID 必须原样带占位符。这条规律被反复验证了四次：manager v1.0.17 在用量 / 模型列表 /
+   对话三条链路上各踩一次，v1.0.19 又在控制面三接口上踩第四次——每次都是同一个原因，
+   即沿用了「占位符对接口无意义」的旧假设。与其逐个记接口，不如记这条口径，它能覆盖还没出现的接口。
+   例外只有 MCP 的 `x-amzn-kiro-profile-arn` 头和导出凭据（见第三节 2026-09-08 小节）。
+7. **IDE 类 UA 的版本号不要改成跟随自动获取**。`kiro_version.rs` 的 `spawn_refresher` 现在只做观测，
+   这是有意的（理由见第三节 2026-09-08 小节第 4 条）。版本号与 `USAGE_API_AWS_SDK_VERSION` 必须
+   成对实测后一起改，`IDE_UA_KIRO_VERSION` 与 `USAGE_API_KIRO_VERSION` 同源、不得各自取值。

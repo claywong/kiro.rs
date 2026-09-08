@@ -15,6 +15,14 @@ use super::{KiroEndpoint, RequestContext};
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
 
+/// Amazon Q for CLI 的产品版本，用于 UA 的 `md/appVersion-`。
+///
+/// 不复用 `config.kiro_version`：那个字段语义上是 Kiro IDE 版本（IDE 端点与 Social
+/// token 刷新都按 `KiroIDE-<version>` 用它），两者是不同产品、版本号不同源。
+/// 此前共用同一字段，导致「为 CLI 对齐版本号」和「为 IDE 对齐版本号」互相打架。
+/// 与本文件其它写死的版本号（aws-sdk-rust / lang/rust）保持同一处维护。
+const AMAZON_Q_CLI_VERSION: &str = "2.3.0";
+
 pub struct CliEndpoint;
 
 impl CliEndpoint {
@@ -34,7 +42,7 @@ impl CliEndpoint {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
             ctx.config.system_version,
-            ctx.config.kiro_version,
+            AMAZON_Q_CLI_VERSION,
         )
     }
 

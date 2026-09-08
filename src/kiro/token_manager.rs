@@ -171,7 +171,9 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = crate::kiro::kiro_version::effective(&config.kiro_version);
+    // 走 effective_ide 而非裸 config.kiro_version：后者默认值是 kiro-cli 的 2.3.0，
+    // 发出去就是不存在的 KiroIDE-2.3.0。详见 kiro_version::IDE_UA_KIRO_VERSION。
+    let kiro_version = crate::kiro::kiro_version::effective_ide(&config.kiro_version);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
@@ -3941,8 +3943,10 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
-        // 失败不阻断查询，由 get_usage_limits 内部按候选表回退。
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填。
+        // 解析失败不阻断查询：此时沿用凭据上已有的 ARN 继续发一次请求。
+        // 注意 get_usage_limits 只在**区域**维度回退，不会换 ARN 重试，
+        // 所以 Enterprise 凭据在这里解析失败时该次查询大概率仍会 403。
         match self.resolve_profile_arn_for(id, &token).await {
             Ok(Some(arn)) => credentials.profile_arn = Some(arn),
             Ok(None) => {}
