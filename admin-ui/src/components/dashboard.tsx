@@ -1743,7 +1743,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Badge>
             )}
 
-            {/* 全选按钮已移到「添加凭据」左侧，与其它操作同处一行 */}
+            {/* 全选入口位于列表上方的状态标签条。 */}
             {/* 已选计数与取消选择由吸底批量栏承担；状态筛选态由下方标签条的
                 激活样式直接体现，不再额外挂一枚可关闭徽章。 */}
             {verifying && !verifyDialogOpen && (
@@ -1764,7 +1764,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
           </div>
 
-          {/* 第二行：筛选（左） + 操作（右） */}
+          {/* 筛选与操作在空间足够时同排，窄屏按组换行。 */}
           <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
@@ -1950,47 +1950,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </div>
             </div>
 
-            {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
-            <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {/* 选中后的批量操作已移到吸底批量栏，见本页底部 BulkBar */}
-
-              {/* 全选：紧邻主操作，因为"先选再批量操作"是同一条动线 */}
-              {currentCredentials.length > 0 && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  onClick={toggleSelectCurrentPage}
-                  title={
-                    currentPageAllSelected
-                      ? "取消选择当前页"
-                      : `全选当前页 ${currentCredentials.length} 个`
-                  }
-                >
-                  <CheckSquare className="h-3.5 w-3.5" />
-                  {currentPageAllSelected ? "取消全选" : "全选当前页"}
-                </Button>
-              )}
-              {filteredCredentials.length > currentCredentials.length && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  onClick={toggleSelectAllFiltered}
-                  title={
-                    allFilteredSelected
-                      ? "取消选择全部筛选结果"
-                      : `全选所有 ${filteredCredentials.length} 个筛选结果`
-                  }
-                >
-                  <CheckSquare className="h-3.5 w-3.5" />
-                  {allFilteredSelected
-                    ? "取消全选所有页"
-                    : `全选所有页 (${filteredCredentials.length})`}
-                </Button>
-              )}
-
-              {/* 主操作 */}
+            {/* 主操作：全选收进列表菜单，避免筛选结果数量影响工具栏宽度。 */}
+            <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:items-center">
               <Button
                 onClick={() => setAddDialogOpen(true)}
                 size="sm"
@@ -2243,26 +2204,78 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               },
             ]}
             trailing={
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
-                <span
-                  className={cn(
-                    "h-2 w-2 rounded-sm",
-                    loadBalancingData?.mode === "balanced"
-                      ? "bg-emerald-500 animate-pulse"
-                      : "bg-blue-500"
-                  )}
-                />
-                {loadBalancingData?.mode === "balanced" ? (
-                  <span className="font-medium text-foreground/90">均衡负载模式</span>
-                ) : (
-                  <span>
-                    优先调度{" "}
-                    <span className="console-num font-mono font-bold text-foreground">
-                      #{data?.currentId || "-"}
+              <>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-sm",
+                      loadBalancingData?.mode === "balanced"
+                        ? "bg-emerald-500 animate-pulse"
+                        : "bg-blue-500"
+                    )}
+                  />
+                  {loadBalancingData?.mode === "balanced" ? (
+                    <span className="font-medium text-foreground/90">均衡负载模式</span>
+                  ) : (
+                    <span>
+                      优先调度{" "}
+                      <span className="console-num font-mono font-bold text-foreground">
+                        #{data?.currentId || "-"}
+                      </span>
                     </span>
-                  </span>
-                )}
-              </div>
+                  )}
+                </div>
+                <DropdownMenu modal={false}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-24 shrink-0"
+                      title="选择凭据"
+                    >
+                      <CheckSquare className="h-3.5 w-3.5" />
+                      选择
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuLabel>选择凭据</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      onSelect={toggleSelectCurrentPage}
+                      disabled={currentCredentials.length === 0}
+                    >
+                      <CheckSquare />
+                      {currentPageAllSelected ? "取消全选当前页" : "全选当前页"}
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {currentCredentials.length}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={toggleSelectAllFiltered}
+                      disabled={filteredCredentials.length === 0}
+                    >
+                      <CheckSquare />
+                      {allFilteredSelected
+                        ? "取消全选所有筛选结果"
+                        : "全选所有筛选结果"}
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {filteredCredentials.length}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onSelect={deselectAll}
+                      disabled={selectedIds.size === 0}
+                    >
+                      <X />
+                      取消选择
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {selectedIds.size}
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
             }
           />
         )}
