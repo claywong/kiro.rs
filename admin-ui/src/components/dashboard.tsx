@@ -243,6 +243,7 @@ type SortField =
   | "successCount"
   | "totalFailureCount"
   | "lastUsedAt"
+  | "createdAt"
   | "id";
 type SortDir = "asc" | "desc";
 const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
@@ -250,6 +251,7 @@ const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "successCount", label: "成功次数" },
   { value: "totalFailureCount", label: "累计失败" },
   { value: "lastUsedAt", label: "最后使用" },
+  { value: "createdAt", label: "创建时间" },
   { value: "id", label: "ID" },
 ];
 const SORT_LABELS: Record<SortField, string> = {
@@ -258,6 +260,7 @@ const SORT_LABELS: Record<SortField, string> = {
   successCount: "成功次数",
   totalFailureCount: "累计失败",
   lastUsedAt: "最后使用",
+  createdAt: "创建时间",
   id: "ID",
 };
 
@@ -400,8 +403,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     setSortField(field);
-    // 成功次数/最后使用默认降序（大/新在前），其余默认升序
-    setSortDir(field === "successCount" || field === "lastUsedAt" ? "desc" : "asc");
+    // 成功次数/最后使用/创建时间默认降序（大/新在前），其余默认升序
+    setSortDir(
+      field === "successCount" || field === "lastUsedAt" || field === "createdAt"
+        ? "desc"
+        : "asc",
+    );
   };
   // 状态筛选：由顶部状态账条驱动。'' = 全部
   //
@@ -466,6 +473,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             // 从未使用（null）恒排在最后，不受升降序影响
             const ta = a.lastUsedAt ? Date.parse(a.lastUsedAt) : null;
             const tb = b.lastUsedAt ? Date.parse(b.lastUsedAt) : null;
+            if (ta === null && tb === null) cmp = 0;
+            else if (ta === null) return 1;
+            else if (tb === null) return -1;
+            else cmp = ta - tb;
+            break;
+          }
+          case "createdAt": {
+            // 无创建时间（null）恒排最后，同 lastUsedAt 处理
+            const ta = a.createdAt ? Date.parse(a.createdAt) : null;
+            const tb = b.createdAt ? Date.parse(b.createdAt) : null;
             if (ta === null && tb === null) cmp = 0;
             else if (ta === null) return 1;
             else if (tb === null) return -1;
@@ -637,9 +654,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     },
   });
-  const disabledCredentialCount =
-    data?.credentials.filter((c) => c.disabled).length || 0;
-
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
     if (c.disabled) return false;
@@ -954,20 +968,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     deselectAll();
   };
 
+  // 清除目标跟随状态账条：停在「超额」段时清除超额凭据（含仍在调度的），其余
+  // 一律按「禁用」段口径（鉴权失败/封禁/手动/失败过多），超额禁用不混入。
+  const clearQuotaMode = stateFilter === "quota";
   const handleClearAll = async () => {
     if (!data?.credentials || data.credentials.length === 0) {
       toast.error("没有可清除的凭据");
       return;
     }
-    const disabled = data.credentials.filter((c) => c.disabled);
-    if (disabled.length === 0) {
-      toast.error("没有可清除的已禁用凭据");
+    const filter = clearQuotaMode ? "quota" : "dead";
+    const targets = data.credentials.filter((c) =>
+      matchesStateFilter(c, balanceMap.get(c.id) ?? c.balance, filter),
+    );
+    const noun = clearQuotaMode ? "已超额" : "已禁用";
+    if (targets.length === 0) {
+      toast.error(`没有可清除的${noun}凭据`);
       return;
     }
     if (
       !(await confirm({
-        title: "清除已禁用凭据",
-        description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+        title: `清除${noun}凭据`,
+        description: `确定要清除所有 ${targets.length} 个${noun}凭据吗？此操作无法撤销。`,
         confirmText: "清除",
         destructive: true,
       }))
@@ -975,7 +996,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     let s = 0,
       f = 0;
-    for (const c of disabled) {
+    for (const c of targets) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(c.id, {
@@ -991,8 +1012,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         });
       } catch {}
     }
-    if (f === 0) toast.success(`成功清除所有 ${s} 个已禁用凭据`);
-    else toast.warning(`清除已禁用凭据：成功 ${s} 个，失败 ${f} 个`);
+    if (f === 0) toast.success(`成功清除所有 ${s} 个${noun}凭据`);
+    else toast.warning(`清除${noun}凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
   };
 
@@ -2143,14 +2164,25 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     destructive
-                    disabled={disabledCredentialCount === 0}
+                    disabled={
+                      clearQuotaMode
+                        ? stateCounts.quota === 0
+                        : stateCounts.dead === 0
+                    }
                     onSelect={(e) => {
                       e.preventDefault();
                       handleClearAll();
                     }}
+                    title={
+                      clearQuotaMode
+                        ? "当前停在「超额」段：清除所有超额凭据（含已禁用与仍在调度的）"
+                        : "清除鉴权失败/封禁/手动禁用/失败过多的凭据；停在「超额」段时改为清除超额"
+                    }
                   >
                     <Trash2 />
-                    清除已禁用 ({disabledCredentialCount})
+                    {clearQuotaMode
+                      ? `清除已超额 (${stateCounts.quota})`
+                      : `清除已禁用 (${stateCounts.dead})`}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
