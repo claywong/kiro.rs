@@ -167,6 +167,7 @@ const TIER_OPTIONS: { value: Tier; label: string }[] = [
   { value: "free", label: "FREE" },
   { value: "pro", label: "PRO" },
   { value: "pro_plus", label: "PRO+" },
+  { value: "pro_max", label: "PRO MAX" },
   { value: "power", label: "POWER" },
   { value: "unknown", label: "未知/未查询" },
 ];
@@ -174,6 +175,7 @@ const TIER_LABELS: Record<Tier, string> = {
   free: "FREE",
   pro: "PRO",
   pro_plus: "PRO+",
+  pro_max: "PRO MAX",
   power: "POWER",
   unknown: "未知",
 };
