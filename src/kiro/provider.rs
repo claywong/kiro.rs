@@ -29,6 +29,12 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 4;
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。
 const MAX_TOTAL_RETRIES: usize = 6;
 
+/// 用户级 429「原号重试」可额外追加的重试轮数硬上限。
+///
+/// 原号重试不计入 `max_retries` 换号预算，但必须有天花板：否则多个凭据各自
+/// 配了较大次数时，单个请求会被拉长到客户端超时。
+const MAX_SAME_CREDENTIAL_RETRY_BONUS: usize = 12;
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -753,12 +759,24 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
         let mut request_excluded_credentials: HashSet<u64> = HashSet::new();
+        // 用户级 429 时已在各凭据上「原号重试」的次数（本次请求内计数，不跨请求累积）
+        let mut same_credential_429: HashMap<u64, u32> = HashMap::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        // 重试计数采用「先扣费、可退款」模型：每轮开头即占用一次预算，命中
+        // 原号 429 重试时把上限 +1（等价于退款），从而让原号重试不吃换号预算。
+        // 写成 while 而非 for，是因为循环体内有大量 `continue`，手动在末尾自增会漏。
+        let mut next_attempt = 0usize;
+        let mut retry_ceiling = max_retries;
+        // 上限的硬顶：即使配置给了很大的原号重试次数，也不允许单个请求无限延长。
+        let retry_ceiling_cap = max_retries + MAX_SAME_CREDENTIAL_RETRY_BONUS;
+
+        while next_attempt < retry_ceiling {
+            let attempt = next_attempt;
+            next_attempt += 1;
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager
@@ -909,7 +927,7 @@ impl KiroProvider {
                     }
 
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if next_attempt < retry_ceiling {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -1074,6 +1092,39 @@ impl KiroProvider {
             // 用户级请求速率限制只在本次调用中临时跳过当前凭据。
             // 不禁用、不冷却，也不改变全局 current_id；下一次新请求仍按原调度选择。
             if status.as_u16() == 429 && endpoint.is_user_request_rate_exceeded(&body) {
+                // 速刷号等配额恢复快的类型可先在原号上重试若干次再换号（按 metadata.type
+                // 查配置表）。重试不占换号预算：命中时把 retry_ceiling +1 抵消本轮扣费。
+                let budget = self
+                    .token_manager
+                    .credential_kind(ctx.id)
+                    .map(|kind| self.token_manager.same_credential_retry_budget(kind))
+                    .unwrap_or(0);
+                let used = same_credential_429.get(&ctx.id).copied().unwrap_or(0);
+                if used < budget && retry_ceiling < retry_ceiling_cap {
+                    same_credential_429.insert(ctx.id, used + 1);
+                    retry_ceiling += 1;
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, Some(429),
+                        outcome::TRANSIENT, Some(&body), attempt_start,
+                    );
+                    tracing::warn!(
+                        "API 请求失败（用户级限流，原号 #{} 重试 {}/{}）: {}",
+                        ctx.id,
+                        used + 1,
+                        budget,
+                        body
+                    );
+                    last_error = Some(
+                        rate_limit_error
+                            .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                            .into(),
+                    );
+                    // 固定间隔：速刷号配额恢复窗口短，递增退避会把延迟拉到不如换号。
+                    sleep(self.token_manager.same_credential_retry_delay()).await;
+                    // 不加入排除集，下一轮调度仍会选到同一个号
+                    continue;
+                }
+
                 // 有其它可用号则排除当前凭据换号重试；无号可切时直接返回限流错误，
                 // 不在同一凭据上原地反复重试（同一请求不应把预算烧在一个已限流的号上）。
                 let can_failover = self.token_manager.has_failover_target_for_request(
@@ -1229,7 +1280,7 @@ impl KiroProvider {
                         body
                     ))
                 };
-                if attempt + 1 < max_retries {
+                if next_attempt < retry_ceiling {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
                         Self::retry_delay_throttle(attempt)
@@ -1268,7 +1319,7 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
+            if next_attempt < retry_ceiling {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }

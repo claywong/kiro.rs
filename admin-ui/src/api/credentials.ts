@@ -473,6 +473,36 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface RateLimitSameCredentialConfig {
+  /** 按账号类型（metadata.type）配置的原号重试次数；未列出的类型为 0 */
+  retries: Record<string, number>
+  /** 原号重试之间的固定间隔（毫秒） */
+  retryDelayMs: number
+  /** 后端提供的可用账号类型键列表，前端据此渲染表单 */
+  knownTypes: string[]
+  /** 单个账号类型允许配置的最大重试次数 */
+  maxRetriesPerType: number
+}
+
+// 获取用户级 429「原号重试」配置
+export async function getRateLimitSameCredentialConfig(): Promise<RateLimitSameCredentialConfig> {
+  const { data } = await api.get<RateLimitSameCredentialConfig>(
+    '/config/rate-limit-same-credential',
+  )
+  return data
+}
+
+// 更新用户级 429「原号重试」配置。retries 为整表替换语义。
+export async function setRateLimitSameCredentialConfig(
+  patch: Partial<Pick<RateLimitSameCredentialConfig, 'retries' | 'retryDelayMs'>>,
+): Promise<RateLimitSameCredentialConfig> {
+  const { data } = await api.put<RateLimitSameCredentialConfig>(
+    '/config/rate-limit-same-credential',
+    patch,
+  )
+  return data
+}
+
 export interface AccountRpmLimitConfig {
   enabled: boolean
   limit: number

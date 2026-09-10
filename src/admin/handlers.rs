@@ -25,6 +25,7 @@ use super::{
         CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
+        SetRateLimitSameCredentialConfigRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
@@ -584,6 +585,26 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/rate-limit-same-credential
+/// 获取用户级 429「原号重试」配置
+pub async fn get_rate_limit_same_credential_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_rate_limit_same_credential_config())
+}
+
+/// PUT /api/admin/config/rate-limit-same-credential
+/// 更新用户级 429「原号重试」配置
+pub async fn set_rate_limit_same_credential_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRateLimitSameCredentialConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rate_limit_same_credential_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
