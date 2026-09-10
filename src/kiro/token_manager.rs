@@ -4637,14 +4637,17 @@ impl MultiTokenManager {
     /// - `Ok(())` - 删除成功
     /// - `Err(_)` - 凭据不存在或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
-        let was_current = {
+        let (was_current, deleted_snapshot) = {
             let mut entries = self.entries.lock();
 
             // 查找凭据
-            let _entry = entries
+            let entry = entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            // 删除前留档快照（含 refreshToken），供误删后找回
+            let deleted_snapshot = entry.credentials_snapshot();
 
             // 记录是否是当前凭据
             let current_id = *self.current_id.lock();
@@ -4653,8 +4656,12 @@ impl MultiTokenManager {
             // 删除凭据
             entries.retain(|e| e.id != id);
 
-            was_current
+            (was_current, deleted_snapshot)
         };
+
+        // 快照单独落一份文件（config/trash/credential-<id>-<时间戳>.json）。
+        // 留档失败不影响删除本身，只记日志。
+        self.archive_deleted_credential(id, &deleted_snapshot);
 
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
@@ -4681,6 +4688,38 @@ impl MultiTokenManager {
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
+    }
+
+    /// 把被删除的凭据快照写入凭据文件同级的 `trash/` 目录，一个凭据一个文件。
+    ///
+    /// 文件名：`credential-<id>-<Unix毫秒时间戳>.json`，内容为完整 `KiroCredentials`
+    /// （含 refreshToken），恢复时读回重新走 Admin API 添加即可。
+    /// 留档是尽力而为：目录创建或写盘失败只记 warn 日志，不阻断删除。
+    fn archive_deleted_credential(&self, id: u64, snapshot: &KiroCredentials) {
+        let Some(cred_path) = self.credentials_path.as_ref() else {
+            tracing::debug!("未配置 credentials_path，跳过删除留档 (凭据 #{})", id);
+            return;
+        };
+        let trash_dir = cred_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("trash");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let file = trash_dir.join(format!("credential-{}-{}.json", id, ts));
+
+        let result = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(&trash_dir)?;
+            let json = serde_json::to_string_pretty(snapshot)?;
+            std::fs::write(&file, json)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => tracing::info!("已删除凭据 #{} 留档到 {:?}", id, file),
+            Err(e) => tracing::warn!("凭据 #{} 删除留档失败: {}", id, e),
+        }
     }
 
     /// 更新指定凭据的 refreshToken（Admin API）
