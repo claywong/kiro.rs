@@ -86,6 +86,8 @@ const DEFAULT_BUILTIN_PROPERTIES: Record<string, CredentialMetadataFieldSchema> 
     oneOf: [
       { const: 'normal', title: '正常号' },
       { const: 'boom', title: '炸弹号' },
+      { const: 'long_speed', title: '长速刷' },
+      { const: 'short_speed', title: '短速刷' },
     ],
     'x-css': 'color: #b45309; background-color: #fffbeb; border-color: #fde68a;',
   },
