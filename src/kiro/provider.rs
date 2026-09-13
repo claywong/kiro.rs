@@ -49,18 +49,9 @@ const CLIENT_CACHE_CAP: usize = 64;
 /// 兜住。
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
 
-/// 首字节（响应头）守卫：单次尝试从发起请求到拿到上游响应头的最长等待。
-///
-/// 与 `STREAM_READ_TIMEOUT_SECS`（reqwest `read_timeout`）分工：后者是「相邻两次读
-/// 之间」的空闲超时，但它在等响应头阶段同样生效且此前不会重置，因此响应头迟迟不到时
-/// 要烧满 120s 才失败 —— 客户端 50s 就断了，重试根本没机会出场。
-///
-/// 链路数据（12h，35k 请求）：1524 次 network_error 中 567 次（37%）精确聚集在
-/// 120002ms，即被 read_timeout 兜底；而重试后成功尝试的首字节 p50 仅 4.4s、p90 11.6s。
-/// 把等响应头单独限到 35s，失败后仍有预算给重试，绝大多数能在客户端超时前拿到
-/// 首字节。拿到响应头之后的流中途空闲仍由 `STREAM_READ_TIMEOUT_SECS` 兜住，长 thinking
-/// 不受影响。
-const RESPONSE_HEADER_TIMEOUT_SECS: u64 = 35;
+/// 首字节（响应头）守卫：单次尝试从发起请求到拿到上游响应头的最长等待，超时按网络
+/// 错误处理并重试。
+const RESPONSE_HEADER_TIMEOUT_SECS: u64 = 50;
 
 /// 带容量上限的 HTTP Client 缓存。
 ///
