@@ -35,6 +35,13 @@ const MAX_TOTAL_RETRIES: usize = 6;
 /// 配了较大次数时，单个请求会被拉长到客户端超时。
 const MAX_SAME_CREDENTIAL_RETRY_BONUS: usize = 12;
 
+// 本地新增：端点轮换下标计算（纯函数，便于单测）。从 `start_name` 在有序端点列表中的
+// 位置起头，按 `rotation` 环绕推进。列表非空由调用方保证。
+fn rotated_endpoint_index(names: &[String], start_name: &str, rotation: usize) -> usize {
+    let start_idx = names.iter().position(|n| n == start_name).unwrap_or(0);
+    (start_idx + rotation) % names.len()
+}
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -205,6 +212,40 @@ impl KiroProvider {
             .endpoint
             .as_deref()
             .unwrap_or(&self.default_endpoint);
+        self.endpoints
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    // 本地新增：速刷号用户级 429 原号重试时的「端点轮换」支持。
+    // 上游只按凭据固定端点请求；速刷号配额恢复快，可在同一张号上轮流用不同端点重试，
+    // 顺序从凭据自身端点起头（如凭据是 cli：cli→ide→cli→ide…）。等上游实现端点轮换后移除。
+
+    /// 已注册端点名的确定性有序列表（按名称排序，保证轮换顺序稳定）。
+    pub(super) fn sorted_endpoint_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.endpoints.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// 端点轮换：给定凭据起始端点，返回从它起头的旋转序列，再按 `rotation` 取第
+    /// `rotation % 端点数` 个端点。`rotation == 0` 时即凭据自身端点，与 `endpoint_for` 一致。
+    pub(super) fn rotated_endpoint_for(
+        &self,
+        credentials: &KiroCredentials,
+        rotation: usize,
+    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let names = self.sorted_endpoint_names();
+        if names.is_empty() {
+            return self.endpoint_for(credentials);
+        }
+        let start_name = credentials
+            .endpoint
+            .as_deref()
+            .unwrap_or(&self.default_endpoint);
+        let idx = rotated_endpoint_index(&names, start_name, rotation);
+        let name = &names[idx];
         self.endpoints
             .get(name)
             .cloned()
@@ -827,7 +868,10 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            // 本地新增：速刷号原号 429 重试时按已重试次数轮换端点；未触发重试（rotation==0）
+            // 或普通号时与 endpoint_for 完全等价。
+            let endpoint_rotation = same_credential_429.get(&ctx.id).copied().unwrap_or(0) as usize;
+            let endpoint = match self.rotated_endpoint_for(&ctx.credentials, endpoint_rotation) {
                 Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
@@ -1090,6 +1134,13 @@ impl KiroProvider {
                     .credential_kind(ctx.id)
                     .map(|kind| self.token_manager.same_credential_retry_budget(kind))
                     .unwrap_or(0);
+                // 本地新增：budget 为「轮数」，每轮把所有端点各打一遍，故原号总重试次数
+                // = budget × 端点数（端点轮换见 rotated_endpoint_for）。
+                // 注意：retry_ceiling 受 MAX_SAME_CREDENTIAL_RETRY_BONUS 硬顶约束，只要
+                // budget × 端点数 ≤ MAX_SAME_CREDENTIAL_RETRY_BONUS 就不会被截断；以后加端点
+                // 或把 budget 配得很大时，需同步调大该常量，否则轮换会在半轮处被硬顶掐断。
+                let endpoint_count = self.sorted_endpoint_names().len().max(1) as u32;
+                let budget = budget.saturating_mul(endpoint_count);
                 let used = same_credential_429.get(&ctx.id).copied().unwrap_or(0);
                 if used < budget && retry_ceiling < retry_ceiling_cap {
                     same_credential_429.insert(ctx.id, used + 1);
@@ -1531,5 +1582,43 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+// 本地新增：端点轮换下标测试，单独成块避免与上游测试相撞。
+#[cfg(test)]
+mod endpoint_rotation_tests {
+    use super::rotated_endpoint_index;
+
+    fn names() -> Vec<String> {
+        vec!["cli".to_string(), "ide".to_string()]
+    }
+
+    #[test]
+    fn rotation_zero_returns_start_endpoint() {
+        // rotation==0 等价于凭据自身端点。
+        assert_eq!(rotated_endpoint_index(&names(), "ide", 0), 1);
+        assert_eq!(rotated_endpoint_index(&names(), "cli", 0), 0);
+    }
+
+    #[test]
+    fn rotation_cycles_from_credential_endpoint() {
+        // 起点 cli：cli(0)→ide(1)→cli(0)→ide(1)…（3 轮 × 2 端点 = 6 次）
+        let seq: Vec<usize> = (0..6)
+            .map(|r| rotated_endpoint_index(&names(), "cli", r))
+            .collect();
+        assert_eq!(seq, vec![0, 1, 0, 1, 0, 1]);
+
+        // 起点 ide：ide(1)→cli(0)→ide(1)→cli(0)…
+        let seq: Vec<usize> = (0..6)
+            .map(|r| rotated_endpoint_index(&names(), "ide", r))
+            .collect();
+        assert_eq!(seq, vec![1, 0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn unknown_start_endpoint_falls_back_to_first() {
+        assert_eq!(rotated_endpoint_index(&names(), "unknown", 0), 0);
+        assert_eq!(rotated_endpoint_index(&names(), "unknown", 1), 1);
     }
 }
