@@ -1372,33 +1372,6 @@ fn discovery_rank(support: CachedModelSupport) -> usize {
     usize::from(support != CachedModelSupport::Confirmed)
 }
 
-/// 该凭据当前 RPM 滑动窗口的剩余余量（`rpm_limit == 0` 视为无限）。
-fn rpm_headroom(entry: &CredentialEntry, now: Instant) -> u64 {
-    let limit = entry.credentials.rpm_limit;
-    if limit == 0 {
-        u64::MAX
-    } else {
-        u64::from(limit.saturating_sub(rpm_window_count(entry, now)))
-    }
-}
-
-/// 兜底模式选号：跨优先级层，按 RPM 剩余余量最大者优先。
-///
-/// 正常调度严格按优先级分层（高优先级层未耗尽不降级），但高优先级层承载最重流量，
-/// 最易触发上游 USER_REQUEST_RATE_EXCEEDED。一次请求在高优先级层连续撞限时，
-/// 继续按优先级换号只会在同一批热号里打转，故此处跳过分层，把重试导向负载最轻
-/// （上游被限概率最低）的冷号。平局按 success_count 少、priority 高、id 小，保证确定性。
-fn pick_by_rpm_headroom(available: &[Candidate<'_>], now: Instant) -> Option<(u64, KiroCredentials)> {
-    let (entry, _) = available.iter().max_by(|(a, _), (b, _)| {
-        rpm_headroom(a, now)
-            .cmp(&rpm_headroom(b, now))
-            .then(b.success_count.cmp(&a.success_count))
-            .then(b.credentials.priority.cmp(&a.credentials.priority))
-            .then(b.id.cmp(&a.id))
-    })?;
-    Some((entry.id, entry.credentials.clone()))
-}
-
 /// balanced 模式选号：发现档优先，其后按成功次数最少（least-used）、优先级高者优先。
 fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)> {
     let (entry, _) = available.iter().min_by_key(|(e, support)| {
@@ -2196,22 +2169,15 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, group, &HashSet::new(), false)
+        self.select_next_credential_excluding(model, group, &HashSet::new())
     }
 
     /// 选择下一个可用凭据。
-    ///
-    /// `salvage` 为兜底模式：正常调度严格按优先级分层（高优先级层未耗尽不降级），
-    /// 但高优先级层长期承载最重流量，最易触发上游 USER_REQUEST_RATE_EXCEEDED。
-    /// 一次请求在高优先级层连续撞限时，继续按优先级换号只会在同一批热号里打转。
-    /// 兜底模式下跳过优先级分层，跨层按 RPM 剩余余量最大（负载最轻、上游被限概率
-    /// 最低）选号，把重试导向闲置的低优先级冷号。仅用于换号重试的后半程。
     fn select_next_credential_excluding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
-        salvage: bool,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -2240,11 +2206,6 @@ impl MultiTokenManager {
 
         if available.is_empty() {
             return None;
-        }
-
-        // 兜底模式：跳过优先级分层，跨层按 RPM 剩余余量最大选号。
-        if salvage {
-            return pick_by_rpm_headroom(&available, now);
         }
 
         let mode = self.load_balancing_mode.lock().clone();
@@ -2276,7 +2237,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, &HashSet::new(), false, true)
+        self.acquire_context_impl(model, group, &HashSet::new(), true)
             .await
             .map(|(context, _)| context)
     }
@@ -2290,9 +2251,8 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
-        salvage: bool,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, excluded_ids, salvage, true)
+        self.acquire_context_impl(model, group, excluded_ids, true)
             .await
             .map(|(context, _)| context)
     }
@@ -2306,7 +2266,6 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
-        salvage: bool,
         update_current: bool,
     ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
@@ -2327,9 +2286,7 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced || salvage {
-                    // 兜底模式不复用当前活跃凭据（它往往正是刚撞限的热号），
-                    // 直接交由跨层 RPM 余量选号。
+                let current_hit = if is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -2397,19 +2354,14 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids, salvage);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                     // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                    // 重选走本地 `_excluding` 版本：自愈后仍须尊重本次换号重试的排除集
-                    // 与 salvage 语义，否则会把刚失败的号重新选回来。
+                    // 重选走本地 `_excluding` 版本：自愈后仍须尊重本次换号重试的排除集，
+                    // 否则会把刚失败的号重新选回来。
                     if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential_excluding(
-                            model,
-                            group,
-                            excluded_ids,
-                            salvage,
-                        );
+                        best = self.select_next_credential_excluding(model, group, excluded_ids);
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -4179,7 +4131,7 @@ impl MultiTokenManager {
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
         let (context, is_balanced) = self
-            .acquire_context_impl(None, None, &HashSet::new(), false, false)
+            .acquire_context_impl(None, None, &HashSet::new(), false)
             .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
@@ -6562,7 +6514,7 @@ mod tests {
         manager.report_success(1);
 
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, &HashSet::new(), false, false)
+            .acquire_context_impl(None, None, &HashSet::new(), false)
             .await
             .unwrap();
 
@@ -7860,7 +7812,7 @@ mod tests {
 
         let excluded_ids = HashSet::from([1]);
         let fallback = manager
-            .acquire_context_excluding(Some("other-model"), None, &excluded_ids, false)
+            .acquire_context_excluding(Some("other-model"), None, &excluded_ids)
             .await
             .unwrap();
         assert_eq!(fallback.id, 2);

@@ -816,9 +816,6 @@ impl KiroProvider {
                     model.as_deref(),
                     group,
                     &request_excluded_credentials,
-                    // 换号重试的后半程进入兜底模式：跨优先级层按 RPM 余量选号，
-                    // 避免在高优先级热号上反复撞 USER_REQUEST_RATE_EXCEEDED。
-                    attempt >= max_retries / 2,
                 )
                 .await
             {
