@@ -3,6 +3,8 @@ import {
   useSetAccountThrottleConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
+  useRateLimitSameCredentialConfig,
+  useSetRateLimitSameCredentialConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -41,6 +43,7 @@ export function DispatchSection() {
     <div className="space-y-6">
       <LoadBalancingGroup />
       <ThrottleGroup />
+      <SameCredentialRetryGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
       <TrafficIngressGroup />
@@ -131,6 +134,79 @@ function ThrottleGroup() {
         pending={saver.isSaving('cooldown')}
         saved={saver.isSaved('cooldown')}
         disabled={isLoading || !failover}
+      />
+    </SettingGroup>
+  )
+}
+
+/** 账号类型键 → 中文标签，与后端 metadata schema 的 oneOf 标题一致 */
+const CREDENTIAL_TYPE_LABELS: Record<string, string> = {
+  normal: '正常号',
+  boom: '炸弹号',
+  long_speed: '长速刷',
+  short_speed: '短速刷',
+}
+
+/**
+ * 用户级 429「原号重试」。
+ *
+ * 放在「账号级风控」之后、「主动限流」之前，是按限流处置的时间顺序排的：
+ * 撞上用户级 429 之后先决定要不要原地再试（这里），再决定换号还是冷却。
+ *
+ * 注意与上一组的区别：这里只管用户级限流（USER_REQUEST_RATE_EXCEEDED），
+ * 不影响账号级风控（suspicious activity）—— 后者原地重试只会延长风控。
+ */
+function SameCredentialRetryGroup() {
+  const { data, isLoading } = useRateLimitSameCredentialConfig()
+  const { mutate } = useSetRateLimitSameCredentialConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const retries = data?.retries ?? {}
+  const knownTypes = data?.knownTypes ?? []
+  const maxPerType = data?.maxRetriesPerType ?? 10
+  const retryDelayMs = data?.retryDelayMs ?? 200
+  const anyEnabled = Object.values(retries).some((n) => n > 0)
+
+  // retries 是整表替换语义：改一个类型要把整表带上，否则其余类型会被清零。
+  const saveType = (type: string, next: number) =>
+    saver.save(type, { retries: { ...retries, [type]: next } })
+
+  return (
+    <SettingGroup
+      title="原号重试（用户级 429）"
+      description="撞上用户级限流时，先在同一个账号上重试几次再换号。速刷号配额恢复快，原地等一下通常比换号划算。0 = 立即换号"
+    >
+      {knownTypes.map((type) => (
+        <SettingNumber
+          key={type}
+          label={CREDENTIAL_TYPE_LABELS[type] ?? type}
+          hint={
+            (retries[type] ?? 0) > 0
+              ? `限流后在原号上最多再试 ${retries[type]} 次，用尽才换号`
+              : '限流后立即换号，不在原号上重试'
+          }
+          value={retries[type] ?? 0}
+          onCommit={(next) => saveType(type, next)}
+          min={0}
+          max={maxPerType}
+          unit="次"
+          presets={[0, 1, 2, 3]}
+          pending={saver.isSaving(type)}
+          saved={saver.isSaved(type)}
+          disabled={isLoading}
+        />
+      ))}
+      <SettingNumber
+        label="重试间隔"
+        hint="原号两次重试之间固定等待这么久；间隔太短等于没重试，太长不如换号"
+        value={retryDelayMs}
+        onCommit={(next) => saver.save('delay', { retryDelayMs: next })}
+        min={50}
+        max={60000}
+        unit="毫秒"
+        presets={[100, 200, 500, 1000]}
+        pending={saver.isSaving('delay')}
+        saved={saver.isSaved('delay')}
+        disabled={isLoading || !anyEnabled}
       />
     </SettingGroup>
   )

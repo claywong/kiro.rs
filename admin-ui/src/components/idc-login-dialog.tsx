@@ -32,6 +32,9 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
   const [region, setRegion] = useState('us-east-1')
   const [startUrl, setStartUrl] = useState('')
   const [email, setEmail] = useState('')
+  const [rpmLimit, setRpmLimit] = useState('')
+  const [priority, setPriority] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
   const [incognito, setIncognito] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
@@ -83,10 +86,23 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
     }
     setIsStarting(true)
     try {
+      const parsedRpmLimit = rpmLimit.trim() === '' ? undefined : Number(rpmLimit)
+      if (parsedRpmLimit !== undefined && (!Number.isInteger(parsedRpmLimit) || parsedRpmLimit < 0)) {
+        toast.error('RPM 必须是不小于 0 的整数')
+        return
+      }
+      const parsedPriority = priority.trim() === '' ? undefined : Number(priority)
+      if (parsedPriority !== undefined && (!Number.isInteger(parsedPriority) || parsedPriority < 0)) {
+        toast.error('优先级必须是不小于 0 的整数')
+        return
+      }
       const resp = await startIdcLogin({
         region: region.trim(),
         startUrl: startUrl.trim() || undefined,
         email: email.trim() || undefined,
+        rpmLimit: parsedRpmLimit,
+        priority: parsedPriority,
+        proxyUrl: proxyUrl.trim() || undefined,
       })
       setSession(resp)
       setStep('waiting')
@@ -197,8 +213,57 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
         )}
 
         {step === 'form' && (
-          <label className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3 cursor-pointer">
-            <input
+          <div className="space-y-3 rounded-lg border p-3">
+            <p className="text-sm font-medium">凭据设置（可选）</p>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1.5">
+                <label htmlFor="idc-rpm" className="text-xs text-muted-foreground">
+                  RPM 上限（0 不限速）
+                </label>
+                <Input
+                  id="idc-rpm"
+                  type="number"
+                  min={0}
+                  step={1}
+                  placeholder="0"
+                  value={rpmLimit}
+                  onChange={(e) => setRpmLimit(e.target.value)}
+                  disabled={isStarting}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="idc-priority" className="text-xs text-muted-foreground">
+                  优先级（越小越优先）
+                </label>
+                <Input
+                  id="idc-priority"
+                  type="number"
+                  min={0}
+                  step={1}
+                  placeholder="0"
+                  value={priority}
+                  onChange={(e) => setPriority(e.target.value)}
+                  disabled={isStarting}
+                />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="idc-proxy" className="text-xs text-muted-foreground">
+                代理 URL
+              </label>
+              <Input
+                id="idc-proxy"
+                placeholder='留空使用全局配置，"direct" 不使用代理'
+                value={proxyUrl}
+                onChange={(e) => setProxyUrl(e.target.value)}
+                disabled={isStarting}
+              />
+            </div>
+          </div>
+        )}
+
+        {step === 'form' && (
+          <label className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3 cursor-pointer">            <input
               type="checkbox"
               checked={incognito}
               onChange={(e) => setIncognito(e.target.checked)}

@@ -16,7 +16,7 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    CredentialMetadata, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
+    CredentialMetadata, CredentialType, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
     normalize_import_auth_method, validate_credential_metadata,
     validate_credential_metadata_schema, validate_external_idp_endpoint,
 };
@@ -47,7 +47,9 @@ use super::types::{
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    RateLimitSameCredentialConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetRateLimitSameCredentialConfigRequest,
     SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse,
@@ -2448,6 +2450,41 @@ impl AdminService {
         Ok(self.get_account_throttle_config())
     }
 
+    /// 获取用户级 429「原号重试」配置
+    pub fn get_rate_limit_same_credential_config(
+        &self,
+    ) -> RateLimitSameCredentialConfigResponse {
+        let (retries, retry_delay_ms) =
+            self.token_manager.get_rate_limit_same_credential_config();
+        RateLimitSameCredentialConfigResponse {
+            retries,
+            retry_delay_ms,
+            known_types: CredentialType::ALL
+                .iter()
+                .map(|t| t.as_config_key().to_string())
+                .collect(),
+            max_retries_per_type: 10,
+        }
+    }
+
+    /// 更新用户级 429「原号重试」配置
+    pub fn set_rate_limit_same_credential_config(
+        &self,
+        req: SetRateLimitSameCredentialConfigRequest,
+    ) -> Result<RateLimitSameCredentialConfigResponse, AdminServiceError> {
+        if req.retries.is_none() && req.retry_delay_ms.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 retries 或 retryDelayMs 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_rate_limit_same_credential_config(req.retries, req.retry_delay_ms)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_rate_limit_same_credential_config())
+    }
+
     /// 获取单账号 RPM 限流配置
     pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
         let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
@@ -3683,6 +3720,7 @@ impl AdminService {
         // 新建凭据独有的字段，其余由设备授权流程统一填充
         let cred_template = KiroCredentials {
             priority: req.priority,
+            rpm_limit: req.rpm_limit,
             email: req.email,
             proxy_url: req.proxy_url,
             ..Default::default()

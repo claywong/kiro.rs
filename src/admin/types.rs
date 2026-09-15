@@ -539,6 +539,32 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 用户级 429「原号重试」配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitSameCredentialConfigResponse {
+    /// 按账号类型（metadata.type）配置的原号重试次数；未列出的类型为 0
+    pub retries: std::collections::BTreeMap<String, u32>,
+    /// 原号重试之间的固定间隔（毫秒）
+    pub retry_delay_ms: u64,
+    /// 可用账号类型的键列表，供前端渲染表单（避免前端硬编码）
+    pub known_types: Vec<String>,
+    /// 单个账号允许配置的最大重试次数
+    pub max_retries_per_type: u32,
+}
+
+/// 更新用户级 429「原号重试」配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRateLimitSameCredentialConfigRequest {
+    /// 按账号类型的重试次数表；整表替换语义，缺省表示不修改
+    #[serde(default)]
+    pub retries: Option<std::collections::BTreeMap<String, u32>>,
+    /// 固定重试间隔（毫秒）；缺省表示不修改，50..=60000
+    #[serde(default)]
+    pub retry_delay_ms: Option<u64>,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1091,6 +1117,8 @@ pub struct StartIdcLoginRequest {
     pub start_url: Option<String>,
     #[serde(default)]
     pub priority: u32,
+    #[serde(default)]
+    pub rpm_limit: u32,
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]

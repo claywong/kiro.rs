@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSIO
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{CredentialType, KiroCredentials};
 use crate::kiro::model::token_refresh::{
     ExternalIdpTokenResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -1222,6 +1222,11 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 用户级 429 时按账号类型配置的「原号重试次数」表（运行时可修改）。
+    /// 键为 `metadata.type` 的序列化名，缺失键按 0 处理。
+    rate_limit_same_credential_retries: Mutex<BTreeMap<String, u32>>,
+    /// 原号 429 重试之间的固定间隔（毫秒，运行时可修改）
+    rate_limit_same_credential_retry_delay_ms: AtomicU64,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1571,6 +1576,8 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let same_cred_retries = config.rate_limit_same_credential_retries.clone();
+        let same_cred_retry_delay_ms = config.rate_limit_same_credential_retry_delay_ms;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1592,6 +1599,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            rate_limit_same_credential_retries: Mutex::new(same_cred_retries),
+            rate_limit_same_credential_retry_delay_ms: AtomicU64::new(same_cred_retry_delay_ms),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -4637,14 +4646,17 @@ impl MultiTokenManager {
     /// - `Ok(())` - 删除成功
     /// - `Err(_)` - 凭据不存在或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
-        let was_current = {
+        let (was_current, deleted_snapshot) = {
             let mut entries = self.entries.lock();
 
             // 查找凭据
-            let _entry = entries
+            let entry = entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            // 删除前留档快照（含 refreshToken），供误删后找回
+            let deleted_snapshot = entry.credentials_snapshot();
 
             // 记录是否是当前凭据
             let current_id = *self.current_id.lock();
@@ -4653,8 +4665,12 @@ impl MultiTokenManager {
             // 删除凭据
             entries.retain(|e| e.id != id);
 
-            was_current
+            (was_current, deleted_snapshot)
         };
+
+        // 快照单独落一份文件（config/trash/credential-<id>-<时间戳>.json）。
+        // 留档失败不影响删除本身，只记日志。
+        self.archive_deleted_credential(id, &deleted_snapshot);
 
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
@@ -4681,6 +4697,38 @@ impl MultiTokenManager {
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
+    }
+
+    /// 把被删除的凭据快照写入凭据文件同级的 `trash/` 目录，一个凭据一个文件。
+    ///
+    /// 文件名：`credential-<id>-<Unix毫秒时间戳>.json`，内容为完整 `KiroCredentials`
+    /// （含 refreshToken），恢复时读回重新走 Admin API 添加即可。
+    /// 留档是尽力而为：目录创建或写盘失败只记 warn 日志，不阻断删除。
+    fn archive_deleted_credential(&self, id: u64, snapshot: &KiroCredentials) {
+        let Some(cred_path) = self.credentials_path.as_ref() else {
+            tracing::debug!("未配置 credentials_path，跳过删除留档 (凭据 #{})", id);
+            return;
+        };
+        let trash_dir = cred_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("trash");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let file = trash_dir.join(format!("credential-{}-{}.json", id, ts));
+
+        let result = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(&trash_dir)?;
+            let json = serde_json::to_string_pretty(snapshot)?;
+            std::fs::write(&file, json)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => tracing::info!("已删除凭据 #{} 留档到 {:?}", id, file),
+            Err(e) => tracing::warn!("凭据 #{} 删除留档失败: {}", id, e),
+        }
     }
 
     /// 更新指定凭据的 refreshToken（Admin API）
@@ -4943,6 +4991,116 @@ impl MultiTokenManager {
         self.update_config_file(move |config| {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
+        })
+    }
+
+    /// 查询指定凭据的账号类型（`metadata.type`）。凭据不存在时返回 `None`。
+    ///
+    /// 只读一个 Copy 的枚举，避免在 429 热路径上用 `clone_credential` 克隆整个凭据。
+    pub fn credential_kind(&self, id: u64) -> Option<CredentialType> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.metadata.kind)
+    }
+
+    /// 获取用户级 429「原号重试」配置（Admin API）。
+    /// 返回：(按账号类型的次数表, 固定重试间隔毫秒)。
+    pub fn get_rate_limit_same_credential_config(&self) -> (BTreeMap<String, u32>, u64) {
+        (
+            self.rate_limit_same_credential_retries.lock().clone(),
+            self.rate_limit_same_credential_retry_delay_ms
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// 查询某账号类型在用户级 429 时可在原号上重试的次数。未配置的类型返回 0。
+    pub fn same_credential_retry_budget(&self, kind: CredentialType) -> u32 {
+        let key = kind.as_config_key();
+        self.rate_limit_same_credential_retries
+            .lock()
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 原号 429 重试之间的固定间隔。
+    pub fn same_credential_retry_delay(&self) -> StdDuration {
+        StdDuration::from_millis(
+            self.rate_limit_same_credential_retry_delay_ms
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置用户级 429「原号重试」配置（Admin API）。
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。`retries` 为整表替换语义：传入的表
+    /// 直接覆盖旧表，未列出的类型即恢复为 0 次（立即换号）。
+    pub fn set_rate_limit_same_credential_config(
+        &self,
+        retries: Option<BTreeMap<String, u32>>,
+        retry_delay_ms: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(table) = retries.as_ref() {
+            for (key, value) in table {
+                // 键必须是已知账号类型，否则是拼写错误：静默接受会让用户以为配置生效了。
+                if CredentialType::from_config_key(key).is_none() {
+                    anyhow::bail!("未知账号类型: {}", key);
+                }
+                // 上限 10 次：原号重试不吃 max_retries 预算，必须由本表自身封顶，
+                // 否则一个大数字会把单个请求钉在同一个限流号上很久。
+                if *value > 10 {
+                    anyhow::bail!("原号重试次数必须在 0..=10 内: {}={}", key, value);
+                }
+            }
+        }
+        if let Some(ms) = retry_delay_ms {
+            if !(50..=60_000).contains(&ms) {
+                anyhow::bail!("原号重试间隔必须在 50..=60000 毫秒内: {}", ms);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_retries, prev_delay) = self.get_rate_limit_same_credential_config();
+        let new_retries = retries.unwrap_or_else(|| prev_retries.clone());
+        let new_delay = retry_delay_ms.unwrap_or(prev_delay);
+
+        if new_retries == prev_retries && new_delay == prev_delay {
+            return Ok(());
+        }
+
+        *self.rate_limit_same_credential_retries.lock() = new_retries.clone();
+        self.rate_limit_same_credential_retry_delay_ms
+            .store(new_delay, Ordering::Relaxed);
+
+        if let Err(err) =
+            self.persist_rate_limit_same_credential_config(new_retries.clone(), new_delay)
+        {
+            // 回滚内存值
+            *self.rate_limit_same_credential_retries.lock() = prev_retries;
+            self.rate_limit_same_credential_retry_delay_ms
+                .store(prev_delay, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "原号 429 重试配置已更新: retries={:?}, delay_ms={}",
+            new_retries,
+            new_delay
+        );
+        Ok(())
+    }
+
+    fn persist_rate_limit_same_credential_config(
+        &self,
+        retries: BTreeMap<String, u32>,
+        retry_delay_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.update_config_file(move |config| {
+            config.rate_limit_same_credential_retries = retries;
+            config.rate_limit_same_credential_retry_delay_ms = retry_delay_ms;
         })
     }
 
@@ -7394,6 +7552,126 @@ mod tests {
             snapshot.entries[0].metadata.extra.get("supplier"),
             Some(&serde_json::Value::String("vendor-a".to_string()))
         );
+    }
+
+    /// 未配置时所有类型预算为 0，即维持「立即换号」的历史行为。
+    #[test]
+    fn same_credential_retry_budget_defaults_to_zero() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for kind in CredentialType::ALL {
+            assert_eq!(
+                manager.same_credential_retry_budget(kind),
+                0,
+                "默认配置下 {} 不应有原号重试预算",
+                kind.as_config_key()
+            );
+        }
+        assert_eq!(
+            manager.same_credential_retry_delay(),
+            StdDuration::from_millis(200)
+        );
+    }
+
+    /// 预算按账号类型独立生效，未列出的类型仍为 0。
+    #[test]
+    fn same_credential_retry_budget_reads_configured_table() {
+        let mut config = Config::default();
+        config.rate_limit_same_credential_retries =
+            BTreeMap::from([("long_speed".to_string(), 3), ("short_speed".to_string(), 2)]);
+        config.rate_limit_same_credential_retry_delay_ms = 500;
+        let manager =
+            MultiTokenManager::new(config, vec![grouped_cred("token", &[])], None, None, false)
+                .unwrap();
+
+        assert_eq!(
+            manager.same_credential_retry_budget(CredentialType::LongSpeed),
+            3
+        );
+        assert_eq!(
+            manager.same_credential_retry_budget(CredentialType::ShortSpeed),
+            2
+        );
+        assert_eq!(manager.same_credential_retry_budget(CredentialType::Normal), 0);
+        assert_eq!(manager.same_credential_retry_budget(CredentialType::Boom), 0);
+        assert_eq!(
+            manager.same_credential_retry_delay(),
+            StdDuration::from_millis(500)
+        );
+    }
+
+    /// 拼错的账号类型必须报错而不是静默接受，否则用户会以为配置生效了。
+    #[test]
+    fn set_same_credential_config_rejects_unknown_type_and_out_of_range() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            manager
+                .set_rate_limit_same_credential_config(
+                    Some(BTreeMap::from([("longspeed".to_string(), 2)])),
+                    None
+                )
+                .is_err(),
+            "未知账号类型应被拒绝"
+        );
+        assert!(
+            manager
+                .set_rate_limit_same_credential_config(
+                    Some(BTreeMap::from([("long_speed".to_string(), 11)])),
+                    None
+                )
+                .is_err(),
+            "超过 10 次的重试预算应被拒绝"
+        );
+        assert!(
+            manager
+                .set_rate_limit_same_credential_config(None, Some(10))
+                .is_err(),
+            "小于 50ms 的间隔应被拒绝"
+        );
+        // 拒绝后内存状态不应被污染
+        assert_eq!(
+            manager.same_credential_retry_budget(CredentialType::LongSpeed),
+            0
+        );
+    }
+
+    /// `credential_kind` 读到的是该凭据自己的 metadata.type。
+    #[test]
+    fn credential_kind_reflects_metadata() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(manager.credential_kind(1), Some(CredentialType::Normal));
+        assert_eq!(manager.credential_kind(999), None, "不存在的凭据应返回 None");
+
+        let metadata = crate::kiro::model::credentials::CredentialMetadata {
+            kind: CredentialType::ShortSpeed,
+            ..Default::default()
+        };
+        manager
+            .update_credential(1, None, None, None, None, None, None, None, Some(metadata))
+            .unwrap();
+        assert_eq!(manager.credential_kind(1), Some(CredentialType::ShortSpeed));
     }
 
     #[tokio::test]

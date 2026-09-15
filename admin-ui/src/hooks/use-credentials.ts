@@ -18,6 +18,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getRateLimitSameCredentialConfig,
+  setRateLimitSameCredentialConfig,
   getHealthGateState,
   getTrafficIngressState,
   getConcurrencyGateState,
@@ -303,6 +305,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取用户级 429「原号重试」配置
+export function useRateLimitSameCredentialConfig() {
+  return useQuery({
+    queryKey: ['rateLimitSameCredentialConfig'],
+    queryFn: getRateLimitSameCredentialConfig,
+  })
+}
+
+// 更新用户级 429「原号重试」配置
+export function useSetRateLimitSameCredentialConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRateLimitSameCredentialConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rateLimitSameCredentialConfig'] })
     },
   })
 }

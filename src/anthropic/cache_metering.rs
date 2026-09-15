@@ -27,7 +27,9 @@ use std::sync::Arc;
 /// 默认条目上限（防止内存无限增长）。
 /// 高并发时段每个活跃长会话会写回整条前缀链（几十段），4096 会被反复打爆导致
 /// 热前缀在下一轮到达前被 LRU 挤掉、命中变 miss，故上调到 64K（内存开销仍仅几 MB）。
-const DEFAULT_CAPACITY: usize = 65536;
+/// 模拟压测下 64K 仍会被打爆挤掉热前缀（命中率停在 ~85%），再上调到 1M
+/// （满载约五六十 MB，对本机可忽略），进一步降低 LRU 误杀。
+const DEFAULT_CAPACITY: usize = 1_048_576;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）

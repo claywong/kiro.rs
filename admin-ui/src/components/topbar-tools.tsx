@@ -34,6 +34,7 @@ interface TopbarToolsProps {
 const NON_DATA_QUERY_ROOTS = new Set([
   'loadBalancingMode',
   'accountThrottleConfig',
+  'rateLimitSameCredentialConfig',
   'accountRpmLimitConfig',
   'selfHealConfig',
   'logGovernanceConfig',

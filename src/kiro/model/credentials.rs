@@ -25,6 +25,39 @@ pub enum CredentialType {
     Normal,
     /// 炸弹账号
     Boom,
+    /// 长速刷账号
+    #[serde(rename = "long_speed")]
+    LongSpeed,
+    /// 短速刷账号
+    #[serde(rename = "short_speed")]
+    ShortSpeed,
+}
+
+impl CredentialType {
+    /// 全部账号类型，顺序与 metadata schema 的 `oneOf` 一致。
+    pub const ALL: [CredentialType; 4] = [
+        CredentialType::Normal,
+        CredentialType::Boom,
+        CredentialType::LongSpeed,
+        CredentialType::ShortSpeed,
+    ];
+
+    /// 序列化名，同时用作配置表的键（与 `#[serde(rename)]` 保持一致）。
+    pub fn as_config_key(&self) -> &'static str {
+        match self {
+            CredentialType::Normal => "normal",
+            CredentialType::Boom => "boom",
+            CredentialType::LongSpeed => "long_speed",
+            CredentialType::ShortSpeed => "short_speed",
+        }
+    }
+
+    /// 从配置键解析账号类型；未知键返回 `None`。
+    pub fn from_config_key(key: &str) -> Option<Self> {
+        CredentialType::ALL
+            .into_iter()
+            .find(|t| t.as_config_key() == key)
+    }
 }
 
 /// 凭据账号在售状态，仅用于运营管理，不参与调度。
@@ -75,7 +108,9 @@ pub fn credential_metadata_schema() -> serde_json::Value {
                 "default": "normal",
                 "oneOf": [
                     { "const": "normal", "title": "正常号" },
-                    { "const": "boom", "title": "炸弹号" }
+                    { "const": "boom", "title": "炸弹号" },
+                    { "const": "long_speed", "title": "长速刷" },
+                    { "const": "short_speed", "title": "短速刷" }
                 ]
             },
             "saleStatus": {
@@ -230,11 +265,13 @@ pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow
         .flatten()
         .filter_map(|item| item.get("const").and_then(|v| v.as_str()))
         .collect();
-    if type_values.len() != 2
-        || !type_values.contains(&"normal")
-        || !type_values.contains(&"boom")
+    let required_types = ["normal", "boom", "long_speed", "short_speed"];
+    if type_values.len() != required_types.len()
+        || !required_types.iter().all(|t| type_values.contains(t))
     {
-        anyhow::bail!("metadata.type 只能描述 normal 和 boom 两个可选值");
+        anyhow::bail!(
+            "metadata.type 只能描述 normal、boom、long_speed 和 short_speed 四个可选值"
+        );
     }
     let sale_status_field = properties
         .get("saleStatus")

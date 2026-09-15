@@ -1103,6 +1103,32 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 用户级 429 限流时，按账号类型（`metadata.type`）决定在**原账号**上重试多少次
+    /// 之后才换号。默认空表 = 所有类型都是 0 次，即维持「立即换号」的历史行为。
+    ///
+    /// 典型用法：速刷号配额恢复快，原地等一下再打同一个号比换号划算。
+    /// ```json
+    /// { "long_speed": 3, "short_speed": 2 }
+    /// ```
+    ///
+    /// 语义边界：
+    /// - 只作用于用户级限流（`is_user_request_rate_exceeded`），**不影响**账号级
+    ///   风控（429 + suspicious activity）——那是上游针对账号的惩罚，原地重试
+    ///   只会延长风控，仍按冷却换号处理。
+    /// - 原号重试**不计入** `max_retries` 预算，避免把换号机会吃光；单个凭据的
+    ///   重试次数由本表的值直接封顶，故不会失控。
+    /// - 键是 `metadata.type` 的序列化名（`normal` / `boom` / `long_speed` /
+    ///   `short_speed`）；未列出的类型按 0 处理。
+    #[serde(default)]
+    pub rate_limit_same_credential_retries: std::collections::BTreeMap<String, u32>,
+
+    /// 原账号 429 重试之间的固定间隔（毫秒，默认 200）。
+    ///
+    /// 固定间隔而非递增退避：速刷号的配额恢复窗口短，递增退避会把请求延迟拉长到
+    /// 不如换号。仅在 `rate_limit_same_credential_retries` 命中时生效。
+    #[serde(default = "default_rate_limit_same_credential_retry_delay_ms")]
+    pub rate_limit_same_credential_retry_delay_ms: u64,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -1324,6 +1350,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_rate_limit_same_credential_retry_delay_ms() -> u64 {
+    200
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -1414,6 +1444,9 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            rate_limit_same_credential_retries: std::collections::BTreeMap::new(),
+            rate_limit_same_credential_retry_delay_ms:
+                default_rate_limit_same_credential_retry_delay_ms(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),

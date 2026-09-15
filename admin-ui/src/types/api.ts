@@ -9,7 +9,7 @@ export interface CredentialsStatusResponse {
   credentials: CredentialStatusItem[]
 }
 
-export type CredentialType = 'normal' | 'boom'
+export type CredentialType = 'normal' | 'boom' | 'long_speed' | 'short_speed'
 export type CredentialSaleStatus = 'not_for_sale' | 'for_sale' | 'sold'
 
 /** 可扩展的凭据元数据；type 和 saleStatus 是固定字段，其余键由后端原样保存。 */
@@ -405,6 +405,7 @@ export interface StartIdcLoginRequest {
   region: string
   startUrl?: string
   priority?: number
+  rpmLimit?: number
   email?: string
   proxyUrl?: string
 }

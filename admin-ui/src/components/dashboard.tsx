@@ -167,6 +167,7 @@ const TIER_OPTIONS: { value: Tier; label: string }[] = [
   { value: "free", label: "FREE" },
   { value: "pro", label: "PRO" },
   { value: "pro_plus", label: "PRO+" },
+  { value: "pro_max", label: "PRO MAX" },
   { value: "power", label: "POWER" },
   { value: "unknown", label: "未知/未查询" },
 ];
@@ -174,6 +175,7 @@ const TIER_LABELS: Record<Tier, string> = {
   free: "FREE",
   pro: "PRO",
   pro_plus: "PRO+",
+  pro_max: "PRO MAX",
   power: "POWER",
   unknown: "未知",
 };
@@ -243,6 +245,7 @@ type SortField =
   | "successCount"
   | "totalFailureCount"
   | "lastUsedAt"
+  | "createdAt"
   | "id";
 type SortDir = "asc" | "desc";
 const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
@@ -250,6 +253,7 @@ const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "successCount", label: "成功次数" },
   { value: "totalFailureCount", label: "累计失败" },
   { value: "lastUsedAt", label: "最后使用" },
+  { value: "createdAt", label: "创建时间" },
   { value: "id", label: "ID" },
 ];
 const SORT_LABELS: Record<SortField, string> = {
@@ -258,6 +262,7 @@ const SORT_LABELS: Record<SortField, string> = {
   successCount: "成功次数",
   totalFailureCount: "累计失败",
   lastUsedAt: "最后使用",
+  createdAt: "创建时间",
   id: "ID",
 };
 
@@ -400,8 +405,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     setSortField(field);
-    // 成功次数/最后使用默认降序（大/新在前），其余默认升序
-    setSortDir(field === "successCount" || field === "lastUsedAt" ? "desc" : "asc");
+    // 成功次数/最后使用/创建时间默认降序（大/新在前），其余默认升序
+    setSortDir(
+      field === "successCount" || field === "lastUsedAt" || field === "createdAt"
+        ? "desc"
+        : "asc",
+    );
   };
   // 状态筛选：由顶部状态账条驱动。'' = 全部
   //
@@ -466,6 +475,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             // 从未使用（null）恒排在最后，不受升降序影响
             const ta = a.lastUsedAt ? Date.parse(a.lastUsedAt) : null;
             const tb = b.lastUsedAt ? Date.parse(b.lastUsedAt) : null;
+            if (ta === null && tb === null) cmp = 0;
+            else if (ta === null) return 1;
+            else if (tb === null) return -1;
+            else cmp = ta - tb;
+            break;
+          }
+          case "createdAt": {
+            // 无创建时间（null）恒排最后，同 lastUsedAt 处理
+            const ta = a.createdAt ? Date.parse(a.createdAt) : null;
+            const tb = b.createdAt ? Date.parse(b.createdAt) : null;
             if (ta === null && tb === null) cmp = 0;
             else if (ta === null) return 1;
             else if (tb === null) return -1;
@@ -637,9 +656,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     },
   });
-  const disabledCredentialCount =
-    data?.credentials.filter((c) => c.disabled).length || 0;
-
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
     if (c.disabled) return false;
@@ -954,20 +970,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     deselectAll();
   };
 
+  // 清除目标跟随状态账条：停在「超额」段时清除超额凭据（含仍在调度的），其余
+  // 一律按「禁用」段口径（鉴权失败/封禁/手动/失败过多），超额禁用不混入。
+  const clearQuotaMode = stateFilter === "quota";
   const handleClearAll = async () => {
     if (!data?.credentials || data.credentials.length === 0) {
       toast.error("没有可清除的凭据");
       return;
     }
-    const disabled = data.credentials.filter((c) => c.disabled);
-    if (disabled.length === 0) {
-      toast.error("没有可清除的已禁用凭据");
+    const filter = clearQuotaMode ? "quota" : "dead";
+    const targets = data.credentials.filter((c) =>
+      matchesStateFilter(c, balanceMap.get(c.id) ?? c.balance, filter),
+    );
+    const noun = clearQuotaMode ? "已超额" : "已禁用";
+    if (targets.length === 0) {
+      toast.error(`没有可清除的${noun}凭据`);
       return;
     }
     if (
       !(await confirm({
-        title: "清除已禁用凭据",
-        description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+        title: `清除${noun}凭据`,
+        description: `确定要清除所有 ${targets.length} 个${noun}凭据吗？此操作无法撤销。`,
         confirmText: "清除",
         destructive: true,
       }))
@@ -975,7 +998,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     let s = 0,
       f = 0;
-    for (const c of disabled) {
+    for (const c of targets) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(c.id, {
@@ -991,8 +1014,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         });
       } catch {}
     }
-    if (f === 0) toast.success(`成功清除所有 ${s} 个已禁用凭据`);
-    else toast.warning(`清除已禁用凭据：成功 ${s} 个，失败 ${f} 个`);
+    if (f === 0) toast.success(`成功清除所有 ${s} 个${noun}凭据`);
+    else toast.warning(`清除${noun}凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
   };
 
@@ -1722,7 +1745,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Badge>
             )}
 
-            {/* 全选按钮已移到「添加凭据」左侧，与其它操作同处一行 */}
+            {/* 全选入口位于列表上方的状态标签条。 */}
             {/* 已选计数与取消选择由吸底批量栏承担；状态筛选态由下方标签条的
                 激活样式直接体现，不再额外挂一枚可关闭徽章。 */}
             {verifying && !verifyDialogOpen && (
@@ -1743,7 +1766,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
           </div>
 
-          {/* 第二行：筛选（左） + 操作（右） */}
+          {/* 筛选与操作在空间足够时同排，窄屏按组换行。 */}
           <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
@@ -1929,47 +1952,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </div>
             </div>
 
-            {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
-            <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {/* 选中后的批量操作已移到吸底批量栏，见本页底部 BulkBar */}
-
-              {/* 全选：紧邻主操作，因为"先选再批量操作"是同一条动线 */}
-              {currentCredentials.length > 0 && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  onClick={toggleSelectCurrentPage}
-                  title={
-                    currentPageAllSelected
-                      ? "取消选择当前页"
-                      : `全选当前页 ${currentCredentials.length} 个`
-                  }
-                >
-                  <CheckSquare className="h-3.5 w-3.5" />
-                  {currentPageAllSelected ? "取消全选" : "全选当前页"}
-                </Button>
-              )}
-              {filteredCredentials.length > currentCredentials.length && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  onClick={toggleSelectAllFiltered}
-                  title={
-                    allFilteredSelected
-                      ? "取消选择全部筛选结果"
-                      : `全选所有 ${filteredCredentials.length} 个筛选结果`
-                  }
-                >
-                  <CheckSquare className="h-3.5 w-3.5" />
-                  {allFilteredSelected
-                    ? "取消全选所有页"
-                    : `全选所有页 (${filteredCredentials.length})`}
-                </Button>
-              )}
-
-              {/* 主操作 */}
+            {/* 主操作：全选收进列表菜单，避免筛选结果数量影响工具栏宽度。 */}
+            <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:items-center">
               <Button
                 onClick={() => setAddDialogOpen(true)}
                 size="sm"
@@ -2143,14 +2127,25 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     destructive
-                    disabled={disabledCredentialCount === 0}
+                    disabled={
+                      clearQuotaMode
+                        ? stateCounts.quota === 0
+                        : stateCounts.dead === 0
+                    }
                     onSelect={(e) => {
                       e.preventDefault();
                       handleClearAll();
                     }}
+                    title={
+                      clearQuotaMode
+                        ? "当前停在「超额」段：清除所有超额凭据（含已禁用与仍在调度的）"
+                        : "清除鉴权失败/封禁/手动禁用/失败过多的凭据；停在「超额」段时改为清除超额"
+                    }
                   >
                     <Trash2 />
-                    清除已禁用 ({disabledCredentialCount})
+                    {clearQuotaMode
+                      ? `清除已超额 (${stateCounts.quota})`
+                      : `清除已禁用 (${stateCounts.dead})`}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -2211,26 +2206,78 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               },
             ]}
             trailing={
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
-                <span
-                  className={cn(
-                    "h-2 w-2 rounded-sm",
-                    loadBalancingData?.mode === "balanced"
-                      ? "bg-emerald-500 animate-pulse"
-                      : "bg-blue-500"
-                  )}
-                />
-                {loadBalancingData?.mode === "balanced" ? (
-                  <span className="font-medium text-foreground/90">均衡负载模式</span>
-                ) : (
-                  <span>
-                    优先调度{" "}
-                    <span className="console-num font-mono font-bold text-foreground">
-                      #{data?.currentId || "-"}
+              <>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-sm",
+                      loadBalancingData?.mode === "balanced"
+                        ? "bg-emerald-500 animate-pulse"
+                        : "bg-blue-500"
+                    )}
+                  />
+                  {loadBalancingData?.mode === "balanced" ? (
+                    <span className="font-medium text-foreground/90">均衡负载模式</span>
+                  ) : (
+                    <span>
+                      优先调度{" "}
+                      <span className="console-num font-mono font-bold text-foreground">
+                        #{data?.currentId || "-"}
+                      </span>
                     </span>
-                  </span>
-                )}
-              </div>
+                  )}
+                </div>
+                <DropdownMenu modal={false}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-24 shrink-0"
+                      title="选择凭据"
+                    >
+                      <CheckSquare className="h-3.5 w-3.5" />
+                      选择
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuLabel>选择凭据</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      onSelect={toggleSelectCurrentPage}
+                      disabled={currentCredentials.length === 0}
+                    >
+                      <CheckSquare />
+                      {currentPageAllSelected ? "取消全选当前页" : "全选当前页"}
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {currentCredentials.length}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={toggleSelectAllFiltered}
+                      disabled={filteredCredentials.length === 0}
+                    >
+                      <CheckSquare />
+                      {allFilteredSelected
+                        ? "取消全选所有筛选结果"
+                        : "全选所有筛选结果"}
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {filteredCredentials.length}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onSelect={deselectAll}
+                      disabled={selectedIds.size === 0}
+                    >
+                      <X />
+                      取消选择
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {selectedIds.size}
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
             }
           />
         )}

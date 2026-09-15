@@ -8,7 +8,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
+export type Tier = 'free' | 'pro' | 'pro_plus' | 'pro_max' | 'power' | 'unknown'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -25,6 +25,7 @@ export function detectTier(title?: string | null): Tier {
   const upper = title.toUpperCase()
   if (upper.includes('POWER')) return 'power'
   if (upper.includes('PRO+') || upper.includes('PRO PLUS')) return 'pro_plus'
+  if (upper.includes('PRO MAX')) return 'pro_max'
   if (upper.includes('PRO')) return 'pro'
   if (upper.includes('FREE')) return 'free'
   return 'unknown'
@@ -48,6 +49,14 @@ function getTierStyle(tier: Tier, original?: string | null): TierStyle {
         label: 'PRO+',
         container:
           'bg-gradient-to-br from-amber-400 to-orange-500 text-white shadow-[0_2px_8px_-2px_rgba(245,158,11,0.5)] border-transparent',
+      }
+    case 'pro_max':
+      // 玫红渐变 — Pro Max，介于 Pro+ 与 Power 之间
+      return {
+        Icon: Zap,
+        label: 'PRO MAX',
+        container:
+          'bg-gradient-to-br from-rose-500 to-pink-600 text-white shadow-[0_2px_8px_-2px_rgba(244,63,94,0.5)] border-transparent',
       }
     case 'pro':
       // 苹果蓝渐变 — 标准 Pro
