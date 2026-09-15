@@ -19,7 +19,9 @@ import {
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
+  getSpeedCredentialsExcludeConfig,
   setRateLimitSameCredentialConfig,
+  setSpeedCredentialsExcludeConfig,
   getHealthGateState,
   getTrafficIngressState,
   getConcurrencyGateState,
@@ -324,6 +326,25 @@ export function useSetRateLimitSameCredentialConfig() {
     mutationFn: setRateLimitSameCredentialConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['rateLimitSameCredentialConfig'] })
+    },
+  })
+}
+
+// 获取速刷号小模型排除配置
+export function useSpeedCredentialsExcludeConfig() {
+  return useQuery({
+    queryKey: ['speedCredentialsExcludeConfig'],
+    queryFn: getSpeedCredentialsExcludeConfig,
+  })
+}
+
+// 更新速刷号小模型排除配置
+export function useSetSpeedCredentialsExcludeConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSpeedCredentialsExcludeConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['speedCredentialsExcludeConfig'] })
     },
   })
 }

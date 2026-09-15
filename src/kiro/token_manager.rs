@@ -1227,6 +1227,10 @@ pub struct MultiTokenManager {
     rate_limit_same_credential_retries: Mutex<BTreeMap<String, u32>>,
     /// 原号 429 重试之间的固定间隔（毫秒，运行时可修改）
     rate_limit_same_credential_retry_delay_ms: AtomicU64,
+    /// 速刷号是否不接 haiku 系列模型（运行时可修改）
+    speed_credentials_exclude_haiku: AtomicBool,
+    /// 速刷号是否不接 sonnet 系列模型（运行时可修改）
+    speed_credentials_exclude_sonnet: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1319,6 +1323,27 @@ fn credential_matches_request(
     }
 
     group_matches(&credentials.groups, group)
+}
+
+/// 本地新增：速刷号的小模型闸门判定（纯函数，便于单测）。
+///
+/// 速刷号单次容量小、配额恢复快，把 haiku/sonnet 这类高频小模型请求挡在外面，
+/// 可以把它们有限的配额留给大模型。两个系列独立开关。
+fn speed_credential_excluded_for_model(
+    kind: CredentialType,
+    model: Option<&str>,
+    exclude_haiku: bool,
+    exclude_sonnet: bool,
+) -> bool {
+    if !kind.is_speed() {
+        return false;
+    }
+    let Some(model) = model else {
+        return false;
+    };
+    // 与 opus 闸门同样用子串匹配：上游模型名形如 claude-haiku-4-5-20251001。
+    let model = model.to_ascii_lowercase();
+    (exclude_haiku && model.contains("haiku")) || (exclude_sonnet && model.contains("sonnet"))
 }
 
 fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
@@ -1551,6 +1576,8 @@ impl MultiTokenManager {
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let same_cred_retries = config.rate_limit_same_credential_retries.clone();
         let same_cred_retry_delay_ms = config.rate_limit_same_credential_retry_delay_ms;
+        let exclude_haiku = config.speed_credentials_exclude_haiku;
+        let exclude_sonnet = config.speed_credentials_exclude_sonnet;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1574,6 +1601,8 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             rate_limit_same_credential_retries: Mutex::new(same_cred_retries),
             rate_limit_same_credential_retry_delay_ms: AtomicU64::new(same_cred_retry_delay_ms),
+            speed_credentials_exclude_haiku: AtomicBool::new(exclude_haiku),
+            speed_credentials_exclude_sonnet: AtomicBool::new(exclude_sonnet),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -2002,7 +2031,7 @@ impl MultiTokenManager {
                 .throttled_until
                 .map(|until| until > now)
                 .unwrap_or(false)
-            || !credential_matches_request(&entry.credentials, model, group)
+            || !self.credential_matches_request_local(&entry.credentials, model, group)
             || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
         {
             return false;
@@ -2069,7 +2098,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
-                && credential_matches_request(&entry.credentials, model, group)
+                && self.credential_matches_request_local(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
             let fresh_count = entry
@@ -2298,7 +2327,7 @@ impl MultiTokenManager {
                         !e.disabled
                             && !excluded_ids.contains(&e.id)
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && credential_matches_request(&e.credentials, model, group)
+                            && self.credential_matches_request_local(&e.credentials, model, group)
                             && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
                     });
@@ -2309,7 +2338,7 @@ impl MultiTokenManager {
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !is_rpm_exceeded(e, now)
                             && !self.rpm_exceeded(e, now)
-                            && credential_matches_request(&e.credentials, model, group)
+                            && self.credential_matches_request_local(&e.credentials, model, group)
                             && model_support != CachedModelSupport::Unsupported
                             && (!confirmed_available
                                 || model_support == CachedModelSupport::Confirmed)
@@ -2381,7 +2410,7 @@ impl MultiTokenManager {
                                 !e.disabled
                                     && !excluded_ids.contains(&e.id)
                                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                    && credential_matches_request(&e.credentials, model, group)
+                                    && self.credential_matches_request_local(&e.credentials, model, group)
                             })
                             .filter_map(|e| rpm_retry_after_secs(e, now))
                             .min();
@@ -3170,7 +3199,7 @@ impl MultiTokenManager {
             for entry in entries.iter_mut() {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
-                    || !credential_matches_request(&entry.credentials, model, group)
+                    || !self.credential_matches_request_local(&entry.credentials, model, group)
                     || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
@@ -3660,7 +3689,7 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && self.credential_matches_request_local(&e.credentials, model, group)
                 })
                 .count()
         }
@@ -4944,6 +4973,79 @@ impl MultiTokenManager {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
         })
+    }
+
+    /// 本地新增：在上游 `credential_matches_request` 之上叠加速刷号小模型闸门。
+    ///
+    /// 所有选号路径都必须走这里而不是直接调上游函数，否则闸门会在某条路径上漏掉
+    /// （粘性复用、故障转移目标判定等处都要一致，不然会选到本该排除的号）。
+    fn credential_matches_request_local(
+        &self,
+        credentials: &KiroCredentials,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        if speed_credential_excluded_for_model(
+            credentials.metadata.kind,
+            model,
+            self.speed_credentials_exclude_haiku
+                .load(Ordering::Relaxed),
+            self.speed_credentials_exclude_sonnet
+                .load(Ordering::Relaxed),
+        ) {
+            return false;
+        }
+        credential_matches_request(credentials, model, group)
+    }
+
+    /// 获取速刷号小模型排除配置（Admin API）。返回：(排除 haiku, 排除 sonnet)。
+    pub fn get_speed_credentials_exclude_config(&self) -> (bool, bool) {
+        (
+            self.speed_credentials_exclude_haiku
+                .load(Ordering::Relaxed),
+            self.speed_credentials_exclude_sonnet
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置速刷号小模型排除配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    pub fn set_speed_credentials_exclude_config(
+        &self,
+        exclude_haiku: Option<bool>,
+        exclude_sonnet: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_haiku, prev_sonnet) = self.get_speed_credentials_exclude_config();
+        let new_haiku = exclude_haiku.unwrap_or(prev_haiku);
+        let new_sonnet = exclude_sonnet.unwrap_or(prev_sonnet);
+
+        if new_haiku == prev_haiku && new_sonnet == prev_sonnet {
+            return Ok(());
+        }
+
+        self.speed_credentials_exclude_haiku
+            .store(new_haiku, Ordering::Relaxed);
+        self.speed_credentials_exclude_sonnet
+            .store(new_sonnet, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.speed_credentials_exclude_haiku = new_haiku;
+            config.speed_credentials_exclude_sonnet = new_sonnet;
+        }) {
+            self.speed_credentials_exclude_haiku
+                .store(prev_haiku, Ordering::Relaxed);
+            self.speed_credentials_exclude_sonnet
+                .store(prev_sonnet, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "速刷号小模型排除配置已更新: haiku={}, sonnet={}",
+            new_haiku,
+            new_sonnet
+        );
+        Ok(())
     }
 
     /// 查询指定凭据的账号类型（`metadata.type`）。凭据不存在时返回 `None`。
@@ -7504,6 +7606,131 @@ mod tests {
             snapshot.entries[0].metadata.extra.get("supplier"),
             Some(&serde_json::Value::String("vendor-a".to_string()))
         );
+    }
+
+    /// 默认（两个开关都关）时，任何类型任何模型都不被排除。
+    #[test]
+    fn speed_exclude_defaults_to_no_exclusion() {
+        for kind in CredentialType::ALL {
+            for model in ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"] {
+                assert!(
+                    !speed_credential_excluded_for_model(kind, Some(model), false, false),
+                    "默认配置不应排除任何组合: {} / {}",
+                    kind.as_config_key(),
+                    model
+                );
+            }
+        }
+    }
+
+    /// 闸门只作用于速刷号，normal/boom 不受影响。
+    #[test]
+    fn speed_exclude_only_applies_to_speed_credentials() {
+        for kind in [CredentialType::Normal, CredentialType::Boom] {
+            assert!(
+                !speed_credential_excluded_for_model(
+                    kind,
+                    Some("claude-haiku-4-5-20251001"),
+                    true,
+                    true
+                ),
+                "{} 不是速刷号，不该被排除",
+                kind.as_config_key()
+            );
+        }
+        for kind in [CredentialType::LongSpeed, CredentialType::ShortSpeed] {
+            assert!(
+                speed_credential_excluded_for_model(
+                    kind,
+                    Some("claude-haiku-4-5-20251001"),
+                    true,
+                    true
+                ),
+                "{} 是速刷号，应被排除",
+                kind.as_config_key()
+            );
+        }
+    }
+
+    /// 两个开关互相独立：只开 haiku 时 sonnet 仍可走速刷号，反之同理。
+    #[test]
+    fn speed_exclude_switches_are_independent() {
+        let speed = CredentialType::ShortSpeed;
+        let haiku = Some("claude-haiku-4-5-20251001");
+        let sonnet = Some("claude-sonnet-5");
+
+        assert!(speed_credential_excluded_for_model(speed, haiku, true, false));
+        assert!(!speed_credential_excluded_for_model(
+            speed, sonnet, true, false
+        ));
+
+        assert!(!speed_credential_excluded_for_model(
+            speed, haiku, false, true
+        ));
+        assert!(speed_credential_excluded_for_model(
+            speed, sonnet, false, true
+        ));
+    }
+
+    /// opus 与缺省模型名不受这两个开关影响（速刷号仍可接 opus）。
+    #[test]
+    fn speed_exclude_never_blocks_opus_or_missing_model() {
+        let speed = CredentialType::LongSpeed;
+        assert!(!speed_credential_excluded_for_model(
+            speed,
+            Some("claude-opus-5"),
+            true,
+            true
+        ));
+        assert!(!speed_credential_excluded_for_model(speed, None, true, true));
+    }
+
+    /// 模型名大小写不敏感，与 opus 闸门的判法一致。
+    #[test]
+    fn speed_exclude_matches_case_insensitively() {
+        assert!(speed_credential_excluded_for_model(
+            CredentialType::ShortSpeed,
+            Some("Claude-HAIKU-4-5"),
+            true,
+            false
+        ));
+    }
+
+    /// 开关打开后，速刷号在真实选号路径上对 haiku 不可见（端到端验证 wrapper 接入）。
+    #[tokio::test]
+    async fn speed_exclude_hides_speed_credential_from_selection() {
+        let mut speed = grouped_cred("speed", &[]);
+        speed.priority = 0;
+        speed.metadata.kind = CredentialType::ShortSpeed;
+        let mut normal = grouped_cred("normal", &[]);
+        normal.priority = 10;
+        normal.metadata.kind = CredentialType::Normal;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![speed, normal], None, None, false)
+                .unwrap();
+
+        // 开关关闭：haiku 走优先级更高的速刷号
+        let ctx = manager
+            .acquire_context(Some("claude-haiku-4-5-20251001"), None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "默认应选 priority 更小的速刷号");
+
+        manager
+            .set_speed_credentials_exclude_config(Some(true), None)
+            .unwrap();
+
+        // 开关打开：haiku 跳过速刷号，落到 priority 更低的 normal 号
+        let ctx = manager
+            .acquire_context(Some("claude-haiku-4-5-20251001"), None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "排除 haiku 后应跳过速刷号选 normal 号");
+
+        // opus 不受影响，仍回到速刷号
+        let ctx = manager.acquire_context(Some("claude-opus-5"), None).await.unwrap();
+        assert_eq!(ctx.id, 1, "opus 不受 haiku 开关影响");
     }
 
     /// 未配置时所有类型预算为 0，即维持「立即换号」的历史行为。

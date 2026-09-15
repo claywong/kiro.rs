@@ -52,6 +52,14 @@ impl CredentialType {
         }
     }
 
+    /// 是否为速刷号（长速刷 / 短速刷）。
+    ///
+    /// 速刷号配额恢复窗口短但单次容量小，调度上有若干专属策略（原号 429 重试、
+    /// 小模型排除），故需要一个统一的判定入口，避免各处重复枚举两个变体。
+    pub fn is_speed(&self) -> bool {
+        matches!(self, CredentialType::LongSpeed | CredentialType::ShortSpeed)
+    }
+
     /// 从配置键解析账号类型；未知键返回 `None`。
     pub fn from_config_key(key: &str) -> Option<Self> {
         CredentialType::ALL

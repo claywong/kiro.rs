@@ -5,6 +5,8 @@ import {
   useSetAccountRpmLimitConfig,
   useRateLimitSameCredentialConfig,
   useSetRateLimitSameCredentialConfig,
+  useSpeedCredentialsExcludeConfig,
+  useSetSpeedCredentialsExcludeConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -44,6 +46,7 @@ export function DispatchSection() {
       <LoadBalancingGroup />
       <ThrottleGroup />
       <SameCredentialRetryGroup />
+      <SpeedCredentialsExcludeGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
       <TrafficIngressGroup />
@@ -207,6 +210,55 @@ function SameCredentialRetryGroup() {
         pending={saver.isSaving('delay')}
         saved={saver.isSaved('delay')}
         disabled={isLoading || !anyEnabled}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
+ * 速刷号的小模型闸门。
+ *
+ * 紧跟「原号重试」是因为两组都只作用于速刷号，摆在一起能一眼看清这类账号的
+ * 全部专属策略。这里是硬闸门：开启后对应模型完全看不到速刷号，若非速刷号
+ * 都不可用，请求会直接返回限流错误而不会退回速刷号兜底。
+ */
+function SpeedCredentialsExcludeGroup() {
+  const { data, isLoading } = useSpeedCredentialsExcludeConfig()
+  const { mutate } = useSetSpeedCredentialsExcludeConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const excludeHaiku = data?.excludeHaiku ?? false
+  const excludeSonnet = data?.excludeSonnet ?? false
+
+  return (
+    <SettingGroup
+      title="速刷号模型排除"
+      description="把小模型的高频请求挡在速刷号外面，把它们有限的配额留给大模型。硬闸门：开启后该系列模型完全不走速刷号，非速刷号全不可用时会直接返回限流"
+    >
+      <SettingSwitch
+        label="haiku 不走速刷号"
+        hint={
+          excludeHaiku
+            ? '模型名含 haiku 的请求只走非速刷号'
+            : 'haiku 请求可以调度到速刷号'
+        }
+        checked={excludeHaiku}
+        onChange={(next) => saver.save('haiku', { excludeHaiku: next })}
+        pending={saver.isSaving('haiku')}
+        saved={saver.isSaved('haiku')}
+        disabled={isLoading}
+      />
+      <SettingSwitch
+        label="sonnet 不走速刷号"
+        hint={
+          excludeSonnet
+            ? '模型名含 sonnet 的请求只走非速刷号'
+            : 'sonnet 请求可以调度到速刷号'
+        }
+        checked={excludeSonnet}
+        onChange={(next) => saver.save('sonnet', { excludeSonnet: next })}
+        pending={saver.isSaving('sonnet')}
+        saved={saver.isSaved('sonnet')}
+        disabled={isLoading}
       />
     </SettingGroup>
   )

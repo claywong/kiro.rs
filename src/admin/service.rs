@@ -48,6 +48,7 @@ use super::types::{
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     RateLimitSameCredentialConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetSpeedCredentialsExcludeConfigRequest, SpeedCredentialsExcludeConfigResponse,
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetRateLimitSameCredentialConfigRequest,
     SetLogGovernanceConfigRequest,
@@ -2483,6 +2484,34 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_rate_limit_same_credential_config())
+    }
+
+    /// 获取速刷号小模型排除配置
+    pub fn get_speed_credentials_exclude_config(&self) -> SpeedCredentialsExcludeConfigResponse {
+        let (exclude_haiku, exclude_sonnet) =
+            self.token_manager.get_speed_credentials_exclude_config();
+        SpeedCredentialsExcludeConfigResponse {
+            exclude_haiku,
+            exclude_sonnet,
+        }
+    }
+
+    /// 更新速刷号小模型排除配置
+    pub fn set_speed_credentials_exclude_config(
+        &self,
+        req: SetSpeedCredentialsExcludeConfigRequest,
+    ) -> Result<SpeedCredentialsExcludeConfigResponse, AdminServiceError> {
+        if req.exclude_haiku.is_none() && req.exclude_sonnet.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 excludeHaiku 或 excludeSonnet 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_speed_credentials_exclude_config(req.exclude_haiku, req.exclude_sonnet)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_speed_credentials_exclude_config())
     }
 
     /// 获取单账号 RPM 限流配置

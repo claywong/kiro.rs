@@ -25,7 +25,7 @@ use super::{
         CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetRateLimitSameCredentialConfigRequest,
+        SetRateLimitSameCredentialConfigRequest, SetSpeedCredentialsExcludeConfigRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
@@ -605,6 +605,26 @@ pub async fn set_rate_limit_same_credential_config(
     Json(payload): Json<SetRateLimitSameCredentialConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_rate_limit_same_credential_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/speed-credentials-exclude
+/// 获取速刷号小模型排除配置
+pub async fn get_speed_credentials_exclude_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_speed_credentials_exclude_config())
+}
+
+/// PUT /api/admin/config/speed-credentials-exclude
+/// 更新速刷号小模型排除配置
+pub async fn set_speed_credentials_exclude_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSpeedCredentialsExcludeConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_speed_credentials_exclude_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
