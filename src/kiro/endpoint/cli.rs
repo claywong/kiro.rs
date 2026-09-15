@@ -115,8 +115,8 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        set_origin_kiro_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        set_origin_kiro_cli(body, ctx.credentials.streaming_profile_arn().as_deref())
     }
 }
 
@@ -124,12 +124,18 @@ impl KiroEndpoint for CliEndpoint {
 /// 1. 所有 "AI_EDITOR" origin 替换为 "KIRO_CLI"
 /// 2. 移除 conversationState.agentContinuationId（Kiro CLI 不发送此字段）
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
-fn set_origin_kiro_cli(body: &str) -> String {
+/// 4. 注入 profileArn（流式端点强制要求；Enterprise/IdC 账号缺失会 400
+///    `profileArn is required for this request.`）
+fn set_origin_kiro_cli(body: &str, profile_arn: Option<&str>) -> String {
     let body = body.replace("\"origin\":\"AI_EDITOR\"", "\"origin\":\"KIRO_CLI\"");
 
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body) else {
         return body;
     };
+
+    if let Some(arn) = profile_arn {
+        json["profileArn"] = serde_json::Value::String(arn.to_string());
+    }
 
     if let Some(state) = json.get_mut("conversationState").and_then(|v| v.as_object_mut()) {
         state.remove("agentContinuationId");
@@ -156,7 +162,7 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_current_message() {
         let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"hi","origin":"AI_EDITOR"}}}}"#;
-        let result = set_origin_kiro_cli(body);
+        let result = set_origin_kiro_cli(body, None);
         assert!(result.contains("\"origin\":\"KIRO_CLI\""));
         assert!(!result.contains("\"origin\":\"AI_EDITOR\""));
     }
@@ -164,7 +170,7 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_history() {
         let body = r#"{"conversationState":{"history":[{"userInputMessage":{"content":"hi","origin":"AI_EDITOR"}},{"userInputMessage":{"content":"hello","origin":"AI_EDITOR"}}],"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR"}}}}"#;
-        let result = set_origin_kiro_cli(body);
+        let result = set_origin_kiro_cli(body, None);
         assert!(!result.contains("\"origin\":\"AI_EDITOR\""));
         assert_eq!(result.matches("\"origin\":\"KIRO_CLI\"").count(), 3);
     }
@@ -172,6 +178,22 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_no_origin() {
         let body = r#"{"conversationState":{}}"#;
-        assert_eq!(set_origin_kiro_cli(body), r#"{"conversationState":{}}"#);
+        assert_eq!(set_origin_kiro_cli(body, None), r#"{"conversationState":{}}"#);
+    }
+
+    #[test]
+    fn test_set_origin_kiro_cli_injects_profile_arn() {
+        let body = r#"{"conversationState":{}}"#;
+        let result = set_origin_kiro_cli(body, Some("arn:aws:codewhisperer:us-east-1:1:profile/X"));
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:us-east-1:1:profile/X");
+    }
+
+    #[test]
+    fn test_set_origin_kiro_cli_no_profile_arn_when_none() {
+        let body = r#"{"conversationState":{}}"#;
+        let result = set_origin_kiro_cli(body, None);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
     }
 }
