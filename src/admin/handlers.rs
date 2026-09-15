@@ -26,6 +26,7 @@ use super::{
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetRateLimitSameCredentialConfigRequest, SetSpeedCredentialsExcludeConfigRequest,
+        SetSpeedCredentialsMinTokensConfigRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetHealthGateRequest, SetSelfHealConfigRequest,
@@ -625,6 +626,29 @@ pub async fn set_speed_credentials_exclude_config(
     Json(payload): Json<SetSpeedCredentialsExcludeConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_speed_credentials_exclude_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/speed-credentials-min-tokens
+/// 获取速刷号最小 token 门槛配置
+pub async fn get_speed_credentials_min_tokens_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_speed_credentials_min_tokens_config())
+}
+
+/// PUT /api/admin/config/speed-credentials-min-tokens
+/// 更新速刷号最小 token 门槛配置
+pub async fn set_speed_credentials_min_tokens_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSpeedCredentialsMinTokensConfigRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_speed_credentials_min_tokens_config(payload)
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -315,20 +315,24 @@ impl KiroProvider {
     pub async fn call_api(
         &self,
         request_body: &str,
+        input_tokens: Option<u64>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, input_tokens, false, sink, group)
+            .await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(
         &self,
         request_body: &str,
+        input_tokens: Option<u64>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, input_tokens, true, sink, group)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -780,6 +784,7 @@ impl KiroProvider {
     async fn call_api_with_retry(
         &self,
         request_body: &str,
+        input_tokens: Option<u64>,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
@@ -814,6 +819,7 @@ impl KiroProvider {
             let mut ctx = match self.token_manager
                 .acquire_context_excluding(
                     model.as_deref(),
+                    input_tokens,
                     group,
                     &request_excluded_credentials,
                 )
@@ -1168,6 +1174,7 @@ impl KiroProvider {
                 // 不在同一凭据上原地反复重试（同一请求不应把预算烧在一个已限流的号上）。
                 let can_failover = self.token_manager.has_failover_target_for_request(
                     model.as_deref(),
+                    input_tokens,
                     group,
                     &request_excluded_credentials,
                     ctx.id,
@@ -1229,6 +1236,7 @@ impl KiroProvider {
                         ctx.id,
                         cooldown,
                         model.as_deref(),
+                        input_tokens,
                         group,
                     );
                 Self::emit_attempt(

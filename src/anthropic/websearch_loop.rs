@@ -497,7 +497,7 @@ async fn run_round(
     // tracer 直接线程化传入本轮 run_round，传给 provider 后每跳重试的
     // 凭据/状态码/失败分类都会记进 trace。
     let call_result = match provider
-        .call_api_stream(&request_body, Some(tracer), group)
+        .call_api_stream(&request_body, None, Some(tracer), group)
         .await
     {
         Ok(r) => r,

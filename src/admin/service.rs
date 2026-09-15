@@ -48,7 +48,8 @@ use super::types::{
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     RateLimitSameCredentialConfigResponse, SetAccountRpmLimitConfigRequest,
-    SetSpeedCredentialsExcludeConfigRequest, SpeedCredentialsExcludeConfigResponse,
+    SetSpeedCredentialsExcludeConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
+    SpeedCredentialsExcludeConfigResponse, SpeedCredentialsMinTokensConfigResponse,
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetRateLimitSameCredentialConfigRequest,
     SetLogGovernanceConfigRequest,
@@ -1155,7 +1156,7 @@ impl AdminService {
                 // 未指定才走账号池调度与故障转移。
                 let call = match request.credential_id {
                     Some(id) => provider.call_api_pinned(&body, id).await?,
-                    None => provider.call_api(&body, None, None).await?,
+                    None => provider.call_api(&body, None, None, None).await?,
                 };
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;
@@ -2512,6 +2513,36 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_speed_credentials_exclude_config())
+    }
+
+    /// 获取速刷号最小 token 门槛配置
+    pub fn get_speed_credentials_min_tokens_config(
+        &self,
+    ) -> SpeedCredentialsMinTokensConfigResponse {
+        let (enabled, min_tokens) =
+            self.token_manager.get_speed_credentials_min_tokens_config();
+        SpeedCredentialsMinTokensConfigResponse {
+            enabled,
+            min_tokens,
+        }
+    }
+
+    /// 更新速刷号最小 token 门槛配置
+    pub fn set_speed_credentials_min_tokens_config(
+        &self,
+        req: SetSpeedCredentialsMinTokensConfigRequest,
+    ) -> Result<SpeedCredentialsMinTokensConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.min_tokens.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 minTokens 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_speed_credentials_min_tokens_config(req.enabled, req.min_tokens)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_speed_credentials_min_tokens_config())
     }
 
     /// 获取单账号 RPM 限流配置

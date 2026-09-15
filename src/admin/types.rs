@@ -587,6 +587,28 @@ pub struct SetSpeedCredentialsExcludeConfigRequest {
     pub exclude_sonnet: Option<bool>,
 }
 
+/// 速刷号最小 token 门槛配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedCredentialsMinTokensConfigResponse {
+    /// 是否启用最小 token 门槛
+    pub enabled: bool,
+    /// 门槛值：输入 token 低于此值的请求不走速刷号
+    pub min_tokens: u64,
+}
+
+/// 更新速刷号最小 token 门槛配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSpeedCredentialsMinTokensConfigRequest {
+    /// 是否启用；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 门槛值（1..=10000000）；缺省表示不修改
+    #[serde(default)]
+    pub min_tokens: Option<u64>,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -1231,6 +1231,10 @@ pub struct MultiTokenManager {
     speed_credentials_exclude_haiku: AtomicBool,
     /// 速刷号是否不接 sonnet 系列模型（运行时可修改）
     speed_credentials_exclude_sonnet: AtomicBool,
+    /// 是否启用速刷号最小 token 门槛（运行时可修改）
+    speed_credentials_min_tokens_enabled: AtomicBool,
+    /// 速刷号最小 token 门槛（运行时可修改）
+    speed_credentials_min_tokens: AtomicU64,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1325,25 +1329,49 @@ fn credential_matches_request(
     group_matches(&credentials.groups, group)
 }
 
-/// 本地新增：速刷号的小模型闸门判定（纯函数，便于单测）。
-///
-/// 速刷号单次容量小、配额恢复快，把 haiku/sonnet 这类高频小模型请求挡在外面，
-/// 可以把它们有限的配额留给大模型。两个系列独立开关。
-fn speed_credential_excluded_for_model(
-    kind: CredentialType,
-    model: Option<&str>,
+/// 本地新增：速刷号闸门配置快照（一次性读出各原子量，避免逐字段 load）。
+#[derive(Debug, Clone, Copy)]
+struct SpeedExclusionRules {
     exclude_haiku: bool,
     exclude_sonnet: bool,
+    /// `Some(threshold)` 表示启用最小 token 门槛；`None` 表示关闭。
+    min_tokens: Option<u64>,
+}
+
+/// 本地新增：速刷号闸门判定（纯函数，便于单测）。
+///
+/// 速刷号单次容量小、配额恢复快，把小请求挡在外面能把它们有限的配额留给大请求。
+/// 两类独立、可叠加的排除条件，命中任一即排除：
+/// - 模型系列：haiku / sonnet（各自独立开关，与模型名子串匹配）；
+/// - 最小 token 门槛：输入 token 低于阈值的请求不走速刷号。
+///
+/// `input_tokens == None` 表示调用方未提供 token 数（如预热、只读探测），此时
+/// 不参与 token 门槛判定——门槛只对携带真实 token 数的业务请求生效。
+fn speed_credential_excluded(
+    kind: CredentialType,
+    model: Option<&str>,
+    input_tokens: Option<u64>,
+    rules: SpeedExclusionRules,
 ) -> bool {
     if !kind.is_speed() {
         return false;
     }
-    let Some(model) = model else {
-        return false;
-    };
-    // 与 opus 闸门同样用子串匹配：上游模型名形如 claude-haiku-4-5-20251001。
-    let model = model.to_ascii_lowercase();
-    (exclude_haiku && model.contains("haiku")) || (exclude_sonnet && model.contains("sonnet"))
+    // 模型系列排除：与 opus 闸门同样用子串匹配（上游名形如 claude-haiku-4-5-20251001）。
+    if let Some(model) = model {
+        let model = model.to_ascii_lowercase();
+        if (rules.exclude_haiku && model.contains("haiku"))
+            || (rules.exclude_sonnet && model.contains("sonnet"))
+        {
+            return true;
+        }
+    }
+    // 最小 token 门槛：低于阈值的请求不走速刷号。缺 token 数的调用不参与判定。
+    if let (Some(threshold), Some(tokens)) = (rules.min_tokens, input_tokens) {
+        if tokens < threshold {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
@@ -1578,6 +1606,8 @@ impl MultiTokenManager {
         let same_cred_retry_delay_ms = config.rate_limit_same_credential_retry_delay_ms;
         let exclude_haiku = config.speed_credentials_exclude_haiku;
         let exclude_sonnet = config.speed_credentials_exclude_sonnet;
+        let min_tokens_enabled = config.speed_credentials_min_tokens_enabled;
+        let min_tokens = config.speed_credentials_min_tokens;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1603,6 +1633,8 @@ impl MultiTokenManager {
             rate_limit_same_credential_retry_delay_ms: AtomicU64::new(same_cred_retry_delay_ms),
             speed_credentials_exclude_haiku: AtomicBool::new(exclude_haiku),
             speed_credentials_exclude_sonnet: AtomicBool::new(exclude_sonnet),
+            speed_credentials_min_tokens_enabled: AtomicBool::new(min_tokens_enabled),
+            speed_credentials_min_tokens: AtomicU64::new(min_tokens),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -2005,6 +2037,7 @@ impl MultiTokenManager {
     pub(crate) fn has_failover_target_for_request(
         &self,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
         current_id: u64,
@@ -2014,7 +2047,7 @@ impl MultiTokenManager {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
                 && !is_rpm_exceeded(entry, now)
-                && self.entry_available_for_request(entry, model, group, now)
+                && self.entry_available_for_request(entry, model, input_tokens, group, now)
         })
     }
 
@@ -2022,6 +2055,7 @@ impl MultiTokenManager {
         &self,
         entry: &CredentialEntry,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         now: Instant,
     ) -> bool {
@@ -2031,7 +2065,7 @@ impl MultiTokenManager {
                 .throttled_until
                 .map(|until| until > now)
                 .unwrap_or(false)
-            || !self.credential_matches_request_local(&entry.credentials, model, group)
+            || !self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
             || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
         {
             return false;
@@ -2078,6 +2112,7 @@ impl MultiTokenManager {
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         now: Instant,
     ) -> Option<u64> {
@@ -2098,7 +2133,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
-                && self.credential_matches_request_local(&entry.credentials, model, group)
+                && self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
             let fresh_count = entry
@@ -2182,7 +2217,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         entries
             .iter()
-            .any(|entry| self.entry_available_for_request(entry, model, group, now))
+            .any(|entry| self.entry_available_for_request(entry, model, None, group, now))
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -2193,18 +2228,20 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     #[cfg(test)]
+    #[cfg(test)]
     fn select_next_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, group, &HashSet::new())
+        self.select_next_credential_excluding(model, None, group, &HashSet::new())
     }
 
     /// 选择下一个可用凭据。
     fn select_next_credential_excluding(
         &self,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
@@ -2225,7 +2262,7 @@ impl MultiTokenManager {
                 {
                     return None;
                 }
-                if !self.entry_available_for_request(e, model, group, now) {
+                if !self.entry_available_for_request(e, model, input_tokens, group, now) {
                     return None;
                 }
                 let model_support = self.cached_model_support(e.id, model);
@@ -2266,7 +2303,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, &HashSet::new(), true)
+        self.acquire_context_impl(model, None, group, &HashSet::new(), true)
             .await
             .map(|(context, _)| context)
     }
@@ -2278,10 +2315,11 @@ impl MultiTokenManager {
     pub async fn acquire_context_excluding(
         &self,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, excluded_ids, true)
+        self.acquire_context_impl(model, input_tokens, group, excluded_ids, true)
             .await
             .map(|(context, _)| context)
     }
@@ -2293,6 +2331,7 @@ impl MultiTokenManager {
     async fn acquire_context_impl(
         &self,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
         update_current: bool,
@@ -2327,7 +2366,7 @@ impl MultiTokenManager {
                         !e.disabled
                             && !excluded_ids.contains(&e.id)
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && self.credential_matches_request_local(&e.credentials, model, group)
+                            && self.credential_matches_request_local(&e.credentials, model, input_tokens, group)
                             && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
                     });
@@ -2338,7 +2377,7 @@ impl MultiTokenManager {
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !is_rpm_exceeded(e, now)
                             && !self.rpm_exceeded(e, now)
-                            && self.credential_matches_request_local(&e.credentials, model, group)
+                            && self.credential_matches_request_local(&e.credentials, model, input_tokens, group)
                             && model_support != CachedModelSupport::Unsupported
                             && (!confirmed_available
                                 || model_support == CachedModelSupport::Confirmed)
@@ -2383,14 +2422,16 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
+                    let mut best =
+                        self.select_next_credential_excluding(model, input_tokens, group, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                     // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                     // 重选走本地 `_excluding` 版本：自愈后仍须尊重本次换号重试的排除集，
                     // 否则会把刚失败的号重新选回来。
-                    if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential_excluding(model, group, excluded_ids);
+                    if best.is_none() && self.try_self_heal(model, input_tokens, group) {
+                        best = self
+                            .select_next_credential_excluding(model, input_tokens, group, excluded_ids);
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -2410,7 +2451,7 @@ impl MultiTokenManager {
                                 !e.disabled
                                     && !excluded_ids.contains(&e.id)
                                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                    && self.credential_matches_request_local(&e.credentials, model, group)
+                                    && self.credential_matches_request_local(&e.credentials, model, input_tokens, group)
                             })
                             .filter_map(|e| rpm_retry_after_secs(e, now))
                             .min();
@@ -2421,7 +2462,7 @@ impl MultiTokenManager {
                         }
                         // 账号级 RPM 重试(整池共用限额)
                         if let Some(retry_after) =
-                            self.rpm_retry_after_secs(&entries, model, group, now)
+                            self.rpm_retry_after_secs(&entries, model, input_tokens, group, now)
                         {
                             return Err(anyhow::Error::new(UpstreamRateLimitError::new(Some(
                                 retry_after.to_string(),
@@ -3062,7 +3103,7 @@ impl MultiTokenManager {
                 if let Some(next) = entries
                     .iter()
                     .filter(|entry| {
-                        self.entry_available_for_request(entry, model, group, Instant::now())
+                        self.entry_available_for_request(entry, model, None, group, Instant::now())
                     })
                     .min_by_key(|e| (e.credentials.priority, e.id))
                 {
@@ -3139,7 +3180,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|entry| {
-                    self.entry_available_for_request(entry, model, group, Instant::now())
+                    self.entry_available_for_request(entry, model, None, group, Instant::now())
                 })
                 .min_by_key(|e| (e.credentials.priority, e.id))
             {
@@ -3179,7 +3220,12 @@ impl MultiTokenManager {
     /// 仅复活 [`DisabledReason::TooManyFailures`]；手动禁用、额度用尽、token 失效等
     /// 其它原因禁用的凭据不受影响。
     /// 返回本次是否实际执行了自愈（调用方据此决定是否重新选取凭据）。
-    fn try_self_heal(&self, model: Option<&str>, group: Option<&str>) -> bool {
+    fn try_self_heal(
+        &self,
+        model: Option<&str>,
+        input_tokens: Option<u64>,
+        group: Option<&str>,
+    ) -> bool {
         if !self.self_heal_enabled.load(Ordering::Relaxed) {
             tracing::debug!("当前请求没有可用凭据，但自愈已关闭");
             return false;
@@ -3199,7 +3245,7 @@ impl MultiTokenManager {
             for entry in entries.iter_mut() {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
-                    || !self.credential_matches_request_local(&entry.credentials, model, group)
+                    || !self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
                     || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
@@ -3309,7 +3355,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|entry| {
-                    self.entry_available_for_request(entry, model, group, Instant::now())
+                    self.entry_available_for_request(entry, model, None, group, Instant::now())
                 })
                 .min_by_key(|e| (e.credentials.priority, e.id))
             {
@@ -3659,6 +3705,7 @@ impl MultiTokenManager {
         id: u64,
         cooldown: StdDuration,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
     ) -> usize {
         let now = Instant::now();
@@ -3689,7 +3736,7 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
-                        && self.credential_matches_request_local(&e.credentials, model, group)
+                        && self.credential_matches_request_local(&e.credentials, model, input_tokens, group)
                 })
                 .count()
         }
@@ -4160,7 +4207,7 @@ impl MultiTokenManager {
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
         let (context, is_balanced) = self
-            .acquire_context_impl(None, None, &HashSet::new(), false)
+            .acquire_context_impl(None, None, None, &HashSet::new(), false)
             .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
@@ -4983,19 +5030,90 @@ impl MultiTokenManager {
         &self,
         credentials: &KiroCredentials,
         model: Option<&str>,
+        input_tokens: Option<u64>,
         group: Option<&str>,
     ) -> bool {
-        if speed_credential_excluded_for_model(
+        if speed_credential_excluded(
             credentials.metadata.kind,
             model,
-            self.speed_credentials_exclude_haiku
-                .load(Ordering::Relaxed),
-            self.speed_credentials_exclude_sonnet
-                .load(Ordering::Relaxed),
+            input_tokens,
+            self.speed_exclusion_rules(),
         ) {
             return false;
         }
         credential_matches_request(credentials, model, group)
+    }
+
+    /// 一次性读出速刷号闸门的运行时配置。
+    fn speed_exclusion_rules(&self) -> SpeedExclusionRules {
+        SpeedExclusionRules {
+            exclude_haiku: self
+                .speed_credentials_exclude_haiku
+                .load(Ordering::Relaxed),
+            exclude_sonnet: self
+                .speed_credentials_exclude_sonnet
+                .load(Ordering::Relaxed),
+            min_tokens: self
+                .speed_credentials_min_tokens_enabled
+                .load(Ordering::Relaxed)
+                .then(|| self.speed_credentials_min_tokens.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// 获取速刷号最小 token 门槛配置（Admin API）。返回：(是否启用, 阈值)。
+    pub fn get_speed_credentials_min_tokens_config(&self) -> (bool, u64) {
+        (
+            self.speed_credentials_min_tokens_enabled
+                .load(Ordering::Relaxed),
+            self.speed_credentials_min_tokens.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置速刷号最小 token 门槛配置（Admin API）。任一参数传 `None` 表示不修改。
+    pub fn set_speed_credentials_min_tokens_config(
+        &self,
+        enabled: Option<bool>,
+        min_tokens: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = min_tokens {
+            // 上限用一个宽松但有限的值兜底，避免误配成天文数字把全部请求挡在速刷号外。
+            if v == 0 || v > 10_000_000 {
+                anyhow::bail!("最小 token 门槛必须在 1..=10000000 内: {}", v);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_enabled, prev_tokens) = self.get_speed_credentials_min_tokens_config();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_tokens = min_tokens.unwrap_or(prev_tokens);
+
+        if new_enabled == prev_enabled && new_tokens == prev_tokens {
+            return Ok(());
+        }
+
+        self.speed_credentials_min_tokens_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.speed_credentials_min_tokens
+            .store(new_tokens, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.speed_credentials_min_tokens_enabled = new_enabled;
+            config.speed_credentials_min_tokens = new_tokens;
+        }) {
+            self.speed_credentials_min_tokens_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.speed_credentials_min_tokens
+                .store(prev_tokens, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "速刷号最小 token 门槛配置已更新: enabled={}, min_tokens={}",
+            new_enabled,
+            new_tokens
+        );
+        Ok(())
     }
 
     /// 获取速刷号小模型排除配置（Admin API）。返回：(排除 haiku, 排除 sonnet)。
@@ -5998,7 +6116,7 @@ mod tests {
         .unwrap();
 
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(manager.try_self_heal(None, None), "全灭且启用时应执行自愈");
+        assert!(manager.try_self_heal(None, None, None), "全灭且启用时应执行自愈");
         assert_eq!(manager.available_count(), 2, "自愈后应恢复全部凭据");
 
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
@@ -6020,11 +6138,11 @@ mod tests {
         .unwrap();
 
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(manager.try_self_heal(None, None), "首次自愈应成功");
+        assert!(manager.try_self_heal(None, None, None), "首次自愈应成功");
 
         // 再次全灭，但仍在冷却窗口内 → 不应再次自愈
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(!manager.try_self_heal(None, None), "冷却窗口内不应再次自愈");
+        assert!(!manager.try_self_heal(None, None, None), "冷却窗口内不应再次自愈");
         assert_eq!(manager.available_count(), 0);
 
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
@@ -6043,11 +6161,11 @@ mod tests {
 
         // 无任何成功，连续自愈到达上限后停止
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        assert!(manager.try_self_heal(None, None, None), "第 1 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+        assert!(manager.try_self_heal(None, None, None), "第 2 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(!manager.try_self_heal(None, None), "达上限后应停止自愈");
+        assert!(!manager.try_self_heal(None, None, None), "达上限后应停止自愈");
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -6061,9 +6179,9 @@ mod tests {
                 .unwrap();
 
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        assert!(manager.try_self_heal(None, None, None), "第 1 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+        assert!(manager.try_self_heal(None, None, None), "第 2 轮自愈");
 
         // 一次成功清零连续计数
         manager.report_success(1);
@@ -6072,7 +6190,7 @@ mod tests {
 
         // 清零后应能重新自愈（不受之前上限影响）
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "成功清零后应可再次自愈");
+        assert!(manager.try_self_heal(None, None, None), "成功清零后应可再次自愈");
     }
 
     #[test]
@@ -6104,7 +6222,7 @@ mod tests {
 
         // 自愈不应复活 Suspended 凭据
         assert!(
-            !manager.try_self_heal(None, None),
+            !manager.try_self_heal(None, None, None),
             "Suspended 凭据不参与自愈"
         );
         assert_eq!(manager.available_count(), 0);
@@ -6138,7 +6256,7 @@ mod tests {
                 .unwrap();
 
         disable_all_via_failures(&manager, &[1]);
-        assert!(!manager.try_self_heal(None, None), "自愈关闭时不应恢复");
+        assert!(!manager.try_self_heal(None, None, None), "自愈关闭时不应恢复");
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -6157,7 +6275,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
-        assert!(manager.try_self_heal(None, None));
+        assert!(manager.try_self_heal(None, None, None));
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
         assert_eq!(consecutive, u32::MAX);
         assert_eq!(total, u64::MAX);
@@ -6347,6 +6465,7 @@ mod tests {
             manager.report_account_throttled_for_request(
                 1,
                 StdDuration::from_secs(3600),
+                None,
                 None,
                 Some("g1"),
             ),
@@ -6616,7 +6735,7 @@ mod tests {
         manager.report_success(1);
 
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, &HashSet::new(), false)
+            .acquire_context_impl(None, None, None, &HashSet::new(), false)
             .await
             .unwrap();
 
@@ -7608,13 +7727,22 @@ mod tests {
         );
     }
 
-    /// 默认（两个开关都关）时，任何类型任何模型都不被排除。
+    /// 测试用：只配模型系列排除、token 门槛关闭的规则。
+    fn model_rules(exclude_haiku: bool, exclude_sonnet: bool) -> SpeedExclusionRules {
+        SpeedExclusionRules {
+            exclude_haiku,
+            exclude_sonnet,
+            min_tokens: None,
+        }
+    }
+
+    /// 默认（全部关闭）时，任何类型任何模型都不被排除。
     #[test]
     fn speed_exclude_defaults_to_no_exclusion() {
         for kind in CredentialType::ALL {
             for model in ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"] {
                 assert!(
-                    !speed_credential_excluded_for_model(kind, Some(model), false, false),
+                    !speed_credential_excluded(kind, Some(model), Some(1), model_rules(false, false)),
                     "默认配置不应排除任何组合: {} / {}",
                     kind.as_config_key(),
                     model
@@ -7628,11 +7756,11 @@ mod tests {
     fn speed_exclude_only_applies_to_speed_credentials() {
         for kind in [CredentialType::Normal, CredentialType::Boom] {
             assert!(
-                !speed_credential_excluded_for_model(
+                !speed_credential_excluded(
                     kind,
                     Some("claude-haiku-4-5-20251001"),
-                    true,
-                    true
+                    None,
+                    model_rules(true, true)
                 ),
                 "{} 不是速刷号，不该被排除",
                 kind.as_config_key()
@@ -7640,11 +7768,11 @@ mod tests {
         }
         for kind in [CredentialType::LongSpeed, CredentialType::ShortSpeed] {
             assert!(
-                speed_credential_excluded_for_model(
+                speed_credential_excluded(
                     kind,
                     Some("claude-haiku-4-5-20251001"),
-                    true,
-                    true
+                    None,
+                    model_rules(true, true)
                 ),
                 "{} 是速刷号，应被排除",
                 kind.as_config_key()
@@ -7652,48 +7780,100 @@ mod tests {
         }
     }
 
-    /// 两个开关互相独立：只开 haiku 时 sonnet 仍可走速刷号，反之同理。
+    /// 两个模型开关互相独立：只开 haiku 时 sonnet 仍可走速刷号，反之同理。
     #[test]
     fn speed_exclude_switches_are_independent() {
         let speed = CredentialType::ShortSpeed;
         let haiku = Some("claude-haiku-4-5-20251001");
         let sonnet = Some("claude-sonnet-5");
 
-        assert!(speed_credential_excluded_for_model(speed, haiku, true, false));
-        assert!(!speed_credential_excluded_for_model(
-            speed, sonnet, true, false
-        ));
+        assert!(speed_credential_excluded(speed, haiku, None, model_rules(true, false)));
+        assert!(!speed_credential_excluded(speed, sonnet, None, model_rules(true, false)));
 
-        assert!(!speed_credential_excluded_for_model(
-            speed, haiku, false, true
-        ));
-        assert!(speed_credential_excluded_for_model(
-            speed, sonnet, false, true
-        ));
+        assert!(!speed_credential_excluded(speed, haiku, None, model_rules(false, true)));
+        assert!(speed_credential_excluded(speed, sonnet, None, model_rules(false, true)));
     }
 
-    /// opus 与缺省模型名不受这两个开关影响（速刷号仍可接 opus）。
+    /// opus 与缺省模型名不受模型开关影响（速刷号仍可接 opus）。
     #[test]
     fn speed_exclude_never_blocks_opus_or_missing_model() {
         let speed = CredentialType::LongSpeed;
-        assert!(!speed_credential_excluded_for_model(
+        assert!(!speed_credential_excluded(
             speed,
             Some("claude-opus-5"),
-            true,
-            true
+            None,
+            model_rules(true, true)
         ));
-        assert!(!speed_credential_excluded_for_model(speed, None, true, true));
+        assert!(!speed_credential_excluded(speed, None, None, model_rules(true, true)));
     }
 
     /// 模型名大小写不敏感，与 opus 闸门的判法一致。
     #[test]
     fn speed_exclude_matches_case_insensitively() {
-        assert!(speed_credential_excluded_for_model(
+        assert!(speed_credential_excluded(
             CredentialType::ShortSpeed,
             Some("Claude-HAIKU-4-5"),
-            true,
-            false
+            None,
+            model_rules(true, false)
         ));
+    }
+
+    /// token 门槛：低于阈值排除、达到阈值放行；边界值（等于阈值）放行。
+    #[test]
+    fn speed_min_tokens_gate_boundary() {
+        let speed = CredentialType::ShortSpeed;
+        let rules = SpeedExclusionRules {
+            exclude_haiku: false,
+            exclude_sonnet: false,
+            min_tokens: Some(150_000),
+        };
+        // 低于阈值：排除
+        assert!(speed_credential_excluded(speed, Some("claude-opus-5"), Some(149_999), rules));
+        // 恰好等于阈值：放行（门槛语义是"低于"）
+        assert!(!speed_credential_excluded(speed, Some("claude-opus-5"), Some(150_000), rules));
+        // 高于阈值：放行
+        assert!(!speed_credential_excluded(speed, Some("claude-opus-5"), Some(200_000), rules));
+    }
+
+    /// token 门槛只作用于速刷号；且缺 token 数（None）时不参与判定。
+    #[test]
+    fn speed_min_tokens_gate_scope_and_missing_tokens() {
+        let rules = SpeedExclusionRules {
+            exclude_haiku: false,
+            exclude_sonnet: false,
+            min_tokens: Some(150_000),
+        };
+        // normal 号不受门槛影响
+        assert!(!speed_credential_excluded(
+            CredentialType::Normal,
+            Some("claude-opus-5"),
+            Some(1),
+            rules
+        ));
+        // 速刷号但缺 token 数：不参与门槛判定
+        assert!(!speed_credential_excluded(
+            CredentialType::ShortSpeed,
+            Some("claude-opus-5"),
+            None,
+            rules
+        ));
+    }
+
+    /// 模型排除与 token 门槛可叠加：命中任一即排除。
+    #[test]
+    fn speed_exclude_model_and_tokens_combine() {
+        let rules = SpeedExclusionRules {
+            exclude_haiku: true,
+            exclude_sonnet: false,
+            min_tokens: Some(150_000),
+        };
+        let speed = CredentialType::ShortSpeed;
+        // 大 haiku 请求：token 达标但命中模型排除
+        assert!(speed_credential_excluded(speed, Some("claude-haiku-4-5"), Some(999_999), rules));
+        // 小 opus 请求：模型放行但命中 token 门槛
+        assert!(speed_credential_excluded(speed, Some("claude-opus-5"), Some(1), rules));
+        // 大 opus 请求：两条都放行
+        assert!(!speed_credential_excluded(speed, Some("claude-opus-5"), Some(999_999), rules));
     }
 
     /// 开关打开后，速刷号在真实选号路径上对 haiku 不可见（端到端验证 wrapper 接入）。
@@ -7731,6 +7911,55 @@ mod tests {
         // opus 不受影响，仍回到速刷号
         let ctx = manager.acquire_context(Some("claude-opus-5"), None).await.unwrap();
         assert_eq!(ctx.id, 1, "opus 不受 haiku 开关影响");
+    }
+
+    /// token 门槛端到端：小请求跳过速刷号、大请求仍走速刷号（验证 token 数
+    /// 从 acquire_context_excluding 一路传到闸门）。
+    #[tokio::test]
+    async fn speed_min_tokens_gate_routes_by_request_size() {
+        let mut speed = grouped_cred("speed", &[]);
+        speed.priority = 0;
+        speed.metadata.kind = CredentialType::ShortSpeed;
+        let mut normal = grouped_cred("normal", &[]);
+        normal.priority = 10;
+        normal.metadata.kind = CredentialType::Normal;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![speed, normal], None, None, false)
+                .unwrap();
+        let empty = HashSet::new();
+
+        // 门槛关闭：大小请求都走优先级更高的速刷号
+        let ctx = manager
+            .acquire_context_excluding(Some("claude-opus-5"), Some(1_000), None, &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "门槛关闭时小请求也走速刷号");
+
+        manager
+            .set_speed_credentials_min_tokens_config(Some(true), Some(150_000))
+            .unwrap();
+
+        // 小请求（低于门槛）跳过速刷号，落到 normal 号
+        let ctx = manager
+            .acquire_context_excluding(Some("claude-opus-5"), Some(1_000), None, &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "低于门槛的小请求应跳过速刷号");
+
+        // 大请求（达到门槛）仍走速刷号
+        let ctx = manager
+            .acquire_context_excluding(Some("claude-opus-5"), Some(200_000), None, &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "达到门槛的大请求应走速刷号");
+
+        // 缺 token 数（None）不参与门槛判定，仍走速刷号
+        let ctx = manager
+            .acquire_context_excluding(Some("claude-opus-5"), None, None, &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "缺 token 数时门槛不生效");
     }
 
     /// 未配置时所有类型预算为 0，即维持「立即换号」的历史行为。
@@ -8039,7 +8268,7 @@ mod tests {
 
         let excluded_ids = HashSet::from([1]);
         let fallback = manager
-            .acquire_context_excluding(Some("other-model"), None, &excluded_ids)
+            .acquire_context_excluding(Some("other-model"), None, None, &excluded_ids)
             .await
             .unwrap();
         assert_eq!(fallback.id, 2);
@@ -8325,6 +8554,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             None,
             None,
+            None,
         );
         let during = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(during.id, 2, "A 冷却期间应故障转移到低优先级 B");
@@ -8432,7 +8662,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !manager.has_failover_target_for_request(None, None, &HashSet::new(), 1),
+            !manager.has_failover_target_for_request(None, None, None, &HashSet::new(), 1),
             "多个凭据中只有当前凭据可用时应原地重试"
         );
     }
@@ -8451,10 +8681,12 @@ mod tests {
         assert!(manager.has_failover_target_for_request(
             None,
             None,
+            None,
             &HashSet::new(),
             1
         ));
         assert!(!manager.has_failover_target_for_request(
+            None,
             None,
             None,
             &HashSet::from([2]),
@@ -8484,6 +8716,7 @@ mod tests {
             manager.report_account_throttled_for_request(
                 1,
                 StdDuration::from_secs(60),
+                None,
                 None,
                 Some("g1"),
             ),

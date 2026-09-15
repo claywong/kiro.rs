@@ -243,7 +243,7 @@ async fn probe_once(provider: &KiroProvider, model_id: &str) -> anyhow::Result<u
 
     let started = std::time::Instant::now();
     let bytes = tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), async {
-        let call = provider.call_api(&body, None, None).await?;
+        let call = provider.call_api(&body, None, None, None).await?;
         let bytes = call.response.bytes().await?;
         Ok::<_, anyhow::Error>(bytes)
     })

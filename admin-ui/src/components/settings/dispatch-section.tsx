@@ -7,6 +7,8 @@ import {
   useSetRateLimitSameCredentialConfig,
   useSpeedCredentialsExcludeConfig,
   useSetSpeedCredentialsExcludeConfig,
+  useSpeedCredentialsMinTokensConfig,
+  useSetSpeedCredentialsMinTokensConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -47,6 +49,7 @@ export function DispatchSection() {
       <ThrottleGroup />
       <SameCredentialRetryGroup />
       <SpeedCredentialsExcludeGroup />
+      <SpeedCredentialsMinTokensGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
       <TrafficIngressGroup />
@@ -259,6 +262,54 @@ function SpeedCredentialsExcludeGroup() {
         pending={saver.isSaving('sonnet')}
         saved={saver.isSaved('sonnet')}
         disabled={isLoading}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
+ * 速刷号最小 token 门槛。
+ *
+ * 与「速刷号模型排除」同族、都只作用于速刷号，故紧挨着放。区别在于这里按请求
+ * 大小过滤而非模型名：小请求走速刷号不划算，把配额留给大上下文请求。同为硬闸门。
+ */
+function SpeedCredentialsMinTokensGroup() {
+  const { data, isLoading } = useSpeedCredentialsMinTokensConfig()
+  const { mutate } = useSetSpeedCredentialsMinTokensConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+  const minTokens = data?.minTokens ?? 150000
+
+  return (
+    <SettingGroup
+      title="速刷号 token 门槛"
+      description="输入 token 低于门槛的请求不走速刷号。速刷号单次容量小，把小请求挡在外面能把配额留给大上下文请求。硬闸门：非速刷号全不可用时会直接返回限流"
+    >
+      <SettingSwitch
+        label="启用 token 门槛"
+        hint={
+          enabled
+            ? `输入低于 ${minTokens} token 的请求只走非速刷号`
+            : '不按 token 数过滤速刷号'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
+      />
+      <SettingNumber
+        label="门槛值"
+        hint="低于此输入 token 数的请求不走速刷号"
+        value={minTokens}
+        onCommit={(next) => saver.save('minTokens', { minTokens: next })}
+        min={1}
+        max={10000000}
+        unit="token"
+        presets={[50000, 100000, 150000, 200000]}
+        pending={saver.isSaving('minTokens')}
+        saved={saver.isSaved('minTokens')}
+        disabled={isLoading || !enabled}
       />
     </SettingGroup>
   )

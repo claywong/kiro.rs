@@ -1147,6 +1147,23 @@ pub struct Config {
     #[serde(default)]
     pub speed_credentials_exclude_sonnet: bool,
 
+    /// 是否启用「速刷号最小 token 门槛」（默认 false）。
+    ///
+    /// 开启后，输入 token 数低于 [`Self::speed_credentials_min_tokens`] 的请求在调度
+    /// 阶段完全看不到速刷号——与 haiku/sonnet 排除同级的硬闸门。速刷号单次容量小、
+    /// 配额恢复快，把小请求挡在外面能把配额留给大上下文请求。
+    ///
+    /// 与模型排除开关独立、可叠加：任一条命中即排除速刷号。
+    #[serde(default)]
+    pub speed_credentials_min_tokens_enabled: bool,
+
+    /// 速刷号最小 token 门槛（默认 150000）。仅在
+    /// [`Self::speed_credentials_min_tokens_enabled`] 为真时生效。
+    ///
+    /// token 数用请求的估算输入 token（与计费口径同源）。低于此值的请求不走速刷号。
+    #[serde(default = "default_speed_credentials_min_tokens")]
+    pub speed_credentials_min_tokens: u64,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -1372,6 +1389,10 @@ fn default_rate_limit_same_credential_retry_delay_ms() -> u64 {
     200
 }
 
+fn default_speed_credentials_min_tokens() -> u64 {
+    150_000
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -1467,6 +1488,8 @@ impl Default for Config {
                 default_rate_limit_same_credential_retry_delay_ms(),
             speed_credentials_exclude_haiku: false,
             speed_credentials_exclude_sonnet: false,
+            speed_credentials_min_tokens_enabled: false,
+            speed_credentials_min_tokens: default_speed_credentials_min_tokens(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
