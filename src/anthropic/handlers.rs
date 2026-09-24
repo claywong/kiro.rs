@@ -1043,7 +1043,12 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(input_tokens.max(0) as u64),
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1392,7 +1397,12 @@ async fn handle_non_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(
+            request_body,
+            Some(input_tokens.max(0) as u64),
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -2179,7 +2189,12 @@ async fn handle_stream_request_buffered(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(fallback_input_tokens.max(0) as u64),
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,

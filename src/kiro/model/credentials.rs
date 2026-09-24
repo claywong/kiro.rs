@@ -52,6 +52,14 @@ impl CredentialType {
         }
     }
 
+    /// 是否为速刷号（长速刷 / 短速刷）。
+    ///
+    /// 速刷号配额恢复窗口短但单次容量小，调度上有若干专属策略（原号 429 重试、
+    /// 小模型排除），故需要一个统一的判定入口，避免各处重复枚举两个变体。
+    pub fn is_speed(&self) -> bool {
+        matches!(self, CredentialType::LongSpeed | CredentialType::ShortSpeed)
+    }
+
     /// 从配置键解析账号类型；未知键返回 `None`。
     pub fn from_config_key(key: &str) -> Option<Self> {
         CredentialType::ALL
@@ -888,11 +896,31 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    ///
+    /// 优先级：凭据.api_region > 凭据.profileArn 里自带的区 > config.api_region > config.region
+    ///
+    /// profileArn 层是根治「跨区 external_idp 账号需手动加 apiRegion」的关键：真实
+    /// profileArn 形如 `arn:aws:codewhisperer:<region>:...`，其区与请求体强绑定，endpoint
+    /// 区不与之对齐会被上游拒为 `400 Improperly formed request`。故 arn 区优先级高于全局
+    /// config 默认（避免 config.apiRegion 统一设成 us-east-1 时挡住跨区账号），但仍低于该
+    /// 凭据显式设置的 apiRegion（保留人工覆盖）。BuilderID/Social 占位符 arn 不参与推导。
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
-        self.api_region
-            .as_deref()
-            .unwrap_or(config.effective_api_region())
+        if let Some(region) = self.api_region.as_deref() {
+            return region;
+        }
+        if let Some(region) = self.api_region_from_profile_arn() {
+            return region;
+        }
+        config.effective_api_region()
+    }
+
+    /// 从真实 profileArn 中解析 API region（第 4 段）。占位符 arn 返回 None。
+    fn api_region_from_profile_arn(&self) -> Option<&str> {
+        let arn = self.profile_arn.as_deref()?;
+        if is_placeholder_profile_arn(arn) {
+            return None;
+        }
+        region_from_arn(arn)
     }
 
     /// 获取有效的代理配置
@@ -1049,6 +1077,12 @@ impl KiroCredentials {
 /// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
 pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == BUILDER_ID_PROFILE_ARN
+}
+
+/// 从 profileArn 提取 region 段。ARN 格式：`arn:aws:codewhisperer:<region>:<account>:profile/<id>`，
+/// region 是冒号分隔的第 4 段（index 3）。段缺失或为空返回 None。
+fn region_from_arn(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -1924,6 +1958,56 @@ mod tests {
         let creds = KiroCredentials::default();
 
         assert_eq!(creds.effective_api_region(&config), "config-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_derives_from_profile_arn() {
+        // 真实 profileArn 的区应压过全局 config.api_region（根治跨区账号 400）
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+        config.api_region = Some("us-east-1".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:834058544039:profile/EAY9UUCHY9C3".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_explicit_overrides_profile_arn() {
+        // 凭据显式 api_region 仍高于 arn 推导
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.api_region = Some("ap-southeast-1".to_string());
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:834058544039:profile/EAY9UUCHY9C3".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "ap-southeast-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_placeholder_arn_not_derived() {
+        // BuilderID 占位符 arn 不参与推导，回退到 config
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_region_from_arn() {
+        assert_eq!(
+            region_from_arn("arn:aws:codewhisperer:eu-central-1:123:profile/X"),
+            Some("eu-central-1")
+        );
+        assert_eq!(region_from_arn("arn:aws:codewhisperer::123:profile/X"), None);
+        assert_eq!(region_from_arn("not-an-arn"), None);
     }
 
     #[test]

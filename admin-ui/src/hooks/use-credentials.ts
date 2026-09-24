@@ -19,7 +19,11 @@ import {
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
+  getSpeedCredentialsExcludeConfig,
+  getSpeedCredentialsMinTokensConfig,
   setRateLimitSameCredentialConfig,
+  setSpeedCredentialsExcludeConfig,
+  setSpeedCredentialsMinTokensConfig,
   getHealthGateState,
   getTrafficIngressState,
   getConcurrencyGateState,
@@ -324,6 +328,44 @@ export function useSetRateLimitSameCredentialConfig() {
     mutationFn: setRateLimitSameCredentialConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['rateLimitSameCredentialConfig'] })
+    },
+  })
+}
+
+// 获取速刷号小模型排除配置
+export function useSpeedCredentialsExcludeConfig() {
+  return useQuery({
+    queryKey: ['speedCredentialsExcludeConfig'],
+    queryFn: getSpeedCredentialsExcludeConfig,
+  })
+}
+
+// 更新速刷号小模型排除配置
+export function useSetSpeedCredentialsExcludeConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSpeedCredentialsExcludeConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['speedCredentialsExcludeConfig'] })
+    },
+  })
+}
+
+// 获取速刷号最小 token 门槛配置
+export function useSpeedCredentialsMinTokensConfig() {
+  return useQuery({
+    queryKey: ['speedCredentialsMinTokensConfig'],
+    queryFn: getSpeedCredentialsMinTokensConfig,
+  })
+}
+
+// 更新速刷号最小 token 门槛配置
+export function useSetSpeedCredentialsMinTokensConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSpeedCredentialsMinTokensConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['speedCredentialsMinTokensConfig'] })
     },
   })
 }

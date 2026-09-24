@@ -503,6 +503,58 @@ export async function setRateLimitSameCredentialConfig(
   return data
 }
 
+export interface SpeedCredentialsExcludeConfig {
+  /** 速刷号是否不接 haiku 系列 */
+  excludeHaiku: boolean
+  /** 速刷号是否不接 sonnet 系列 */
+  excludeSonnet: boolean
+}
+
+// 获取速刷号小模型排除配置
+export async function getSpeedCredentialsExcludeConfig(): Promise<SpeedCredentialsExcludeConfig> {
+  const { data } = await api.get<SpeedCredentialsExcludeConfig>(
+    '/config/speed-credentials-exclude',
+  )
+  return data
+}
+
+// 更新速刷号小模型排除配置
+export async function setSpeedCredentialsExcludeConfig(
+  patch: Partial<SpeedCredentialsExcludeConfig>,
+): Promise<SpeedCredentialsExcludeConfig> {
+  const { data } = await api.put<SpeedCredentialsExcludeConfig>(
+    '/config/speed-credentials-exclude',
+    patch,
+  )
+  return data
+}
+
+export interface SpeedCredentialsMinTokensConfig {
+  /** 是否启用最小 token 门槛 */
+  enabled: boolean
+  /** 门槛值：输入 token 低于此值的请求不走速刷号 */
+  minTokens: number
+}
+
+// 获取速刷号最小 token 门槛配置
+export async function getSpeedCredentialsMinTokensConfig(): Promise<SpeedCredentialsMinTokensConfig> {
+  const { data } = await api.get<SpeedCredentialsMinTokensConfig>(
+    '/config/speed-credentials-min-tokens',
+  )
+  return data
+}
+
+// 更新速刷号最小 token 门槛配置
+export async function setSpeedCredentialsMinTokensConfig(
+  patch: Partial<SpeedCredentialsMinTokensConfig>,
+): Promise<SpeedCredentialsMinTokensConfig> {
+  const { data } = await api.put<SpeedCredentialsMinTokensConfig>(
+    '/config/speed-credentials-min-tokens',
+    patch,
+  )
+  return data
+}
+
 export interface AccountRpmLimitConfig {
   enabled: boolean
   limit: number

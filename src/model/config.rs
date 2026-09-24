@@ -1129,6 +1129,41 @@ pub struct Config {
     #[serde(default = "default_rate_limit_same_credential_retry_delay_ms")]
     pub rate_limit_same_credential_retry_delay_ms: u64,
 
+    /// 速刷号（`long_speed` / `short_speed`）是否不接 haiku 系列模型（默认 false）。
+    ///
+    /// 开启后，模型名含 `haiku` 的请求在调度阶段完全看不到速刷号——与 opus 需付费
+    /// 订阅同级的硬闸门。速刷号配额恢复快但单次容量小，把小模型的高频请求挡在外面
+    /// 可以把它们的配额留给大模型。
+    ///
+    /// 注意这是硬闸门：若所有非速刷号都不可用，haiku 请求会直接返回限流错误，
+    /// 不会退回速刷号兜底。可用性由账号池自身保证。
+    #[serde(default)]
+    pub speed_credentials_exclude_haiku: bool,
+
+    /// 速刷号（`long_speed` / `short_speed`）是否不接 sonnet 系列模型（默认 false）。
+    ///
+    /// 语义与 [`Self::speed_credentials_exclude_haiku`] 完全一致，只是匹配 `sonnet`。
+    /// 两个开关独立，可只排除其中一个系列。
+    #[serde(default)]
+    pub speed_credentials_exclude_sonnet: bool,
+
+    /// 是否启用「速刷号最小 token 门槛」（默认 false）。
+    ///
+    /// 开启后，输入 token 数低于 [`Self::speed_credentials_min_tokens`] 的请求在调度
+    /// 阶段完全看不到速刷号——与 haiku/sonnet 排除同级的硬闸门。速刷号单次容量小、
+    /// 配额恢复快，把小请求挡在外面能把配额留给大上下文请求。
+    ///
+    /// 与模型排除开关独立、可叠加：任一条命中即排除速刷号。
+    #[serde(default)]
+    pub speed_credentials_min_tokens_enabled: bool,
+
+    /// 速刷号最小 token 门槛（默认 150000）。仅在
+    /// [`Self::speed_credentials_min_tokens_enabled`] 为真时生效。
+    ///
+    /// token 数用请求的估算输入 token（与计费口径同源）。低于此值的请求不走速刷号。
+    #[serde(default = "default_speed_credentials_min_tokens")]
+    pub speed_credentials_min_tokens: u64,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -1354,6 +1389,10 @@ fn default_rate_limit_same_credential_retry_delay_ms() -> u64 {
     200
 }
 
+fn default_speed_credentials_min_tokens() -> u64 {
+    150_000
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -1447,6 +1486,10 @@ impl Default for Config {
             rate_limit_same_credential_retries: std::collections::BTreeMap::new(),
             rate_limit_same_credential_retry_delay_ms:
                 default_rate_limit_same_credential_retry_delay_ms(),
+            speed_credentials_exclude_haiku: false,
+            speed_credentials_exclude_sonnet: false,
+            speed_credentials_min_tokens_enabled: false,
+            speed_credentials_min_tokens: default_speed_credentials_min_tokens(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),

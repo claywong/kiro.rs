@@ -565,6 +565,50 @@ pub struct SetRateLimitSameCredentialConfigRequest {
     pub retry_delay_ms: Option<u64>,
 }
 
+/// 速刷号小模型排除配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedCredentialsExcludeConfigResponse {
+    /// 速刷号是否不接 haiku 系列
+    pub exclude_haiku: bool,
+    /// 速刷号是否不接 sonnet 系列
+    pub exclude_sonnet: bool,
+}
+
+/// 更新速刷号小模型排除配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSpeedCredentialsExcludeConfigRequest {
+    /// 是否排除 haiku 系列；缺省表示不修改
+    #[serde(default)]
+    pub exclude_haiku: Option<bool>,
+    /// 是否排除 sonnet 系列；缺省表示不修改
+    #[serde(default)]
+    pub exclude_sonnet: Option<bool>,
+}
+
+/// 速刷号最小 token 门槛配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedCredentialsMinTokensConfigResponse {
+    /// 是否启用最小 token 门槛
+    pub enabled: bool,
+    /// 门槛值：输入 token 低于此值的请求不走速刷号
+    pub min_tokens: u64,
+}
+
+/// 更新速刷号最小 token 门槛配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSpeedCredentialsMinTokensConfigRequest {
+    /// 是否启用；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 门槛值（1..=10000000）；缺省表示不修改
+    #[serde(default)]
+    pub min_tokens: Option<u64>,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
