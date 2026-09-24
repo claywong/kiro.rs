@@ -2062,8 +2062,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     disabled={
                       resetAllSuccess.isPending || !data?.credentials?.length
                     }
-                    onSelect={(e) => {
-                      e.preventDefault();
+                    onSelect={async () => {
+                      if (
+                        !(await confirm({
+                          title: "重置成功次数",
+                          description:
+                            "确定要将所有凭据的成功次数清零吗？此操作无法撤销。",
+                          confirmText: "确认重置",
+                          destructive: true,
+                        }))
+                      )
+                        return;
                       resetAllSuccess.mutate(undefined, {
                         onSuccess: (res) => toast.success(res.message),
                         onError: (err) =>
