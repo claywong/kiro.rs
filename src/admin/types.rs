@@ -64,6 +64,8 @@ pub struct CredentialStatusItem {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 本站启用累计统计后消耗的 credit，不受成功次数重置影响。
+    pub total_credits: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理

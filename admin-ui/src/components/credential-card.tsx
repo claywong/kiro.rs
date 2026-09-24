@@ -1,3 +1,4 @@
+import { CredentialCreditUsage } from "@/components/credential-credit-usage";
 import { useState, useEffect, useCallback } from "react";
 import { toast } from "sonner";
 import {
@@ -1013,6 +1014,8 @@ export function CredentialCard({
           </button>
         </div>
 
+        <CredentialCreditUsage credits={credential.totalCredits} />
+
         <div className="w-16 text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             TTFT
@@ -1195,7 +1198,7 @@ export function CredentialCard({
 
           <CardContent className="flex flex-1 flex-col p-4 space-y-3.5">
             {/* 核心指标 (Metrics Grid) */}
-            <div className="grid grid-cols-3 divide-x divide-border/30 text-center py-1">
+            <div className="grid grid-cols-4 divide-x divide-border/30 text-center py-1">
               {/* Priority */}
               <div className="flex flex-col items-center justify-center px-1">
                 <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
@@ -1260,6 +1263,8 @@ export function CredentialCard({
                   <RotateCcw className="h-2.5 w-2.5 opacity-50" />
                 </button>
               </div>
+
+              <CredentialCreditUsage credits={credential.totalCredits} />
 
               {/* Failures */}
               <div className="flex flex-col items-center justify-center px-1">

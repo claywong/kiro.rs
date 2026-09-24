@@ -54,6 +54,7 @@ pub(crate) struct UsageRecordHook {
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
+    pub(crate) credit_token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
     pub key_id: u64,
     pub model: String,
     /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
@@ -73,6 +74,7 @@ impl UsageRecordHook {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
+            credit_token_manager: state.kiro_provider.as_ref().map(|p| p.token_manager().clone()),
             key_id,
             model,
             effort: None,
@@ -134,6 +136,9 @@ impl UsageRecordHook {
         }
         // 本地新增：喂给近 1 分钟消耗窗口（凭证列表展示用，与 trace 开关无关）
         crate::admin::recent_spend::tracker().record(credential_id, rec.credits);
+        if let Some(manager) = &self.credit_token_manager {
+            manager.record_local_credits(credential_id, rec.credits);
+        }
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
@@ -2637,6 +2642,7 @@ mod tests {
             recorder: None,
             aggregator: None,
             client_keys: None,
+            credit_token_manager: None,
             key_id: 7,
             model: "gpt-5.6-sol".to_string(),
             effort: None,
@@ -2986,6 +2992,7 @@ mod tests {
             recorder: None,
             aggregator: None,
             client_keys: None,
+            credit_token_manager: None,
             key_id: 7,
             model: "claude-opus-5".to_string(),
             effort: None,
@@ -3409,3 +3416,6 @@ mod thinking_override_tests {
         assert!(payload.output_config.is_none());
     }
 }
+
+#[cfg(test)]
+mod credit_stats_tests;

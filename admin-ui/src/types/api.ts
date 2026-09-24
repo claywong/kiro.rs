@@ -87,6 +87,8 @@ export interface CredentialStatusItem {
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
+  /** 本站启用累计统计后消耗的 credit；旧服务未返回时不展示为零。 */
+  totalCredits?: number
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean

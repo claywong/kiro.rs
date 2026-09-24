@@ -838,6 +838,7 @@ fn record_aggregated_usage(
 /// observed.
 struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
+    credit_token_manager: Option<Arc<crate::kiro::token_manager::MultiTokenManager>>,
     tracer: Option<Arc<RequestTracer>>,
     credential_id: u64,
     usage: TokenUsage,
@@ -845,9 +846,13 @@ struct WebSearchUsageSettlement {
     settled: bool,
 }
 
+#[cfg(test)]
+mod credit_stats_tests;
+
 impl WebSearchUsageSettlement {
-    fn new(hook: UsageRecordHook, tracer: Arc<RequestTracer>) -> Self {
+    fn new(mut hook: UsageRecordHook, tracer: Arc<RequestTracer>) -> Self {
         Self {
+            credit_token_manager: hook.credit_token_manager.take(),
             hook,
             tracer: Some(tracer),
             credential_id: 0,
@@ -858,8 +863,9 @@ impl WebSearchUsageSettlement {
     }
 
     #[cfg(test)]
-    fn without_trace(hook: UsageRecordHook) -> Self {
+    fn without_trace(mut hook: UsageRecordHook) -> Self {
         Self {
+            credit_token_manager: hook.credit_token_manager.take(),
             hook,
             tracer: None,
             credential_id: 0,
@@ -870,6 +876,10 @@ impl WebSearchUsageSettlement {
     }
 
     fn add(&mut self, credential_id: u64, usage: TokenUsage, credits: f64) {
+        // 每轮按实际凭据记账，避免多轮换号后全部累计到最后一个凭据。
+        if let Some(manager) = &self.credit_token_manager {
+            manager.record_local_credits(credential_id, credits);
+        }
         if credential_id != 0 {
             self.credential_id = credential_id;
         }
@@ -2124,6 +2134,7 @@ mod tests {
             recorder: None,
             aggregator: Some(aggregator.clone()),
             client_keys: None,
+            credit_token_manager: None,
             key_id: 0,
             model: "test-model".to_string(),
             effort: None,

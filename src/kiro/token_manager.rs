@@ -31,6 +31,8 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+mod credit_stats;
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -914,6 +916,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 本站累计消耗的 credit。
+    total_credits: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 临时冷却到期时间（账号级 429 风控触发后短期跳过该凭据）
@@ -1073,6 +1077,8 @@ impl CredentialEntry {
 struct StatsEntry {
     success_count: u64,
     #[serde(default)]
+    total_credits: f64,
+    #[serde(default)]
     total_failure_count: u64,
     last_used_at: Option<String>,
 }
@@ -1119,6 +1125,8 @@ pub struct CredentialEntrySnapshot {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 本站累计消耗的 credit（独立于成功次数重置）。
+    pub total_credits: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -1546,6 +1554,7 @@ impl MultiTokenManager {
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason,
                     success_count: 0,
+                    total_credits: 0.0,
                     last_used_at: None,
                     throttled_until: None,
                     rpm_window: VecDeque::new(),
@@ -2864,6 +2873,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.total_credits = s.total_credits;
                 entry.total_failure_count = s.total_failure_count;
                 entry.last_used_at = s.last_used_at.clone();
             }
@@ -2889,6 +2899,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            total_credits: e.total_credits,
                             total_failure_count: e.total_failure_count,
                             last_used_at: e.last_used_at.clone(),
                         },
@@ -3619,6 +3630,7 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
+                    total_credits: e.total_credits,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -4489,6 +4501,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                total_credits: 0.0,
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
