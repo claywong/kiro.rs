@@ -1157,7 +1157,7 @@ impl AdminService {
                 // 未指定才走账号池调度与故障转移。
                 let call = match request.credential_id {
                     Some(id) => provider.call_api_pinned(&body, id).await?,
-                    None => provider.call_api(&body, None, None, None).await?,
+                    None => provider.call_api(&body, None, None, None, None).await?,
                 };
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;

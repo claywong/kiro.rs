@@ -35,6 +35,7 @@ mod websearch;
 mod websearch_loop;
 // 本地新增模块单独成行，避免上游增删 mod 时整体重排造成冲突。
 mod thinking_mode;
+pub mod conversation_id_stats;
 
 // `create_router_with_provider` 是公开扩展点（允许外部以自定义 provider 构造路由），
 // 项目内默认走 `create_router_with_shared_provider`，因此本身不会触发该函数。

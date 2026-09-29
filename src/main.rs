@@ -286,6 +286,11 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // conversationId 来源占比（session / 随机），每 10 分钟汇总一行 INFO
+    anthropic::conversation_id_stats::spawn_reporter();
+    // 会话亲和：清理过期绑定 + 每 10 分钟汇总命中率
+    token_manager.spawn_session_affinity_maintenance();
+
     // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
     let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
         std::sync::Arc::new(

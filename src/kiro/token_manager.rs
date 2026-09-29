@@ -32,6 +32,10 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
 mod credit_stats;
+mod session_affinity;
+
+pub use session_affinity::AffinityOutcome;
+use session_affinity::SessionAffinity;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1272,6 +1276,10 @@ pub struct MultiTokenManager {
     /// 每个凭证的累计已用 credit（从 traces.db 统计），每分钟更新一次。
     /// 用于 credit_limit 过滤：已用 >= limit 的凭证不再调度。
     credit_usage_cache: Mutex<HashMap<u64, f64>>,
+    /// 会话亲和绑定表（session_id → 凭据）
+    session_affinity: SessionAffinity,
+    /// 会话亲和开关（启动时读 config）
+    session_affinity_enabled: bool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1294,6 +1302,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次选号的会话亲和结果（`Hit` 时 provider 对 429 先原号重试）
+    pub affinity: AffinityOutcome,
 }
 
 pub struct IdcReloginCredentials {
@@ -1433,11 +1443,23 @@ fn discovery_rank(support: CachedModelSupport) -> usize {
     usize::from(support != CachedModelSupport::Confirmed)
 }
 
-/// balanced 模式选号：发现档优先，其后按成功次数最少（least-used）、优先级高者优先。
-fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)> {
+/// 会话亲和负载：凭据当前的活跃绑定会话数（无 session 的请求传空表，恒为 0）。
+type AffinityLoad = HashMap<u64, usize>;
+
+fn affinity_load_of(load: &AffinityLoad, id: u64) -> usize {
+    load.get(&id).copied().unwrap_or(0)
+}
+
+/// balanced 模式选号：发现档优先，其后按活跃绑定会话最少、成功次数最少（least-used）、
+/// 优先级高者优先。
+fn pick_least_used(
+    available: &[Candidate<'_>],
+    load: &AffinityLoad,
+) -> Option<(u64, KiroCredentials)> {
     let (entry, _) = available.iter().min_by_key(|(e, support)| {
         (
             discovery_rank(*support),
+            affinity_load_of(load, e.id),
             e.success_count,
             e.credentials.priority,
         )
@@ -1445,7 +1467,7 @@ fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)
     Some((entry.id, entry.credentials.clone()))
 }
 
-/// priority 模式选号：三级排序 —— 发现档 → 优先级层 → 同层成功次数最少。
+/// priority 模式选号：发现档 → 优先级层 → 同层活跃绑定会话最少 → 同层成功次数最少。
 ///
 /// 前两级取最优层（发现档最优、priority 最小）后，同层内按 `success_count`
 /// 最少（least-used）调度，与 balanced 模式同一「按消耗均衡」的语义，只是
@@ -1453,6 +1475,7 @@ fn pick_least_used(available: &[Candidate<'_>]) -> Option<(u64, KiroCredentials)
 /// 未耗尽绝不降级，仅在层内做均衡。平局按 id 保证确定性。
 fn pick_by_discovery_priority_least_used(
     available: &[Candidate<'_>],
+    load: &AffinityLoad,
 ) -> Option<(u64, KiroCredentials)> {
     let min_rank = available
         .iter()
@@ -1470,8 +1493,9 @@ fn pick_by_discovery_priority_least_used(
             discovery_rank(*support) == min_rank && e.credentials.priority == min_priority
         })
         .min_by(|(a, _), (b, _)| {
-            a.success_count
-                .cmp(&b.success_count)
+            affinity_load_of(load, a.id)
+                .cmp(&affinity_load_of(load, b.id))
+                .then(a.success_count.cmp(&b.success_count))
                 .then(a.id.cmp(&b.id))
         })?;
     Some((entry.id, entry.credentials.clone()))
@@ -1623,6 +1647,10 @@ impl MultiTokenManager {
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
+        let session_affinity_enabled = config.session_affinity_enabled;
+        let session_affinity_ttl_secs = config.session_affinity_ttl_secs;
+        let session_affinity_max_entries = config.session_affinity_max_entries;
+        let session_affinity_load_window_secs = config.session_affinity_load_window_secs;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1658,6 +1686,12 @@ impl MultiTokenManager {
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
             credit_usage_cache: Mutex::new(HashMap::new()),
+            session_affinity: SessionAffinity::new(
+                session_affinity_ttl_secs,
+                session_affinity_max_entries,
+                session_affinity_load_window_secs,
+            ),
+            session_affinity_enabled,
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -2185,7 +2219,13 @@ impl MultiTokenManager {
     /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
     /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
     /// 抢先占用，调用方应重新选择凭据。
+    #[cfg(test)]
     fn record_request(&self, id: u64) -> bool {
+        self.record_request_inner(id, false)
+    }
+
+    /// `force = true`：会话亲和命中时忽略池级 RPM 上限，照常记账。
+    fn record_request_inner(&self, id: u64, force: bool) -> bool {
         let now = Instant::now();
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut entries = self.entries.lock();
@@ -2210,7 +2250,7 @@ impl MultiTokenManager {
                 break;
             }
         }
-        if entry.rpm_window.len() >= limit as usize {
+        if !force && entry.rpm_window.len() >= limit as usize {
             return false;
         }
         entry.rpm_window.push_back(now);
@@ -2243,7 +2283,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, None, group, &HashSet::new())
+        self.select_next_credential_excluding(model, None, group, &HashSet::new(), false)
     }
 
     /// 选择下一个可用凭据。
@@ -2253,7 +2293,15 @@ impl MultiTokenManager {
         input_tokens: Option<u64>,
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
+        load_aware: bool,
     ) -> Option<(u64, KiroCredentials)> {
+        // 带 session 的首次绑定 / 改绑：同层内先按活跃绑定会话数打散。
+        // 在锁 entries 之前取，避免与亲和表锁嵌套。
+        let load = if load_aware {
+            self.session_affinity.active_load(Instant::now())
+        } else {
+            AffinityLoad::new()
+        };
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -2287,12 +2335,12 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
-            "balanced" => pick_least_used(&available),
+            "balanced" => pick_least_used(&available, &load),
             _ => {
                 // priority 模式（默认）：发现档 → 优先级层 → 同层成功次数最少。
                 // 同层内按 success_count 做 least-used 均衡，与 balanced 同一消耗语义，
                 // 区别是 priority 严格分层（高优先级层未耗尽不降级）。
-                pick_by_discovery_priority_least_used(&available)
+                pick_by_discovery_priority_least_used(&available, &load)
             }
         }
     }
@@ -2312,7 +2360,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, None, group, &HashSet::new(), true)
+        self.acquire_context_impl(model, None, group, &HashSet::new(), true, None, None)
             .await
             .map(|(context, _)| context)
     }
@@ -2321,6 +2369,7 @@ impl MultiTokenManager {
     ///
     /// 排除集合仅属于调用方当前请求；命中其他凭据时不会更新全局 `current_id`，
     /// 因而不会改变下一次新请求的正常调度起点。
+    #[cfg(test)]
     pub async fn acquire_context_excluding(
         &self,
         model: Option<&str>,
@@ -2328,7 +2377,36 @@ impl MultiTokenManager {
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, input_tokens, group, excluded_ids, true)
+        self.acquire_context_impl(model, input_tokens, group, excluded_ids, true, None, None)
+            .await
+            .map(|(context, _)| context)
+    }
+
+    /// 带会话亲和的选号：`session_key` 已绑定且该凭据可用时直接复用
+    /// （忽略 RPM 与优先级分层，其它可用性检查照常）；否则走原有调度并绑定选中的凭据。
+    ///
+    /// per-cred RPM 在这里记账（调用方不要再记）：`rpm_recorded` 是本次外部请求已记过
+    /// 账的凭据，同号重试不重复记。亲和命中强制记账；首绑 / 改绑须先抢到 RPM 名额，
+    /// 抢不到就重新选号且不写绑定，避免绑定指向一个没有名额的号。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        input_tokens: Option<u64>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        session_key: Option<&str>,
+        rpm_recorded: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
+        let session_key = session_key.filter(|_| self.session_affinity_enabled);
+        self.acquire_context_impl(
+            model,
+            input_tokens,
+            group,
+            excluded_ids,
+            true,
+            session_key,
+            Some(rpm_recorded),
+        )
             .await
             .map(|(context, _)| context)
     }
@@ -2344,6 +2422,9 @@ impl MultiTokenManager {
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
         update_current: bool,
+        session_key: Option<&str>,
+        // Some：在此记 per-cred RPM（集合内的凭据已记过，跳过）；None：调用方自行记账
+        per_cred_rpm_recorded: Option<&HashSet<u64>>,
     ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2358,7 +2439,27 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, is_balanced) = {
+            // 会话亲和：已绑定且仍可用（未排除 / 未禁用 / 未 throttle / 模型、分组、
+            // credit_limit 满足）时直接复用，不看 RPM 和优先级分层。
+            let affinity_hit = session_key.and_then(|key| {
+                let bound = self.session_affinity.lookup(key, Instant::now())?;
+                let entries = self.entries.lock();
+                let now = Instant::now();
+                entries
+                    .iter()
+                    .find(|e| e.id == bound)
+                    .filter(|e| {
+                        !excluded_ids.contains(&e.id)
+                            && self.entry_available_for_request(e, model, input_tokens, group, now)
+                    })
+                    .map(|e| (e.id, e.credentials.clone()))
+            });
+            let is_affinity_hit = affinity_hit.is_some();
+
+            let (id, credentials, is_balanced) = if let Some((id, credentials)) = affinity_hit {
+                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                (id, credentials, is_balanced)
+            } else {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
@@ -2432,7 +2533,13 @@ impl MultiTokenManager {
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best =
-                        self.select_next_credential_excluding(model, input_tokens, group, excluded_ids);
+                        self.select_next_credential_excluding(
+                            model,
+                            input_tokens,
+                            group,
+                            excluded_ids,
+                            session_key.is_some(),
+                        );
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                     // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
@@ -2440,7 +2547,13 @@ impl MultiTokenManager {
                     // 否则会把刚失败的号重新选回来。
                     if best.is_none() && self.try_self_heal(model, input_tokens, group) {
                         best = self
-                            .select_next_credential_excluding(model, input_tokens, group, excluded_ids);
+                            .select_next_credential_excluding(
+                            model,
+                            input_tokens,
+                            group,
+                            excluded_ids,
+                            session_key.is_some(),
+                        );
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -2490,11 +2603,37 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
                     // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
-                    if update_current && !self.record_request(id) {
+                    // 亲和命中忽略池级 RPM 上限（照常记账）。
+                    if update_current && !self.record_request_inner(id, is_affinity_hit) {
                         // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
                         continue;
+                    }
+                    // per-cred RPM 记账必须先于写亲和表：并发下名额被抢时重新选号，
+                    // 绑定不会指向没有名额的号（否则下一轮会以 Hit 绕过 RPM）。
+                    if let Some(recorded) = per_cred_rpm_recorded {
+                        if !recorded.contains(&id) {
+                            if is_affinity_hit {
+                                self.force_record_request(id);
+                            } else if !self.try_record_request(id) {
+                                continue;
+                            }
+                        }
+                    }
+                    // 选号确定后再写亲和表：失败重选的中间结果不会污染绑定。
+                    match session_key {
+                        Some(key) => {
+                            ctx.affinity = self.session_affinity.record_use(key, id, Instant::now());
+                            tracing::debug!(
+                                affinity = ctx.affinity.as_str(),
+                                credential_id = id,
+                                session = &key[..key.len().min(8)],
+                                "会话亲和选号"
+                            );
+                        }
+                        None if update_current => self.session_affinity.count_none(),
+                        None => {}
                     }
                     return Ok((ctx, is_balanced));
                 }
@@ -2538,6 +2677,39 @@ impl MultiTokenManager {
             tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
             Ok(Some(self.report_refresh_failure(id)))
         }
+    }
+
+    /// 启动会话亲和后台任务：每 60 秒清理过期绑定，每 10 分钟打一行 INFO 汇总。
+    pub fn spawn_session_affinity_maintenance(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticks: u64 = 0;
+            loop {
+                tokio::time::sleep(StdDuration::from_secs(60)).await;
+                let Some(manager) = weak.upgrade() else { break };
+                manager.session_affinity.evict_expired(Instant::now());
+                ticks += 1;
+                if ticks % 10 != 0 {
+                    continue;
+                }
+                let [none, bind, hit, rebind] = manager.session_affinity.take_counters();
+                let total = none + bind + hit + rebind;
+                if total == 0 {
+                    continue;
+                }
+                let with_session = bind + hit + rebind;
+                let hit_pct = if with_session == 0 {
+                    0.0
+                } else {
+                    hit as f64 * 100.0 / with_session as f64
+                };
+                tracing::info!(
+                    enabled = manager.session_affinity_enabled,
+                    sessions = manager.session_affinity.len(),
+                    "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} none={none}"
+                );
+            }
+        });
     }
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
@@ -2587,6 +2759,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                affinity: AffinityOutcome::None,
             });
         }
 
@@ -2657,6 +2830,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            affinity: AffinityOutcome::None,
         })
     }
 
@@ -2940,6 +3114,26 @@ impl MultiTokenManager {
 
     /// 原子校验并记录一次外部请求使用该凭据。
     /// Provider 对同一外部请求中的同凭据重试去重；故障转移到新凭据时分别记账。
+    /// 会话亲和命中时使用：忽略 per-cred RPM 上限，但照常写入窗口，
+    /// 让其它请求的调度看到该凭据的真实负载。
+    pub(crate) fn force_record_request(&self, id: u64) {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(RPM_WINDOW);
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if let Some(cutoff) = cutoff {
+                while entry
+                    .recent_requests
+                    .front()
+                    .is_some_and(|timestamp| *timestamp <= cutoff)
+                {
+                    entry.recent_requests.pop_front();
+                }
+            }
+            entry.recent_requests.push_back(now);
+        }
+    }
+
     pub(crate) fn try_record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let cutoff = now.checked_sub(RPM_WINDOW);
@@ -4219,7 +4413,7 @@ impl MultiTokenManager {
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
         let (context, is_balanced) = self
-            .acquire_context_impl(None, None, None, &HashSet::new(), false)
+            .acquire_context_impl(None, None, None, &HashSet::new(), false, None, None)
             .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
@@ -5529,6 +5723,185 @@ mod tests {
         MultiTokenManager::new(config, vec![cred], None, None, true).unwrap()
     }
 
+    /// 会话亲和测试：N 个同层凭据，token 有效无需刷新
+    fn affinity_manager(n: usize, rpm_limit: u32) -> MultiTokenManager {
+        let creds = (0..n)
+            .map(|i| KiroCredentials {
+                access_token: Some(format!("t{i}")),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                rpm_limit,
+                ..KiroCredentials::default()
+            })
+            .collect();
+        MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap()
+    }
+
+    async fn acquire_for(manager: &MultiTokenManager, session: Option<&str>) -> CallContext {
+        manager
+            .acquire_context_for_session(None, None, None, &HashSet::new(), session, &HashSet::new())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_affinity_sticks_to_bound_credential() {
+        let manager = affinity_manager(3, 0);
+        let first = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(first.affinity, AffinityOutcome::Bind);
+        // 让绑定号变成「最常用」，least-used 调度本会换号
+        for _ in 0..5 {
+            manager.report_success(first.id);
+        }
+        for _ in 0..3 {
+            let ctx = acquire_for(&manager, Some("s1")).await;
+            assert_eq!(ctx.id, first.id);
+            assert_eq!(ctx.affinity, AffinityOutcome::Hit);
+        }
+        // 无 session 请求不受影响，仍按原调度避开高 success_count 的号
+        let other = acquire_for(&manager, None).await;
+        assert_eq!(other.affinity, AffinityOutcome::None);
+        assert_ne!(other.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_first_pick_matches_existing_scheduler() {
+        let manager = affinity_manager(3, 0);
+        manager.report_success(1);
+        manager.report_success(2);
+        // 同层 least-used → 3 号；带 session 的首次选号结果应一致
+        let plain = manager
+            .acquire_context_impl(None, None, None, &HashSet::new(), false, None, None)
+            .await
+            .unwrap()
+            .0;
+        let bound = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(bound.id, plain.id);
+        assert_eq!(bound.affinity, AffinityOutcome::Bind);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_ignores_rpm_limit_on_bound_credential() {
+        let manager = affinity_manager(2, 1);
+        let first = acquire_for(&manager, Some("s1")).await;
+        let entries_full = {
+            let entries = manager.entries.lock();
+            let e = entries.iter().find(|e| e.id == first.id).unwrap();
+            is_rpm_exceeded(e, Instant::now())
+        };
+        assert!(entries_full, "绑定号应已打满 per-cred RPM");
+        let again = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(again.id, first.id, "亲和命中应忽略 RPM 上限");
+        assert_eq!(again.affinity, AffinityOutcome::Hit);
+        // 无 session 请求仍遵守 RPM，避开打满的号
+        let plain = acquire_for(&manager, None).await;
+        assert_ne!(plain.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_rebinds_when_bound_unavailable() {
+        let manager = affinity_manager(3, 0);
+        let first = acquire_for(&manager, Some("s1")).await;
+
+        // 本次请求排除（如原号 429 重试耗尽）→ 换号并改绑
+        let excluded: HashSet<u64> = [first.id].into_iter().collect();
+        let second = manager
+            .acquire_context_for_session(None, None, None, &excluded, Some("s1"), &HashSet::new())
+            .await
+            .unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.affinity, AffinityOutcome::Rebind);
+        // 后续请求跟新号走
+        let third = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(third.id, second.id);
+        assert_eq!(third.affinity, AffinityOutcome::Hit);
+
+        // 绑定号被禁用 → 改绑
+        manager.set_disabled(second.id, true).unwrap();
+        let fourth = acquire_for(&manager, Some("s1")).await;
+        assert_ne!(fourth.id, second.id);
+        assert_eq!(fourth.affinity, AffinityOutcome::Rebind);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_disabled_by_config() {
+        let mut config = Config::default();
+        config.session_affinity_enabled = false;
+        let creds = (0..2)
+            .map(|i| KiroCredentials {
+                access_token: Some(format!("t{i}")),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                ..KiroCredentials::default()
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+        let ctx = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(ctx.affinity, AffinityOutcome::None);
+        assert_eq!(manager.session_affinity.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_acquire_records_per_cred_rpm_once_per_request() {
+        let manager = affinity_manager(2, 5);
+        let recent = |id: u64| {
+            let entries = manager.entries.lock();
+            entries.iter().find(|e| e.id == id).unwrap().recent_requests.len()
+        };
+        let first = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(recent(first.id), 1, "首绑选号时即占用 per-cred RPM 名额");
+        // 同一外部请求内同号重试（已在 rpm_recorded 中）不重复记账
+        let recorded: HashSet<u64> = [first.id].into_iter().collect();
+        let retry = manager
+            .acquire_context_for_session(None, None, None, &HashSet::new(), Some("s1"), &recorded)
+            .await
+            .unwrap();
+        assert_eq!(retry.id, first.id);
+        assert_eq!(recent(first.id), 1);
+    }
+
+    #[tokio::test]
+    async fn session_bind_skips_credential_without_rpm_quota() {
+        // 2 号 rpm 已满：首绑不能落在它上面，也不能写出指向它的绑定
+        let manager = affinity_manager(2, 1);
+        assert!(manager.try_record_request(1));
+        let ctx = acquire_for(&manager, Some("s1")).await;
+        assert_eq!(ctx.id, 2);
+        assert_eq!(manager.session_affinity.lookup("s1", Instant::now()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn session_affinity_first_bind_prefers_least_bound_credential() {
+        let manager = affinity_manager(2, 0);
+        let first = acquire_for(&manager, Some("s1")).await;
+        let other = if first.id == 1 { 2 } else { 1 };
+        // 另一个号成功次数更多：纯 least-used 会再选 first，按负载应选 other
+        for _ in 0..5 {
+            manager.report_success(other);
+        }
+        let second = acquire_for(&manager, Some("s2")).await;
+        assert_eq!(second.id, other, "同层应优先选活跃绑定会话更少的号");
+        assert_eq!(second.affinity, AffinityOutcome::Bind);
+        // 无 session 请求不看负载，仍按 least-used
+        let plain = acquire_for(&manager, None).await;
+        assert_eq!(plain.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_load_does_not_cross_priority_layers() {
+        let creds = [0u32, 1]
+            .into_iter()
+            .map(|p| KiroCredentials {
+                access_token: Some(format!("t{p}")),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                priority: p,
+                ..KiroCredentials::default()
+            })
+            .collect();
+        let manager = MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+        let a = acquire_for(&manager, Some("s1")).await;
+        let b = acquire_for(&manager, Some("s2")).await;
+        assert_eq!(a.id, b.id, "负载只在同优先级层内生效，不降级到低优先级层");
+    }
+
     #[test]
     fn rpm_disabled_never_exceeds() {
         let mgr = rpm_test_manager(false, 1);
@@ -6748,7 +7121,7 @@ mod tests {
         manager.report_success(1);
 
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, None, &HashSet::new(), false)
+            .acquire_context_impl(None, None, None, &HashSet::new(), false, None, None)
             .await
             .unwrap();
 
