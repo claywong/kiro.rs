@@ -214,6 +214,10 @@ pub(crate) struct RequestTracer {
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
     /// Token 管理器句柄，用于结束时上报 TTFT EWMA（可选）
     token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
+    /// 会话亲和键（metadata.user_id 里的 session_id；无 session 为 None）
+    session_key: Option<String>,
+    /// 最后一跳的会话亲和结果（provider 经 TraceSink::on_affinity 上报）
+    affinity: parking_lot::Mutex<Option<&'static str>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -239,6 +243,18 @@ struct RequestTraceOptions {
     is_stream: bool,
     /// 本次请求最终下发的推理思考级别（None 表示未请求 effort）
     effort: Option<String>,
+    /// 会话亲和键，见 [`session_affinity_key`]
+    session_key: Option<String>,
+}
+
+/// 会话亲和键：`metadata.user_id` 里的 session_id，与发往上游的 conversationId 同源。
+/// 取不到 session 时返回 None（不做亲和）。
+fn session_affinity_key(payload: &MessagesRequest) -> Option<String> {
+    payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(super::converter::extract_session_id)
 }
 
 impl RequestTracer {
@@ -259,7 +275,14 @@ impl RequestTracer {
             thinking_chars: std::sync::atomic::AtomicU64::new(0),
             attempts: parking_lot::Mutex::new(Vec::new()),
             token_manager: state.kiro_provider.as_ref().map(|p| p.token_manager().clone()),
+            session_key: options.session_key,
+            affinity: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// 会话亲和键（传给 provider 选号）
+    pub fn session_key(&self) -> Option<&str> {
+        self.session_key.as_deref()
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -382,6 +405,7 @@ impl RequestTracer {
             thinking_ms,
             thinking_chars,
             effort: self.effort.clone(),
+            affinity: self.affinity.lock().map(str::to_string),
             attempts,
         };
         store.insert(&rec);
@@ -409,6 +433,10 @@ impl TraceSink for RequestTracer {
         // before persisting to the (trace_id, attempt) primary key.
         attempt.attempt = attempts.len() as u32;
         attempts.push(attempt);
+    }
+
+    fn on_affinity(&self, affinity: &'static str) {
+        *self.affinity.lock() = Some(affinity);
     }
 }
 
@@ -843,6 +871,7 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: payload.stream,
                 effort: None,
+                session_key: session_affinity_key(&payload),
             },
         )));
         let resp = websearch::handle_websearch_request(
@@ -862,6 +891,9 @@ pub async fn post_messages(
         return resp;
     }
 
+    // 以下都会进入上游对话，按请求统计一次 conversationId 来源
+    super::conversation_id_stats::record(&payload);
+
     let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
@@ -878,6 +910,7 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: payload_stream,
                 effort: None,
+                session_key: session_affinity_key(&payload),
             },
         ));
         return super::websearch_loop::run_web_search_loop(
@@ -984,6 +1017,7 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: true,
                 effort: effort.clone(),
+                session_key: session_affinity_key(&payload),
             },
         ));
         handle_stream_request(
@@ -1013,6 +1047,7 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: false,
                 effort: effort.clone(),
+                session_key: session_affinity_key(&payload),
             },
         ));
         handle_non_stream_request(
@@ -1053,6 +1088,7 @@ async fn handle_stream_request(
             Some(input_tokens.max(0) as u64),
             Some(tracer.as_ref()),
             group.as_deref(),
+            tracer.session_key(),
         )
         .await
     {
@@ -1407,6 +1443,7 @@ async fn handle_non_stream_request(
             Some(input_tokens.max(0) as u64),
             Some(tracer.as_ref()),
             group.as_deref(),
+            tracer.session_key(),
         )
         .await
     {
@@ -1993,6 +2030,7 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: payload.stream,
                 effort: None,
+                session_key: session_affinity_key(&payload),
             },
         )));
         let resp = websearch::handle_websearch_request(
@@ -2011,6 +2049,9 @@ pub async fn post_messages_cc(
         return resp;
     }
 
+    // 以下都会进入上游对话，按请求统计一次 conversationId 来源
+    super::conversation_id_stats::record(&payload);
+
     let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
@@ -2025,6 +2066,7 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: payload_stream,
                 effort: None,
+                session_key: session_affinity_key(&payload),
             },
         ));
         return super::websearch_loop::run_web_search_loop(
@@ -2130,6 +2172,7 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: true,
                 effort: effort.clone(),
+                session_key: session_affinity_key(&payload),
             },
         ));
         handle_stream_request_buffered(
@@ -2156,6 +2199,7 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: false,
                 effort: effort.clone(),
+                session_key: session_affinity_key(&payload),
             },
         ));
         handle_non_stream_request(
@@ -2199,6 +2243,7 @@ async fn handle_stream_request_buffered(
             Some(fallback_input_tokens.max(0) as u64),
             Some(tracer.as_ref()),
             group.as_deref(),
+            tracer.session_key(),
         )
         .await
     {
@@ -2429,6 +2474,7 @@ mod tests {
                 model: "test-model".to_string(),
                 is_stream: true,
                 effort: None,
+                session_key: None,
             },
         ));
         let mut ctx = StreamContext::new_with_thinking(
@@ -2474,6 +2520,8 @@ mod tests {
             thinking_chars: std::sync::atomic::AtomicU64::new(0),
             token_manager: None,
             attempts: parking_lot::Mutex::new(Vec::new()),
+            session_key: None,
+            affinity: parking_lot::Mutex::new(None),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2547,6 +2595,8 @@ mod tests {
             thinking_chars: std::sync::atomic::AtomicU64::new(0),
             token_manager: None,
             attempts: parking_lot::Mutex::new(Vec::new()),
+            session_key: None,
+            affinity: parking_lot::Mutex::new(None),
         };
 
         tracer.mark_first_token();
@@ -2582,6 +2632,8 @@ mod tests {
             thinking_chars: std::sync::atomic::AtomicU64::new(0),
             token_manager: None,
             attempts: parking_lot::Mutex::new(Vec::new()),
+            session_key: None,
+            affinity: parking_lot::Mutex::new(None),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2637,6 +2689,8 @@ mod tests {
             thinking_chars: std::sync::atomic::AtomicU64::new(0),
             attempts: parking_lot::Mutex::new(Vec::new()),
             token_manager: None,
+            session_key: None,
+            affinity: parking_lot::Mutex::new(None),
         });
         let mut hook = UsageRecordHook {
             recorder: None,

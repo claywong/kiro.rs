@@ -323,6 +323,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -627,7 +628,7 @@ impl std::error::Error for ConversionError {}
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
 /// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
         if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {

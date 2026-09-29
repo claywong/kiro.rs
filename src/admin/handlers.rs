@@ -1693,6 +1693,7 @@ pub async fn list_traces(
                 "thinkingMs": r.thinking_ms,
                 "thinkingChars": r.thinking_chars,
                 "effort": r.effort,
+                "affinity": r.affinity,
                 "attempts": attempts,
             })
         })

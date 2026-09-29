@@ -1129,6 +1129,35 @@ pub struct Config {
     #[serde(default = "default_rate_limit_same_credential_retry_delay_ms")]
     pub rate_limit_same_credential_retry_delay_ms: u64,
 
+    /// 会话亲和开关（默认 true）。
+    ///
+    /// 按 `metadata.user_id` 里的 session_id 把会话绑定到首次选中的凭据，后续请求
+    /// 忽略 RPM 限制直接复用该凭据（其它可用性检查照常），以提高上游 prompt cache 命中。
+    #[serde(default = "default_true")]
+    pub session_affinity_enabled: bool,
+
+    /// 会话绑定的滑动 TTL（秒，默认 3600）。每次命中刷新。
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+
+    /// 会话绑定表最大条目数（默认 100000），超出时淘汰最久未用的会话。
+    #[serde(default = "default_session_affinity_max_entries")]
+    pub session_affinity_max_entries: usize,
+
+    /// 首次绑定 / 改绑按负载选号时统计「活跃绑定」的窗口（秒，默认 300）。
+    /// 同优先级层内优先选近该窗口内有请求的绑定会话最少的凭据。
+    #[serde(default = "default_session_affinity_load_window_secs")]
+    pub session_affinity_load_window_secs: u64,
+
+    /// 亲和凭据遇到用户级 429 时，在原号上额外重试的次数（默认 2，即共 3 次），
+    /// 仍失败才换号并改绑。
+    #[serde(default = "default_session_affinity_429_retries")]
+    pub session_affinity_429_retries: u32,
+
+    /// 亲和凭据 429 原号重试的间隔（毫秒，默认 1000）。
+    #[serde(default = "default_session_affinity_429_retry_delay_ms")]
+    pub session_affinity_429_retry_delay_ms: u64,
+
     /// 速刷号（`long_speed` / `short_speed`）是否不接 haiku 系列模型（默认 false）。
     ///
     /// 开启后，模型名含 `haiku` 的请求在调度阶段完全看不到速刷号——与 opus 需付费
@@ -1389,6 +1418,26 @@ fn default_rate_limit_same_credential_retry_delay_ms() -> u64 {
     200
 }
 
+fn default_session_affinity_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_session_affinity_load_window_secs() -> u64 {
+    300
+}
+
+fn default_session_affinity_max_entries() -> usize {
+    100_000
+}
+
+fn default_session_affinity_429_retries() -> u32 {
+    2
+}
+
+fn default_session_affinity_429_retry_delay_ms() -> u64 {
+    1000
+}
+
 fn default_speed_credentials_min_tokens() -> u64 {
     150_000
 }
@@ -1486,6 +1535,12 @@ impl Default for Config {
             rate_limit_same_credential_retries: std::collections::BTreeMap::new(),
             rate_limit_same_credential_retry_delay_ms:
                 default_rate_limit_same_credential_retry_delay_ms(),
+            session_affinity_enabled: true,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
+            session_affinity_max_entries: default_session_affinity_max_entries(),
+            session_affinity_load_window_secs: default_session_affinity_load_window_secs(),
+            session_affinity_429_retries: default_session_affinity_429_retries(),
+            session_affinity_429_retry_delay_ms: default_session_affinity_429_retry_delay_ms(),
             speed_credentials_exclude_haiku: false,
             speed_credentials_exclude_sonnet: false,
             speed_credentials_min_tokens_enabled: false,

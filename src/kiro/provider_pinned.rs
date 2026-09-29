@@ -39,6 +39,7 @@ impl KiroProvider {
             id: credential_id,
             credentials,
             token,
+            affinity: crate::kiro::token_manager::AffinityOutcome::None,
         };
         // Enterprise / IdC 账号需要真实 profileArn，与账号池路径保持一致
         self.ensure_profile_arn(&mut ctx).await?;

@@ -184,6 +184,30 @@ function effortVariant(
   }
 }
 
+const AFFINITY_META: Record<
+  string,
+  { label: string; variant: 'default' | 'secondary' | 'outline' | 'success' | 'warning'; hint: string }
+> = {
+  hit: { label: '亲和', variant: 'success', hint: '会话亲和命中：复用已绑定的凭据（上游缓存大概率命中）' },
+  bind: { label: '首绑', variant: 'outline', hint: '新会话首次绑定到该凭据（上游缓存冷启动）' },
+  rebind: { label: '改绑', variant: 'warning', hint: '原绑定凭据不可用或 429 重试耗尽，改绑到该凭据（缓存丢失）' },
+  none: { label: '无会话', variant: 'secondary', hint: '请求没有 session_id，未参与会话亲和' },
+}
+
+function AffinityBadge({ affinity, compact }: { affinity?: string | null; compact?: boolean }) {
+  if (!affinity) return null
+  const meta = AFFINITY_META[affinity] ?? { label: affinity, variant: 'secondary' as const, hint: affinity }
+  return (
+    <Badge
+      variant={meta.variant}
+      title={meta.hint}
+      className={compact ? 'shrink-0 px-1.5 py-0 text-[10px]' : undefined}
+    >
+      {meta.label}
+    </Badge>
+  )
+}
+
 function ThinkingCell({ rec }: { rec: TraceRecord }) {
   const ms = rec.thinkingMs
   const chars = rec.thinkingChars ?? 0
@@ -614,8 +638,9 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         id: 'credential',
         header: '最终凭据',
         cell: (r) => (
-          <span className="inline-block max-w-[190px] truncate">
-            {credLabel(r.finalCredentialId, r.finalEmail)}
+          <span className="inline-flex max-w-[240px] items-center gap-1.5">
+            <span className="truncate">{credLabel(r.finalCredentialId, r.finalEmail)}</span>
+            <AffinityBadge affinity={r.affinity} compact />
           </span>
         ),
       },
@@ -946,6 +971,11 @@ function TraceDetailDrawer({
             <DrawerField label="最终凭据" mono>
               {credLabel(rec.finalCredentialId, rec.finalEmail)}
             </DrawerField>
+            {rec.affinity && (
+              <DrawerField label="会话亲和">
+                <AffinityBadge affinity={rec.affinity} />
+              </DrawerField>
+            )}
             <DrawerField label="入口 Key" mono>
               {keyLabel(rec.keyId, rec.keyName)}
             </DrawerField>

@@ -643,6 +643,8 @@ export interface TraceRecord {
   thinkingChars?: number
   /** 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值） */
   effort?: string | null
+  /** 会话亲和选号结果（hit / bind / rebind / none；上线前的老记录为 null） */
+  affinity?: string | null
   attempts: TraceAttempt[]
 }
 

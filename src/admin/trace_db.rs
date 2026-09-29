@@ -152,6 +152,9 @@ pub struct TraceRecord {
     /// 推理思考级别（low / medium / high / max / xhigh，仅 effort 请求时有值）
     #[serde(default)]
     pub effort: Option<String>,
+    /// 会话亲和结果（none / bind / hit / rebind，取最后一跳；老行为 None）
+    #[serde(default)]
+    pub affinity: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -191,6 +194,8 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+    /// 上报本跳选号的会话亲和结果（none / bind / hit / rebind）。默认忽略。
+    fn on_affinity(&self, _affinity: &'static str) {}
 }
 
 /// 查询过滤条件
@@ -289,7 +294,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 11] = [
+        let columns: [(&str, &str); 12] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -303,6 +308,8 @@ impl TraceStore {
             ("first_answer_ms", "INTEGER"),
             ("thinking_ms", "INTEGER"),
             ("thinking_chars", "INTEGER NOT NULL DEFAULT 0"),
+            // 会话亲和结果（none / bind / hit / rebind），老行为 NULL
+            ("affinity", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -367,9 +374,10 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, effort, first_answer_ms, thinking_ms, thinking_chars) \
+                 credits, first_token_ms, effort, first_answer_ms, thinking_ms, thinking_chars, \
+                 affinity) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24)",
+                 ?21,?22,?23,?24,?25)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -395,6 +403,7 @@ impl TraceStore {
                     rec.first_answer_ms.map(|v| v as i64),
                     rec.thinking_ms.map(|v| v as i64),
                     rec.thinking_chars as i64,
+                    rec.affinity,
                 ],
             )?;
             for a in &rec.attempts {
@@ -549,7 +558,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, effort, \
-             first_answer_ms, thinking_ms, thinking_chars \
+             first_answer_ms, thinking_ms, thinking_chars, affinity \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -580,6 +589,7 @@ impl TraceStore {
                 first_answer_ms: row.get::<_, Option<i64>>(20)?.map(|v| v as u64),
                 thinking_ms: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
                 thinking_chars: row.get::<_, i64>(22)? as u64,
+                affinity: row.get::<_, Option<String>>(23)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -858,7 +868,8 @@ CREATE TABLE IF NOT EXISTS traces (
     effort            TEXT,
     first_answer_ms   INTEGER,
     thinking_ms       INTEGER,
-    thinking_chars    INTEGER NOT NULL DEFAULT 0
+    thinking_chars    INTEGER NOT NULL DEFAULT 0,
+    affinity          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -922,6 +933,7 @@ mod tests {
             first_answer_ms: None,
             thinking_ms: None,
             thinking_chars: 0,
+            affinity: Some("hit".to_string()),
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1030,6 +1042,7 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+        assert_eq!(out[0].affinity.as_deref(), Some("hit"));
     }
 
     #[test]

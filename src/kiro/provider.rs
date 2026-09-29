@@ -17,7 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{AffinityOutcome, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -312,14 +312,16 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// `sink` 可选，用于逐跳上报链路追踪。
+    /// `session_key` 为会话亲和键（metadata.user_id 里的 session_id），None 不做亲和。
     pub async fn call_api(
         &self,
         request_body: &str,
         input_tokens: Option<u64>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, input_tokens, false, sink, group)
+        self.call_api_with_retry(request_body, input_tokens, false, sink, group, session_key)
             .await
     }
 
@@ -330,8 +332,9 @@ impl KiroProvider {
         input_tokens: Option<u64>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, input_tokens, true, sink, group)
+        self.call_api_with_retry(request_body, input_tokens, true, sink, group, session_key)
             .await
     }
 
@@ -788,6 +791,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -798,6 +802,8 @@ impl KiroProvider {
         let mut request_excluded_credentials: HashSet<u64> = HashSet::new();
         // 用户级 429 时已在各凭据上「原号重试」的次数（本次请求内计数，不跨请求累积）
         let mut same_credential_429: HashMap<u64, u32> = HashMap::new();
+        // 会话亲和凭据遇到用户级 429 时已在原号上重试的次数（本次请求内计数）
+        let mut affinity_429: HashMap<u64, u32> = HashMap::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -817,11 +823,13 @@ impl KiroProvider {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager
-                .acquire_context_excluding(
+                .acquire_context_for_session(
                     model.as_deref(),
                     input_tokens,
                     group,
                     &request_excluded_credentials,
+                    session_key,
+                    &rpm_recorded,
                 )
                 .await
             {
@@ -846,12 +854,13 @@ impl KiroProvider {
                 }
             };
 
-            if !rpm_recorded.contains(&ctx.id) {
-                if !self.token_manager.try_record_request(ctx.id) {
-                    continue;
-                }
-                rpm_recorded.insert(ctx.id);
+            if let Some(sink) = sink {
+                sink.on_affinity(ctx.affinity.as_str());
             }
+
+            // per-cred RPM 已在选号时记账（亲和命中强制记、首绑 / 改绑先抢名额），
+            // 这里只登记，让同号重试不重复记。
+            rpm_recorded.insert(ctx.id);
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
@@ -1130,6 +1139,38 @@ impl KiroProvider {
             // 用户级请求速率限制只在本次调用中临时跳过当前凭据。
             // 不禁用、不冷却，也不改变全局 current_id；下一次新请求仍按原调度选择。
             if status.as_u16() == 429 && endpoint.is_user_request_rate_exceeded(&body) {
+                // 会话亲和命中的凭据：先在原号上重试 N 次（默认 2，共 3 次），保住上游缓存；
+                // 仍失败才走下面的换号逻辑（换号后亲和表自动改绑到新凭据）。
+                // 与速刷号原号重试一样不占换号预算。
+                if ctx.affinity == AffinityOutcome::Hit {
+                    let budget = config.session_affinity_429_retries;
+                    let used = affinity_429.get(&ctx.id).copied().unwrap_or(0);
+                    if used < budget && retry_ceiling < retry_ceiling_cap {
+                        affinity_429.insert(ctx.id, used + 1);
+                        retry_ceiling += 1;
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(429),
+                            outcome::TRANSIENT, Some(&body), attempt_start,
+                        );
+                        tracing::warn!(
+                            "API 请求失败（用户级限流，亲和凭据 #{} 原号重试 {}/{}）: {}",
+                            ctx.id,
+                            used + 1,
+                            budget,
+                            body
+                        );
+                        last_error = Some(
+                            rate_limit_error
+                                .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                                .into(),
+                        );
+                        sleep(Duration::from_millis(config.session_affinity_429_retry_delay_ms))
+                            .await;
+                        // 不加入排除集：亲和表仍指向该号，下一轮选号会再次命中
+                        continue;
+                    }
+                }
+
                 // 速刷号等配额恢复快的类型可先在原号上重试若干次再换号（按 metadata.type
                 // 查配置表）。重试不占换号预算：命中时把 retry_ceiling +1 抵消本轮扣费。
                 let budget = self
