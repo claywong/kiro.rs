@@ -143,19 +143,17 @@ function formatTokenFull(n: number): string {
 
 /**
  * 输出速率 OTPS（output tokens / second）。
- * - 流式：分母取「耗时 - 首个产出帧延迟」（即真正产出内容的时间）。
- *   优先用 firstAnswerMs：思考发生在它之前，若用 firstTokenMs 作分母起点，
- *   整段思考会被算进「产出内容的时间」，带思考的请求 OTPS 被系统性低估。
- *   「产出」含正文与工具调用两种，所以思考后直接发工具调用的请求同样命中。
- *   老记录没有 firstAnswerMs，回退到 firstTokenMs 维持原行为。
+ * - 流式：分母取「耗时 - 首个上游 chunk 延迟」（firstTokenMs）。
+ *   不能用 firstAnswerMs 作起点：分子 outputTokens 是上游计费口径，已包含思考 token，
+ *   若分母扣掉思考时间，整段思考 token 会被压进最后几十毫秒的正文窗口，
+ *   长思考 + 短工具调用的请求会算出上万 t/s 的离谱值。分子分母必须同口径。
  * - 非流式：无首 Token 概念，分母取整段耗时
  * 分母 <= 0 或无输出时返回 null（不展示）。
  */
 function computeOtps(rec: TraceRecord): number | null {
   const output = rec.outputTokens ?? 0
   if (output <= 0) return null
-  const start = rec.firstAnswerMs ?? rec.firstTokenMs
-  const ttft = rec.isStream && start != null ? start : 0
+  const ttft = rec.isStream && rec.firstTokenMs != null ? rec.firstTokenMs : 0
   const genMs = rec.durationMs - ttft
   if (genMs <= 0) return null
   return (output / genMs) * 1000
