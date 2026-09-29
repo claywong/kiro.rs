@@ -13,3 +13,5 @@ pub mod token_manager;
 pub mod provider_pinned;
 #[cfg(test)]
 mod provider_affinity_tests;
+#[cfg(test)]
+mod provider_network_error_tests;

@@ -221,6 +221,15 @@
   `update_current` 是上游给 Admin 只读查询用的，`excluded_ids`/`salvage` 是本地换号重试用的。
   写回 `current_id` 的条件是 `update_current && excluded_ids.is_empty()`。
 
+### 本地偏离：网络错误不禁用凭据（provider.rs 发送失败分支）
+
+上游在「凭据有专属代理 + 请求发送失败」时调用 `report_failure_for_request`，连续 3 次即
+`TooManyFailures` 禁用。本地改为：API 路径只把该凭据加入本次请求的
+`request_excluded_credentials`（有可切换目标时才加），MCP 路径仅打日志；两者都**不计
+failure_count**。原因：`error sending request` 多为代理/网络抖动，不代表凭据坏了。
+合并时若上游改动这两个分支，保住「不调 report_failure」这一点；
+测试 `provider_network_error_tests.rs` 覆盖。
+
 ### 2026-07-29 合并上游 v0.7.4（403 自愈节流 + IDC relogin 凭据替换）
 
 上游 `b7077b5`。7 处冲突，其中 5 处是「双方各自新增」（结构体字段、独立函数），全保留；

@@ -568,15 +568,15 @@ impl KiroProvider {
                         attempt_start,
                     );
                     // 凭据专属代理故障时，跳过该凭据换下一个。
+                    // 本地偏离上游：网络错误不计入 failure_count，不会因此禁用凭据
+                    // （MCP 路径无请求级排除集，靠调度自然轮换，见 MERGE_NOTES.md）。
                     let has_own_proxy = ctx
                         .credentials
                         .proxy_url
                         .as_deref()
                         .is_some_and(|u| !u.trim().is_empty());
                     if has_own_proxy {
-                        tracing::warn!("凭据 #{} 有专属代理且 MCP 请求失败，跳过该凭据", ctx.id);
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, None, group);
+                        tracing::warn!("凭据 #{} 有专属代理且 MCP 请求失败（不计失败）", ctx.id);
                     }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
@@ -961,16 +961,27 @@ impl KiroProvider {
                     // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
                     // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
                     // 例外：首字节守卫超时不代表凭据/代理坏了（可能只是上游慢），
-                    // 不计入失败计数，直接快速重试，避免误伤凭据触发 TooManyFailures。
+                    // 直接快速重试。
+                    // 本地偏离上游：网络错误（error sending request 等）只在本次请求内
+                    // 排除该凭据，不计入 failure_count，避免代理抖动累计 3 次把凭据
+                    // 禁用成 TooManyFailures（见 MERGE_NOTES.md）。
                     let has_own_proxy = ctx.credentials.proxy_url.as_deref()
                         .map_or(false, |u| !u.trim().is_empty());
                     if has_own_proxy && !header_timeout {
                         tracing::warn!(
-                            "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
+                            "凭据 #{} 有专属代理且网络请求失败，本次请求跳过该凭据（不计失败）",
                             ctx.id
                         );
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
+                        // 无号可切时不排除，留在原号重试，保住真实的网络错误信息
+                        if self.token_manager.has_failover_target_for_request(
+                            model.as_deref(),
+                            input_tokens,
+                            group,
+                            &request_excluded_credentials,
+                            ctx.id,
+                        ) {
+                            request_excluded_credentials.insert(ctx.id);
+                        }
                     }
 
                     last_error = Some(e.into());
