@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 
-/// 一次推送的目标配置。健康联动与流量入口使用同一协议，只是目标站点与账号不同。
+/// 一次推送的目标配置（流量入口使用）。
 pub(crate) struct SchedulableTarget<'a> {
     pub label: &'static str,
     pub base_url: &'a str,

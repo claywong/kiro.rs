@@ -607,42 +607,6 @@ export async function setSelfHealConfig(
   return data
 }
 
-/** 健康联动总开关状态 */
-export interface HealthGateState {
-  /** 是否已配置（baseUrl / token / accountIds 填全）。false 时开关不可用 */
-  configured: boolean
-  /** 总开关当前状态 */
-  enabled: boolean
-  /** 外部系统基址，如 `https://4code.us` */
-  baseUrl: string
-  /** 联动的外部账号数 */
-  accountCount: number
-  /** 最近一轮判定：`稳定` / `不稳定`。null = 还没判过 */
-  verdict: string | null
-  /**
-   * 已推给对方的 `schedulable`。null = 本进程还没推过。
-   *
-   * 关掉总开关时后端会异步推送 `false`；推送完成前这里仍是最近一次成功值。
-   */
-  appliedSchedulable: boolean | null
-}
-
-// 读健康联动总开关状态
-export async function getHealthGateState(): Promise<HealthGateState> {
-  const { data } = await api.get<HealthGateState>('/config/health-gate')
-  return data
-}
-
-// 切健康联动总开关
-export async function setHealthGateEnabled(
-  enabled: boolean,
-): Promise<HealthGateState> {
-  const { data } = await api.put<HealthGateState>('/config/health-gate', {
-    enabled,
-  })
-  return data
-}
-
 /** 独立流量入口开关状态。外部系统 token 不会返回前端。 */
 export interface TrafficIngressState {
   /** baseUrl / token / accountIds 是否已经填全 */
@@ -671,54 +635,6 @@ export async function setTrafficIngressEnabled(
   const { data } = await api.put<TrafficIngressState>('/config/traffic-ingress', {
     enabled,
   })
-  return data
-}
-
-/** 并发联动状态：本地有效凭证 RPM 总量按除数换算成外部账号并发上限。 */
-export interface ConcurrencyGateState {
-  /** baseUrl / token / accountIds 是否已经填全 */
-  configured: boolean
-  /** 联动是否启用 */
-  enabled: boolean
-  /** 外部系统基址，如 `https://4code.us` */
-  baseUrl: string
-  /** 受控外部账号数 */
-  accountCount: number
-  /** 当前换算除数 */
-  divisor: number
-  /** 手动并发值；null = 走自动换算 */
-  manualConcurrency: number | null
-  /** 有效凭证 rpmLimit 总量（不限速项已按 unlimitedRpm 折算） */
-  rpmTotal: number
-  /** 上述总量里按不限速折算的凭证数；> 0 说明总量掺了估值 */
-  unlimitedCredentials: number
-  /** 当前该推的并发值（含夹取），用于预览 */
-  resolvedConcurrency: number
-  /** 最近一次成功推送的并发值；null = 尚未成功同步 */
-  appliedConcurrency: number | null
-  minConcurrency: number
-  maxConcurrency: number
-}
-
-export async function getConcurrencyGateState(): Promise<ConcurrencyGateState> {
-  const { data } = await api.get<ConcurrencyGateState>('/config/concurrency-gate')
-  return data
-}
-
-/**
- * 更新并发联动。三个字段各自独立，只传要改的。
- *
- * `manualConcurrency` 传 `null` 表示清除手动值回到自动换算；不传该键则保持原值。
- */
-export async function setConcurrencyGateConfig(payload: {
-  enabled?: boolean
-  divisor?: number
-  manualConcurrency?: number | null
-}): Promise<ConcurrencyGateState> {
-  const { data } = await api.put<ConcurrencyGateState>(
-    '/config/concurrency-gate',
-    payload,
-  )
   return data
 }
 

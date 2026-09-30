@@ -386,7 +386,7 @@ Admin API 鉴权同样支持：
 
 ### 流量管理
 
-三个可选联动特性，均在顶层配置块（与 `host` / `port` 同级）。未配置时不启动对应后台任务。
+可选的流量入口特性，配置在顶层（与 `host` / `port` 同级）。未配置时不启动对应后台任务。
 
 #### 流量入口（`trafficIngress`）
 
@@ -420,53 +420,7 @@ Admin API 鉴权同样支持：
 | `retryIntervalSecs` | `30` | 推送失败后的重试间隔（秒） |
 | `maxAttempts` | `3` | 单个账号一次推送最多尝试次数 |
 
-读数来源：`token_manager.available_rpm_total()` —— 可用凭据 `rpmLimit` 之和（与并发联动同一口径）。这是**容量**指标而非实际流量，选它是关键：实际流量会随入口开关变化（入口一关流量被分走、读数更低），拿它当判据会永远开不回来；容量不从请求派生，关掉入口不会让读数变好也不会变坏，双向切换才成立。
-
-#### 健康联动（`healthGate`）
-
-周期性判断本地健康度并**反向**推给外部账号：本地稳→推 `schedulable=false`（兜底池不接量），本地不稳→推 `schedulable=true`（放兜底池顶上）。判定是三路取「或」：可用凭据比例、主动探测、近 1 分钟报错数。详见 `src/admin/health_gate.rs` 模块文档。
-
-```json
-{
-  "healthGate": {
-    "enabled": false,
-    "baseUrl": "https://4code.us",
-    "token": "外部系统 Admin Token",
-    "authHeader": "X-API-Key",
-    "accountIds": [10, 11],
-    "errorThreshold": 10,
-    "checkIntervalSecs": 30,
-    "confirmations": 2,
-    "reaffirmIntervalSecs": 300,
-    "maxAttempts": 3
-  }
-}
-```
-
-#### 并发联动（`concurrencyGate`）
-
-把本地有效凭据 RPM 总量按固定除数换算成外部账号的并发上限：`concurrency = rpmTotal / divisor`，再夹到 `[min, max]`。与前两者独立：这里推的是 `concurrency`（能接多少）而非 `schedulable`（要不要接）。
-
-```json
-{
-  "concurrencyGate": {
-    "enabled": false,
-    "baseUrl": "https://4code.us",
-    "token": "外部系统 Admin Token",
-    "authHeader": "X-API-Key",
-    "accountIds": [10, 11],
-    "divisor": 6,
-    "minConcurrency": 10,
-    "maxConcurrency": 200,
-    "unlimitedRpm": 300,
-    "checkIntervalSecs": 60,
-    "reaffirmIntervalSecs": 300,
-    "maxAttempts": 3
-  }
-}
-```
-
-`divisor` 与 `manualConcurrency` 可由 Admin API 运行时修改，配置文件值仅作初始值。`manualConcurrency` 非空时跳过 RPM 换算直接用手动值，受上下限约束。
+读数来源：`token_manager.available_rpm_total()` —— 可用凭据 `rpmLimit` 之和。这是**容量**指标而非实际流量，选它是关键：实际流量会随入口开关变化（入口一关流量被分走、读数更低），拿它当判据会永远开不回来；容量不从请求派生，关掉入口不会让读数变好也不会变坏，双向切换才成立。
 
 <a id="credentials"></a>
 ## 🔐 凭据

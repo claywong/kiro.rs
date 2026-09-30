@@ -298,46 +298,6 @@ async fn main() {
         )
     });
 
-    // 健康探测器：周期发真实推理请求，判断本地链路还能不能出货。
-    // 只在 healthGate 整体可用且显式开了 probeEnabled 时才起——它是要花钱的。
-    // 必须先于看门狗构建，因为看门狗要读它的状态。
-    let health_probe_state = if config.health_gate.is_usable() && config.health_gate.probe_enabled {
-        Some(admin::health_probe::spawn(
-            admin::health_probe::ProbeOptions {
-                interval_secs: config.health_gate.probe_interval_secs,
-                model_id: config.health_gate.probe_model.clone(),
-            },
-            kiro_provider.clone(),
-            admin_trace_store.clone(),
-        ))
-    } else {
-        None
-    };
-
-    // 健康联动看门狗：把本地健康度反向推成外部系统的账号调度开关
-    // （本地稳 → 关掉外部调度；本地不稳 → 打开）。配置不完整时内部直接跳过。
-    //
-    // 判据三路合一：凭据池存量 + 主动探测 + 报错数。前两路不依赖流量，
-    // 这很关键——只用报错绝对条数会震荡：兜底一开、流量被分走，报错数必然掉到
-    // 阈值下，于是判为健康又关掉兜底，流量涌回来再全报错，如此往复。
-    //
-    // 用独立 Client：对方是普通 JSON 接口，不需要流式那套读超时。
-    // 返回的状态句柄交给 AdminService，面板据此读写总开关。
-    let health_gate_state =
-        match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
-            Ok(client) => admin::health_gate::spawn(
-                config.health_gate.clone(),
-                admin_trace_store.clone(),
-                client,
-                token_manager.clone(),
-                health_probe_state.clone(),
-            ),
-            Err(e) => {
-                tracing::warn!("健康联动：HTTP 客户端构建失败，联动不启动: {}", e);
-                None
-            }
-        };
-
     // 手动流量入口：独立控制 g7e6ai.com 指定账号是否参与调度。
     // 强制直连：对方按本机公网出口做 IP 白名单，复用全局代理会被 403 拒绝。
     let traffic_ingress_state =
@@ -353,22 +313,6 @@ async fn main() {
             }
         };
 
-    // 并发联动：把本地有效凭证的 RPM 总量换算成 4code.us 指定账号的并发上限。
-    // 客户端沿用健康联动那套（同一站点，走 proxy_config_for_vendor），不用流量入口的
-    // 强制直连——那是 g7e6ai.com 的 IP 白名单要求，与本目标无关。
-    let concurrency_gate_state =
-        match http_client::build_client(proxy_config_for_vendor.as_ref(), 15, config.tls_backend) {
-            Ok(client) => admin::concurrency_gate::spawn(
-                config.concurrency_gate.clone(),
-                client,
-                token_manager.clone(),
-            ),
-            Err(error) => {
-                tracing::warn!("并发联动：HTTP 客户端构建失败，控制器不启动: {}", error);
-                None
-            }
-        };
-
     // AdminService 在此统一构建（而非仅在 Admin API 分支内）：卖家 webhook 提取 Key 后
     // 要复用它的 import_one_credential 入库，而入站 webhook 不该依赖 adminApiKey 是否配置。
     // 后台调度器仍只在 Admin API 启用时才启动，不会多跑任务。
@@ -376,9 +320,7 @@ async fn main() {
         admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
             .with_kiro_provider(kiro_provider.clone())
             .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone()))
-            .with_health_gate(health_gate_state.clone())
-            .with_traffic_ingress(traffic_ingress_state.clone())
-            .with_concurrency_gate(concurrency_gate_state.clone()),
+            .with_traffic_ingress(traffic_ingress_state.clone()),
     );
 
     // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。

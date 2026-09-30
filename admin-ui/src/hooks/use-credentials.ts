@@ -24,15 +24,11 @@ import {
   setRateLimitSameCredentialConfig,
   setSpeedCredentialsExcludeConfig,
   setSpeedCredentialsMinTokensConfig,
-  getHealthGateState,
   getTrafficIngressState,
-  getConcurrencyGateState,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
   getSelfHealConfig,
-  setHealthGateEnabled,
   setTrafficIngressEnabled,
-  setConcurrencyGateConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
@@ -409,29 +405,6 @@ export function useSetSelfHealConfig() {
   })
 }
 
-/**
- * 健康联动总开关状态。30s 刷新以便观测判定与已推送值的变化
- * （看门狗默认 30s 一轮，对齐它的节奏）。
- */
-export function useHealthGateState() {
-  return useQuery({
-    queryKey: ['healthGateState'],
-    queryFn: getHealthGateState,
-    refetchInterval: 30_000,
-  })
-}
-
-// 切健康联动总开关
-export function useSetHealthGateEnabled() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: setHealthGateEnabled,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['healthGateState'] })
-    },
-  })
-}
-
 // 独立流量入口状态；轮询用于更新异步推送结果。
 export function useTrafficIngressState() {
   return useQuery({
@@ -448,27 +421,6 @@ export function useSetTrafficIngressEnabled() {
     onSuccess: (state) => {
       queryClient.setQueryData(['trafficIngressState'], state)
       queryClient.invalidateQueries({ queryKey: ['trafficIngressState'] })
-    },
-  })
-}
-
-// 并发联动状态。轮询间隔与流量入口一致：后端每 60 秒重算一次，
-// 10 秒轮询能较快看到 RPM 总量变化和异步推送结果。
-export function useConcurrencyGateState() {
-  return useQuery({
-    queryKey: ['concurrencyGateState'],
-    queryFn: getConcurrencyGateState,
-    refetchInterval: 10_000,
-  })
-}
-
-export function useSetConcurrencyGateConfig() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: setConcurrencyGateConfig,
-    onSuccess: (state) => {
-      queryClient.setQueryData(['concurrencyGateState'], state)
-      queryClient.invalidateQueries({ queryKey: ['concurrencyGateState'] })
     },
   })
 }

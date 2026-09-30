@@ -29,8 +29,8 @@ use super::{
         SetSpeedCredentialsMinTokensConfigRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetHealthGateRequest, SetSelfHealConfigRequest,
-        SetConcurrencyGateRequest, SetTrafficIngressRequest,
+        SetSelfHealConfigRequest,
+        SetTrafficIngressRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -690,24 +690,6 @@ pub async fn set_self_heal_config(
     }
 }
 
-/// GET /api/admin/config/health-gate
-/// 读健康联动总开关状态（含当前判定与已推给外部的值）
-pub async fn get_health_gate_state(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_health_gate_state())
-}
-
-/// PUT /api/admin/config/health-gate
-/// 切健康联动总开关（运行时生效 + 持久化）。关闭时把外部账号设为不可调度
-pub async fn set_health_gate_state(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetHealthGateRequest>,
-) -> impl IntoResponse {
-    match state.service.set_health_gate_enabled(payload.enabled) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
 /// GET /api/admin/config/traffic-ingress
 pub async fn get_traffic_ingress_state(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_traffic_ingress_state())
@@ -719,22 +701,6 @@ pub async fn set_traffic_ingress_state(
     Json(payload): Json<SetTrafficIngressRequest>,
 ) -> impl IntoResponse {
     match state.service.set_traffic_ingress_enabled(payload.enabled) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/concurrency-gate
-pub async fn get_concurrency_gate_state(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_concurrency_gate_state())
-}
-
-/// PUT /api/admin/config/concurrency-gate
-pub async fn set_concurrency_gate_state(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetConcurrencyGateRequest>,
-) -> impl IntoResponse {
-    match state.service.set_concurrency_gate_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

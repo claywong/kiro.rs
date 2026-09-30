@@ -8943,8 +8943,8 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
     }
 
-    /// 并发联动的分母：口径必须与 available_count 完全一致，否则面板显示的可用数
-    /// 与推给外部的并发对不上账。
+    /// 流量入口 RPM 判据的读数：口径必须与 available_count 完全一致，否则面板显示的
+    /// 可用数与判据对不上账。
     #[test]
     fn test_available_rpm_total_skips_disabled_and_folds_unlimited() {
         let mut a = grouped_cred("a", &[]);

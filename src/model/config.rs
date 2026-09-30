@@ -282,8 +282,7 @@ pub struct VendorConfig {
     ///
     /// **改成 `false` 等于让本家越过全局急停。** 总闸的价值在于它是一个能一键停掉
     /// 全部自动扣费的地方；本项关掉后，总闸对本家这条轮询链路整体失效，包括
-    /// `try_auto_purchase` 那一步的扣费。且总闸会被健康联动自动翻转，所以这相当于
-    /// 把本家的花钱从那套自动逻辑里摘出来。想停掉本家只有两条路：关本家的
+    /// `try_auto_purchase` 那一步的扣费。想停掉本家只有两条路：关本家的
     /// `auto_purchase`，或把 [`Self::stock_poll_interval_secs`] 改成 0。
     ///
     /// 绕过的范围**只有总闸、且只有轮询触发的那条路** ——
@@ -291,8 +290,8 @@ pub struct VendorConfig {
     /// [`AutoPurchaseSource`](crate::vendor::service::AutoPurchaseSource)。
     /// 池闸（`auto_purchase_pool_target`）、失效授权判定、并发锁都不绕，仍然有界。
     ///
-    /// 什么时候该关：总闸常态关闭（例如靠健康联动自动开关），但你要这一家不受
-    /// 那套联动影响、该补货就补。开着总闸时本项没有区别。
+    /// 什么时候该关：总闸常态关闭，但你要这一家不受总闸影响、该补货就补。
+    /// 开着总闸时本项没有区别。
     #[serde(default = "default_true")]
     pub stock_poll_respect_global_gate: bool,
 }
@@ -523,213 +522,17 @@ impl VendorConfig {
     }
 }
 
-/// 健康联动：把本地「近 1 分钟报错数」反向映射为外部系统的账号调度开关。
-///
-/// 语义刻意是**反的**：本地稳（报错 < 阈值）就把外部账号的调度**关掉**，本地一旦
-/// 不稳（报错 >= 阈值）再把它**打开**。外部账号在这里的角色是兜底池——平时不让它
-/// 接量（省额度 / 保它的账号健康度），只在本地扛不住时放进来接一段。
-///
-/// 判据取 `traces.db` 的 60 秒窗口报错数（同概览页「报错 · 近 1 分钟」那张卡）。
-/// trace 关闭时该计数不再更新，此时整个联动会跳过而非按残留读数误判。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HealthGateConfig {
-    /// 总开关。默认关闭 —— 这是本地运维特性，不配就完全不跑。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 外部系统基址，如 `https://4code.us`。末尾斜杠会被自动去掉。
-    #[serde(default)]
-    pub base_url: String,
-
-    /// 外部系统的 Admin Token。
-    #[serde(default)]
-    pub token: String,
-
-    /// 传 token 用的请求头名（默认 `X-API-Key`）。
-    ///
-    /// 4code.us 实测认证走 `X-API-Key`：同一个 token 用 `Authorization: Bearer` 会被
-    /// 回 401 `INVALID_TOKEN`。做成可配是为了对方换认证方式时不用改代码——填
-    /// `Authorization` 时需自行在 token 里带上 `Bearer ` 前缀。
-    #[serde(default = "default_health_gate_auth_header")]
-    pub auth_header: String,
-
-    /// 要联动开关的外部账号 ID 列表。空列表等于没启用。
-    #[serde(default)]
-    pub account_ids: Vec<u64>,
-
-    /// 不稳定判定阈值：近 1 分钟报错数 **>=** 此值即视为不稳定（默认 10）。
-    #[serde(default = "default_health_gate_error_threshold")]
-    pub error_threshold: u64,
-
-    /// 轮询间隔（秒，默认 30）。判据窗口固定 60 秒，间隔取其一半，
-    /// 保证任何一分钟的异常至少被看到一次。
-    #[serde(default = "default_health_gate_interval_secs")]
-    pub check_interval_secs: u64,
-
-    /// 连续多少次判定一致才真正切换开关（默认 2）。
-    ///
-    /// 防抖用。报错数在阈值上下抖动时，单次读数就切会导致反复推开关，既刷对方
-    /// 审计日志也让调度状态来回跳。要求连续几个周期口径一致再动。
-    #[serde(default = "default_health_gate_confirmations")]
-    pub confirmations: u32,
-
-    /// 状态没变时也按当前判定重推一次的间隔（秒，默认 300 = 5 分钟）。
-    ///
-    /// 为什么需要：本地只记「上次推成功的值」，不去读对方当前状态。若有人在对方
-    /// 后台手动改了开关，本地记录就与实际脱节，且因为状态"没变"而永远不再推，
-    /// 一直错到下次健康度翻转。定期重推让这种漂移自愈。开关接口幂等，重推同值无副作用。
-    ///
-    /// `0` 表示只在翻转时推、不做定期兜底。
-    #[serde(default = "default_health_gate_reaffirm_interval_secs")]
-    pub reaffirm_interval_secs: u64,
-
-    /// 单次推送失败后的重试次数（默认 3，含首发共 3 次尝试）。
-    ///
-    /// 只对网络错误与对方 5xx 重试。4xx（token 失效 / 账号不存在）重试无意义，
-    /// 直接放弃并留给下个周期——那类问题得改配置，不是等一等就好。
-    #[serde(default = "default_health_gate_max_attempts")]
-    pub max_attempts: u32,
-
-    // ── 以下为「不依赖流量的判据」相关配置 ────────────────────────────────
-    // 报错绝对条数在闭环里会失效（兜底一开、流量被分走，分子塌了，「没量」和
-    // 「健康」读数一样），所以补两类零流量下依然有效的判据：凭据池存量、主动探测。
-    /// 可用凭据比例低于此值即判不稳定。**默认 0，即不启用该维度。**
-    ///
-    /// 注意这个判据容易误报，默认关闭是刻意的：`available_count()` 把限流冷却中
-    /// （`throttled_until` 未到期）的凭据也算作不可用，而账号级 429 冷却是正常
-    /// 运行中的预期行为、不是故障。流量一大就有大批凭据在冷却里轮转，比例天然
-    /// 很低，此时系统完全健康。方向还是反的：流量越大 → 冷却越多 → 比例越低
-    /// → 越倾向判不稳定，会在系统最正常忙碌的时候误报。
-    ///
-    /// 10 张里只有 1 张可用也可能完全正常——能不能扛住取决于当前流量和这张的
-    /// 剩余配额，与另外 9 张在冷却无关。
-    ///
-    /// 无论此项如何配置，「`available == 0`（一张可用的都没有）」始终判不稳定，
-    /// 那条是底线，不受这里影响。
-    #[serde(default = "default_health_gate_min_available_ratio")]
-    pub min_available_ratio: f64,
-
-    /// 是否开启主动探测（默认关闭）。
-    ///
-    /// 探测发的是**真实推理请求、会计费**，所以默认不开。它覆盖的是存量信号的
-    /// 盲区：凭据全好但推理接口坏了的时候 available 是满的，只能真出一次货才知道。
-    #[serde(default)]
-    pub probe_enabled: bool,
-
-    /// 探测间隔（秒，默认 30）。同时是「窗口内有成功请求则跳过本轮」的窗口长度。
-    ///
-    /// 因为有成功就跳过，探测频率天然与流量成反比：忙时一次不发，闲时才发，
-    /// 而闲时正是存量信号覆盖不到、真正需要探测的时刻。
-    #[serde(default = "default_health_gate_probe_interval_secs")]
-    pub probe_interval_secs: u64,
-
-    /// 探测用的模型 ID（默认 `claude-opus-5`）。
-    ///
-    /// 用用户真实在用的模型探测，测出来的健康度才有意义，不会出现「便宜模型通了
-    /// 但主力模型挂了」的假阳性。代价是这是最贵的档，且可能有独立额度——
-    /// 配置前请确认高频探测不会啃掉用户真正要用的配额。
-    #[serde(default = "default_health_gate_probe_model")]
-    pub probe_model: String,
-
-    /// 连续多少次探测失败才判不稳定（默认 2）。单次网络抖动不下结论。
-    #[serde(default = "default_health_gate_probe_failures")]
-    pub probe_failures: u32,
-}
-
-impl Default for HealthGateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: String::new(),
-            token: String::new(),
-            auth_header: default_health_gate_auth_header(),
-            account_ids: Vec::new(),
-            error_threshold: default_health_gate_error_threshold(),
-            check_interval_secs: default_health_gate_interval_secs(),
-            confirmations: default_health_gate_confirmations(),
-            reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
-            max_attempts: default_health_gate_max_attempts(),
-            min_available_ratio: default_health_gate_min_available_ratio(),
-            probe_enabled: false,
-            probe_interval_secs: default_health_gate_probe_interval_secs(),
-            probe_model: default_health_gate_probe_model(),
-            probe_failures: default_health_gate_probe_failures(),
-        }
-    }
-}
-
-impl HealthGateConfig {
-    /// 配置是否完整可用：开关开着，且基址 / token / 账号列表都给全了。
-    /// 缺任一项都当没启用处理 —— 半配状态下静默不跑比每周期报错刷屏好。
-    pub fn is_usable(&self) -> bool {
-        self.enabled && self.is_configured()
-    }
-
-    /// 配置是否齐全（不看 `enabled`）。
-    ///
-    /// 与 [`Self::is_usable`] 的分工：本方法答「填全了吗」，`is_usable` 答
-    /// 「填全了且现在开着吗」。看门狗按本方法决定要不要**起任务** —— 起了之后
-    /// `enabled` 由面板运行时切换，若按 `is_usable` 起任务，启动时是关的就压根
-    /// 没有循环在跑，面板打开开关后要等到重启才生效。
-    pub fn is_configured(&self) -> bool {
-        !self.base_url.trim().is_empty()
-            && !self.token.trim().is_empty()
-            && !self.account_ids.is_empty()
-    }
-
-    /// 去掉末尾斜杠的基址，供拼接路径使用。
-    pub fn normalized_base_url(&self) -> &str {
-        self.base_url.trim().trim_end_matches('/')
-    }
-
-    /// 认证头名，空配置时回落到默认值（空头名会让 reqwest 直接 panic）。
-    pub fn auth_header(&self) -> &str {
-        let h = self.auth_header.trim();
-        if h.is_empty() { "X-API-Key" } else { h }
-    }
-}
-
-fn default_health_gate_auth_header() -> String {
+/// 外部账号推送（流量入口）用的认证头默认值。
+fn default_external_auth_header() -> String {
     "X-API-Key".to_string()
 }
 
-fn default_health_gate_error_threshold() -> u64 {
-    10
-}
-
-fn default_health_gate_interval_secs() -> u64 {
+fn default_external_retry_interval_secs() -> u64 {
     30
 }
 
-fn default_health_gate_confirmations() -> u32 {
-    2
-}
-
-fn default_health_gate_reaffirm_interval_secs() -> u64 {
-    300
-}
-
-fn default_health_gate_max_attempts() -> u32 {
+fn default_external_max_attempts() -> u32 {
     3
-}
-
-fn default_health_gate_min_available_ratio() -> f64 {
-    // 0 = 不启用比例判据，只保留 available == 0 那条底线。
-    // 理由见 `min_available_ratio` 字段注释：限流冷却会让比例在系统健康时也很低。
-    0.0
-}
-
-fn default_health_gate_probe_interval_secs() -> u64 {
-    30
-}
-
-fn default_health_gate_probe_model() -> String {
-    "claude-opus-5".to_string()
-}
-
-fn default_health_gate_probe_failures() -> u32 {
-    2
 }
 
 /// 手动流量入口：直接控制外部系统指定账号是否参与调度。
@@ -748,8 +551,8 @@ pub struct TrafficIngressConfig {
     #[serde(default)]
     pub token: String,
 
-    /// 传 token 用的请求头名，协议与健康联动一致。
-    #[serde(default = "default_health_gate_auth_header")]
+    /// 传 token 用的请求头名。
+    #[serde(default = "default_external_auth_header")]
     pub auth_header: String,
 
     /// 需要随入口开关一起切换的外部账号 ID。
@@ -757,11 +560,11 @@ pub struct TrafficIngressConfig {
     pub account_ids: Vec<u64>,
 
     /// 整轮推送失败后的重试间隔。
-    #[serde(default = "default_health_gate_interval_secs")]
+    #[serde(default = "default_external_retry_interval_secs")]
     pub retry_interval_secs: u64,
 
     /// 单个账号一次推送最多尝试次数，含首发。
-    #[serde(default = "default_health_gate_max_attempts")]
+    #[serde(default = "default_external_max_attempts")]
     pub max_attempts: u32,
 
     /// RPM 容量下限。本地可用凭证 RPM 总量低于此值时强制关闭入口，
@@ -779,8 +582,8 @@ pub struct TrafficIngressConfig {
     #[serde(default = "default_traffic_ingress_confirmations")]
     pub confirmations: u32,
 
-    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值，口径与并发联动一致。
-    #[serde(default = "default_concurrency_gate_unlimited_rpm")]
+    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值。
+    #[serde(default = "default_traffic_ingress_unlimited_rpm")]
     pub unlimited_rpm: u32,
 }
 
@@ -790,14 +593,14 @@ impl Default for TrafficIngressConfig {
             enabled: false,
             base_url: default_traffic_ingress_base_url(),
             token: String::new(),
-            auth_header: default_health_gate_auth_header(),
+            auth_header: default_external_auth_header(),
             account_ids: Vec::new(),
-            retry_interval_secs: default_health_gate_interval_secs(),
-            max_attempts: default_health_gate_max_attempts(),
+            retry_interval_secs: default_external_retry_interval_secs(),
+            max_attempts: default_external_max_attempts(),
             min_rpm: default_traffic_ingress_min_rpm(),
             check_interval_secs: default_traffic_ingress_check_interval_secs(),
             confirmations: default_traffic_ingress_confirmations(),
-            unlimited_rpm: default_concurrency_gate_unlimited_rpm(),
+            unlimited_rpm: default_traffic_ingress_unlimited_rpm(),
         }
     }
 }
@@ -847,149 +650,9 @@ fn default_traffic_ingress_confirmations() -> u32 {
     2
 }
 
-/// 并发联动：把本地有效凭证的 RPM 总量按固定除数换算成外部账号的并发上限。
-///
-/// 与健康联动（推 `schedulable`）、流量入口（推 `schedulable`）是三件独立的事：
-/// 这里推的是 `concurrency`，即「能接多少」而非「要不要接」。同一个外部账号被
-/// 两个模块分别写这两个字段不冲突。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConcurrencyGateConfig {
-    /// 是否启用联动。关闭时不再推送，外部账号保留最后推上去的值。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 外部系统基址。默认 4code.us —— 它的上游正是本机，容量口径才对得上。
-    #[serde(default = "default_concurrency_gate_base_url")]
-    pub base_url: String,
-
-    /// 外部系统的 Admin Token。
-    #[serde(default)]
-    pub token: String,
-
-    /// 传 token 用的请求头名，协议与健康联动一致。
-    #[serde(default = "default_health_gate_auth_header")]
-    pub auth_header: String,
-
-    /// 需要同步并发上限的外部账号 ID。
-    #[serde(default)]
-    pub account_ids: Vec<u64>,
-
-    /// 换算除数：并发 = 有效 RPM 总量 / divisor，向下取整。
-    #[serde(default = "default_concurrency_gate_divisor")]
-    pub divisor: u32,
-
-    /// 手动覆盖并发值。`Some(n)` 时直接推 n，忽略换算结果；`None` 走自动换算。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub manual_concurrency: Option<u32>,
-
-    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值。
-    #[serde(default = "default_concurrency_gate_unlimited_rpm")]
-    pub unlimited_rpm: u32,
-
-    /// 推上去的并发下限，避免算出 0 导致外部账号完全停摆。
-    #[serde(default = "default_concurrency_gate_min")]
-    pub min_concurrency: u32,
-
-    /// 推上去的并发上限，兜住换算异常放大。
-    #[serde(default = "default_concurrency_gate_max")]
-    pub max_concurrency: u32,
-
-    /// 重算周期。RPM 总量只随凭证增删/启停变化，不必太密。
-    #[serde(default = "default_concurrency_gate_interval_secs")]
-    pub check_interval_secs: u64,
-
-    /// 即使目标值没变也定期重推一次，用于纠正对方后台被手动改动造成的漂移。
-    #[serde(default = "default_health_gate_reaffirm_interval_secs")]
-    pub reaffirm_interval_secs: u64,
-
-    /// 单个账号一次推送最多尝试次数，含首发。
-    #[serde(default = "default_health_gate_max_attempts")]
-    pub max_attempts: u32,
-}
-
-impl Default for ConcurrencyGateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_concurrency_gate_base_url(),
-            token: String::new(),
-            auth_header: default_health_gate_auth_header(),
-            account_ids: Vec::new(),
-            divisor: default_concurrency_gate_divisor(),
-            manual_concurrency: None,
-            unlimited_rpm: default_concurrency_gate_unlimited_rpm(),
-            min_concurrency: default_concurrency_gate_min(),
-            max_concurrency: default_concurrency_gate_max(),
-            check_interval_secs: default_concurrency_gate_interval_secs(),
-            reaffirm_interval_secs: default_health_gate_reaffirm_interval_secs(),
-            max_attempts: default_health_gate_max_attempts(),
-        }
-    }
-}
-
-impl ConcurrencyGateConfig {
-    pub fn is_configured(&self) -> bool {
-        !self.base_url.trim().is_empty()
-            && !self.token.trim().is_empty()
-            && !self.account_ids.is_empty()
-    }
-
-    pub fn normalized_base_url(&self) -> &str {
-        self.base_url.trim().trim_end_matches('/')
-    }
-
-    pub fn auth_header(&self) -> &str {
-        let header = self.auth_header.trim();
-        if header.is_empty() { "X-API-Key" } else { header }
-    }
-
-    /// 除数为 0 时按默认值处理，避免配置写错导致除零。
-    pub fn effective_divisor(&self) -> u32 {
-        if self.divisor == 0 {
-            default_concurrency_gate_divisor()
-        } else {
-            self.divisor
-        }
-    }
-
-    /// 把有效 RPM 总量换算为要推送的并发值，并夹到 [min, max]。
-    ///
-    /// 手动值同样受夹取约束：它是「跳过换算」，不是「跳过安全边界」。
-    pub fn resolve_concurrency(&self, total_rpm: u32) -> u32 {
-        let raw = match self.manual_concurrency {
-            Some(manual) => manual,
-            None => total_rpm / self.effective_divisor(),
-        };
-        let high = self.max_concurrency.max(self.min_concurrency);
-        raw.clamp(self.min_concurrency, high)
-    }
-}
-
-fn default_concurrency_gate_base_url() -> String {
-    "https://4code.us".to_string()
-}
-
-fn default_concurrency_gate_divisor() -> u32 {
-    6
-}
-
 /// 与被禁用凭证上常见的 `rpmLimit: 300` 对齐，作为不限速凭证的折算口径。
-fn default_concurrency_gate_unlimited_rpm() -> u32 {
+fn default_traffic_ingress_unlimited_rpm() -> u32 {
     300
-}
-
-fn default_concurrency_gate_min() -> u32 {
-    1
-}
-
-fn default_concurrency_gate_max() -> u32 {
-    200
-}
-
-fn default_concurrency_gate_interval_secs() -> u64 {
-    60
 }
 
 /// KNA 应用配置
@@ -1282,18 +945,9 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 健康联动：按本地近 1 分钟报错数反向控制外部系统的账号调度开关。
-    /// 详见 [`HealthGateConfig`]。默认关闭。
-    #[serde(default)]
-    pub health_gate: HealthGateConfig,
-
     /// 手动流量入口：控制 g7e6ai.com 指定账号的 schedulable 开关。
     #[serde(default)]
     pub traffic_ingress: TrafficIngressConfig,
-
-    /// 并发联动：把本地有效凭证的 RPM 总量换算成外部账号的并发上限。默认关闭。
-    #[serde(default)]
-    pub concurrency_gate: ConcurrencyGateConfig,
 
     /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
     /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
@@ -1571,9 +1225,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
-            health_gate: HealthGateConfig::default(),
             traffic_ingress: TrafficIngressConfig::default(),
-            concurrency_gate: ConcurrencyGateConfig::default(),
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,
@@ -2183,6 +1835,19 @@ mod vendor_config_compat_tests {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.auto_purchase_enabled);
         assert!(Config::default().auto_purchase_enabled);
+    }
+
+    /// 已移除的健康联动 / 并发联动：存量 config.json 里残留的配置块要能被静默忽略，
+    /// 不能因未知字段导致启动失败。
+    #[test]
+    fn 已移除联动配置块不影响加载() {
+        let config: Config = serde_json::from_str(
+            r#"{"healthGate":{"enabled":true,"accountIds":[1]},
+                "concurrencyGate":{"enabled":true,"divisor":6},
+                "trafficIngress":{"minRpm":100}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.traffic_ingress.min_rpm, 100);
     }
 
     /// 显式写 false 要能关掉 —— 总闸的整个用途就在这里
