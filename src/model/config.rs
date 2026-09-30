@@ -1132,9 +1132,17 @@ pub struct Config {
     /// 会话亲和开关（默认 true）。
     ///
     /// 按 `metadata.user_id` 里的 session_id 把会话绑定到首次选中的凭据，后续请求
-    /// 忽略 RPM 限制直接复用该凭据（其它可用性检查照常），以提高上游 prompt cache 命中。
+    /// 允许超出 RPM 限制复用该凭据（上限见 `session_affinity_rpm_multiplier`，其它可用性
+    /// 检查照常），以提高上游 prompt cache 命中。
     #[serde(default = "default_true")]
     pub session_affinity_enabled: bool,
+
+    /// 亲和命中时 RPM 允许突破到的倍数（默认 3.0，最小 1.0）。
+    ///
+    /// 凭据级 `rpmLimit` 与池级 `accountRpmLimit` 各自按此倍数放宽；任一窗口达到
+    /// `limit × 倍数` 时直接返回 429 + Retry-After，不改绑（保住上游缓存，客户端退避后回原号）。
+    #[serde(default = "default_session_affinity_rpm_multiplier")]
+    pub session_affinity_rpm_multiplier: f64,
 
     /// 会话绑定的滑动 TTL（秒，默认 3600）。每次命中刷新。
     #[serde(default = "default_session_affinity_ttl_secs")]
@@ -1430,6 +1438,10 @@ fn default_session_affinity_max_entries() -> usize {
     100_000
 }
 
+fn default_session_affinity_rpm_multiplier() -> f64 {
+    3.0
+}
+
 fn default_session_affinity_429_retries() -> u32 {
     2
 }
@@ -1536,6 +1548,7 @@ impl Default for Config {
             rate_limit_same_credential_retry_delay_ms:
                 default_rate_limit_same_credential_retry_delay_ms(),
             session_affinity_enabled: true,
+            session_affinity_rpm_multiplier: default_session_affinity_rpm_multiplier(),
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             session_affinity_max_entries: default_session_affinity_max_entries(),
             session_affinity_load_window_secs: default_session_affinity_load_window_secs(),

@@ -31,6 +31,7 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+mod affinity_rpm;
 mod credit_stats;
 mod session_affinity;
 
@@ -2219,13 +2220,7 @@ impl MultiTokenManager {
     /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
     /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
     /// 抢先占用，调用方应重新选择凭据。
-    #[cfg(test)]
     fn record_request(&self, id: u64) -> bool {
-        self.record_request_inner(id, false)
-    }
-
-    /// `force = true`：会话亲和命中时忽略池级 RPM 上限，照常记账。
-    fn record_request_inner(&self, id: u64, force: bool) -> bool {
         let now = Instant::now();
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut entries = self.entries.lock();
@@ -2250,7 +2245,7 @@ impl MultiTokenManager {
                 break;
             }
         }
-        if !force && entry.rpm_window.len() >= limit as usize {
+        if entry.rpm_window.len() >= limit as usize {
             return false;
         }
         entry.rpm_window.push_back(now);
@@ -2383,11 +2378,12 @@ impl MultiTokenManager {
     }
 
     /// 带会话亲和的选号：`session_key` 已绑定且该凭据可用时直接复用
-    /// （忽略 RPM 与优先级分层，其它可用性检查照常）；否则走原有调度并绑定选中的凭据。
+    /// （不看优先级分层，RPM 放宽到 `session_affinity_rpm_multiplier` 倍，其它可用性检查照常）；
+    /// 否则走原有调度并绑定选中的凭据。
     ///
     /// per-cred RPM 在这里记账（调用方不要再记）：`rpm_recorded` 是本次外部请求已记过
-    /// 账的凭据，同号重试不重复记。亲和命中强制记账；首绑 / 改绑须先抢到 RPM 名额，
-    /// 抢不到就重新选号且不写绑定，避免绑定指向一个没有名额的号。
+    /// 账的凭据，同号重试不重复记。亲和命中达到放宽上限时直接返回 429 + Retry-After（不改绑）；
+    /// 首绑 / 改绑须先抢到 RPM 名额，抢不到就重新选号且不写绑定，避免绑定指向一个没有名额的号。
     pub async fn acquire_context_for_session(
         &self,
         model: Option<&str>,
@@ -2440,7 +2436,7 @@ impl MultiTokenManager {
             }
 
             // 会话亲和：已绑定且仍可用（未排除 / 未禁用 / 未 throttle / 模型、分组、
-            // credit_limit 满足）时直接复用，不看 RPM 和优先级分层。
+            // credit_limit 满足）时直接复用，不看优先级分层；RPM 在记账时按放宽上限检查。
             let affinity_hit = session_key.and_then(|key| {
                 let bound = self.session_affinity.lookup(key, Instant::now())?;
                 let entries = self.entries.lock();
@@ -2604,22 +2600,14 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(mut ctx) => {
-                    // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
-                    // 亲和命中忽略池级 RPM 上限（照常记账）。
-                    if update_current && !self.record_request_inner(id, is_affinity_hit) {
-                        // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
+                    // RPM 记账（含亲和命中的放宽上限，见 affinity_rpm.rs）；名额被抢时重新选号。
+                    if !self.record_selected_rpm(
+                        id,
+                        is_affinity_hit,
+                        update_current,
+                        per_cred_rpm_recorded,
+                    )? {
                         continue;
-                    }
-                    // per-cred RPM 记账必须先于写亲和表：并发下名额被抢时重新选号，
-                    // 绑定不会指向没有名额的号（否则下一轮会以 Hit 绕过 RPM）。
-                    if let Some(recorded) = per_cred_rpm_recorded {
-                        if !recorded.contains(&id) {
-                            if is_affinity_hit {
-                                self.force_record_request(id);
-                            } else if !self.try_record_request(id) {
-                                continue;
-                            }
-                        }
                     }
                     // 选号确定后再写亲和表：失败重选的中间结果不会污染绑定。
                     match session_key {
@@ -3114,26 +3102,6 @@ impl MultiTokenManager {
 
     /// 原子校验并记录一次外部请求使用该凭据。
     /// Provider 对同一外部请求中的同凭据重试去重；故障转移到新凭据时分别记账。
-    /// 会话亲和命中时使用：忽略 per-cred RPM 上限，但照常写入窗口，
-    /// 让其它请求的调度看到该凭据的真实负载。
-    pub(crate) fn force_record_request(&self, id: u64) {
-        let now = Instant::now();
-        let cutoff = now.checked_sub(RPM_WINDOW);
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-            if let Some(cutoff) = cutoff {
-                while entry
-                    .recent_requests
-                    .front()
-                    .is_some_and(|timestamp| *timestamp <= cutoff)
-                {
-                    entry.recent_requests.pop_front();
-                }
-            }
-            entry.recent_requests.push_back(now);
-        }
-    }
-
     pub(crate) fn try_record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let cutoff = now.checked_sub(RPM_WINDOW);

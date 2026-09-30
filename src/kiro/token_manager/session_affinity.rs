@@ -2,7 +2,7 @@
 //!
 //! 上游 prompt cache 大概率按账号隔离：同一会话的多轮请求若被调度到不同账号，
 //! 上游需要全价重读整段上下文。这里记录每个会话最近一次成功发出请求的凭据，
-//! 后续请求优先复用它（忽略 RPM 限制，其它可用性检查照常，见 `acquire_context_impl`）。
+//! 后续请求优先复用它（RPM 放宽到倍数上限，见 `affinity_rpm.rs`；其它可用性检查照常）。
 //!
 //! - 键是 `metadata.user_id` 里的 session_id（与发往上游的 conversationId 同源）。
 //! - 滑动 TTL：每次命中 / 改绑都刷新 `last_used`。
