@@ -1,7 +1,7 @@
 /** 本站累计消耗；@author wangzhong */
 export function CredentialCreditUsage({ credits }: { credits?: number }) {
   const value = credits != null && Number.isFinite(credits)
-    ? credits.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 3 })
+    ? credits.toLocaleString("en-US", { maximumFractionDigits: 0 })
     : "—";
 
   return (
