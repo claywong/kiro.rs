@@ -346,6 +346,21 @@ Enterprise 凭据 + `ListAvailableProfiles` **瞬时失败**时，本地会带�
 钉死语义有专门测试锁住（往全局缓存塞 `1.0.437` 后断言 UA 仍发钉死值），
 IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
 
+### 合并 hank9999/kiro.rs（origin）：Opus 5 支持 + 质量门控 CI
+
+`origin` 是 hank9999 的仓库（并非 ZyphrZero 上游），这次带来 `5ca5703`（Opus 5 支持）和
+`e09625c`（`.github/workflows/quality-gates.yaml`）。
+
+- `converter.rs` / `handlers.rs` / `README.md` 冲突区**全取本地**：本地早已支持 opus-5（还多
+  opus-5.5 / fable-5），`/v1/models` 已让位给动态目录（见第一节），adaptive thinking 走
+  `thinking_mode::backend_requires_adaptive_thinking`。对方的改动都是基于旧版逐版本 if-else
+  和静态清单写的，取了反而是回退；`test_map_model_opus_5` 本地已有同名测试，取了会编译报重复定义。
+- CI workflow 原样收下。注意其中 `cargo fmt --check` 与 `clippy -D warnings` 在本地代码上
+  目前过不了（fmt 有 51 个文件差异，build 有 14 个警告），推 PR 到对方仓库时会红，
+  本仓库自己的 Actions 是否启用另行决定。
+
+验证：`cargo build` 警告数维持 14，`cargo test` 1246 passed。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。
