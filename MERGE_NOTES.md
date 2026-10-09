@@ -55,6 +55,12 @@
   `output_config`，下错上游 400）、`/v1/models` 元数据优先。
 - **调度增强**：换号重试排除集（`excluded_ids`）、salvage 兜底跨层按 RPM 余量选号、
   TTFT EWMA 同层调度、黏性放开条件（跨层倒挂自愈）。
+- **会话亲和总开关**：`session_affinity_enabled` 由启动期静态 `bool` 改为 `AtomicBool`，运行时可切换。
+  读写与持久化在 `token_manager/session_affinity_switch.rs`，Admin API 在 `admin/session_affinity_switch.rs`
+  （`GET/PUT /api/admin/config/session-affinity`），设置页在 `settings/session-affinity-group.tsx`。
+  **关闭不清空绑定表**（用户决策）：靠 TTL 自然过期，TTL 内重开继续命中。
+  冲突面：`token_manager.rs` 只有字段类型、构造、`acquire_context_for_session` 过滤点、维护日志四处小改；
+  `dispatch-section.tsx` 只加一行 import 和一行组件。
 - **凭证近 1 分钟额度消耗**：`src/admin/recent_spend.rs` + `GET /api/admin/credentials/recent-spend`，
   凭证卡「1分钟耗」读数。计的是上游 credits 消耗速率，用于观测单凭证负载。
 

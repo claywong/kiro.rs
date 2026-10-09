@@ -43,6 +43,7 @@ use super::{
 };
 // 本地新增 handler 单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
 use super::recent_spend::credential_recent_spend;
+use super::session_affinity_switch::{get_session_affinity, set_session_affinity};
 
 /// 请求体最大大小限制 (50MB)
 ///
@@ -121,6 +122,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/session-affinity",
+            get(get_session_affinity).put(set_session_affinity),
         )
         .route(
             "/config/rate-limit-same-credential",

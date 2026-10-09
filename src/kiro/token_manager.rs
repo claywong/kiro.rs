@@ -34,6 +34,8 @@ use crate::model::config::Config;
 mod affinity_rpm;
 mod credit_stats;
 mod session_affinity;
+// 本地新增模块单独成行，避免上游增删模块时反复冲突。
+mod session_affinity_switch;
 
 pub use session_affinity::AffinityOutcome;
 use session_affinity::SessionAffinity;
@@ -1279,8 +1281,8 @@ pub struct MultiTokenManager {
     credit_usage_cache: Mutex<HashMap<u64, f64>>,
     /// 会话亲和绑定表（session_id → 凭据）
     session_affinity: SessionAffinity,
-    /// 会话亲和开关（启动时读 config）
-    session_affinity_enabled: bool,
+    /// 会话亲和总开关（启动时读 config，运行期可经 Admin API 切换，见 `session_affinity_switch`）
+    session_affinity_enabled: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1692,7 +1694,7 @@ impl MultiTokenManager {
                 session_affinity_max_entries,
                 session_affinity_load_window_secs,
             ),
-            session_affinity_enabled,
+            session_affinity_enabled: AtomicBool::new(session_affinity_enabled),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -2393,7 +2395,7 @@ impl MultiTokenManager {
         session_key: Option<&str>,
         rpm_recorded: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
-        let session_key = session_key.filter(|_| self.session_affinity_enabled);
+        let session_key = session_key.filter(|_| self.is_session_affinity_enabled());
         self.acquire_context_impl(
             model,
             input_tokens,
@@ -2692,7 +2694,7 @@ impl MultiTokenManager {
                     hit as f64 * 100.0 / with_session as f64
                 };
                 tracing::info!(
-                    enabled = manager.session_affinity_enabled,
+                    enabled = manager.is_session_affinity_enabled(),
                     sessions = manager.session_affinity.len(),
                     "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} none={none}"
                 );

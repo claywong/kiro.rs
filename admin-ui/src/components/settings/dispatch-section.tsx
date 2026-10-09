@@ -25,6 +25,8 @@ import {
   useFieldSaver,
 } from '@/components/console/setting-row'
 import { reportSaveError } from '@/components/settings/report-error'
+// 本地新增组件单独成行，避免上游改动同一 import 块时反复冲突。
+import { SessionAffinityGroup } from '@/components/settings/session-affinity-group'
 
 const SECS_PER_MIN = 60
 // 与后端 SetAccountRpmLimitConfigRequest 的校验区间保持一致
@@ -42,6 +44,7 @@ export function DispatchSection() {
   return (
     <div className="space-y-6">
       <LoadBalancingGroup />
+      <SessionAffinityGroup />
       <ThrottleGroup />
       <SameCredentialRetryGroup />
       <SpeedCredentialsExcludeGroup />
