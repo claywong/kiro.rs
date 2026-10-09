@@ -318,18 +318,32 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-opus-5.5"
-                || mapped == "claude-fable-5" =>
+                || is_claude_5_plus_1m_family(&mapped) =>
         {
             1_000_000
         }
         _ => 200_000,
     }
+}
+
+/// sonnet / opus / fable / mythos 主版本 >= 5 视为 1M 窗口，新小版本无需逐个登记。
+///
+/// haiku 不在此列：Claude 5 代 haiku 的窗口没有依据，保持 200k 默认，需要时显式加。
+/// 输入是 `map_model` 归一化后的 ID（形如 `claude-sonnet-5.5`）。
+fn is_claude_5_plus_1m_family(mapped: &str) -> bool {
+    let Some(body) = mapped.strip_prefix("claude-") else {
+        return false;
+    };
+    ["sonnet", "opus", "fable", "mythos"].iter().any(|family| {
+        body.strip_prefix(family)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|version| version.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= 5)
+    })
 }
 
 /// 模型接受 effort 时所用的 `additionalModelRequestFields` 键名。
@@ -1999,6 +2013,62 @@ mod tests {
             Some("claude-fable-5".to_string())
         );
         assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_context_window_claude_5_plus_defaults_to_1m() {
+        // 未登记的未来小版本 / 大版本自动 1M
+        for name in [
+            "claude-sonnet-5-6",
+            "claude-opus-5-7",
+            "claude-fable-5-2",
+            "claude-mythos-5",
+            "claude-opus-6",
+        ] {
+            assert_eq!(get_context_window_size(name), 1_000_000, "{name}");
+        }
+        // 4.x 只有显式登记的几个是 1M
+        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-5"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-4-5"), 200_000);
+        // haiku 不按主版本推断
+        assert_eq!(get_context_window_size("claude-haiku-5"), 200_000);
+        assert_eq!(get_context_window_size("claude-haiku-4-5"), 200_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5_5() {
+        for name in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5-5-thinking",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-sonnet-5.5".to_string()),
+                "{name}"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5.5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_fable_5_1() {
+        // Anthropic 侧连字符形式与 Kiro 侧点号形式都应归一到点号 ID
+        for name in [
+            "claude-fable-5-1",
+            "claude-fable-5.1",
+            "claude-fable-5-1-thinking",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-fable-5.1".to_string()),
+                "{name}"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-fable-5.1"), 1_000_000);
     }
 
     #[test]

@@ -361,6 +361,25 @@ IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
 
 验证：`cargo build` 警告数维持 14，`cargo test` 1246 passed。
 
+### 合并 hank9999/kiro.rs（origin）：Fable 5.1 + tool_result 图片 + v2026.10.1
+
+来自 `fcb6e7a`（Fable 5.1 / tool_result 图片）、`9741858`（Opus 5.5）、`9da05bc`（版本号）。
+
+- `converter.rs` / `handlers.rs` / `README.md` 冲突区**全取本地**，理由同上一节：对方基于旧版逐版本
+  if-else 写的，本地 `normalize_claude_model` 已能归一 `claude-fable-5-1` → `claude-fable-5.1`，
+  tool_result 图片本地已有 `extract_kiro_image`（带去重），上游那版无去重，取了会回退。
+  冲突区之外的自动合并残片需检查：`extract_tool_result_content` 尾部残留了上游的 `(text, images)`，已删。
+- **本地补丁**：`get_context_window_size` 的 1M 列表此前只有 `claude-fable-5`，漏了 `claude-fable-5.1`，
+  会让 5.1 的 usage 上报缩小 5 倍；已补，并加 `test_map_model_fable_5_1`。
+- 上游 `test_map_model_sonnet/opus` 等断言被本地的更宽松版本取代（冲突取本地），未改上游断言语义。
+- `Cargo.toml` / `Cargo.lock` 版本号：与 origin 保持一致，取 `2026.10.1`（本地原为 `0.8.0`）。
+- **本地补丁**：`claude-sonnet-5.5` 的 1M 窗口兜底（上游尚无 Sonnet 5.5 映射，等上游实现后移除）；
+  `get_context_window_size` 改为 sonnet / opus / fable / mythos 主版本 ≥ 5 自动 1M
+  （`is_claude_5_plus_1m_family`），新小版本不必再逐个登记。haiku 不按主版本推断，仍默认 200k。
+- 待决：`map_model("claude-fable-5")` 仍返回 `claude-fable-5`，而 Kiro 实测只认 `claude-fable-5.1`。
+
+验证：`cargo build` 警告数维持 14，`cargo test` 1219 passed。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。
