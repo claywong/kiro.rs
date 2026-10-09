@@ -607,37 +607,6 @@ export async function setSelfHealConfig(
   return data
 }
 
-/** 独立流量入口开关状态。外部系统 token 不会返回前端。 */
-export interface TrafficIngressState {
-  /** baseUrl / token / accountIds 是否已经填全 */
-  configured: boolean
-  /** 期望的外部账号调度状态 */
-  enabled: boolean
-  /** 外部系统基址，如 `https://g7e6ai.com` */
-  baseUrl: string
-  /** 受控外部账号数 */
-  accountCount: number
-  /** 最近一次成功推送的 `schedulable`；null 表示尚未成功同步 */
-  appliedSchedulable: boolean | null
-  /** 最近一轮 RPM 判据结论：false = 容量不足、被强制关闭；true = 容量足、不拦；
-   *  null = 还没判过或判据已停用（`minRpm = 0`）。 */
-  rpmOk: boolean | null
-}
-
-export async function getTrafficIngressState(): Promise<TrafficIngressState> {
-  const { data } = await api.get<TrafficIngressState>('/config/traffic-ingress')
-  return data
-}
-
-export async function setTrafficIngressEnabled(
-  enabled: boolean,
-): Promise<TrafficIngressState> {
-  const { data } = await api.put<TrafficIngressState>('/config/traffic-ingress', {
-    enabled,
-  })
-  return data
-}
-
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

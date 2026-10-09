@@ -669,31 +669,6 @@ pub struct SetSelfHealConfigRequest {
     pub max_consecutive_rounds: Option<u32>,
 }
 
-/// 手动流量入口开关状态。响应不包含外部系统 token。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrafficIngressStateResponse {
-    /// baseUrl / token / accountIds 是否已经填全
-    pub configured: bool,
-    /// 当前期望状态。未配置时恒为 false
-    pub enabled: bool,
-    /// 外部系统基址
-    pub base_url: String,
-    /// 受控账号数
-    pub account_count: usize,
-    /// 最近一次成功推送的 schedulable；null 表示尚未成功同步
-    pub applied_schedulable: Option<bool>,
-    /// 最近一轮 RPM 判据结论：false = 容量不足、被强制关闭；true = 容量足、不拦；
-    /// null = 还没判过或判据已停用（`minRpm = 0`）。
-    pub rpm_ok: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetTrafficIngressRequest {
-    pub enabled: bool,
-}
-
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

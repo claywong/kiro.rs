@@ -386,6 +386,18 @@ IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
 
 验证：`cargo build` 警告数维持 14，`cargo test` 1219 passed。
 
+### 已整体移除的本地特性（冲突时不要恢复）
+
+| 特性 | 移除提交 | 说明 |
+|---|---|---|
+| 健康联动 / 并发联动 | `64fca10` | `health_gate.rs` / `health_probe.rs` / `concurrency_gate.rs` / `concurrency_client.rs` |
+| 流量入口 | 本次 | `traffic_ingress.rs`（RPM 容量闸门 + 手动开关，推送外部 `schedulable`），连带 `schedulable_client.rs`、`token_manager.available_rpm_total`、`TrafficIngressConfig` 与设置页分组 |
+
+- 三者都已无调用方。`config.rs` 里保留了一条测试，确认存量 `config.json` 里残留的
+  `healthGate` / `concurrencyGate` / `trafficIngress` 块会被静默忽略，不会因未知字段启动失败。
+- 需要找回时从对应提交的父提交捞（流量入口从本次提交的父提交），别重写。
+- 合并时若上游改动落在这几个文件上，直接取删除。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。

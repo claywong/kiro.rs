@@ -30,7 +30,6 @@ use super::{
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetSelfHealConfigRequest,
-        SetTrafficIngressRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -687,22 +686,6 @@ pub async fn set_self_heal_config(
     match state.service.set_self_heal_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/traffic-ingress
-pub async fn get_traffic_ingress_state(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_traffic_ingress_state())
-}
-
-/// PUT /api/admin/config/traffic-ingress
-pub async fn set_traffic_ingress_state(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetTrafficIngressRequest>,
-) -> impl IntoResponse {
-    match state.service.set_traffic_ingress_enabled(payload.enabled) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

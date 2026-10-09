@@ -30,9 +30,6 @@ use super::{
         set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
         set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
-        // 本地独有：流量入口的读写接口，单独成行避免与上游 use 块重排冲突。
-        get_traffic_ingress_state, set_traffic_ingress_state,
-
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
         test_model,
@@ -148,10 +145,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/self-heal",
             get(get_self_heal_config).put(set_self_heal_config),
-        )
-        .route(
-            "/config/traffic-ingress",
-            get(get_traffic_ingress_state).put(set_traffic_ingress_state),
         )
         .route(
             "/config/log-governance",

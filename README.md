@@ -384,44 +384,6 @@ Admin API 鉴权同样支持：
 
 非空的 `config.apiKey` 每次启动都会同步为不可删除、可轮换的系统 Key `id=0`。手动修改配置后，旧系统 Key 立即失效，新值自动启用；已有名称、描述、分组和累计统计会保留。Admin 面板新建或轮换的客户端 Key 统一以 `sk-` 开头，但请求鉴权不会对任何已存储 Key 强制检查前缀。`adminApiKey` 独立用于 Admin UI / Admin API 登录，不参与 `/v1` 业务流量鉴权。
 
-### 流量管理
-
-可选的流量入口特性，配置在顶层（与 `host` / `port` 同级）。未配置时不启动对应后台任务。
-
-#### 流量入口（`trafficIngress`）
-
-手动开关 + RPM 容量闸门，控制外部账号是否对本机接量。最终推给外部系统的 `schedulable` 是**手动开关与 RPM 判据取「与」**：手动开且本地有效凭据 RPM 总量 ≥ `minRpm` 时才真正开启。
-
-```json
-{
-  "trafficIngress": {
-    "enabled": false,
-    "baseUrl": "https://g7e6ai.com",
-    "token": "外部系统 Admin Token",
-    "authHeader": "X-API-Key",
-    "accountIds": [42, 43],
-    "minRpm": 200,
-    "checkIntervalSecs": 30,
-    "confirmations": 2,
-    "unlimitedRpm": 300,
-    "retryIntervalSecs": 30,
-    "maxAttempts": 3
-  }
-}
-```
-
-| 字段 | 默认 | 说明 |
-|---|---:|---|
-| `enabled` | `false` | 手动总开关，面板可切 |
-| `minRpm` | `200` | 本地可用凭据 RPM 总量低于此值时强制关闭入口，回到此值及以上再自动开回来；`0` = 停用 RPM 判据，退化成纯手动开关 |
-| `checkIntervalSecs` | `30` | RPM 判据检查周期（秒） |
-| `confirmations` | `2` | 连续多少轮判定一致才切换，用于防抖 |
-| `unlimitedRpm` | `300` | 凭据 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值 |
-| `retryIntervalSecs` | `30` | 推送失败后的重试间隔（秒） |
-| `maxAttempts` | `3` | 单个账号一次推送最多尝试次数 |
-
-读数来源：`token_manager.available_rpm_total()` —— 可用凭据 `rpmLimit` 之和。这是**容量**指标而非实际流量，选它是关键：实际流量会随入口开关变化（入口一关流量被分走、读数更低），拿它当判据会永远开不回来；容量不从请求派生，关掉入口不会让读数变好也不会变坏，双向切换才成立。
-
 <a id="credentials"></a>
 ## 🔐 凭据
 

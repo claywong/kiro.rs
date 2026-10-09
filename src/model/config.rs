@@ -522,139 +522,6 @@ impl VendorConfig {
     }
 }
 
-/// 外部账号推送（流量入口）用的认证头默认值。
-fn default_external_auth_header() -> String {
-    "X-API-Key".to_string()
-}
-
-fn default_external_retry_interval_secs() -> u64 {
-    30
-}
-
-fn default_external_max_attempts() -> u32 {
-    3
-}
-
-/// 手动流量入口：直接控制外部系统指定账号是否参与调度。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrafficIngressConfig {
-    /// 期望的流量入口状态。true = 可调度，false = 不可调度。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 外部系统基址，默认指向 g7e6ai.com。
-    #[serde(default = "default_traffic_ingress_base_url")]
-    pub base_url: String,
-
-    /// 外部系统的 Admin Token。
-    #[serde(default)]
-    pub token: String,
-
-    /// 传 token 用的请求头名。
-    #[serde(default = "default_external_auth_header")]
-    pub auth_header: String,
-
-    /// 需要随入口开关一起切换的外部账号 ID。
-    #[serde(default)]
-    pub account_ids: Vec<u64>,
-
-    /// 整轮推送失败后的重试间隔。
-    #[serde(default = "default_external_retry_interval_secs")]
-    pub retry_interval_secs: u64,
-
-    /// 单个账号一次推送最多尝试次数，含首发。
-    #[serde(default = "default_external_max_attempts")]
-    pub max_attempts: u32,
-
-    /// RPM 容量下限。本地可用凭证 RPM 总量低于此值时强制关闭入口，
-    /// 回到此值及以上再自动开回来（仍需手动开关为开）。
-    ///
-    /// `0` = 停用该判据，入口只受手动开关控制。
-    #[serde(default = "default_traffic_ingress_min_rpm")]
-    pub min_rpm: u32,
-
-    /// RPM 判据的检查周期。
-    #[serde(default = "default_traffic_ingress_check_interval_secs")]
-    pub check_interval_secs: u64,
-
-    /// 连续多少轮判定一致才真正切换，用于 RPM 在阈值上下抖动时防抖。
-    #[serde(default = "default_traffic_ingress_confirmations")]
-    pub confirmations: u32,
-
-    /// 凭证 `rpmLimit=0`（本地语义为不限速）时参与求和的折算值。
-    #[serde(default = "default_traffic_ingress_unlimited_rpm")]
-    pub unlimited_rpm: u32,
-}
-
-impl Default for TrafficIngressConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_traffic_ingress_base_url(),
-            token: String::new(),
-            auth_header: default_external_auth_header(),
-            account_ids: Vec::new(),
-            retry_interval_secs: default_external_retry_interval_secs(),
-            max_attempts: default_external_max_attempts(),
-            min_rpm: default_traffic_ingress_min_rpm(),
-            check_interval_secs: default_traffic_ingress_check_interval_secs(),
-            confirmations: default_traffic_ingress_confirmations(),
-            unlimited_rpm: default_traffic_ingress_unlimited_rpm(),
-        }
-    }
-}
-
-impl TrafficIngressConfig {
-    pub fn is_configured(&self) -> bool {
-        !self.base_url.trim().is_empty()
-            && !self.token.trim().is_empty()
-            && !self.account_ids.is_empty()
-    }
-
-    pub fn normalized_base_url(&self) -> &str {
-        self.base_url.trim().trim_end_matches('/')
-    }
-
-    pub fn auth_header(&self) -> &str {
-        let header = self.auth_header.trim();
-        if header.is_empty() { "X-API-Key" } else { header }
-    }
-
-    /// RPM 判据是否参与决策。`min_rpm = 0` 表示停用。
-    pub fn rpm_gate_active(&self) -> bool {
-        self.min_rpm > 0
-    }
-
-    /// 给定 RPM 总量，判断该判据是否放行。停用时恒为 true。
-    pub fn rpm_allows(&self, total_rpm: u32) -> bool {
-        !self.rpm_gate_active() || total_rpm >= self.min_rpm
-    }
-}
-
-fn default_traffic_ingress_base_url() -> String {
-    "https://g7e6ai.com".to_string()
-}
-
-/// 低于这个 RPM 总量就认为本地容量不足以对外接量。
-fn default_traffic_ingress_min_rpm() -> u32 {
-    200
-}
-
-fn default_traffic_ingress_check_interval_secs() -> u64 {
-    30
-}
-
-/// 两轮一致才切换：30s 周期下最多晚 30s 生效，换掉阈值抖动时的来回推送。
-fn default_traffic_ingress_confirmations() -> u32 {
-    2
-}
-
-/// 与被禁用凭证上常见的 `rpmLimit: 300` 对齐，作为不限速凭证的折算口径。
-fn default_traffic_ingress_unlimited_rpm() -> u32 {
-    300
-}
-
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -945,10 +812,6 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 手动流量入口：控制 g7e6ai.com 指定账号的 schedulable 开关。
-    #[serde(default)]
-    pub traffic_ingress: TrafficIngressConfig,
-
     /// 卖家（Key 供应商）对接配置 —— 单供应商写法，保留兼容。
     /// 多家请用 `vendors`；两者同时存在时本字段等价于 `vendors` 的第一项之前，
     /// 合并规则见 [`Config::resolved_vendors`]。未配置时 webhook 端点与出站接口均不启用。
@@ -1225,7 +1088,6 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
-            traffic_ingress: TrafficIngressConfig::default(),
             vendor: None,
             vendors: Vec::new(),
             auto_purchase_pool_target: 0,
@@ -1844,10 +1706,10 @@ mod vendor_config_compat_tests {
         let config: Config = serde_json::from_str(
             r#"{"healthGate":{"enabled":true,"accountIds":[1]},
                 "concurrencyGate":{"enabled":true,"divisor":6},
-                "trafficIngress":{"minRpm":100}}"#,
+                "trafficIngress":{"enabled":true,"minRpm":100,"accountIds":[1]}}"#,
         )
         .unwrap();
-        assert_eq!(config.traffic_ingress.min_rpm, 100);
+        assert!(config.auto_purchase_enabled);
     }
 
     /// 显式写 false 要能关掉 —— 总闸的整个用途就在这里

@@ -13,8 +13,6 @@ import {
   useSetLoadBalancingMode,
   useSelfHealConfig,
   useSetSelfHealConfig,
-  useTrafficIngressState,
-  useSetTrafficIngressEnabled,
 } from '@/hooks/use-credentials'
 import {
   SettingGroup,
@@ -51,23 +49,8 @@ export function DispatchSection() {
       <SpeedCredentialsMinTokensGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
-      <TrafficIngressGroup />
     </div>
   )
-}
-
-function appliedText(value: boolean | null | undefined) {
-  if (value == null) return '尚未同步'
-  return value ? '可调度' : '不可调度'
-}
-
-function hostOf(url: string | undefined) {
-  if (!url) return '未配置'
-  try {
-    return new URL(url).host
-  } catch {
-    return url
-  }
 }
 
 function LoadBalancingGroup() {
@@ -424,44 +407,6 @@ function SelfHealGroup() {
         hint="当前连续自愈轮数 / 累计恢复凭据次数"
       >
         连续 {data?.consecutiveRounds ?? 0} 轮 · 累计恢复 {data?.totalCount ?? 0} 次
-      </SettingReadout>
-    </SettingGroup>
-  )
-}
-
-function TrafficIngressGroup() {
-  const { data, isLoading } = useTrafficIngressState()
-  const { mutate } = useSetTrafficIngressEnabled()
-  const saver = useFieldSaver(mutate, reportSaveError)
-  const configured = data?.configured ?? false
-  const enabled = data?.enabled ?? false
-
-  return (
-    <SettingGroup
-      title="流量入口"
-      description="独立控制外部账号是否可调度，并受本地 RPM 容量判据约束"
-    >
-      <SettingSwitch
-        label="启用流量入口"
-        hint={
-          configured
-            ? enabled && data?.rpmOk === false
-              ? '入口已开启，但当前 RPM 容量不足，外部账号会保持不可调度'
-              : '切换后异步同步到受控外部账号'
-            : '需先在 config.json 配置 trafficIngress 的地址、令牌和账号'
-        }
-        checked={enabled}
-        onChange={(next) => saver.save('enabled', next)}
-        pending={saver.isSaving('enabled')}
-        saved={saver.isSaved('enabled')}
-        disabled={isLoading || !configured}
-      />
-      <SettingReadout label="运行状态" hint="目标系统 / 账号数 / 最近一次成功同步值">
-        {hostOf(data?.baseUrl)} · {data?.accountCount ?? 0} 个账号 · 已同步{' '}
-        {appliedText(data?.appliedSchedulable)}
-      </SettingReadout>
-      <SettingReadout label="RPM 容量判据">
-        {data?.rpmOk == null ? '未判定' : data.rpmOk ? '充足' : '不足'}
       </SettingReadout>
     </SettingGroup>
   )

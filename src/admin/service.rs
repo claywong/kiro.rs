@@ -56,7 +56,7 @@ use super::types::{
     SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest, TrafficIngressStateResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），7.5 分钟。
@@ -334,8 +334,6 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
-    /// 手动流量入口控制器。None = 未配置
-    traffic_ingress: Option<crate::admin::traffic_ingress::SharedTrafficIngressState>,
 }
 
 /// Social 登录会话状态
@@ -691,7 +689,6 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
-            traffic_ingress: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -731,20 +728,6 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
-    }
-
-    pub fn with_traffic_ingress(
-        mut self,
-        state: Option<crate::admin::traffic_ingress::SharedTrafficIngressState>,
-    ) -> Self {
-        self.traffic_ingress = state;
-        self
-    }
-
-    pub fn traffic_ingress(
-        &self,
-    ) -> Option<&crate::admin::traffic_ingress::SharedTrafficIngressState> {
-        self.traffic_ingress.as_ref()
     }
 
     /// 获取所有凭据状态
@@ -2549,64 +2532,6 @@ impl AdminService {
             consecutive_rounds,
             total_count,
         }
-    }
-
-    /// 读取手动流量入口状态。token 永不进入响应。
-    pub fn get_traffic_ingress_state(&self) -> TrafficIngressStateResponse {
-        let config = &self.token_manager.config().traffic_ingress;
-        match self.traffic_ingress() {
-            Some(state) => TrafficIngressStateResponse {
-                configured: true,
-                enabled: state.enabled(),
-                base_url: config.normalized_base_url().to_string(),
-                account_count: config.account_ids.len(),
-                applied_schedulable: state.applied(),
-                rpm_ok: state.rpm_ok(),
-            },
-            None => TrafficIngressStateResponse {
-                configured: false,
-                enabled: false,
-                base_url: config.normalized_base_url().to_string(),
-                account_count: config.account_ids.len(),
-                applied_schedulable: None,
-                rpm_ok: None,
-            },
-        }
-    }
-
-    /// 手动切换流量入口，并持久化期望状态。
-    pub fn set_traffic_ingress_enabled(
-        &self,
-        enabled: bool,
-    ) -> Result<TrafficIngressStateResponse, AdminServiceError> {
-        let Some(state) = self.traffic_ingress() else {
-            return Err(AdminServiceError::InvalidCredential(
-                "流量入口未配置（需填 trafficIngress 的 token / accountIds），无法切换"
-                    .to_string(),
-            ));
-        };
-        state.set_enabled(enabled);
-        if let Err(error) = self.persist_traffic_ingress_enabled(enabled) {
-            tracing::warn!("持久化流量入口开关失败（运行时已生效）: {}", error);
-        }
-        Ok(self.get_traffic_ingress_state())
-    }
-
-    fn persist_traffic_ingress_enabled(&self, enabled: bool) -> anyhow::Result<()> {
-        use anyhow::Context;
-        let config_path = self
-            .token_manager
-            .config()
-            .config_path()
-            .map(|path| path.to_path_buf())
-            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，流量入口仅在当前进程生效"))?;
-        let mut config = crate::model::config::Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.traffic_ingress.enabled = enabled;
-        config
-            .save()
-            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
-        Ok(())
     }
 
     /// 更新自愈治理配置
