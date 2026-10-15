@@ -17,7 +17,7 @@ import {
   CredentialMetadataField,
   metadataFieldDefault,
 } from '@/components/credential-metadata-field'
-import { updateCredential } from '@/api/credentials'
+import { updateCredential, setCredentialPriority } from '@/api/credentials'
 import type {
   CredentialMetadata,
   CredentialMetadataSchema,
@@ -76,6 +76,8 @@ export function BatchEditCredentialDialog({
   const [saleStatus, setSaleStatus] = useState<CredentialSaleStatus>('not_for_sale')
   const [editSalePrice, setEditSalePrice] = useState(false)
   const [salePrice, setSalePrice] = useState('')
+  const [editPriority, setEditPriority] = useState(false)
+  const [priority, setPriority] = useState('')
 
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -95,6 +97,8 @@ export function BatchEditCredentialDialog({
       )
       setEditSalePrice(false)
       setSalePrice('')
+      setEditPriority(false)
+      setPriority('')
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -108,8 +112,19 @@ export function BatchEditCredentialDialog({
   }
 
   const handleApply = async () => {
-    if (!editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice) {
+    if (
+      !editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice
+      && !editPriority
+    ) {
       toast.error('请至少开启一项要修改的字段')
+      return
+    }
+    const parsedPriority = Number(priority)
+    if (
+      editPriority
+      && (priority.trim() === '' || !Number.isInteger(parsedPriority) || parsedPriority < 0)
+    ) {
+      toast.error('优先级必须是大于或等于 0 的整数')
       return
     }
     const parsedSalePrice = salePrice.trim() === '' ? undefined : Number(salePrice)
@@ -128,6 +143,7 @@ export function BatchEditCredentialDialog({
     for (let i = 0; i < credentials.length; i++) {
       const c = credentials[i]
       const req: UpdateCredentialRequest = {}
+      const needUpdate = editGroups || editSource || editType || editSaleStatus || editSalePrice
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
       if (editType || editSaleStatus || editSalePrice) {
@@ -143,7 +159,9 @@ export function BatchEditCredentialDialog({
         req.metadata = metadata
       }
       try {
-        await updateCredential(c.id, req)
+        if (needUpdate) await updateCredential(c.id, req)
+        // 优先级走独立接口，与其他字段分开提交
+        if (editPriority) await setCredentialPriority(c.id, parsedPriority)
         ok++
       } catch {
         fail++
@@ -200,6 +218,30 @@ export function BatchEditCredentialDialog({
                   onChange={setGroups}
                   disabled={running}
                 />
+              </>
+            )}
+          </div>
+
+          {/* 优先级区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改优先级</span>
+              <Switch checked={editPriority} onCheckedChange={setEditPriority} disabled={running} />
+            </label>
+            {editPriority && (
+              <>
+                <Input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={priority}
+                  onChange={(e) => setPriority(e.target.value)}
+                  placeholder="统一设置为该值"
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  数值越小越优先，应用到所有选中账号。
+                </p>
               </>
             )}
           </div>
