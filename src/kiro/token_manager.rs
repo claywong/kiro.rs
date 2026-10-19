@@ -36,9 +36,12 @@ mod credit_stats;
 mod session_affinity;
 // 本地新增模块单独成行，避免上游增删模块时反复冲突。
 mod session_affinity_switch;
+mod usage_ratio;
 
 pub use session_affinity::AffinityOutcome;
 use session_affinity::SessionAffinity;
+// 本地新增 use 单独成行，避免上游改动时反复冲突。
+use usage_ratio::{UsageKeys, usage_key_of, usage_permille};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1458,11 +1461,13 @@ fn affinity_load_of(load: &AffinityLoad, id: u64) -> usize {
 fn pick_least_used(
     available: &[Candidate<'_>],
     load: &AffinityLoad,
+    usage: &UsageKeys,
 ) -> Option<(u64, KiroCredentials)> {
     let (entry, _) = available.iter().min_by_key(|(e, support)| {
         (
             discovery_rank(*support),
             affinity_load_of(load, e.id),
+            usage_key_of(usage, e.id),
             e.success_count,
             e.credentials.priority,
         )
@@ -1479,6 +1484,7 @@ fn pick_least_used(
 fn pick_by_discovery_priority_least_used(
     available: &[Candidate<'_>],
     load: &AffinityLoad,
+    usage: &UsageKeys,
 ) -> Option<(u64, KiroCredentials)> {
     let min_rank = available
         .iter()
@@ -1498,6 +1504,7 @@ fn pick_by_discovery_priority_least_used(
         .min_by(|(a, _), (b, _)| {
             affinity_load_of(load, a.id)
                 .cmp(&affinity_load_of(load, b.id))
+                .then(usage_key_of(usage, a.id).cmp(&usage_key_of(usage, b.id)))
                 .then(a.success_count.cmp(&b.success_count))
                 .then(a.id.cmp(&b.id))
         })?;
@@ -2300,16 +2307,30 @@ impl MultiTokenManager {
             return None;
         }
 
+        // 使用率排序键：已用 credit（credit_usage_cache）/ 套餐总 credit。
+        let usage: UsageKeys = {
+            let cache = self.credit_usage_cache.lock();
+            available
+                .iter()
+                .map(|(e, _)| {
+                    (
+                        e.id,
+                        usage_permille(&e.credentials, cache.get(&e.id).copied()),
+                    )
+                })
+                .collect()
+        };
+
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
-            "balanced" => pick_least_used(&available, &load),
+            "balanced" => pick_least_used(&available, &load, &usage),
             _ => {
-                // priority 模式（默认）：发现档 → 优先级层 → 同层成功次数最少。
+                // priority 模式（默认）：发现档 → 优先级层 → 同层使用率最低（再按成功次数）。
                 // 同层内按 success_count 做 least-used 均衡，与 balanced 同一消耗语义，
                 // 区别是 priority 严格分层（高优先级层未耗尽不降级）。
-                pick_by_discovery_priority_least_used(&available, &load)
+                pick_by_discovery_priority_least_used(&available, &load, &usage)
             }
         }
     }
