@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{CredentialType, KiroCredentials};
 use crate::kiro::token_manager::{AffinityOutcome, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -33,7 +33,7 @@ const MAX_TOTAL_RETRIES: usize = 6;
 ///
 /// 原号重试不计入 `max_retries` 换号预算，但必须有天花板：否则多个凭据各自
 /// 配了较大次数时，单个请求会被拉长到客户端超时。
-const MAX_SAME_CREDENTIAL_RETRY_BONUS: usize = 12;
+const MAX_SAME_CREDENTIAL_RETRY_BONUS: usize = 20;
 
 // 本地新增：端点轮换下标计算（纯函数，便于单测）。从 `start_name` 在有序端点列表中的
 // 位置起头，按 `rotation` 环绕推进。列表非空由调用方保证。
@@ -222,11 +222,57 @@ impl KiroProvider {
     // 上游只按凭据固定端点请求；速刷号配额恢复快，可在同一张号上轮流用不同端点重试，
     // 顺序从凭据自身端点起头（如凭据是 cli：cli→ide→cli→ide…）。等上游实现端点轮换后移除。
 
-    /// 已注册端点名的确定性有序列表（按名称排序，保证轮换顺序稳定）。
+    /// 参与默认轮换的端点名的确定性有序列表（按名称排序，保证轮换顺序稳定）。
+    ///
+    /// 排除 `in_default_rotation() == false` 的端点（runtime / codewhisperer），
+    /// 使它们的注册不改变存量的 ide↔cli 轮换与重试预算。
     pub(super) fn sorted_endpoint_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.endpoints.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .endpoints
+            .iter()
+            .filter(|(_, e)| e.in_default_rotation())
+            .map(|(n, _)| n.clone())
+            .collect();
         names.sort();
         names
+    }
+
+    /// 全部已注册端点数（短速刷随机端点模式下，每轮重试把它们各打一遍）。
+    pub(super) fn all_endpoint_count(&self) -> usize {
+        self.endpoints.len().max(1)
+    }
+
+    /// 生成一轮随机端点序列：全部端点各一次、顺序随机；首位避开 `avoid`（上一次尝试的端点）。
+    pub(super) fn shuffled_endpoint_round(&self, avoid: Option<&str>) -> Vec<String> {
+        let mut names: Vec<String> = self.endpoints.keys().cloned().collect();
+        names.sort();
+        fastrand::shuffle(&mut names);
+        if names.len() > 1 && Some(names[0].as_str()) == avoid {
+            let j = fastrand::usize(1..names.len());
+            names.swap(0, j);
+        }
+        names
+    }
+
+    /// 短速刷随机端点：在全部已注册端点里随机选一个，避开 `avoid`（上一次尝试用过的）。
+    /// 只有一个端点时无从避开，直接返回它。
+    pub(super) fn random_endpoint(
+        &self,
+        avoid: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let mut names: Vec<&String> = self.endpoints.keys().collect();
+        names.sort();
+        let candidates: Vec<&String> = names
+            .iter()
+            .copied()
+            .filter(|n| Some(n.as_str()) != avoid)
+            .collect();
+        let pool = if candidates.is_empty() { &names } else { &candidates };
+        let name = pool[fastrand::usize(..pool.len())];
+        self.endpoints
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
     /// 端点轮换：给定凭据起始端点，返回从它起头的旋转序列，再按 `rotation` 取第
@@ -802,6 +848,10 @@ impl KiroProvider {
         let mut request_excluded_credentials: HashSet<u64> = HashSet::new();
         // 用户级 429 时已在各凭据上「原号重试」的次数（本次请求内计数，不跨请求累积）
         let mut same_credential_429: HashMap<u64, u32> = HashMap::new();
+        // 短速刷随机端点：记录上一次尝试用过的端点，下一次尝试避开它。
+        let mut last_attempt_endpoint: Option<&'static str> = None;
+        // 短速刷随机端点：每个凭据当前这一轮的随机端点序列（每轮全部端点各一次）。
+        let mut random_round: HashMap<u64, Vec<String>> = HashMap::new();
         // 会话亲和凭据遇到用户级 429 时已在原号上重试的次数（本次请求内计数）
         let mut affinity_429: HashMap<u64, u32> = HashMap::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -883,7 +933,32 @@ impl KiroProvider {
             // 本地新增：速刷号原号 429 重试时按已重试次数轮换端点；未触发重试（rotation==0）
             // 或普通号时与 endpoint_for 完全等价。
             let endpoint_rotation = same_credential_429.get(&ctx.id).copied().unwrap_or(0) as usize;
-            let endpoint = match self.rotated_endpoint_for(&ctx.credentials, endpoint_rotation) {
+            let is_short_speed = ctx.credentials.metadata.kind == CredentialType::ShortSpeed;
+            let endpoint_choice = if is_short_speed
+                && self.token_manager.short_speed_random_endpoint_enabled()
+            {
+                if endpoint_rotation == 0 {
+                    self.random_endpoint(last_attempt_endpoint)
+                } else {
+                    // 第 k 次原号重试取本轮序列第 (k-1)%n 位；每轮开头重新洗牌。
+                    let n = self.all_endpoint_count();
+                    let idx = (endpoint_rotation - 1) % n;
+                    if idx == 0 || !random_round.contains_key(&ctx.id) {
+                        random_round.insert(
+                            ctx.id,
+                            self.shuffled_endpoint_round(last_attempt_endpoint),
+                        );
+                    }
+                    let name = random_round[&ctx.id][idx].clone();
+                    self.endpoints
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+                }
+            } else {
+                self.rotated_endpoint_for(&ctx.credentials, endpoint_rotation)
+            };
+            let endpoint = match endpoint_choice {
                 Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
@@ -897,6 +972,7 @@ impl KiroProvider {
                 }
             };
             let endpoint_name = endpoint.name();
+            last_attempt_endpoint = Some(endpoint_name);
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -928,9 +1004,17 @@ impl KiroProvider {
             }
             // 首字节守卫：只限「等响应头」这一段。超时按网络错误处理，走下面同一个
             // 重试分支（不禁用、不切换凭据），把一次 120s 的干等换成一次快速重试。
+            // 短速刷开启首字超时后改用更短的专属时限（默认 10s），其余沿用通用守卫。
+            let header_limit = if is_short_speed {
+                self.token_manager
+                    .short_speed_first_token_timeout()
+                    .unwrap_or(Duration::from_secs(RESPONSE_HEADER_TIMEOUT_SECS))
+            } else {
+                Duration::from_secs(RESPONSE_HEADER_TIMEOUT_SECS)
+            };
             let mut header_timeout = false;
             let send_result = match tokio::time::timeout(
-                Duration::from_secs(RESPONSE_HEADER_TIMEOUT_SECS),
+                header_limit,
                 self.client_for(&ctx.credentials)?.execute(request),
             )
             .await
@@ -940,7 +1024,7 @@ impl KiroProvider {
                     header_timeout = true;
                     Err(anyhow::anyhow!(
                         "等待上游响应头超过 {}s（首字节守卫）",
-                        RESPONSE_HEADER_TIMEOUT_SECS
+                        header_limit.as_secs()
                     ))
                 }
             };
@@ -1194,7 +1278,13 @@ impl KiroProvider {
                 // 注意：retry_ceiling 受 MAX_SAME_CREDENTIAL_RETRY_BONUS 硬顶约束，只要
                 // budget × 端点数 ≤ MAX_SAME_CREDENTIAL_RETRY_BONUS 就不会被截断；以后加端点
                 // 或把 budget 配得很大时，需同步调大该常量，否则轮换会在半轮处被硬顶掐断。
-                let endpoint_count = self.sorted_endpoint_names().len().max(1) as u32;
+                let endpoint_count = if ctx.credentials.metadata.kind == CredentialType::ShortSpeed
+                    && self.token_manager.short_speed_random_endpoint_enabled()
+                {
+                    self.all_endpoint_count() as u32
+                } else {
+                    self.sorted_endpoint_names().len().max(1) as u32
+                };
                 let budget = budget.saturating_mul(endpoint_count);
                 let used = same_credential_429.get(&ctx.id).copied().unwrap_or(0);
                 if used < budget && retry_ceiling < retry_ceiling_cap {

@@ -731,6 +731,27 @@ pub struct Config {
     #[serde(default = "default_speed_credentials_min_tokens")]
     pub speed_credentials_min_tokens: u64,
 
+    /// 是否启用短速刷（`short_speed`）首字超时（默认 false）。
+    ///
+    /// 开启后，短速刷号的请求在 [`Self::short_speed_first_token_timeout_secs`] 内没等到
+    /// 上游响应头即视为失败并立即重试，不再干等通用的首字节守卫（50s）。只作用于
+    /// 短速刷；超时不计入凭据失败次数、不禁用凭据。
+    #[serde(default)]
+    pub short_speed_first_token_timeout_enabled: bool,
+
+    /// 短速刷首字超时（秒，默认 10）。仅在
+    /// [`Self::short_speed_first_token_timeout_enabled`] 为真时生效。
+    #[serde(default = "default_short_speed_first_token_timeout_secs")]
+    pub short_speed_first_token_timeout_secs: u64,
+
+    /// 短速刷是否在已注册的全部端点（runtime / ide / codewhisperer / cli）间随机选择
+    /// （默认 false）。
+    ///
+    /// 开启后，短速刷号每次尝试随机选一个端点，并避开上一次尝试用过的端点，
+    /// 同一请求内不会连续打同一个端点。关闭时沿用凭据自身端点。
+    #[serde(default)]
+    pub short_speed_random_endpoint: bool,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -971,6 +992,10 @@ fn default_speed_credentials_min_tokens() -> u64 {
     150_000
 }
 
+fn default_short_speed_first_token_timeout_secs() -> u64 {
+    10
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -1075,6 +1100,9 @@ impl Default for Config {
             speed_credentials_exclude_sonnet: false,
             speed_credentials_min_tokens_enabled: false,
             speed_credentials_min_tokens: default_speed_credentials_min_tokens(),
+            short_speed_first_token_timeout_enabled: false,
+            short_speed_first_token_timeout_secs: default_short_speed_first_token_timeout_secs(),
+            short_speed_random_endpoint: false,
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),

@@ -7,6 +7,8 @@ import {
   useSetRateLimitSameCredentialConfig,
   useSpeedCredentialsExcludeConfig,
   useSetSpeedCredentialsExcludeConfig,
+  useShortSpeedConfig,
+  useSetShortSpeedConfig,
   useSpeedCredentialsMinTokensConfig,
   useSetSpeedCredentialsMinTokensConfig,
   useLoadBalancingMode,
@@ -47,6 +49,7 @@ export function DispatchSection() {
       <SameCredentialRetryGroup />
       <SpeedCredentialsExcludeGroup />
       <SpeedCredentialsMinTokensGroup />
+      <ShortSpeedGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
     </div>
@@ -290,6 +293,65 @@ function SpeedCredentialsMinTokensGroup() {
         pending={saver.isSaving('minTokens')}
         saved={saver.isSaved('minTokens')}
         disabled={isLoading || !enabled}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
+ * 短速刷专属策略：首字超时 + 四端点随机轮询。只作用于 metadata.type = short_speed 的号。
+ */
+function ShortSpeedGroup() {
+  const { data, isLoading } = useShortSpeedConfig()
+  const { mutate } = useSetShortSpeedConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const timeoutEnabled = data?.firstTokenTimeoutEnabled ?? false
+  const timeoutSecs = data?.firstTokenTimeoutSecs ?? 10
+  const randomEndpoint = data?.randomEndpoint ?? false
+
+  return (
+    <SettingGroup
+      title="短速刷"
+      description="仅作用于短速刷号。首字超时让慢响应快速失败重试；随机端点在 runtime / ide / codewhisperer / cli 四个端点间轮换"
+    >
+      <SettingSwitch
+        label="启用首字超时"
+        hint={
+          timeoutEnabled
+            ? `${timeoutSecs} 秒内没收到上游响应头即视为失败并重试（不计凭据失败）`
+            : '沿用通用首字节守卫（50 秒）'
+        }
+        checked={timeoutEnabled}
+        onChange={(next) => saver.save('timeoutEnabled', { firstTokenTimeoutEnabled: next })}
+        pending={saver.isSaving('timeoutEnabled')}
+        saved={saver.isSaved('timeoutEnabled')}
+        disabled={isLoading}
+      />
+      <SettingNumber
+        label="首字超时"
+        hint="超过该时长未收到上游响应即判定失败"
+        value={timeoutSecs}
+        onCommit={(next) => saver.save('timeoutSecs', { firstTokenTimeoutSecs: next })}
+        min={1}
+        max={50}
+        unit="秒"
+        presets={[5, 10, 15, 20]}
+        pending={saver.isSaving('timeoutSecs')}
+        saved={saver.isSaved('timeoutSecs')}
+        disabled={isLoading || !timeoutEnabled}
+      />
+      <SettingSwitch
+        label="四端点随机轮询"
+        hint={
+          randomEndpoint
+            ? '每次请求随机选一个端点且不连续重复；429 原号重试每轮把 4 个端点随机顺序各打一次'
+            : '使用凭据自身端点'
+        }
+        checked={randomEndpoint}
+        onChange={(next) => saver.save('randomEndpoint', { randomEndpoint: next })}
+        pending={saver.isSaving('randomEndpoint')}
+        saved={saver.isSaved('randomEndpoint')}
+        disabled={isLoading}
       />
     </SettingGroup>
   )

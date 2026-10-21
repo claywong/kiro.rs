@@ -1253,6 +1253,12 @@ pub struct MultiTokenManager {
     speed_credentials_min_tokens_enabled: AtomicBool,
     /// 速刷号最小 token 门槛（运行时可修改）
     speed_credentials_min_tokens: AtomicU64,
+    /// 短速刷首字超时开关（运行时可修改）
+    short_speed_first_token_timeout_enabled: AtomicBool,
+    /// 短速刷首字超时秒数（运行时可修改）
+    short_speed_first_token_timeout_secs: AtomicU64,
+    /// 短速刷是否在全部端点间随机选择（运行时可修改）
+    short_speed_random_endpoint: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1651,6 +1657,9 @@ impl MultiTokenManager {
         let exclude_sonnet = config.speed_credentials_exclude_sonnet;
         let min_tokens_enabled = config.speed_credentials_min_tokens_enabled;
         let min_tokens = config.speed_credentials_min_tokens;
+        let ss_ttft_enabled = config.short_speed_first_token_timeout_enabled;
+        let ss_ttft_secs = config.short_speed_first_token_timeout_secs;
+        let ss_random_endpoint = config.short_speed_random_endpoint;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1682,6 +1691,9 @@ impl MultiTokenManager {
             speed_credentials_exclude_sonnet: AtomicBool::new(exclude_sonnet),
             speed_credentials_min_tokens_enabled: AtomicBool::new(min_tokens_enabled),
             speed_credentials_min_tokens: AtomicU64::new(min_tokens),
+            short_speed_first_token_timeout_enabled: AtomicBool::new(ss_ttft_enabled),
+            short_speed_first_token_timeout_secs: AtomicU64::new(ss_ttft_secs),
+            short_speed_random_endpoint: AtomicBool::new(ss_random_endpoint),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -5282,6 +5294,89 @@ impl MultiTokenManager {
             "速刷号最小 token 门槛配置已更新: enabled={}, min_tokens={}",
             new_enabled,
             new_tokens
+        );
+        Ok(())
+    }
+
+    /// 获取短速刷配置（Admin API）。返回：(首字超时开关, 首字超时秒数, 随机端点开关)。
+    pub fn get_short_speed_config(&self) -> (bool, u64, bool) {
+        (
+            self.short_speed_first_token_timeout_enabled
+                .load(Ordering::Relaxed),
+            self.short_speed_first_token_timeout_secs
+                .load(Ordering::Relaxed),
+            self.short_speed_random_endpoint.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 短速刷首字超时：开启时返回超时秒数，关闭返回 `None`（热路径，只读原子量）。
+    pub fn short_speed_first_token_timeout(&self) -> Option<StdDuration> {
+        self.short_speed_first_token_timeout_enabled
+            .load(Ordering::Relaxed)
+            .then(|| {
+                StdDuration::from_secs(
+                    self.short_speed_first_token_timeout_secs
+                        .load(Ordering::Relaxed),
+                )
+            })
+    }
+
+    /// 短速刷是否启用随机端点。
+    pub fn short_speed_random_endpoint_enabled(&self) -> bool {
+        self.short_speed_random_endpoint.load(Ordering::Relaxed)
+    }
+
+    /// 设置短速刷配置（Admin API）。任一参数传 `None` 表示不修改。
+    pub fn set_short_speed_config(
+        &self,
+        timeout_enabled: Option<bool>,
+        timeout_secs: Option<u64>,
+        random_endpoint: Option<bool>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = timeout_secs {
+            // 下限 1s 防止误配成 0 让所有短速刷请求必超时；上限不超过通用守卫（50s）才有意义。
+            if !(1..=50).contains(&v) {
+                anyhow::bail!("短速刷首字超时必须在 1..=50 秒内: {}", v);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_enabled, prev_secs, prev_random) = self.get_short_speed_config();
+        let new_enabled = timeout_enabled.unwrap_or(prev_enabled);
+        let new_secs = timeout_secs.unwrap_or(prev_secs);
+        let new_random = random_endpoint.unwrap_or(prev_random);
+
+        if new_enabled == prev_enabled && new_secs == prev_secs && new_random == prev_random {
+            return Ok(());
+        }
+
+        self.short_speed_first_token_timeout_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.short_speed_first_token_timeout_secs
+            .store(new_secs, Ordering::Relaxed);
+        self.short_speed_random_endpoint
+            .store(new_random, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.short_speed_first_token_timeout_enabled = new_enabled;
+            config.short_speed_first_token_timeout_secs = new_secs;
+            config.short_speed_random_endpoint = new_random;
+        }) {
+            self.short_speed_first_token_timeout_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.short_speed_first_token_timeout_secs
+                .store(prev_secs, Ordering::Relaxed);
+            self.short_speed_random_endpoint
+                .store(prev_random, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "短速刷配置已更新: first_token_timeout_enabled={}, secs={}, random_endpoint={}",
+            new_enabled,
+            new_secs,
+            new_random
         );
         Ok(())
     }

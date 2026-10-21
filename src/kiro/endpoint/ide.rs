@@ -14,13 +14,40 @@ use crate::kiro::kiro_version;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
+/// Runtime 端点名称（`runtime.{region}.kiro.dev`）
+pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
+/// Legacy CodeWhisperer 端点名称（固定 `codewhisperer.us-east-1.amazonaws.com`）
+pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
+
+/// IDE 风格端点的三种主机形态。请求头 / 请求体完全一致，只有名称与主机不同。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdeHost {
+    /// `q.{region}.amazonaws.com`（Legacy Kiro IDE）
+    LegacyQ,
+    /// `runtime.{region}.kiro.dev`
+    Runtime,
+    /// `codewhisperer.us-east-1.amazonaws.com`（region 固定）
+    CodeWhisperer,
+}
 
 /// Kiro IDE 端点
-pub struct IdeEndpoint;
+pub struct IdeEndpoint {
+    host: IdeHost,
+}
 
 impl IdeEndpoint {
     pub fn new() -> Self {
-        Self
+        Self { host: IdeHost::LegacyQ }
+    }
+
+    /// Runtime 端点：`https://runtime.{region}.kiro.dev/generateAssistantResponse`
+    pub fn runtime() -> Self {
+        Self { host: IdeHost::Runtime }
+    }
+
+    /// Legacy CodeWhisperer 端点：`https://codewhisperer.us-east-1.amazonaws.com/...`
+    pub fn codewhisperer() -> Self {
+        Self { host: IdeHost::CodeWhisperer }
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
@@ -28,7 +55,11 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        match self.host {
+            IdeHost::LegacyQ => format!("q.{}.amazonaws.com", self.api_region(ctx)),
+            IdeHost::Runtime => format!("runtime.{}.kiro.dev", self.api_region(ctx)),
+            IdeHost::CodeWhisperer => "codewhisperer.us-east-1.amazonaws.com".to_string(),
+        }
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -62,18 +93,25 @@ impl Default for IdeEndpoint {
 
 impl KiroEndpoint for IdeEndpoint {
     fn name(&self) -> &'static str {
-        IDE_ENDPOINT_NAME
+        match self.host {
+            IdeHost::LegacyQ => IDE_ENDPOINT_NAME,
+            IdeHost::Runtime => RUNTIME_ENDPOINT_NAME,
+            IdeHost::CodeWhisperer => CODEWHISPERER_ENDPOINT_NAME,
+        }
+    }
+
+    /// 只有 Legacy IDE 参与 429 原号重试的默认轮换；Runtime / CodeWhisperer 仅供
+    /// 短速刷随机端点开关使用，避免注册它们后改变存量的 ide↔cli 轮换行为。
+    fn in_default_rotation(&self) -> bool {
+        self.host == IdeHost::LegacyQ
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -172,6 +210,36 @@ mod tests {
                 "UA 的 SDK 版本应与用量链路统一: {ua}"
             );
         }
+    }
+
+    #[test]
+    fn test_runtime_and_codewhisperer_urls_and_rotation() {
+        use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "t",
+            machine_id: "m",
+            config: &config,
+        };
+        let region = credentials.effective_api_region(&config).to_string();
+
+        let ide = super::IdeEndpoint::new();
+        let rt = super::IdeEndpoint::runtime();
+        let cw = super::IdeEndpoint::codewhisperer();
+
+        assert_eq!(ide.api_url(&ctx), format!("https://q.{region}.amazonaws.com/generateAssistantResponse"));
+        assert_eq!(rt.api_url(&ctx), format!("https://runtime.{region}.kiro.dev/generateAssistantResponse"));
+        assert_eq!(cw.api_url(&ctx), "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse");
+        assert_eq!((ide.name(), rt.name(), cw.name()), ("ide", "runtime", "codewhisperer"));
+        // 只有 ide 参与默认的 429 轮换，注册 runtime/codewhisperer 不改变存量行为
+        assert!(ide.in_default_rotation());
+        assert!(!rt.in_default_rotation());
+        assert!(!cw.in_default_rotation());
     }
 
     #[test]

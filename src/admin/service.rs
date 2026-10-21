@@ -48,7 +48,7 @@ use super::types::{
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     RateLimitSameCredentialConfigResponse, SetAccountRpmLimitConfigRequest,
-    SetSpeedCredentialsExcludeConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
+    SetShortSpeedConfigRequest, ShortSpeedConfigResponse, SetSpeedCredentialsExcludeConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
     SpeedCredentialsExcludeConfigResponse, SpeedCredentialsMinTokensConfigResponse,
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetRateLimitSameCredentialConfigRequest,
@@ -2488,6 +2488,42 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_speed_credentials_min_tokens_config())
+    }
+
+    /// 获取短速刷配置
+    pub fn get_short_speed_config(&self) -> ShortSpeedConfigResponse {
+        let (enabled, secs, random) = self.token_manager.get_short_speed_config();
+        ShortSpeedConfigResponse {
+            first_token_timeout_enabled: enabled,
+            first_token_timeout_secs: secs,
+            random_endpoint: random,
+        }
+    }
+
+    /// 更新短速刷配置
+    pub fn set_short_speed_config(
+        &self,
+        req: SetShortSpeedConfigRequest,
+    ) -> Result<ShortSpeedConfigResponse, AdminServiceError> {
+        if req.first_token_timeout_enabled.is_none()
+            && req.first_token_timeout_secs.is_none()
+            && req.random_endpoint.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 firstTokenTimeoutEnabled / firstTokenTimeoutSecs / randomEndpoint 之一"
+                    .to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_short_speed_config(
+                req.first_token_timeout_enabled,
+                req.first_token_timeout_secs,
+                req.random_endpoint,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_short_speed_config())
     }
 
     /// 获取单账号 RPM 限流配置
