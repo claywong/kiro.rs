@@ -555,6 +555,29 @@ export async function setSpeedCredentialsMinTokensConfig(
   return data
 }
 
+export interface ShortSpeedConfig {
+  /** 是否启用首字超时 */
+  firstTokenTimeoutEnabled: boolean
+  /** 首字超时（秒） */
+  firstTokenTimeoutSecs: number
+  /** 是否在全部端点间随机选择 */
+  randomEndpoint: boolean
+}
+
+// 获取短速刷配置
+export async function getShortSpeedConfig(): Promise<ShortSpeedConfig> {
+  const { data } = await api.get<ShortSpeedConfig>('/config/short-speed')
+  return data
+}
+
+// 更新短速刷配置
+export async function setShortSpeedConfig(
+  patch: Partial<ShortSpeedConfig>,
+): Promise<ShortSpeedConfig> {
+  const { data } = await api.put<ShortSpeedConfig>('/config/short-speed', patch)
+  return data
+}
+
 export interface AccountRpmLimitConfig {
   enabled: boolean
   limit: number

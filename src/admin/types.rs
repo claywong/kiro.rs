@@ -611,6 +611,33 @@ pub struct SetSpeedCredentialsMinTokensConfigRequest {
     pub min_tokens: Option<u64>,
 }
 
+/// 短速刷配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortSpeedConfigResponse {
+    /// 是否启用首字超时
+    pub first_token_timeout_enabled: bool,
+    /// 首字超时（秒）
+    pub first_token_timeout_secs: u64,
+    /// 是否在全部端点间随机选择
+    pub random_endpoint: bool,
+}
+
+/// 更新短速刷配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetShortSpeedConfigRequest {
+    /// 是否启用首字超时；缺省表示不修改
+    #[serde(default)]
+    pub first_token_timeout_enabled: Option<bool>,
+    /// 首字超时秒数（1..=50）；缺省表示不修改
+    #[serde(default)]
+    pub first_token_timeout_secs: Option<u64>,
+    /// 是否随机端点；缺省表示不修改
+    #[serde(default)]
+    pub random_endpoint: Option<bool>,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

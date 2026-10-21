@@ -20,9 +20,11 @@ import {
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
   getSpeedCredentialsExcludeConfig,
+  getShortSpeedConfig,
   getSpeedCredentialsMinTokensConfig,
   setRateLimitSameCredentialConfig,
   setSpeedCredentialsExcludeConfig,
+  setShortSpeedConfig,
   setSpeedCredentialsMinTokensConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
@@ -360,6 +362,25 @@ export function useSetSpeedCredentialsMinTokensConfig() {
     mutationFn: setSpeedCredentialsMinTokensConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['speedCredentialsMinTokensConfig'] })
+    },
+  })
+}
+
+// 获取短速刷配置
+export function useShortSpeedConfig() {
+  return useQuery({
+    queryKey: ['shortSpeedConfig'],
+    queryFn: getShortSpeedConfig,
+  })
+}
+
+// 更新短速刷配置
+export function useSetShortSpeedConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setShortSpeedConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['shortSpeedConfig'] })
     },
   })
 }
