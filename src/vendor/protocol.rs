@@ -54,6 +54,11 @@ pub enum VendorFlavor {
     /// 数据但字段名是 `uptime_secs`。独有：`/my/credits` 流水、`/my/keys` **给密钥正文**。
     /// 详见 [`super::flavor_kiroooo`]。
     KiroOoo,
+    /// KiroShop（kiro.yonghu.shop）：`/api/v1/*` + `Authorization: Bearer ks_live_xxx`。
+    /// 商品制店铺（建单 → 取号），交付的是 **JSON 凭据**而非 `ksk_` Key。
+    /// 商品映射为「区」；只做手动购买，无 webhook、无余额接口。
+    /// 详见 [`super::flavor_kiroshop`]。
+    Kiroshop,
 }
 
 impl VendorFlavor {
@@ -66,6 +71,7 @@ impl VendorFlavor {
             Self::Kiromarket => "kiromarket",
             Self::Kirored => "kirored",
             Self::KiroOoo => "kiro-ooo",
+            Self::Kiroshop => "kiroshop",
         }
     }
 
@@ -102,13 +108,15 @@ impl VendorFlavor {
             // 极易写错，而拼错会直接报错拒启动，容忍几个近似写法比让人排查
             // 「为什么 flavor 不认」划算。注意不能宽到 `kiro` —— 那会与 kiroapp 混淆。
             "kiroooo" | "kirooo" | "kirooooo" | "ooo" => Some(Self::KiroOoo),
+            // 域名 kiro.yonghu.shop 归一化后是 kiroyonghushop
+            "kiroshop" | "kiroyonghushop" | "yonghushop" => Some(Self::Kiroshop),
             _ => None,
         }
     }
 
     /// 所有可选值，用于报错时给出提示
     pub fn all_names() -> &'static str {
-        "legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored, kiro-ooo"
+        "legacy, kiroapp, kiroapp-cc, drop, kiromarket, kirored, kiro-ooo, kiroshop"
     }
 
     /// 该风味支持哪些能力。面板据此决定展示或隐藏对应卡片。
@@ -251,6 +259,21 @@ impl VendorFlavor {
                 // 且**不传默认 us-east-1**。必须开：关掉的话 resolve_zone 直接返回
                 // None，下单就落到默认的美区 —— 而实测美区常关停 0 库存，
                 // 面板显示的却是欧区的数量与单价，症状是「明明有货却提不出来」。
+                zoned_purchase: true,
+            },
+            Self::Kiroshop => VendorCapabilities {
+                // 只有商品、订单、取号三组接口，其余一概没有
+                system_status: false,
+                gen_logs: false,
+                webhook_manage: false,
+                purchase_orders: true,
+                redeem: false,
+                ledger: false,
+                my_keys: false,
+                earliest_key: false,
+                batch_scoped_purchase: false,
+                tiered_pricing: false,
+                // 商品即「区」：下单必须指定商品，自动选区取有货中最便宜的
                 zoned_purchase: true,
             },
         }

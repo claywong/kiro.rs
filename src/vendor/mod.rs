@@ -37,6 +37,7 @@ pub mod flavor_kiroapp;
 pub mod flavor_kiroapp_cc;
 pub mod flavor_kiromarket;
 pub mod flavor_kiroooo;
+pub mod flavor_kiroshop;
 pub mod flavor_kirored;
 pub mod flavor_legacy;
 pub mod protocol;

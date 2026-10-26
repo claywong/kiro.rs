@@ -373,6 +373,9 @@ fn default_vendor_rpm_limit() -> u32 {
 /// kiro.red 入库凭据的缺省优先级。数值越小越优先，10 表示排在自有号（0）之后。
 pub const DEFAULT_KIRORED_PRIORITY: u32 = 10;
 
+/// KiroShop 入库凭据的缺省优先级。买来的个人号排在自有号之后。
+pub const DEFAULT_KIROSHOP_PRIORITY: u32 = 15;
+
 /// 单供应商时期的隐式 id。存量事件按它回填，故不能改。
 pub const DEFAULT_VENDOR_ID: &str = "default";
 
@@ -473,6 +476,7 @@ impl VendorConfig {
         }
         match self.flavor {
             crate::vendor::protocol::VendorFlavor::Kirored => DEFAULT_KIRORED_PRIORITY,
+            crate::vendor::protocol::VendorFlavor::Kiroshop => DEFAULT_KIROSHOP_PRIORITY,
             _ => 0,
         }
     }

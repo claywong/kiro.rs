@@ -21,6 +21,7 @@ use super::flavor_kiromarket as kiromarket;
 // 本地新增导入单独成行，避免与上游按序排列的 use 块冲突。
 use super::flavor_kiroooo as kiroooo;
 use super::flavor_kirored as kirored;
+use super::flavor_kiroshop as kiroshop;
 use super::flavor_legacy as legacy;
 use super::protocol::{
     EarliestKeyInfo, LedgerEntry, OrderInfo, Paged, ProfileInfo, PurchaseResult, RedeemResult,
@@ -71,6 +72,14 @@ impl VendorClient {
 
     /// 构建 kiro.red 专用客户端（复用同一个 reqwest::Client）。
     /// 仅在 flavor == Kirored 的委托分支里调用。
+    fn kiroshop_client(&self) -> kiroshop::KiroshopClient {
+        kiroshop::KiroshopClient::new(
+            self.http.clone(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+        )
+    }
+
     fn kirored_client(&self) -> kirored::KiroredClient {
         kirored::KiroredClient::new(
             self.http.clone(),
@@ -100,7 +109,9 @@ impl VendorClient {
             | VendorFlavor::Drop
             | VendorFlavor::Kiromarket
             | VendorFlavor::KiroOoo => req.header("X-API-Key", &self.api_key),
-            VendorFlavor::Kiroapp | VendorFlavor::KiroappCc => req.bearer_auth(&self.api_key),
+            VendorFlavor::Kiroapp | VendorFlavor::KiroappCc | VendorFlavor::Kiroshop => {
+                req.bearer_auth(&self.api_key)
+            }
             // kiro.red 不走这条通用鉴权 —— 它有自己的签名 + JWT 管线
             // （见 flavor_kirored）。此分支不应被走到，原样返回不加头。
             VendorFlavor::Kirored => req,
@@ -554,6 +565,12 @@ impl VendorClient {
             // kiro.red 走独立管线：内部完成登录 → 选品 → 下单 → 查卡密。
             // batch_order_id / zone 对本家无意义（选品在运行时按 health 自动做）。
             VendorFlavor::Kirored => self.kirored_client().purchase(count, client_order_id).await,
+            // KiroShop：zone 是商品 id，建单 + 取号在客户端内一气完成
+            VendorFlavor::Kiroshop => {
+                self.kiroshop_client()
+                    .purchase(count, client_order_id, zone)
+                    .await
+            }
             // kiro.ooo：路径是 /my/keys/claim（不是 /my/purchase），数量参数与首家
             // 同名（count + client_order_id），但**区域参数叫 `region` 而非 `zone``**，
             // 且不传时卖家默认 us-east-1 —— 而美区常关停 0 库存，所以有区就必须带。
@@ -611,6 +628,7 @@ impl VendorClient {
             }
             // kiro.red 无库存端点，把商品列表里的健康商品折叠成中立库存
             VendorFlavor::Kirored => self.kirored_client().stock().await,
+            VendorFlavor::Kiroshop => self.kiroshop_client().stock().await,
             VendorFlavor::KiroOoo => {
                 // 优先走双区货架：`/my/stock` 只给一份扁平数字（实测是当前开放那个区
                 // 的），拿它当全局库存会出现「面板显示欧区的 13 个 / 单价 50，下单却
@@ -689,6 +707,8 @@ impl VendorClient {
             }
             // kiro.red 走 /user/user/info，余额是积分
             VendorFlavor::Kirored => self.kirored_client().profile().await,
+            // 本家没有余额 / 档案接口，面板对应字段留空
+            VendorFlavor::Kiroshop => Ok(ProfileInfo::default()),
             // 本家档案里**没有余额** —— `remaining` 是剩余配额且实测恒为 0，真实余额
             // 在 `credits`，而该字段只出现在 /my/stock 与 /my/credits。故补一次
             // /my/credits?limit=1（limit 压到 1 是为了别把整份流水拉回来，
@@ -748,6 +768,7 @@ impl VendorClient {
                 let orders: Vec<kiroooo::PurchaseOrderRow> = self.get(kiroooo::PATH_ORDERS).await?;
                 Ok(kiroooo::orders_to_paged(orders))
             }
+            VendorFlavor::Kiroshop => self.kiroshop_client().purchase_orders(page).await,
             VendorFlavor::Kirored => {
                 // 这家的列表接口是 POST + 签名 + 可能加密，走它自己的管线
                 self.kirored_client().purchase_orders(page, page_size).await
@@ -820,7 +841,10 @@ impl VendorClient {
                     self.post_json(kiroooo::PATH_REDEEM, &body).await?;
                 Ok(r.into())
             }
-            VendorFlavor::KiroappCc | VendorFlavor::Drop | VendorFlavor::Kirored => {
+            VendorFlavor::KiroappCc
+            | VendorFlavor::Drop
+            | VendorFlavor::Kirored
+            | VendorFlavor::Kiroshop => {
                 Err(VendorApiError::unsupported("兑换码充值"))
             }
         }
