@@ -26,6 +26,8 @@ pub enum AffinityOutcome {
     Hit,
     /// 原绑定凭据不可用，改绑到新凭据
     Rebind,
+    /// 绑定凭据达到 RPM 放宽上限，本次临时溢出到其它凭据（主绑定不变）
+    Overflow,
 }
 
 impl AffinityOutcome {
@@ -35,6 +37,7 @@ impl AffinityOutcome {
             Self::Bind => "bind",
             Self::Hit => "hit",
             Self::Rebind => "rebind",
+            Self::Overflow => "overflow",
         }
     }
 
@@ -46,6 +49,8 @@ impl AffinityOutcome {
 struct Binding {
     credential_id: u64,
     last_used: Instant,
+    /// 溢出号及其最近一次使用时间（负载窗口内有效）；改绑时清空
+    overflow: Option<(u64, Instant)>,
 }
 
 pub(crate) struct SessionAffinity {
@@ -55,7 +60,7 @@ pub(crate) struct SessionAffinity {
     /// 统计活跃负载的窗口：`last_used` 在窗口内的绑定才算占用该凭据
     load_window: Duration,
     /// 各结果的窗口计数（汇总日志后清零）
-    counters: [AtomicU64; 4],
+    counters: [AtomicU64; 5],
 }
 
 impl SessionAffinity {
@@ -65,7 +70,7 @@ impl SessionAffinity {
             ttl: Duration::from_secs(ttl_secs.max(1)),
             max_entries: max_entries.max(1),
             load_window: Duration::from_secs(load_window_secs.max(1)),
-            counters: [const { AtomicU64::new(0) }; 4],
+            counters: [const { AtomicU64::new(0) }; 5],
         }
     }
 
@@ -94,14 +99,49 @@ impl SessionAffinity {
         if !bindings.contains_key(session) && bindings.len() >= self.max_entries {
             Self::evict_oldest(&mut bindings);
         }
+        // 命中时保留溢出号；首绑 / 改绑时清空
+        let overflow = match outcome {
+            AffinityOutcome::Hit => bindings.get(session).and_then(|b| b.overflow),
+            _ => None,
+        };
         bindings.insert(
             session.to_string(),
             Binding {
                 credential_id,
                 last_used: now,
+                overflow,
             },
         );
         drop(bindings);
+        self.counters[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        outcome
+    }
+
+    /// 会话当前的溢出号（主绑定未过期且溢出号在负载窗口内有效）。只读。
+    pub(crate) fn lookup_overflow(&self, session: &str, now: Instant) -> Option<u64> {
+        let window = self.load_window.min(self.ttl);
+        self.bindings
+            .lock()
+            .get(session)
+            .filter(|b| now.duration_since(b.last_used) < self.ttl)
+            .and_then(|b| b.overflow)
+            .filter(|&(_, used)| now.duration_since(used) < window)
+            .map(|(id, _)| id)
+    }
+
+    /// 记录一次溢出：主绑定不变但刷新 TTL，溢出号更新为 `credential_id`。
+    /// 主绑定已不存在（被并发清理）时只计数。
+    pub(crate) fn record_overflow(
+        &self,
+        session: &str,
+        credential_id: u64,
+        now: Instant,
+    ) -> AffinityOutcome {
+        if let Some(b) = self.bindings.lock().get_mut(session) {
+            b.last_used = now;
+            b.overflow = Some((credential_id, now));
+        }
+        let outcome = AffinityOutcome::Overflow;
         self.counters[outcome.index()].fetch_add(1, Ordering::Relaxed);
         outcome
     }
@@ -113,6 +153,12 @@ impl SessionAffinity {
         for b in self.bindings.lock().values() {
             if now.duration_since(b.last_used) < window {
                 *load.entry(b.credential_id).or_insert(0) += 1;
+            }
+            // 溢出号同样占用该凭据，否则热会话的溢出会全挤到同一个「看起来空闲」的号上
+            if let Some((id, used)) = b.overflow
+                && now.duration_since(used) < window
+            {
+                *load.entry(id).or_insert(0) += 1;
             }
         }
         load
@@ -146,8 +192,8 @@ impl SessionAffinity {
         self.bindings.lock().len()
     }
 
-    /// 取出并清零窗口计数：[none, bind, hit, rebind]
-    pub(crate) fn take_counters(&self) -> [u64; 4] {
+    /// 取出并清零窗口计数：[none, bind, hit, rebind, overflow]
+    pub(crate) fn take_counters(&self) -> [u64; 5] {
         std::array::from_fn(|i| self.counters[i].swap(0, Ordering::Relaxed))
     }
 }
@@ -166,8 +212,8 @@ mod tests {
         assert_eq!(aff.record_use("s1", 7, now), AffinityOutcome::Hit);
         assert_eq!(aff.record_use("s1", 9, now), AffinityOutcome::Rebind);
         assert_eq!(aff.lookup("s1", now), Some(9));
-        assert_eq!(aff.take_counters(), [0, 1, 1, 1]);
-        assert_eq!(aff.take_counters(), [0, 0, 0, 0]);
+        assert_eq!(aff.take_counters(), [0, 1, 1, 1, 0]);
+        assert_eq!(aff.take_counters(), [0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -210,5 +256,31 @@ mod tests {
         assert_eq!(load.get(&1), Some(&1));
         assert_eq!(load.get(&2), Some(&2));
         assert_eq!(aff.lookup("old", t0 + Duration::from_secs(310)), Some(1));
+    }
+
+    #[test]
+    fn overflow_keeps_primary_binding_and_expires_with_load_window() {
+        let aff = SessionAffinity::new(3600, 10, 300);
+        let t0 = Instant::now();
+        aff.record_use("s1", 7, t0);
+        assert_eq!(aff.lookup_overflow("s1", t0), None);
+        assert_eq!(aff.record_overflow("s1", 9, t0), AffinityOutcome::Overflow);
+        assert_eq!(aff.lookup("s1", t0), Some(7), "主绑定不变");
+        assert_eq!(aff.lookup_overflow("s1", t0), Some(9));
+        // 溢出号计入负载
+        let load = aff.active_load(t0);
+        assert_eq!((load.get(&7), load.get(&9)), (Some(&1), Some(&1)));
+        // 命中原号保留溢出号
+        assert_eq!(aff.record_use("s1", 7, t0 + Duration::from_secs(10)), AffinityOutcome::Hit);
+        assert_eq!(aff.lookup_overflow("s1", t0 + Duration::from_secs(10)), Some(9));
+        // 超出负载窗口失效（主绑定仍在 TTL 内）
+        let later = t0 + Duration::from_secs(301);
+        assert_eq!(aff.lookup_overflow("s1", later), None);
+        assert_eq!(aff.lookup("s1", later), Some(7));
+        // 改绑清空溢出号
+        aff.record_overflow("s1", 9, later);
+        aff.record_use("s1", 8, later);
+        assert_eq!(aff.lookup_overflow("s1", later), None);
+        assert_eq!(aff.take_counters(), [0, 1, 1, 1, 2]);
     }
 }

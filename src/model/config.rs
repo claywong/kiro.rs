@@ -674,9 +674,25 @@ pub struct Config {
     /// 亲和命中时 RPM 允许突破到的倍数（默认 3.0，最小 1.0）。
     ///
     /// 凭据级 `rpmLimit` 与池级 `accountRpmLimit` 各自按此倍数放宽；任一窗口达到
-    /// `limit × 倍数` 时直接返回 429 + Retry-After，不改绑（保住上游缓存，客户端退避后回原号）。
+    /// `limit × 倍数` 时不改绑，依次尝试：短等（`session_affinity_cap_max_wait_ms`）→
+    /// 溢出（`session_affinity_overflow_enabled`）→ 返回 429 + Retry-After。
     #[serde(default = "default_session_affinity_rpm_multiplier")]
     pub session_affinity_rpm_multiplier: f64,
+
+    /// 亲和命中达到 RPM 放宽上限时，服务端等待名额释放的最长时间（毫秒，默认 3000）。
+    ///
+    /// 名额会在该时间内释放（窗口里最早的请求过期）时，原地等待后重试原号，保住上游缓存；
+    /// 超过该值才走溢出或 429。每次选号最多等一次。0 表示不等待。
+    #[serde(default = "default_session_affinity_cap_max_wait_ms")]
+    pub session_affinity_cap_max_wait_ms: u64,
+
+    /// 亲和命中达到 RPM 放宽上限且无法短等时，是否临时溢出到其它凭据（默认 true）。
+    ///
+    /// 溢出不改主绑定：本次请求按正常调度（1 倍 RPM、优先级分层、同层负载最低）选另一个号，
+    /// 并把它记为该会话的溢出号（`session_affinity_load_window_secs` 内有效），下次溢出优先
+    /// 复用，让热会话稳定摊在两个号上。关闭则维持旧行为：直接返回 429。
+    #[serde(default = "default_true")]
+    pub session_affinity_overflow_enabled: bool,
 
     /// 会话绑定的滑动 TTL（秒，默认 3600）。每次命中刷新。
     #[serde(default = "default_session_affinity_ttl_secs")]
@@ -984,6 +1000,10 @@ fn default_session_affinity_rpm_multiplier() -> f64 {
     3.0
 }
 
+fn default_session_affinity_cap_max_wait_ms() -> u64 {
+    3000
+}
+
 fn default_session_affinity_429_retries() -> u32 {
     2
 }
@@ -1095,6 +1115,8 @@ impl Default for Config {
                 default_rate_limit_same_credential_retry_delay_ms(),
             session_affinity_enabled: true,
             session_affinity_rpm_multiplier: default_session_affinity_rpm_multiplier(),
+            session_affinity_cap_max_wait_ms: default_session_affinity_cap_max_wait_ms(),
+            session_affinity_overflow_enabled: true,
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             session_affinity_max_entries: default_session_affinity_max_entries(),
             session_affinity_load_window_secs: default_session_affinity_load_window_secs(),

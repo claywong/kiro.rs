@@ -32,6 +32,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
 mod affinity_rpm;
+use affinity_rpm::{CapAction, RpmRecord};
 mod credit_stats;
 mod session_affinity;
 // 本地新增模块单独成行，避免上游增删模块时反复冲突。
@@ -2432,6 +2433,9 @@ impl MultiTokenManager {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // 亲和触顶：本次选号是否已短等过一次；Some = 改走溢出（主绑定号 + 其名额释放等待时长）
+        let mut affinity_waited = false;
+        let mut overflow_from: Option<(u64, StdDuration)> = None;
 
         loop {
             if attempt_count >= max_attempts {
@@ -2442,9 +2446,23 @@ impl MultiTokenManager {
                 );
             }
 
+            // 溢出：主绑定号触顶，本次临时换号，不走亲和命中与常规调度
+            let overflow_pick = match (overflow_from, session_key) {
+                (Some((bound, wait)), Some(key)) => Some(self.select_overflow_credential(
+                    key,
+                    bound,
+                    wait,
+                    model,
+                    input_tokens,
+                    group,
+                    excluded_ids,
+                )?),
+                _ => None,
+            };
+
             // 会话亲和：已绑定且仍可用（未排除 / 未禁用 / 未 throttle / 模型、分组、
             // credit_limit 满足）时直接复用，不看优先级分层；RPM 在记账时按放宽上限检查。
-            let affinity_hit = session_key.and_then(|key| {
+            let affinity_hit = session_key.filter(|_| overflow_pick.is_none()).and_then(|key| {
                 let bound = self.session_affinity.lookup(key, Instant::now())?;
                 let entries = self.entries.lock();
                 let now = Instant::now();
@@ -2459,7 +2477,9 @@ impl MultiTokenManager {
             });
             let is_affinity_hit = affinity_hit.is_some();
 
-            let (id, credentials, is_balanced) = if let Some((id, credentials)) = affinity_hit {
+            let (id, credentials, is_balanced) = if let Some((id, credentials)) =
+                affinity_hit.or_else(|| overflow_pick.clone())
+            {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
                 (id, credentials, is_balanced)
             } else {
@@ -2607,17 +2627,35 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(mut ctx) => {
-                    // RPM 记账（含亲和命中的放宽上限，见 affinity_rpm.rs）；名额被抢时重新选号。
-                    if !self.record_selected_rpm(
+                    // RPM 记账（含亲和命中的放宽上限，见 affinity_rpm.rs）；名额被抢时重新选号，
+                    // 亲和触顶时短等 / 溢出 / 429。
+                    match self.record_selected_rpm(
                         id,
                         is_affinity_hit,
                         update_current,
                         per_cred_rpm_recorded,
-                    )? {
-                        continue;
+                    ) {
+                        RpmRecord::Recorded => {}
+                        RpmRecord::Lost => continue,
+                        RpmRecord::AffinityCapped(wait) => {
+                            match self.handle_affinity_cap(id, wait, &mut affinity_waited).await? {
+                                CapAction::Retried => {}
+                                CapAction::Overflow(wait) => overflow_from = Some((id, wait)),
+                            }
+                            continue;
+                        }
                     }
                     // 选号确定后再写亲和表：失败重选的中间结果不会污染绑定。
                     match session_key {
+                        Some(key) if overflow_pick.is_some() => {
+                            ctx.affinity = self.session_affinity.record_overflow(key, id, Instant::now());
+                            tracing::debug!(
+                                affinity = ctx.affinity.as_str(),
+                                credential_id = id,
+                                session = &key[..key.len().min(8)],
+                                "会话亲和溢出选号"
+                            );
+                        }
                         Some(key) => {
                             ctx.affinity = self.session_affinity.record_use(key, id, Instant::now());
                             tracing::debug!(
@@ -2687,12 +2725,12 @@ impl MultiTokenManager {
                 if ticks % 10 != 0 {
                     continue;
                 }
-                let [none, bind, hit, rebind] = manager.session_affinity.take_counters();
-                let total = none + bind + hit + rebind;
+                let [none, bind, hit, rebind, overflow] = manager.session_affinity.take_counters();
+                let total = none + bind + hit + rebind + overflow;
                 if total == 0 {
                     continue;
                 }
-                let with_session = bind + hit + rebind;
+                let with_session = bind + hit + rebind + overflow;
                 let hit_pct = if with_session == 0 {
                     0.0
                 } else {
@@ -2701,7 +2739,7 @@ impl MultiTokenManager {
                 tracing::info!(
                     enabled = manager.is_session_affinity_enabled(),
                     sessions = manager.session_affinity.len(),
-                    "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} none={none}"
+                    "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} overflow={overflow} none={none}"
                 );
             }
         });
