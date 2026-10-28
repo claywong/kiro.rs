@@ -671,7 +671,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub session_affinity_enabled: bool,
 
-    /// 亲和命中时 RPM 允许突破到的倍数（默认 3.0，最小 1.0）。
+    /// 亲和命中时 RPM 允许突破到的倍数（默认 3.0，最小 1.0；设置页可调 1 ~ 10，即时生效）。
     ///
     /// 凭据级 `rpmLimit` 与池级 `accountRpmLimit` 各自按此倍数放宽；任一窗口达到
     /// `limit × 倍数` 时不改绑，依次尝试：短等（`session_affinity_cap_max_wait_ms`）→

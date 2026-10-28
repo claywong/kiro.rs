@@ -40,6 +40,9 @@ mod session_affinity_switch;
 mod usage_ratio;
 
 pub use session_affinity::AffinityOutcome;
+pub use session_affinity_switch::{
+    SESSION_AFFINITY_CAP_MAX_WAIT_LIMIT_MS, SESSION_AFFINITY_RPM_MULTIPLIER_RANGE,
+};
 use session_affinity::SessionAffinity;
 // 本地新增 use 单独成行，避免上游改动时反复冲突。
 use usage_ratio::{UsageKeys, usage_key_of, usage_permille};
@@ -1293,6 +1296,10 @@ pub struct MultiTokenManager {
     session_affinity: SessionAffinity,
     /// 会话亲和总开关（启动时读 config，运行期可经 Admin API 切换，见 `session_affinity_switch`）
     session_affinity_enabled: AtomicBool,
+    /// 亲和 RPM 放宽倍数（f64 位模式）/ 触顶短等上限（毫秒）/ 溢出开关，运行期可经 Admin API 调整
+    session_affinity_rpm_multiplier_bits: AtomicU64,
+    session_affinity_cap_max_wait_ms: AtomicU64,
+    session_affinity_overflow_enabled: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1668,6 +1675,9 @@ impl MultiTokenManager {
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let session_affinity_enabled = config.session_affinity_enabled;
+        let session_affinity_rpm_multiplier = config.session_affinity_rpm_multiplier;
+        let session_affinity_cap_max_wait_ms = config.session_affinity_cap_max_wait_ms;
+        let session_affinity_overflow_enabled = config.session_affinity_overflow_enabled;
         let session_affinity_ttl_secs = config.session_affinity_ttl_secs;
         let session_affinity_max_entries = config.session_affinity_max_entries;
         let session_affinity_load_window_secs = config.session_affinity_load_window_secs;
@@ -1715,6 +1725,11 @@ impl MultiTokenManager {
                 session_affinity_load_window_secs,
             ),
             session_affinity_enabled: AtomicBool::new(session_affinity_enabled),
+            session_affinity_rpm_multiplier_bits: AtomicU64::new(
+                session_affinity_rpm_multiplier.to_bits(),
+            ),
+            session_affinity_cap_max_wait_ms: AtomicU64::new(session_affinity_cap_max_wait_ms),
+            session_affinity_overflow_enabled: AtomicBool::new(session_affinity_overflow_enabled),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘

@@ -2,7 +2,7 @@
 //!
 //! 亲和命中为保住上游 prompt cache 允许突破 RPM（软约束），但不能无限突破：
 //! 凭据级 `rpm_limit` 与池级 `account_rpm_limit` 各自放宽到 `limit × 倍数`
-//! （`session_affinity_rpm_multiplier`，默认 3）。任一窗口达到该值时不改绑，依次：
+//! （`session_affinity_rpm_multiplier`，默认 3，运行期可调）。任一窗口达到该值时不改绑，依次：
 //! 1. 名额在 `session_affinity_cap_max_wait_ms` 内释放：服务端等待后重试原号；
 //! 2. `session_affinity_overflow_enabled`：本次溢出到其它凭据（优先复用该会话的溢出号，
 //!    否则按正常调度选号，1 倍 RPM），主绑定不变；
@@ -88,7 +88,7 @@ impl MultiTokenManager {
         wait: Duration,
         waited: &mut bool,
     ) -> anyhow::Result<CapAction> {
-        let max_wait = Duration::from_millis(self.config.session_affinity_cap_max_wait_ms);
+        let max_wait = Duration::from_millis(self.session_affinity_cap_max_wait_ms());
         if !*waited && wait <= max_wait {
             *waited = true;
             tracing::debug!(
@@ -99,7 +99,7 @@ impl MultiTokenManager {
             tokio::time::sleep(wait).await;
             return Ok(CapAction::Retried);
         }
-        if self.config.session_affinity_overflow_enabled {
+        if self.is_session_affinity_overflow_enabled() {
             return Ok(CapAction::Overflow(wait));
         }
         tracing::warn!(credential_id = id, retry_after = ceil_secs(wait), "会话亲和触顶，返回 429");
@@ -174,7 +174,7 @@ impl MultiTokenManager {
         record_cred: bool,
     ) -> Option<Duration> {
         let now = Instant::now();
-        let multiplier = self.config.session_affinity_rpm_multiplier;
+        let multiplier = self.session_affinity_rpm_multiplier();
         let pool_limit = if self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
             self.account_rpm_limit.load(Ordering::Relaxed)
         } else {
