@@ -78,6 +78,8 @@ export function BatchEditCredentialDialog({
   const [salePrice, setSalePrice] = useState('')
   const [editPriority, setEditPriority] = useState(false)
   const [priority, setPriority] = useState('')
+  const [editRpm, setEditRpm] = useState(false)
+  const [rpm, setRpm] = useState('')
 
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -99,6 +101,8 @@ export function BatchEditCredentialDialog({
       setSalePrice('')
       setEditPriority(false)
       setPriority('')
+      setEditRpm(false)
+      setRpm('')
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -114,7 +118,7 @@ export function BatchEditCredentialDialog({
   const handleApply = async () => {
     if (
       !editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice
-      && !editPriority
+      && !editPriority && !editRpm
     ) {
       toast.error('请至少开启一项要修改的字段')
       return
@@ -125,6 +129,11 @@ export function BatchEditCredentialDialog({
       && (priority.trim() === '' || !Number.isInteger(parsedPriority) || parsedPriority < 0)
     ) {
       toast.error('优先级必须是大于或等于 0 的整数')
+      return
+    }
+    const parsedRpm = Number(rpm)
+    if (editRpm && (rpm.trim() === '' || !Number.isInteger(parsedRpm) || parsedRpm < 0)) {
+      toast.error('RPM 上限必须是大于或等于 0 的整数')
       return
     }
     const parsedSalePrice = salePrice.trim() === '' ? undefined : Number(salePrice)
@@ -143,9 +152,11 @@ export function BatchEditCredentialDialog({
     for (let i = 0; i < credentials.length; i++) {
       const c = credentials[i]
       const req: UpdateCredentialRequest = {}
-      const needUpdate = editGroups || editSource || editType || editSaleStatus || editSalePrice
+      const needUpdate = editGroups || editSource || editType || editSaleStatus
+        || editSalePrice || editRpm
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
+      if (editRpm) req.rpmLimit = parsedRpm
       if (editType || editSaleStatus || editSalePrice) {
         const metadata: CredentialMetadata = {
           ...metadataValues(c.metadata),
@@ -241,6 +252,30 @@ export function BatchEditCredentialDialog({
                 />
                 <p className="text-[11px] text-muted-foreground">
                   数值越小越优先，应用到所有选中账号。
+                </p>
+              </>
+            )}
+          </div>
+
+          {/* RPM 上限区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改 RPM 上限</span>
+              <Switch checked={editRpm} onCheckedChange={setEditRpm} disabled={running} />
+            </label>
+            {editRpm && (
+              <>
+                <Input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={rpm}
+                  onChange={(e) => setRpm(e.target.value)}
+                  placeholder="统一设置为该值"
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  每分钟请求上限，0 表示不限速，应用到所有选中账号。
                 </p>
               </>
             )}
