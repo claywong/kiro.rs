@@ -940,6 +940,8 @@ impl VendorService {
             ),
             // kiro.red 无 webhook，不会走到这里（入站未启用），加兜底分支防 match 不穷尽
             VendorFlavor::Kirored => (str_field("purchase_order_id"), None),
+            // KiroShop 无 webhook，同样不会走到这里
+            VendorFlavor::Kiroshop => (str_field("purchase_order_id"), None),
             // 本家文档明确 claim 用 client_order_id 做幂等（与首家同字段名），
             // webhook 推送里也带它。优先取它，回退到 purchase_order_id（以防日后
             // 卖家给订单号起个独立字段）。校验 hex32（实测订单号确是 32 位十六进制）。

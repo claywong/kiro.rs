@@ -32,6 +32,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
 mod affinity_rpm;
+use affinity_rpm::{CapAction, RpmRecord};
 mod credit_stats;
 mod session_affinity;
 // 本地新增模块单独成行，避免上游增删模块时反复冲突。
@@ -39,6 +40,9 @@ mod session_affinity_switch;
 mod usage_ratio;
 
 pub use session_affinity::AffinityOutcome;
+pub use session_affinity_switch::{
+    SESSION_AFFINITY_CAP_MAX_WAIT_LIMIT_MS, SESSION_AFFINITY_RPM_MULTIPLIER_RANGE,
+};
 use session_affinity::SessionAffinity;
 // 本地新增 use 单独成行，避免上游改动时反复冲突。
 use usage_ratio::{UsageKeys, usage_key_of, usage_permille};
@@ -1253,6 +1257,12 @@ pub struct MultiTokenManager {
     speed_credentials_min_tokens_enabled: AtomicBool,
     /// 速刷号最小 token 门槛（运行时可修改）
     speed_credentials_min_tokens: AtomicU64,
+    /// 短速刷首字超时开关（运行时可修改）
+    short_speed_first_token_timeout_enabled: AtomicBool,
+    /// 短速刷首字超时秒数（运行时可修改）
+    short_speed_first_token_timeout_secs: AtomicU64,
+    /// 短速刷是否在全部端点间随机选择（运行时可修改）
+    short_speed_random_endpoint: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1286,6 +1296,10 @@ pub struct MultiTokenManager {
     session_affinity: SessionAffinity,
     /// 会话亲和总开关（启动时读 config，运行期可经 Admin API 切换，见 `session_affinity_switch`）
     session_affinity_enabled: AtomicBool,
+    /// 亲和 RPM 放宽倍数（f64 位模式）/ 触顶短等上限（毫秒）/ 溢出开关，运行期可经 Admin API 调整
+    session_affinity_rpm_multiplier_bits: AtomicU64,
+    session_affinity_cap_max_wait_ms: AtomicU64,
+    session_affinity_overflow_enabled: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1651,6 +1665,9 @@ impl MultiTokenManager {
         let exclude_sonnet = config.speed_credentials_exclude_sonnet;
         let min_tokens_enabled = config.speed_credentials_min_tokens_enabled;
         let min_tokens = config.speed_credentials_min_tokens;
+        let ss_ttft_enabled = config.short_speed_first_token_timeout_enabled;
+        let ss_ttft_secs = config.short_speed_first_token_timeout_secs;
+        let ss_random_endpoint = config.short_speed_random_endpoint;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1658,6 +1675,9 @@ impl MultiTokenManager {
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let session_affinity_enabled = config.session_affinity_enabled;
+        let session_affinity_rpm_multiplier = config.session_affinity_rpm_multiplier;
+        let session_affinity_cap_max_wait_ms = config.session_affinity_cap_max_wait_ms;
+        let session_affinity_overflow_enabled = config.session_affinity_overflow_enabled;
         let session_affinity_ttl_secs = config.session_affinity_ttl_secs;
         let session_affinity_max_entries = config.session_affinity_max_entries;
         let session_affinity_load_window_secs = config.session_affinity_load_window_secs;
@@ -1682,6 +1702,9 @@ impl MultiTokenManager {
             speed_credentials_exclude_sonnet: AtomicBool::new(exclude_sonnet),
             speed_credentials_min_tokens_enabled: AtomicBool::new(min_tokens_enabled),
             speed_credentials_min_tokens: AtomicU64::new(min_tokens),
+            short_speed_first_token_timeout_enabled: AtomicBool::new(ss_ttft_enabled),
+            short_speed_first_token_timeout_secs: AtomicU64::new(ss_ttft_secs),
+            short_speed_random_endpoint: AtomicBool::new(ss_random_endpoint),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -1702,6 +1725,11 @@ impl MultiTokenManager {
                 session_affinity_load_window_secs,
             ),
             session_affinity_enabled: AtomicBool::new(session_affinity_enabled),
+            session_affinity_rpm_multiplier_bits: AtomicU64::new(
+                session_affinity_rpm_multiplier.to_bits(),
+            ),
+            session_affinity_cap_max_wait_ms: AtomicU64::new(session_affinity_cap_max_wait_ms),
+            session_affinity_overflow_enabled: AtomicBool::new(session_affinity_overflow_enabled),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -2420,6 +2448,9 @@ impl MultiTokenManager {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // 亲和触顶：本次选号是否已短等过一次；Some = 改走溢出（主绑定号 + 其名额释放等待时长）
+        let mut affinity_waited = false;
+        let mut overflow_from: Option<(u64, StdDuration)> = None;
 
         loop {
             if attempt_count >= max_attempts {
@@ -2430,9 +2461,23 @@ impl MultiTokenManager {
                 );
             }
 
+            // 溢出：主绑定号触顶，本次临时换号，不走亲和命中与常规调度
+            let overflow_pick = match (overflow_from, session_key) {
+                (Some((bound, wait)), Some(key)) => Some(self.select_overflow_credential(
+                    key,
+                    bound,
+                    wait,
+                    model,
+                    input_tokens,
+                    group,
+                    excluded_ids,
+                )?),
+                _ => None,
+            };
+
             // 会话亲和：已绑定且仍可用（未排除 / 未禁用 / 未 throttle / 模型、分组、
             // credit_limit 满足）时直接复用，不看优先级分层；RPM 在记账时按放宽上限检查。
-            let affinity_hit = session_key.and_then(|key| {
+            let affinity_hit = session_key.filter(|_| overflow_pick.is_none()).and_then(|key| {
                 let bound = self.session_affinity.lookup(key, Instant::now())?;
                 let entries = self.entries.lock();
                 let now = Instant::now();
@@ -2447,7 +2492,9 @@ impl MultiTokenManager {
             });
             let is_affinity_hit = affinity_hit.is_some();
 
-            let (id, credentials, is_balanced) = if let Some((id, credentials)) = affinity_hit {
+            let (id, credentials, is_balanced) = if let Some((id, credentials)) =
+                affinity_hit.or_else(|| overflow_pick.clone())
+            {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
                 (id, credentials, is_balanced)
             } else {
@@ -2595,17 +2642,35 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(mut ctx) => {
-                    // RPM 记账（含亲和命中的放宽上限，见 affinity_rpm.rs）；名额被抢时重新选号。
-                    if !self.record_selected_rpm(
+                    // RPM 记账（含亲和命中的放宽上限，见 affinity_rpm.rs）；名额被抢时重新选号，
+                    // 亲和触顶时短等 / 溢出 / 429。
+                    match self.record_selected_rpm(
                         id,
                         is_affinity_hit,
                         update_current,
                         per_cred_rpm_recorded,
-                    )? {
-                        continue;
+                    ) {
+                        RpmRecord::Recorded => {}
+                        RpmRecord::Lost => continue,
+                        RpmRecord::AffinityCapped(wait) => {
+                            match self.handle_affinity_cap(id, wait, &mut affinity_waited).await? {
+                                CapAction::Retried => {}
+                                CapAction::Overflow(wait) => overflow_from = Some((id, wait)),
+                            }
+                            continue;
+                        }
                     }
                     // 选号确定后再写亲和表：失败重选的中间结果不会污染绑定。
                     match session_key {
+                        Some(key) if overflow_pick.is_some() => {
+                            ctx.affinity = self.session_affinity.record_overflow(key, id, Instant::now());
+                            tracing::debug!(
+                                affinity = ctx.affinity.as_str(),
+                                credential_id = id,
+                                session = &key[..key.len().min(8)],
+                                "会话亲和溢出选号"
+                            );
+                        }
                         Some(key) => {
                             ctx.affinity = self.session_affinity.record_use(key, id, Instant::now());
                             tracing::debug!(
@@ -2675,12 +2740,12 @@ impl MultiTokenManager {
                 if ticks % 10 != 0 {
                     continue;
                 }
-                let [none, bind, hit, rebind] = manager.session_affinity.take_counters();
-                let total = none + bind + hit + rebind;
+                let [none, bind, hit, rebind, overflow] = manager.session_affinity.take_counters();
+                let total = none + bind + hit + rebind + overflow;
                 if total == 0 {
                     continue;
                 }
-                let with_session = bind + hit + rebind;
+                let with_session = bind + hit + rebind + overflow;
                 let hit_pct = if with_session == 0 {
                     0.0
                 } else {
@@ -2689,7 +2754,7 @@ impl MultiTokenManager {
                 tracing::info!(
                     enabled = manager.is_session_affinity_enabled(),
                     sessions = manager.session_affinity.len(),
-                    "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} none={none}"
+                    "会话亲和（近 10 分钟）: total={total} hit={hit} ({hit_pct:.1}%) bind={bind} rebind={rebind} overflow={overflow} none={none}"
                 );
             }
         });
@@ -5282,6 +5347,89 @@ impl MultiTokenManager {
             "速刷号最小 token 门槛配置已更新: enabled={}, min_tokens={}",
             new_enabled,
             new_tokens
+        );
+        Ok(())
+    }
+
+    /// 获取短速刷配置（Admin API）。返回：(首字超时开关, 首字超时秒数, 随机端点开关)。
+    pub fn get_short_speed_config(&self) -> (bool, u64, bool) {
+        (
+            self.short_speed_first_token_timeout_enabled
+                .load(Ordering::Relaxed),
+            self.short_speed_first_token_timeout_secs
+                .load(Ordering::Relaxed),
+            self.short_speed_random_endpoint.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 短速刷首字超时：开启时返回超时秒数，关闭返回 `None`（热路径，只读原子量）。
+    pub fn short_speed_first_token_timeout(&self) -> Option<StdDuration> {
+        self.short_speed_first_token_timeout_enabled
+            .load(Ordering::Relaxed)
+            .then(|| {
+                StdDuration::from_secs(
+                    self.short_speed_first_token_timeout_secs
+                        .load(Ordering::Relaxed),
+                )
+            })
+    }
+
+    /// 短速刷是否启用随机端点。
+    pub fn short_speed_random_endpoint_enabled(&self) -> bool {
+        self.short_speed_random_endpoint.load(Ordering::Relaxed)
+    }
+
+    /// 设置短速刷配置（Admin API）。任一参数传 `None` 表示不修改。
+    pub fn set_short_speed_config(
+        &self,
+        timeout_enabled: Option<bool>,
+        timeout_secs: Option<u64>,
+        random_endpoint: Option<bool>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = timeout_secs {
+            // 下限 1s 防止误配成 0 让所有短速刷请求必超时；上限不超过通用守卫（50s）才有意义。
+            if !(1..=50).contains(&v) {
+                anyhow::bail!("短速刷首字超时必须在 1..=50 秒内: {}", v);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_enabled, prev_secs, prev_random) = self.get_short_speed_config();
+        let new_enabled = timeout_enabled.unwrap_or(prev_enabled);
+        let new_secs = timeout_secs.unwrap_or(prev_secs);
+        let new_random = random_endpoint.unwrap_or(prev_random);
+
+        if new_enabled == prev_enabled && new_secs == prev_secs && new_random == prev_random {
+            return Ok(());
+        }
+
+        self.short_speed_first_token_timeout_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.short_speed_first_token_timeout_secs
+            .store(new_secs, Ordering::Relaxed);
+        self.short_speed_random_endpoint
+            .store(new_random, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.short_speed_first_token_timeout_enabled = new_enabled;
+            config.short_speed_first_token_timeout_secs = new_secs;
+            config.short_speed_random_endpoint = new_random;
+        }) {
+            self.short_speed_first_token_timeout_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.short_speed_first_token_timeout_secs
+                .store(prev_secs, Ordering::Relaxed);
+            self.short_speed_random_endpoint
+                .store(prev_random, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "短速刷配置已更新: first_token_timeout_enabled={}, secs={}, random_endpoint={}",
+            new_enabled,
+            new_secs,
+            new_random
         );
         Ok(())
     }

@@ -189,6 +189,7 @@ const AFFINITY_META: Record<
   hit: { label: '亲和', variant: 'success', hint: '会话亲和命中：复用已绑定的凭据（上游缓存大概率命中）' },
   bind: { label: '首绑', variant: 'outline', hint: '新会话首次绑定到该凭据（上游缓存冷启动）' },
   rebind: { label: '改绑', variant: 'warning', hint: '原绑定凭据不可用或 429 重试耗尽，改绑到该凭据（缓存丢失）' },
+  overflow: { label: '溢出', variant: 'warning', hint: '绑定凭据达到 RPM 放宽上限，本次临时溢出到该凭据（主绑定不变）' },
   none: { label: '无会话', variant: 'secondary', hint: '请求没有 session_id，未参与会话亲和' },
 }
 

@@ -10,6 +10,9 @@
 //!   对上游 prompt cache 有利。若需要干净状态，等 TTL 过期或重启进程。
 //! - 持久化失败则回滚内存值，与 `set_account_throttle_config` 一致。
 //!
+//! 亲和 RPM 放宽倍数、触顶后的短等上限与溢出开关（见 `affinity_rpm.rs`）也在这里运行期可调，
+//! 语义相同。
+//!
 //! @author wangzhong
 
 use std::sync::atomic::Ordering;
@@ -48,7 +51,82 @@ impl MultiTokenManager {
         );
         Ok(())
     }
+
+    /// 亲和命中时 RPM 允许突破到的倍数
+    pub fn session_affinity_rpm_multiplier(&self) -> f64 {
+        f64::from_bits(self.session_affinity_rpm_multiplier_bits.load(Ordering::Relaxed))
+    }
+
+    /// 亲和触顶时服务端等待名额释放的上限（毫秒）
+    pub fn session_affinity_cap_max_wait_ms(&self) -> u64 {
+        self.session_affinity_cap_max_wait_ms.load(Ordering::Relaxed)
+    }
+
+    /// 亲和触顶且无法短等时是否溢出到其它凭据
+    pub fn is_session_affinity_overflow_enabled(&self) -> bool {
+        self.session_affinity_overflow_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 设置亲和 RPM 放宽倍数与触顶处理（Admin API），`None` 表示该项不变。
+    /// 调用方负责按 [`SESSION_AFFINITY_RPM_MULTIPLIER_RANGE`] /
+    /// [`SESSION_AFFINITY_CAP_MAX_WAIT_LIMIT_MS`] 校验。
+    pub fn set_session_affinity_cap_config(
+        &self,
+        rpm_multiplier: Option<f64>,
+        max_wait_ms: Option<u64>,
+        overflow_enabled: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let prev = (
+            self.session_affinity_rpm_multiplier(),
+            self.session_affinity_cap_max_wait_ms(),
+            self.is_session_affinity_overflow_enabled(),
+        );
+        let next = (
+            rpm_multiplier.unwrap_or(prev.0),
+            max_wait_ms.unwrap_or(prev.1),
+            overflow_enabled.unwrap_or(prev.2),
+        );
+        if next == prev {
+            return Ok(());
+        }
+
+        self.store_session_affinity_cap_config(next);
+        let (multiplier, wait, overflow) = next;
+        if let Err(err) = self.update_config_file(move |config| {
+            config.session_affinity_rpm_multiplier = multiplier;
+            config.session_affinity_cap_max_wait_ms = wait;
+            config.session_affinity_overflow_enabled = overflow;
+        }) {
+            self.store_session_affinity_cap_config(prev);
+            return Err(err);
+        }
+
+        tracing::info!(
+            rpm_multiplier = multiplier,
+            max_wait_ms = wait,
+            overflow_enabled = overflow,
+            "会话亲和 RPM 放宽与触顶处理已更新"
+        );
+        Ok(())
+    }
+
+    fn store_session_affinity_cap_config(&self, (multiplier, wait, overflow): (f64, u64, bool)) {
+        self.session_affinity_rpm_multiplier_bits
+            .store(multiplier.to_bits(), Ordering::Relaxed);
+        self.session_affinity_cap_max_wait_ms
+            .store(wait, Ordering::Relaxed);
+        self.session_affinity_overflow_enabled
+            .store(overflow, Ordering::Relaxed);
+    }
 }
+
+/// 亲和触顶短等上限的最大可设值（毫秒）：等满一个 RPM 窗口（60s）必然有名额，再长没有意义
+pub const SESSION_AFFINITY_CAP_MAX_WAIT_LIMIT_MS: u64 = 60_000;
+
+/// 亲和 RPM 放宽倍数的可设区间（1 = 不放宽）
+pub const SESSION_AFFINITY_RPM_MULTIPLIER_RANGE: std::ops::RangeInclusive<f64> = 1.0..=10.0;
 
 #[cfg(test)]
 mod tests {
@@ -118,6 +196,32 @@ mod tests {
         let resumed = acquire(&manager, "s1").await;
         assert_eq!(resumed.affinity, AffinityOutcome::Hit, "重开后旧绑定恢复命中");
         assert_eq!(resumed.id, first.id);
+    }
+
+    #[test]
+    fn cap_handling_follows_config_and_persists() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-affinity-cap-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, r#"{"sessionAffinityCapMaxWaitMs":1500}"#).unwrap();
+
+        let manager = manager_with(Config::load(&config_path).unwrap(), 1);
+        assert_eq!(manager.session_affinity_cap_max_wait_ms(), 1500);
+        assert!(manager.is_session_affinity_overflow_enabled(), "溢出默认开启");
+        assert_eq!(manager.session_affinity_rpm_multiplier(), 3.0, "倍数默认 3");
+
+        // 只改一项，其它保持
+        manager.set_session_affinity_cap_config(None, None, Some(false)).unwrap();
+        assert_eq!(manager.session_affinity_cap_max_wait_ms(), 1500);
+        assert!(!manager.is_session_affinity_overflow_enabled());
+
+        manager.set_session_affinity_cap_config(Some(1.5), Some(0), None).unwrap();
+        assert_eq!(manager.session_affinity_rpm_multiplier(), 1.5);
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.session_affinity_rpm_multiplier, 1.5);
+        assert_eq!(persisted.session_affinity_cap_max_wait_ms, 0);
+        assert!(!persisted.session_affinity_overflow_enabled);
+
+        std::fs::remove_file(&config_path).unwrap();
     }
 
     #[test]

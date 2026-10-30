@@ -30,6 +30,10 @@ pub(crate) enum ParsedVendorCredential {
         auth_region: Option<String>,
         machine_id: Option<String>,
         email: Option<String>,
+        /// IdC 型凭据（KiroShop 交付）才有：刷新 token 需要 OIDC 客户端凭据
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        auth_method: Option<String>,
     },
 }
 
@@ -50,18 +54,36 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `expiresAt` 兼容 RFC3339 字符串与整数时间戳（毫秒或秒）。
+/// KiroShop 给的是毫秒整数，不转的话过期时间会被当成缺失而丢掉。
+fn expires_at_string(object: &Map<String, Value>) -> Option<String> {
+    match object.get("expiresAt")? {
+        Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        Value::Number(n) => {
+            let raw = n.as_i64()?;
+            // 1e11 秒已是公元 5138 年，小于它的整数只可能是秒
+            let ms = if raw.abs() < 100_000_000_000 { raw * 1000 } else { raw };
+            chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
+        }
+        _ => None,
+    }
+}
+
 fn parse_social_credential(value: &Value) -> Option<ParsedVendorCredential> {
     let object = value.as_object()?;
     Some(ParsedVendorCredential::Social {
         refresh_token: optional_string(object, "refreshToken")?,
         access_token: optional_string(object, "accessToken"),
         profile_arn: optional_string(object, "profileArn"),
-        expires_at: optional_string(object, "expiresAt"),
+        expires_at: expires_at_string(object),
         provider: optional_string(object, "provider"),
         auth_region: optional_string(object, "authRegion")
             .or_else(|| optional_string(object, "region")),
         machine_id: optional_string(object, "machineId"),
         email: optional_string(object, "email"),
+        client_id: optional_string(object, "clientId"),
+        client_secret: optional_string(object, "clientSecret"),
+        auth_method: optional_string(object, "authMethod"),
     })
 }
 
@@ -171,15 +193,26 @@ pub async fn import_keys(
                     auth_region,
                     machine_id,
                     email,
+                    client_id,
+                    client_secret,
+                    auth_method,
                 } => AddCredentialRequest {
                     refresh_token: Some(refresh_token),
                     access_token,
                     profile_arn,
                     expires_at,
-                    auth_method: "social".to_string(),
+                    // 带 clientId/clientSecret 的是 IdC，缺 authMethod 时也按 idc 处理，
+                    // 否则会拿 social 的刷新端点去刷 IdC 的 token
+                    auth_method: auth_method.unwrap_or_else(|| {
+                        if client_id.is_some() && client_secret.is_some() {
+                            "idc".to_string()
+                        } else {
+                            "social".to_string()
+                        }
+                    }),
                     provider,
-                    client_id: None,
-                    client_secret: None,
+                    client_id,
+                    client_secret,
                     start_url: None,
                     token_endpoint: None,
                     issuer_url: None,
@@ -252,8 +285,46 @@ mod tests {
                 auth_region: None,
                 machine_id: None,
                 email: Some("person@example.com".to_string()),
+                client_id: None,
+                client_secret: None,
+                auth_method: None,
             }]
         );
+    }
+
+    #[test]
+    fn idc凭据保留client凭据_毫秒时间戳转rfc3339() {
+        let parsed = parse_vendor_credentials(
+            r#"{"email":"a@b.c","refreshToken":"aor_x","authMethod":"idc","provider":"BuilderId",
+                "clientId":"cid","clientSecret":"csec","region":"us-east-1","expiresAt":1792950189265}"#,
+        )
+        .unwrap();
+        let ParsedVendorCredential::Social {
+            client_id,
+            client_secret,
+            auth_method,
+            auth_region,
+            expires_at,
+            ..
+        } = &parsed[0]
+        else {
+            panic!("应识别为 Social/IdC")
+        };
+        assert_eq!(client_id.as_deref(), Some("cid"));
+        assert_eq!(client_secret.as_deref(), Some("csec"));
+        assert_eq!(auth_method.as_deref(), Some("idc"));
+        assert_eq!(auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(expires_at.as_deref(), Some("2026-10-25T17:43:09.265+00:00"));
+    }
+
+    #[test]
+    fn 秒级时间戳也能转换() {
+        let parsed =
+            parse_vendor_credentials(r#"{"refreshToken":"aor_x","expiresAt":1792950189}"#).unwrap();
+        let ParsedVendorCredential::Social { expires_at, .. } = &parsed[0] else {
+            panic!()
+        };
+        assert_eq!(expires_at.as_deref(), Some("2026-10-25T17:43:09+00:00"));
     }
 
     #[test]

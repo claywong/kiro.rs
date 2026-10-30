@@ -29,6 +29,14 @@ pub trait KiroEndpoint: Send + Sync {
         "application/json"
     }
 
+    /// 是否参与 429 原号重试的默认端点轮换（默认参与）。
+    ///
+    /// 返回 false 的端点仍在注册表里、可被凭据显式指定，也可被短速刷「随机端点」
+    /// 开关选中，但不会进入默认的 ide↔cli 有序轮换。
+    fn in_default_rotation(&self) -> bool {
+        true
+    }
+
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;
 
