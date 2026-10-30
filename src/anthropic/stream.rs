@@ -176,58 +176,16 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// thinking 标签专用的「引用字符」集合（只含真正的引用/转义符）
+/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
 ///
-/// [`QUOTE_CHARS`] 出于工具调用兜底的保守考虑囊括了几乎所有 ASCII 标点，
-/// 但 thinking 正文几乎总以 `.` `?` `!` `:` 之类的句末标点收尾，
-/// 用宽集合判定会把 `...as fact.</thinking>` 里的真结束标签误判成「被引用」而跳过，
-/// 导致 thinking 块永不闭合、后续正文全被当成 thinking_delta 下发。
-/// 故这里只保留反引号、双引号、单引号、反斜杠。
-const THINKING_QUOTE_CHARS: &[u8] = &[b'`', b'"', b'\'', b'\\'];
-
-/// 检查指定位置的字符是否是 thinking 标签的引用字符
-fn is_thinking_quote_char(buffer: &str, pos: usize) -> bool {
-    buffer
-        .as_bytes()
-        .get(pos)
-        .map(|c| THINKING_QUOTE_CHARS.contains(c))
-        .unwrap_or(false)
-}
-
-/// 检查指定位置是否是行内空白（空格 / 制表符），**不含换行**
+/// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
+/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
+/// 这个函数会跳过这些情况，只返回真正的结束标签位置。
 ///
-/// 用于区分「句中提及标签」与「真结束标签」：前者被空格隔开
-/// （`提到 </thinking> 的问题`），后者紧贴正文或独占一行。
-fn is_inline_space(buffer: &str, pos: usize) -> bool {
-    matches!(buffer.as_bytes().get(pos), Some(b' ') | Some(b'\t'))
-}
-
-/// 查找真正的 thinking 结束标签（不被引用字符包裹）
-///
-/// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号或引号包裹
-/// （如 `` `</thinking>` ``），这类「引用」会被跳过。
-///
-/// 判定规则：第一个未被 [`THINKING_QUOTE_CHARS`] 包裹、且非「两侧都被空格/制表符
-/// 隔开」的 `</thinking>` 即为真结束标签。协议上整段响应只有一个真结束标签
-/// （状态机命中后即置 `thinking_extracted`），故不要求标签后必须紧跟 `\n\n`——
-/// 模型完全可能直接输出 `</thinking>正文` 或 `</thinking>\n正文`，
-/// `\n\n` 硬要求会让这些形态永远无法闭合。
-///
-/// 跳过 / 等待的情况：
-/// - 被引用字符包裹（反引号、双引号、单引号、反斜杠）
-/// - **两侧都**紧邻空格或制表符：这是句中提及的典型形态
-///   （`提到 </thinking> 的问题`），模型在正文里谈论标签，不能据此闭合。
-///   单侧空格不作为提及的证据——`</thinking> 正文` / `思考完毕 </thinking>` 都是
-///   完全正常的真结束形态，若单侧即判提及，thinking 块会永不闭合、
-///   整段正文以 thinking_delta 下发，并因「只有 thinking 块」触发收尾兜底把
-///   `stop_reason` 误置为 `max_tokens`。换行同样不算隔开——`\n</thinking>`
-///   是最常见的真结束形态。
-/// - 标签正好在缓冲区末尾：后一个字符可能是尚未到达的反引号，返回 `None` 等待更多内容
-///   （流结束或 tool_use 边界由 [`find_real_thinking_end_tag_at_buffer_end`] 兜底）
-///
-/// 取舍：两侧空格的真结束标签（`思考完毕 </thinking> 正文`）仍会漏判。代价不对称——
-/// 漏判真标签会丢掉整段正文并误报 `max_tokens`，误判提及只是让 thinking 提前截断、
-/// 内容仍完整可见，故按「宁可误判提及」取舍。
+/// 跳过的情况：
+/// - 被引用字符包裹（反引号、引号等）
+/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
+/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
 ///
 /// # 参数
 /// - `buffer`: 要搜索的字符串
@@ -242,44 +200,37 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
     while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        // 检查前面是否有引用字符 / 空格
-        let has_quote_before = absolute_pos > 0 && is_thinking_quote_char(buffer, absolute_pos - 1);
-        let spaced_before = absolute_pos > 0 && is_inline_space(buffer, absolute_pos - 1);
+        // 检查前面是否有引用字符
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
 
+        // 检查后面是否有引用字符
         let after_pos = absolute_pos + TAG.len();
+        let has_quote_after = is_quote_char(buffer, after_pos);
 
-        // 标签后还没有任何字符：无法排除「下一个 chunk 到来的是反引号」，等待更多内容
-        if after_pos >= buffer.len() {
-            return None;
-        }
-
-        // 检查后面是否有引用字符 / 空格
-        let has_quote_after = is_thinking_quote_char(buffer, after_pos);
-        let spaced_after = is_inline_space(buffer, after_pos);
-
-        // 被引用包裹，或**两侧都**被空格隔开（句中提及的典型形态）→ 跳过继续搜索。
-        // 单侧空格不算提及：`</thinking> 正文`、`思考完毕 </thinking>` 都是真结束形态。
-        if has_quote_before || has_quote_after || (spaced_before && spaced_after) {
+        // 如果被引用字符包裹，跳过
+        if has_quote_before || has_quote_after {
             search_start = absolute_pos + 1;
             continue;
         }
 
-        return Some(absolute_pos);
+        // 检查后面的内容
+        let after_content = &buffer[after_pos..];
+
+        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
+        if after_content.len() < 2 {
+            return None;
+        }
+
+        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
+        if after_content.starts_with("\n\n") {
+            return Some(absolute_pos);
+        }
+
+        // 不是双换行符，跳过继续搜索
+        search_start = absolute_pos + 1;
     }
 
     None
-}
-
-/// 计算结束标签之后需要一并剥离的分隔换行数（最多 2 个）
-///
-/// 模型可能输出 `</thinking>\n\n正文`、`</thinking>\n正文` 或 `</thinking>正文`，
-/// 这些换行属于标签与正文之间的分隔符，不应作为正文首部下发。
-fn thinking_end_tag_trailing_newlines(buffer: &str, after_tag_pos: usize) -> usize {
-    buffer[after_tag_pos..]
-        .bytes()
-        .take(2)
-        .take_while(|c| *c == b'\n')
-        .count()
 }
 
 /// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
@@ -297,11 +248,11 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
         let absolute_pos = search_start + pos;
 
         // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_thinking_quote_char(buffer, absolute_pos - 1);
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
 
         // 检查后面是否有引用字符
         let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_thinking_quote_char(buffer, after_pos);
+        let has_quote_after = is_quote_char(buffer, after_pos);
 
         if has_quote_before || has_quote_after {
             search_start = absolute_pos + 1;
@@ -330,11 +281,11 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
         let absolute_pos = search_start + pos;
 
         // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_thinking_quote_char(buffer, absolute_pos - 1);
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
 
         // 检查后面是否有引用字符
         let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_thinking_quote_char(buffer, after_pos);
+        let has_quote_after = is_quote_char(buffer, after_pos);
 
         // 如果不被引用字符包裹，则是真正的开始标签
         if !has_quote_before && !has_quote_after {
@@ -776,14 +727,12 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let before = &text[..start_pos];
     let after_open = &text[start_pos + "<thinking>".len()..];
 
-    // 查找结束标签：优先常规匹配，退而使用末尾匹配
+    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
     let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        // 标签后的分隔换行最多剥 2 个，且必须按实际到达数量计算：
-        // 结束标签后可能是 `\n\n`、`\n`，也可能直接是正文（如中文），
-        // 写死 `</thinking>\n\n` 的长度会切过 UTF-8 字符边界导致 panic。
-        let after_tag = end_pos + "</thinking>".len();
-        let newlines = thinking_end_tag_trailing_newlines(after_open, after_tag);
-        (&after_open[..end_pos], &after_open[after_tag + newlines..])
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
     } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
         let after_tag = end_pos + "</thinking>".len();
         (&after_open[..end_pos], after_open[after_tag..].trim_start())
@@ -1514,12 +1463,6 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// `</thinking>` 之后还可剥离的分隔换行数（最多 2 个）
-    ///
-    /// 结束标签与正文之间的 `\n\n` 可能跨事件到达（标签所在 chunk 只带到第一个 `\n`，
-    /// 第二个 `\n` 在下一个 chunk）。剥离剩余额度必须跨 chunk 保持，
-    /// 否则迟到的换行会作为正文首字符泄漏给客户端。
-    pending_separator_newlines: usize,
     /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
@@ -1630,7 +1573,6 @@ impl StreamContext {
             pending_thinking_signature: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
-            pending_separator_newlines: 0,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
             metering: None,
@@ -1935,22 +1877,16 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 `</thinking>` 及其后最多 2 个分隔换行。
-                    // 结束标签后不一定是 `\n\n`，也可能是 `\n` 或直接跟正文，
-                    // 故按实际到达的换行数动态剥离，不能写死 `</thinking>\n\n` 的长度。
-                    // 若换行尚未到齐（跨 chunk），把剩余额度记进
-                    // `pending_separator_newlines`，由后续正文分支继续剥。
-                    let after_tag = end_pos + "</thinking>".len();
-                    let newlines =
-                        thinking_end_tag_trailing_newlines(&self.thinking_buffer, after_tag);
-                    self.pending_separator_newlines = 2 - newlines;
-                    self.thinking_buffer = self.thinking_buffer[after_tag + newlines..].to_string();
+                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
+                    self.thinking_buffer =
+                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
-                    // 保留末尾可能是部分结束标签的内容：find_real_thinking_end_tag 在
-                    // `</thinking>` 正好位于 buffer 末尾时返回 None（要等下一个字符，
-                    // 以排除后面跟反引号的引用形态），因此保留区取 `</thinking>\n\n`
-                    // 的长度（13 字节）留足余量，避免标签前几个字符被误当 thinking_delta 发出。
+                    // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
+                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
+                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
+                    // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
+                    // 标签的前几个字符会被错误地作为 thinking_delta 发出。
                     let target_len = self
                         .thinking_buffer
                         .len()
@@ -1972,20 +1908,9 @@ impl StreamContext {
             } else {
                 // thinking 已提取完成，剩余内容作为 text_delta
                 if !self.thinking_buffer.is_empty() {
-                    // 先补剥 `</thinking>` 与正文之间迟到的分隔换行
-                    while self.pending_separator_newlines > 0
-                        && self.thinking_buffer.starts_with('\n')
-                    {
-                        self.thinking_buffer = self.thinking_buffer[1..].to_string();
-                        self.pending_separator_newlines -= 1;
-                    }
-                    // 一旦出现非换行内容，额度作废，避免误剥正文里的空行
-                    if !self.thinking_buffer.is_empty() {
-                        self.pending_separator_newlines = 0;
-                        let remaining = self.thinking_buffer.clone();
-                        self.thinking_buffer.clear();
-                        events.extend(self.create_text_delta_events(&remaining));
-                    }
+                    let remaining = self.thinking_buffer.clone();
+                    self.thinking_buffer.clear();
+                    events.extend(self.create_text_delta_events(&remaining));
                 }
                 break;
             }
@@ -3577,106 +3502,10 @@ mod tests {
             Some(9)
         );
 
-        // 标签正好在缓冲区末尾：等待下一个字符以排除反引号引用形态
+        // 没有双换行符的情况
         assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
-
-        // 不再要求标签后必须是 `\n\n`：单个换行、直接跟正文都算真结束标签。
-        // 旧实现在这两种形态下返回 None，导致 thinking 块永不闭合。
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), Some(0));
-
-        // 标签后紧跟空格：单侧空格不是提及的证据，仍是真结束标签。
-        // `</thinking> 正文` 是模型的常见输出形态（英文尤甚）。
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), Some(0));
-    }
-
-    /// 模型在 thinking 正文里**提及**结束标签时不得误闭合。
-    ///
-    /// 放宽 `\n\n` 硬要求后，这类形态失去了原有的天然屏障，
-    /// 改由「两侧都被空格隔开 = 句中提及」的判定兜住。
-    #[test]
-    fn test_find_real_thinking_end_tag_skips_inline_mentions() {
-        // 未加引号、两侧被空格隔开的句中提及 → 跳过，命中后面真正的结束标签
-        let s = "问题在于 </thinking> 没被识别\n\n真结束</thinking>\n\n";
-        let pos = find_real_thinking_end_tag(s).expect("应命中真结束标签");
-        assert_eq!(
-            &s[pos..pos + "</thinking>".len()],
-            "</thinking>",
-            "命中位置必须是标签"
-        );
-        assert!(
-            pos > s.find("没被识别").unwrap(),
-            "不能命中句中提及的那个标签，got pos={pos}"
-        );
-
-        // 换行不算隔开：`\n</thinking>` 是最常见的真结束形态
-        assert_eq!(
-            find_real_thinking_end_tag("思考完毕\n</thinking>\n\n正文"),
-            Some("思考完毕\n".len())
-        );
-    }
-
-    /// 单侧空格必须视为真结束标签。
-    ///
-    /// 曾经「任一侧有空格即判提及」，导致 `</thinking> 正文` / `思考完毕 </thinking>`
-    /// 这类常见形态永不闭合：整段正文以 thinking_delta 下发，且因为全程没有 text 块，
-    /// 收尾兜底会补一个空格当正文并把 `stop_reason` 误置为 `max_tokens`。
-    #[test]
-    fn test_find_real_thinking_end_tag_single_side_space_is_real() {
-        // 标签后单个空格（英文输出尤其常见）
-        assert_eq!(
-            find_real_thinking_end_tag("Done.</thinking> Body text here."),
-            Some(5),
-            "标签后单侧空格应闭合"
-        );
-        assert_eq!(
-            find_real_thinking_end_tag("思考。</thinking> 正文内容。"),
-            Some("思考。".len()),
-            "标签后单侧空格应闭合（中文）"
-        );
-        // 标签前单个空格
-        assert_eq!(
-            find_real_thinking_end_tag("思考完毕 </thinking>正文内容。"),
-            Some("思考完毕 ".len()),
-            "标签前单侧空格应闭合"
-        );
-        // 制表符同理
-        assert_eq!(
-            find_real_thinking_end_tag("思考。</thinking>\t正文内容。"),
-            Some("思考。".len()),
-            "标签后单侧制表符应闭合"
-        );
-        // 单侧空格 + 引号仍判提及（引号优先）
-        assert_eq!(find_real_thinking_end_tag("提到 `</thinking>`的问题"), None);
-    }
-
-    /// 复现线上现象：thinking 正文以句号结尾、`</thinking>` 后直接跟正文（无 `\n\n`），
-    /// 结束标签必须被识别，否则后续全部正文会被当成 thinking_delta 继续下发，
-    /// 客户端看到一个永不闭合的 thinking 块。
-    #[test]
-    fn test_find_real_thinking_end_tag_after_sentence_punctuation() {
-        // 句号紧贴结束标签（QUOTE_CHARS 里含 '.'，历史上会被误判为「引用」而跳过）
-        assert_eq!(
-            find_real_thinking_end_tag("before presenting it as fact.</thinking>\n\n正文"),
-            Some(29),
-            "句号后的结束标签不应被当作引用跳过"
-        );
-        // 结束标签后直接跟正文、没有 `\n\n`（旧实现要求双换行，会漏判）
-        assert_eq!(
-            find_real_thinking_end_tag("as fact.</thinking>已经把链路读完了。"),
-            Some(8),
-            "结束标签后直接跟正文时也应识别"
-        );
-        // 问号、感叹号、冒号同理
-        assert_eq!(
-            find_real_thinking_end_tag("要不要修？</thinking>\n\n正文"),
-            Some(15),
-            "问号后的结束标签不应被当作引用跳过"
-        );
-        // 中文全角句号（非 ASCII，不在 QUOTE_CHARS 内）作为对照，本来就该通过
-        assert_eq!(
-            find_real_thinking_end_tag("读完了。</thinking>\n\n正文"),
-            Some(12)
-        );
+        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
     }
 
     #[test]
@@ -4719,58 +4548,6 @@ mod tests {
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
-    }
-
-    /// 端到端复现线上故障：thinking 正文以句号收尾、`</thinking>` 后**直接**跟中文正文
-    /// （既没有 `\n\n`，句号又落在旧 QUOTE_CHARS 里）。
-    /// 旧实现两个条件同时判否 → 结束标签永不识别 → 整段正文被当成 thinking_delta 下发，
-    /// 客户端渲染出一个永不闭合的 thinking 块。
-    #[test]
-    fn test_end_tag_after_period_followed_directly_by_body_text() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let _initial_events = ctx.generate_initial_events();
-
-        let mut all = Vec::new();
-        all.extend(ctx.process_assistant_response(
-            "<thinking>\nverify that pitfall before presenting it as fact.</thinking>已经把链路读完了。",
-        ));
-        all.extend(ctx.generate_final_events());
-
-        let thinking = collect_thinking_content(&all);
-        assert_eq!(
-            thinking, "verify that pitfall before presenting it as fact.",
-            "thinking 必须在结束标签处闭合，got: {:?}",
-            thinking
-        );
-
-        let text = collect_text_content(&all);
-        assert_eq!(
-            text, "已经把链路读完了。",
-            "结束标签后的正文必须作为 text 下发，got: {:?}",
-            text
-        );
-    }
-
-    /// 非流式路径同款：结束标签后直接跟中文正文时，
-    /// 旧的 `end_pos + "</thinking>\n\n".len()` 会切过 UTF-8 边界 panic。
-    #[test]
-    fn test_extract_thinking_end_tag_followed_directly_by_multibyte_text() {
-        let (thinking, remaining) =
-            extract_thinking_from_complete_text("<thinking>\n分析完毕。</thinking>已经把链路读完了。");
-        assert_eq!(thinking.as_deref(), Some("分析完毕。"));
-        assert_eq!(remaining, "已经把链路读完了。");
-
-        // 单个换行分隔
-        let (thinking, remaining) =
-            extract_thinking_from_complete_text("<thinking>\nabc</thinking>\n中文正文");
-        assert_eq!(thinking.as_deref(), Some("abc"));
-        assert_eq!(remaining, "中文正文");
     }
 
     #[test]

@@ -42,6 +42,7 @@
 ///     `thinking.type: adaptive | disabled`，无 `enabled`；Anthropic 侧也建议
 ///     两种模式都可用时用 adaptive。故与 Opus 4.6 统一走 adaptive。
 /// - `fable` / `mythos` → true。这两族自 5 起才存在。
+/// - `haiku` 主版本 >= 5 → true（`claude-haiku-5.5`）。haiku 4.5 仍是固定预算。
 /// - 其余一律 false：4.5 及更早只支持固定预算。
 ///
 /// 无法解析的形态按 false 处理：宁可多注一个无用标签，也不要把本该带预算的模型
@@ -57,6 +58,13 @@ pub fn backend_requires_adaptive_thinking(backend_id: &str) -> bool {
         if body.starts_with(family) {
             return true;
         }
+    }
+
+    // haiku 只看主版本：5 代起（claude-haiku-5.5）走原生 reasoning 的 adaptive，
+    // 4.5 仍是固定预算。不并入下面 opus/sonnet 的「4.6 起」规则，haiku 没有 4.6。
+    if let Some(rest) = body.strip_prefix("haiku") {
+        let (major, _) = parse_version(rest.trim_start_matches(['-', '.']));
+        return matches!(major, Some(major) if major >= 5);
     }
 
     for family in ["opus", "sonnet"] {
@@ -132,6 +140,8 @@ mod tests {
             "claude-sonnet-5",
             "claude-fable-5",
             "claude-mythos-5",
+            "claude-haiku-5.5",
+            "claude-haiku-5-5",
         ] {
             assert!(
                 backend_requires_adaptive_thinking(id),
