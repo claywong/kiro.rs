@@ -84,6 +84,30 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// 解析 `GET /orders/{id}/delivery` 的响应（信封：`data` 即条目数组 + `meta`）。
+/// 单独成函数并用**真实响应**做 fixture —— 这里踩过双层信封的坑，且 HTTP 层
+/// 测试缺位时它是唯一回归防线。
+fn parse_delivery_page(text: &str) -> Result<DeliveryPage> {
+    let v: Value = serde_json::from_str(text).map_err(|e| KiroshopError {
+        status: None,
+        code: Some("parse_response".into()),
+        message: format!("解析响应失败: {e}；原文片段: {}", truncate(text, 200)),
+    })?;
+    let data = v
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let items: Vec<DeliveryItem> = data
+        .iter()
+        .filter_map(|i| serde_json::from_value::<DeliveryItem>(i.clone()).ok())
+        .collect();
+    Ok(DeliveryPage {
+        data: items,
+        meta: v.get("meta").cloned(),
+    })
+}
+
 // ============ DTO ============
 
 /// 通用信封：`{"data": ...}`（部分带 `meta`）
@@ -609,6 +633,10 @@ impl KiroshopClient {
     }
 
     /// 增量拿号：`after_seq` 之后新到的。游标用返回的 `next_after_seq`。
+    ///
+    /// 注意此端点的信封是 `{"data":[...],"meta":{...}}` —— `data` 就是条目数组
+    /// 本身，**不是**再包一层对象，不能走 [`unwrap_data`]（曾因此把顶层数组按
+    /// 位置塞进结构体字段，解析必炸）。
     pub async fn delivery(&self, order_id: &str, after_seq: i64, limit: u32) -> Result<DeliveryPage> {
         let limit = limit.clamp(1, 500);
         let (_, text) = self
@@ -620,7 +648,7 @@ impl KiroshopClient {
                 ],
             )
             .await?;
-        Ok(unwrap_data::<DeliveryPage>(&text)?.0)
+        parse_delivery_page(&text)
     }
 
     // ---- 补号 ----
@@ -842,15 +870,27 @@ mod tests {
 
     #[test]
     fn 增量拿号页解析() {
-        let page: DeliveryPage = serde_json::from_str(
-            r#"{"data":[{"seq":1,"content":"{\"a\":1}","delivered_at":null},
-                {"seq":2,"content":" {\"b\":2} "}],"meta":{"delivered":2,"quantity":3,
-                "status":"paid","next_after_seq":2,"has_more":false}}"#,
+        // 真实响应形态（生产踩坑后回归）：顶层 data 就是条目数组，不能再剥一层
+        let page = parse_delivery_page(
+            r#"{"data":[{"seq":1,"content":"{\"email\":\"a@b.c\",\"refreshToken\":\"x\"}","delivered_at":null},
+                {"seq":2,"content":" {\"email\":\"d@e.f\"} ","delivered_at":"2026-11-02T06:49:00Z"}],
+                "meta":{"delivered":2,"quantity":3,"status":"out_of_stock","next_after_seq":2,"has_more":false}}"#,
         )
         .unwrap();
         assert_eq!(page.data.len(), 2);
-        assert_eq!(page.data[1].content.trim(), r#"{"b":2}"#);
+        assert_eq!(page.data[1].content.trim(), r#"{"email":"d@e.f"}"#);
         assert_eq!(page.next_after_seq(), Some(2));
+
+        // 空页（预定单未到货）：data 空数组，游标保持
+        let empty = parse_delivery_page(
+            r#"{"data":[],"meta":{"delivered":0,"quantity":3,"status":"out_of_stock","next_after_seq":0,"has_more":false}}"#,
+        )
+        .unwrap();
+        assert!(empty.data.is_empty());
+        assert_eq!(empty.next_after_seq(), Some(0));
+
+        // 坏响应必须报错而非静默空页
+        assert!(parse_delivery_page("<html>").is_err());
     }
 
     #[test]
