@@ -907,6 +907,12 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_kiroapp_cc: Option<LegacyKiroappCcConfig>,
 
+    /// KiroShop（kiro.yonghu.shop）独立配置段。商品制店铺，不走 `vendors`
+    /// 的 flavor 框架（装不下预定排队 / 增量拿号 / 补号 / 售后）。
+    /// 详见 [`crate::kiroshop::config`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiroshop: Option<crate::kiroshop::config::KiroshopConfig>,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -1092,6 +1098,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            kiroshop: None,
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),

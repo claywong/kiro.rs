@@ -12,7 +12,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, Store, SlidersHorizontal } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, Store, SlidersHorizontal, ShoppingBag } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -46,13 +46,18 @@ const VendorPage = lazy(() =>
     default: m.VendorPage,
   })),
 );
+const KiroshopPage = lazy(() =>
+  import("@/components/kiroshop-page").then((m) => ({
+    default: m.KiroshopPage,
+  })),
+);
 const SettingsPage = lazy(() =>
   import("@/components/settings-page").then((m) => ({
     default: m.SettingsPage,
   })),
 );
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "vendor" | "settings";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "vendor" | "kiroshop" | "settings";
 
 const TABS: {
   key: Tab;
@@ -97,6 +102,12 @@ const TABS: {
     icon: <Store className="h-3.5 w-3.5" />,
   },
   {
+    key: "kiroshop",
+    label: "KiroShop",
+    mobileLabel: "商城",
+    icon: <ShoppingBag className="h-3.5 w-3.5" />,
+  },
+  {
     key: "settings",
     label: "设置",
     mobileLabel: "设置",
@@ -115,6 +126,7 @@ function readTabFromHash(): Tab {
     h === "overview" ||
     h === "traces" ||
     h === "vendor" ||
+    h === "kiroshop" ||
     h === "settings"
   )
     return h;
@@ -449,6 +461,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "vendor" && <VendorPage />}
+        {tab === "kiroshop" && <KiroshopPage />}
         {tab === "settings" && <SettingsPage />}
       </Suspense>
     </main>

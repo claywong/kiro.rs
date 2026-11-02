@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod image_resize;
 mod kiro;
+mod kiroshop;
 mod model;
 pub mod token;
 mod vendor;
@@ -45,10 +46,17 @@ async fn main() {
     ensure_config_files(&config_path, &credentials_path);
 
     // 加载配置
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+
+    // KiroShop 独立模块：把旧 vendors 里的 kiroshop 条目迁移到顶层 kiroshop 段
+    if kiroshop::migrate_from_vendors(&mut config) {
+        if let Err(e) = config.save() {
+            tracing::warn!("KiroShop 配置迁移写入失败（本进程内仍按迁移后配置运行）: {}", e);
+        }
+    }
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
@@ -180,6 +188,7 @@ async fn main() {
 
     // count_tokens 初始化会 move 掉 proxy_config，卖家出站客户端仍需复用同一份代理配置
     let proxy_config_for_vendor = proxy_config.clone();
+    let proxy_config_for_kiroshop = proxy_config.clone();
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -334,6 +343,43 @@ async fn main() {
         // 只对配了 stockPollIntervalSecs 的家生效，未配的家不起任何任务。
         vendor_registry.spawn_stock_pollers();
     }
+
+    // KiroShop 独立模块：不走上面的 flavor 框架（商品制：预定排队 / 增量拿号 /
+    // 补号 / 售后 / 事件流）。库打开失败用内存兜底，与 vendor 事件库同一策略。
+    let kiroshop_store = kiroshop::KiroshopStore::open(cache_dir.join("kiroshop.db")).unwrap_or_else(
+        |e| {
+            tracing::warn!("打开 kiroshop.db 失败，KiroShop 在途跟踪仅存于内存: {}", e);
+            kiroshop::KiroshopStore::open_in_memory().expect("内存 KiroShop 库初始化失败")
+        },
+    );
+    let kiroshop_http = http_client::build_client(proxy_config_for_kiroshop.as_ref(), 30, config.tls_backend)
+        .unwrap_or_else(|e| {
+            tracing::warn!("KiroShop 专用 HTTP 客户端构建失败，退回默认客户端: {}", e);
+            reqwest::Client::new()
+        });
+    let kiroshop_service = kiroshop::KiroshopService::new(
+        kiroshop_http,
+        config.kiroshop.clone().unwrap_or_default(),
+        kiroshop_store,
+        admin_service.clone(),
+    );
+    // 配置持久化走 token_manager 的 config.json 读改写通道
+    let kiroshop_persister: std::sync::Arc<dyn kiroshop::service::ConfigPersist> =
+        token_manager.clone();
+    kiroshop_service.set_config_persister(kiroshop_persister);
+    if config
+        .kiroshop
+        .as_ref()
+        .is_some_and(|k| k.is_ready())
+    {
+        tracing::info!("KiroShop 商城对接已启用（/api/admin/kiroshop 与 /webhook/kiroshop/<token>）");
+        tokio::spawn(kiroshop_service.clone().run());
+    } else {
+        tracing::info!("KiroShop 未配置或未启用（config.json 的 kiroshop 段），轮询不启动");
+    }
+    let kiroshop_state = kiroshop::KiroshopState {
+        service: kiroshop_service,
+    };
     // 端点提示在下方路由清单里打印，注册表随后被 VendorState 接管，先取出所需计数。
     let vendor_count = vendor_registry.len();
     let vendor_inbound_count = vendor_registry
@@ -396,8 +442,17 @@ async fn main() {
                     admin::admin_auth_middleware,
                 ),
             );
-            let admin_app =
-                admin::create_admin_router(admin_state).nest("/vendor", vendor_admin_app);
+            // KiroShop 管理接口与 vendor 共用 adminApiKey 认证（同样要显式套中间件）
+            let kiroshop_admin_app =
+                kiroshop::create_kiroshop_admin_router(kiroshop_state.clone()).layer(
+                    axum::middleware::from_fn_with_state(
+                        admin_state.clone(),
+                        admin::admin_auth_middleware,
+                    ),
+                );
+            let admin_app = admin::create_admin_router(admin_state)
+                .nest("/vendor", vendor_admin_app)
+                .nest("/kiroshop", kiroshop_admin_app);
 
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
@@ -415,6 +470,9 @@ async fn main() {
     // 入站卖家 webhook：独立于 adminApiKey 是否配置。认证靠路径 token，
     // 未配置 vendor 时路由仍在但一律 404。
     let app = app.nest("/webhook", vendor::create_vendor_webhook_router(vendor_state));
+    // KiroShop 入站回调（三段路径，与 vendor 的两段 /webhook/{token} 无冲突）。
+    // 未配置 token 时一律 404。
+    let app = app.merge(kiroshop::create_kiroshop_webhook_router(kiroshop_state));
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
