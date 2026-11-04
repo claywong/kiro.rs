@@ -710,52 +710,69 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     0
 }
 
-/// 从完整文本中提取 thinking 块（用于非流式响应）
+/// 从完整文本中提取**全部** thinking 块（用于非流式响应）
 ///
 /// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
 /// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
 ///
+/// 与流式状态机对齐支持**多段** thinking：一条回复里可能出现多段
+/// `<thinking>…</thinking>`（交错思考 / 模型模仿历史回传格式），每段
+/// 都切进独立的 thinking 项，正文按出现位置穿插其间。
+///
 /// # 返回值
-/// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
-/// - `(None, original_text)` — 未检测到，原样返回
-pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
-    let start_pos = match find_real_thinking_start_tag(text) {
-        Some(pos) => pos,
-        None => return (None, text.to_string()),
-    };
+/// 交替序列 `(is_thinking, content)`：true 为 thinking 内容，false 为正文。
+/// 未检测到任何 thinking 块时返回单个 `[(false, 原文)]`。
+pub(crate) fn extract_thinking_from_complete_text(text: &str) -> Vec<(bool, String)> {
+    let mut result = Vec::new();
+    let mut rest = text;
 
-    let before = &text[..start_pos];
-    let after_open = &text[start_pos + "<thinking>".len()..];
+    loop {
+        let start_pos = match find_real_thinking_start_tag(rest) {
+            Some(pos) => pos,
+            None => break,
+        };
 
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
+        let before = &rest[..start_pos];
+        let after_open = &rest[start_pos + "<thinking>".len()..];
 
-    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
+        // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
+        let (thinking_raw, text_after) =
+            if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+                (
+                    &after_open[..end_pos],
+                    &after_open[end_pos + "</thinking>\n\n".len()..],
+                )
+            } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+                let after_tag = end_pos + "</thinking>".len();
+                (&after_open[..end_pos], after_open[after_tag..].trim_start())
+            } else {
+                // 开标签后找不到有效结束标签：不做提取，后续全部当正文
+                break;
+            };
 
-    // 组装剩余文本：跳过纯空白的 before 部分
-    let mut remaining = String::new();
-    if !before.trim().is_empty() {
-        remaining.push_str(before);
+        // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
+        let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
+
+        // 标签前的正文按出现位置保留（跳过纯空白，与流式一致）
+        if !before.trim().is_empty() {
+            result.push((false, before.to_string()));
+        }
+        if !thinking_content.is_empty() {
+            result.push((true, thinking_content.to_string()));
+        }
+
+        rest = text_after;
+        if rest.is_empty() {
+            break;
+        }
     }
-    remaining.push_str(text_after);
 
-    if thinking_content.is_empty() {
-        (None, remaining)
-    } else {
-        (Some(thinking_content.to_string()), remaining)
+    // 尾部剩余文本：未检测到任何标签时的原文 / 最后一段 thinking 之后的正文 /
+    // 含未闭合开标签的残余（当正文输出，与旧实现一致）。
+    if result.is_empty() || !rest.is_empty() {
+        result.push((false, rest.to_string()));
     }
+    result
 }
 
 /// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列，
@@ -1779,7 +1796,13 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block && !self.thinking_extracted {
+            // 不在 thinking 块内就持续扫描 <thinking> 开标签，不设「只提取一次」的开关：
+            // 一条回复里可能出现多段 thinking——5 代模型的交错思考（interleaved）会在
+            // 正文/工具调用之间穿插思考；converter 回传历史 assistant 消息时也拼成了
+            // `<thinking>…</thinking>\n\n正文` 格式，模型会模仿该格式在正文中间再写一段。
+            // 旧实现用单向的 thinking_extracted 开关，第二段起 `<thinking>` 不再被识别，
+            // 思考内容连标签原样混入正文输出。
+            if !self.in_thinking_block {
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
                 if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
                     // 发送 <thinking> 之前的内容作为 text_delta
@@ -1789,6 +1812,11 @@ impl StreamContext {
                     if !before_thinking.is_empty() && !before_thinking.trim().is_empty() {
                         events.extend(self.create_text_delta_events(&before_thinking));
                     }
+
+                    // 开新 thinking 块前必须关闭开着的 text 块：第二段及以后的 thinking
+                    // 出现时，前面正文的 text 块通常开着（第一段之前 text 块必然未创建，
+                    // close 是空操作）。SSE 协议要求上一块 stop 之后才能 start 新块。
+                    events.extend(self.close_open_text_block());
 
                     // 进入 thinking 块
                     self.in_thinking_block = true;
@@ -1813,29 +1841,28 @@ impl StreamContext {
                     );
                     events.extend(start_events);
                 } else {
-                    // 没有找到 <thinking>，检查是否可能是部分标签
-                    // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("<thinking>".len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
+                    // 没有找到 <thinking>，把「确定安全」的前缀作为正文立即吐出，
+                    // 只 hold 两种待判定尾巴（等下个 chunk 判定，final 兜底吐出，不吞字）：
+                    // 1. 尾部可能是部分 `<thinking>` 前缀——最后一个 '<' 之后没有 '>'，
+                    //    下个 chunk 可能补全标签（旧实现按固定 10 字节 hold，会无谓
+                    //    扣住正文尾部直到流尾；改为精确前缀判定后正文即时输出）。
+                    // 2. 整段安全前缀全是空白——4.6 模型中 <thinking> 标签跨事件分割时，
+                    //    前导空白（如 "\n\n"）先行吐出会创建 text 块，导致 text 块
+                    //    先于 thinking 块出现，故继续保留在缓冲区等待更多内容。
+                    let keep = partial_invoke_tag_suffix_len(&self.thinking_buffer);
+                    let split = self.thinking_buffer.len() - keep;
+                    let safe_len = find_char_boundary(&self.thinking_buffer, split);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        // 如果 thinking 尚未提取，且安全内容只是空白字符，
-                        // 则不发送为 text_delta，继续保留在缓冲区等待更多内容。
-                        // 这避免了 4.6 模型中 <thinking> 标签跨事件分割时，
-                        // 前导空白（如 "\n\n"）被错误地创建为 text 块，
-                        // 导致 text 块先于 thinking 块出现的问题。
-                        if !safe_content.is_empty() && !safe_content.trim().is_empty() {
+                        if !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
                             self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
                     }
                     break;
                 }
-            } else if self.in_thinking_block {
-                // 剥离 <thinking> 标签后紧跟的换行符（可能跨 chunk）
+            } else {
+                // 在 thinking 块内：剥离 <thinking> 标签后紧跟的换行符（可能跨 chunk）
                 if self.strip_thinking_leading_newline {
                     if self.thinking_buffer.starts_with('\n') {
                         self.thinking_buffer = self.thinking_buffer[1..].to_string();
@@ -1905,14 +1932,6 @@ impl StreamContext {
                     }
                     break;
                 }
-            } else {
-                // thinking 已提取完成，剩余内容作为 text_delta
-                if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
-                break;
             }
         }
 
@@ -2490,11 +2509,10 @@ impl StreamContext {
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
         // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
-        if self.thinking_enabled
-            && !self.in_thinking_block
-            && !self.thinking_extracted
-            && !self.thinking_buffer.is_empty()
-        {
+        // 注意不再检查 thinking_extracted：多段 thinking 支持后，提取过一段仍可能出现
+        // 下一段 `<thinking>`，缓冲区里的部分标签尾巴必须继续 hold（flush 会把跨
+        // tool_use 分片的标签拆坏）；等不到下一段时由 generate_final_events 兜底吐出。
+        if self.thinking_enabled && !self.in_thinking_block && !self.thinking_buffer.is_empty() {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
         }
@@ -3363,8 +3381,9 @@ mod tests {
 
     #[test]
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
-        // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
-        // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
+        // thinking 模式下，待判定是否为部分 `<thinking>` 标签的尾巴会暂存在
+        // thinking_buffer。当紧接着出现 tool_use 时，文本必须先于 tool_use block
+        // 输出（到达即吐，tool_use 前关闭 text 块），不能被 tool_use 吞掉。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -3374,17 +3393,25 @@ mod tests {
         );
         let _initial_events = ctx.generate_initial_events();
 
-        // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
-        // 因而会留在 thinking_buffer 中等待后续 chunk。
+        // 普通短文本不构成部分标签前缀，到达即作为正文输出（不再按固定字节数
+        // 扣住——旧实现会扣到 tool_use / 流尾才吐）。
         let ev1 = ctx.process_assistant_response("有修");
         assert!(
-            ev1.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should be buffered under thinking mode"
+            ev1
+                .iter()
+                .any(|e| e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == "有修"),
+            "plain short text should be emitted immediately under thinking mode"
         );
         let ev2 = ctx.process_assistant_response("改：");
         assert!(
-            ev2.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should still be buffered under thinking mode"
+            ev2
+                .iter()
+                .any(|e| e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == "改："),
+            "second short text chunk should also be emitted immediately"
         );
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -3394,55 +3421,22 @@ mod tests {
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
 
-        let text_start_index = events.iter().find_map(|e| {
-            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                e.data["index"].as_i64()
-            } else {
-                None
-            }
-        });
-        let pos_text_delta = events.iter().position(|e| {
-            e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-        });
-        let pos_text_stop = text_start_index.and_then(|idx| {
-            events.iter().position(|e| {
-                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
-            })
+        // tool_use 前必须关闭开着的 text 块：text_stop 先于 tool_use_start。
+        let text_stop_pos = events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["content_block"]["type"] != "tool_use"
         });
         let pos_tool_start = events.iter().position(|e| {
             e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
         });
 
         assert!(
-            text_start_index.is_some(),
-            "should start a text block to flush buffered text"
-        );
-        assert!(
-            pos_text_delta.is_some(),
-            "should flush buffered text as text_delta"
-        );
-        assert!(
-            pos_text_stop.is_some(),
+            text_stop_pos.is_some(),
             "should stop text block before tool_use block starts"
         );
         assert!(pos_tool_start.is_some(), "should start tool_use block");
-
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
-
         assert!(
-            pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
-            "ordering should be: text_delta -> text_stop -> tool_use_start"
-        );
-
-        assert!(
-            events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == "有修改："
-            }),
-            "flushed text should equal the buffered prefix"
+            text_stop_pos.unwrap() < pos_tool_start.unwrap(),
+            "ordering should be: text_stop -> tool_use_start"
         );
     }
 
@@ -5389,6 +5383,195 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
+    }
+
+    /// 复现排查：正文中间再次出现的 `<thinking>` 块（交错思考）是否被正确切分。
+    ///
+    /// 场景 A：纯文本标签路径，一段回复里出现两段 `<thinking>`。
+    /// 场景 B：原生 reasoningContentEvent 先到（置 thinking_extracted），
+    /// 之后文本流里再出现 `<thinking>` 标签。
+    /// 两个场景下，thinking_extracted 单向开关使第二段标签不再被识别，
+    /// 思考内容原样混入 text 输出。
+    #[test]
+    fn repro_second_thinking_block_leaks_into_text() {
+        // 场景 A：两段文本 thinking
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>第一段思考</thinking>\n\n正文甲",
+        ));
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>第二段思考</thinking>\n\n正文乙",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "第一段思考第二段思考",
+            "两段思考都应进 thinking 块"
+        );
+        assert_eq!(collect_text_content(&all_events), "正文甲正文乙");
+    }
+
+    #[test]
+    fn repro_native_then_text_thinking_leaks_into_text() {
+        // 场景 B：原生 reasoning 先到，文本 thinking 后到
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("原生思考".to_string()),
+                signature: None,
+                redacted_content: None,
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>文本思考</thinking>\n\n正文",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "原生思考文本思考",
+            "两段思考都应进 thinking 块"
+        );
+        assert_eq!(collect_text_content(&all_events), "正文");
+    }
+
+    /// 非流式完整文本提取：多段 thinking 全部切出，正文按位置穿插。
+    #[test]
+    fn extract_thinking_from_complete_text_handles_multiple_blocks() {
+        let segments = extract_thinking_from_complete_text(
+            "<thinking>甲</thinking>\n\n正文一<thinking>乙</thinking>\n\n正文二",
+        );
+        let shape: Vec<(bool, &str)> = segments
+            .iter()
+            .map(|(is_thinking, s)| (*is_thinking, s.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(true, "甲"), (false, "正文一"), (true, "乙"), (false, "正文二")]
+        );
+    }
+
+    /// 非流式：无标签时原文整体作为正文返回。
+    #[test]
+    fn extract_thinking_from_complete_text_plain_text_passthrough() {
+        let segments = extract_thinking_from_complete_text("普通正文");
+        assert_eq!(
+            segments,
+            vec![(false, "普通正文".to_string())]
+        );
+    }
+
+    /// 非流式：开标签无结束标签时不提取，残余当正文（与旧实现一致）。
+    #[test]
+    fn extract_thinking_from_complete_text_unclosed_tag_stays_in_text() {
+        let segments = extract_thinking_from_complete_text("<thinking>没闭合");
+        assert_eq!(
+            segments,
+            vec![(false, "<thinking>没闭合".to_string())]
+        );
+    }
+
+    /// 第二段 `<thinking>` 开标签跨 chunk 分片（`<thin` + `king>`），hold 的部分标签
+    /// 前缀必须与后续 chunk 正确拼接切分，不得泄露到正文。
+    #[test]
+    fn second_thinking_tag_split_across_chunks_is_reassembled() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>第一段</thinking>\n\n正文甲<thin",
+        ));
+        all_events.extend(ctx.process_assistant_response("king>第二段</thinking>\n\n正文乙"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all_events), "第一段第二段");
+        assert_eq!(collect_text_content(&all_events), "正文甲正文乙");
+    }
+
+    /// 正文以 `<` 结尾但等不来 `<thinking>`：尾巴由 final 兜底吐出，不吞字。
+    #[test]
+    fn trailing_partial_tag_flushes_at_final_without_loss() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events
+            .extend(ctx.process_assistant_response("<thinking>思考</thinking>\n\n正文<"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all_events), "思考");
+        assert_eq!(collect_text_content(&all_events), "正文<");
+    }
+
+    /// 多段 thinking 的块顺序：thinking、text 交替出现且各块完整闭合
+    /// （Anthropic 协议允许 content 数组中 thinking / text 交错多块）。
+    #[test]
+    fn interleaved_blocks_open_and_close_in_order() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>甲</thinking>\n\n文本一<thinking>乙</thinking>\n\n文本二",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        // 收集所有块的 start/stop 序列，验证两两配对且无嵌套。
+        let mut open_blocks: Vec<(i64, &str)> = Vec::new();
+        let mut balanced = true;
+        for e in &all_events {
+            if e.event == "content_block_start" {
+                open_blocks.push((
+                    e.data["index"].as_i64().unwrap_or(-1),
+                    e.data["content_block"]["type"].as_str().unwrap_or(""),
+                ));
+            } else if e.event == "content_block_stop" {
+                if open_blocks.pop().is_none() {
+                    balanced = false;
+                }
+            }
+        }
+        assert!(balanced, "every stop must close an open block");
+        assert!(open_blocks.is_empty(), "all blocks must be closed");
+
+        let types: Vec<&str> = all_events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .filter_map(|e| e.data["content_block"]["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["thinking", "text", "thinking", "text"],
+            "blocks must alternate thinking/text/thinking/text"
+        );
     }
 
     #[test]

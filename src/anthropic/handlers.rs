@@ -1836,27 +1836,10 @@ fn build_non_stream_content(
                 "signature": native_thinking_signature
                     .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
             }));
-        } else {
-            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
-            let (thinking, remaining_text) =
-                super::stream::extract_thinking_from_complete_text(&text_content);
-
-            if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-                }));
-            }
-
-            if !remaining_text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": remaining_text
-                }));
-            }
         }
 
+        // redacted_thinking 源自原生 reasoning 事件流，按上游顺序排在正文之前
+        // （与流式版 thinking → redacted → text 的顺序一致）。
         for redacted in native_redacted_thinking {
             content.push(json!({
                 "type": "redacted_thinking",
@@ -1864,11 +1847,28 @@ fn build_non_stream_content(
             }));
         }
 
-        if has_native_thinking && !text_content.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": text_content
-            }));
+        // 从完整文本中提取**全部** thinking 块，兼容旧的 <thinking> 文本路径。
+        // 一条回复可能含多段（交错思考 / 模型模仿历史回传格式），
+        // 每段独立成块，正文按出现位置穿插。原生 thinking 已存在时同样执行：
+        // 混流场景（原生事件 + 文本标签）下文本里的思考段不能漏进正文。
+        let segments = super::stream::extract_thinking_from_complete_text(&text_content);
+
+        for (is_thinking, segment) in segments {
+            if segment.is_empty() {
+                continue;
+            }
+            if is_thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": segment,
+                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                }));
+            } else {
+                content.push(json!({
+                    "type": "text",
+                    "text": segment
+                }));
+            }
         }
     } else if !text_content.is_empty() {
         content.push(json!({
@@ -3161,6 +3161,27 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body.contains(secret));
         assert!(body.contains("Upstream API request failed"));
+    }
+
+    /// 非流式混流：原生 thinking 事件 + 文本流里的 `<thinking>` 标签并存时，
+    /// 文本里的思考段必须切出为独立 thinking 块，不能带标签漏进正文。
+    #[test]
+    fn non_stream_mixed_native_and_text_thinking_extracts_both() {
+        let content = build_non_stream_content(
+            true,
+            "<thinking>文本思考</thinking>\n\n正文".to_string(),
+            "原生思考".to_string(),
+            None,
+            vec![],
+        );
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "原生思考");
+        assert_eq!(content[1]["type"], "thinking");
+        assert_eq!(content[1]["thinking"], "文本思考");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "正文");
     }
 
     #[test]
