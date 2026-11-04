@@ -699,11 +699,26 @@ async fn receive_webhook(
                 .into_response();
         }
     };
-    match st.service.handle_shop_event(&ev).await {
+    // 放进独立任务执行，再等它的结果：卖家侧超时断开连接时，axum 会丢弃本 handler 的
+    // future；若处理链路（拉号 → 入库含网络验活 → advance_delivery 写计数）直接跑在
+    // handler 里，会在某个 await 点被取消，出现「凭据已入库、计数没写」，而卖家 30s 后
+    // 重试时事件 id 已占坑直接 200，没人补上这次计数。spawn 后任务与连接生命周期无关。
+    let service = st.service.clone();
+    let event_id = ev.id;
+    let handle = tokio::spawn(async move { service.handle_shop_event(&ev).await });
+    let result = match handle.await {
+        Ok(r) => r,
+        Err(join_err) => Err(KiroshopError {
+            status: None,
+            code: None,
+            message: format!("事件处理任务异常退出: {join_err}"),
+        }),
+    };
+    match result {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
             // 5xx 让卖家按 30s/2m/10m/... 重试 8 次；本地轮询也会兜底
-            tracing::warn!(event = ev.id, "KiroShop webhook 处理失败: {e}");
+            tracing::warn!(event = event_id, "KiroShop webhook 处理失败: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),
@@ -752,4 +767,41 @@ pub fn create_kiroshop_webhook_router(state: KiroshopState) -> Router {
             post(receive_webhook).layer(axum::extract::DefaultBodyLimit::max(MAX_WEBHOOK_BODY)),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    /// receive_webhook 把处理链路 spawn 出去的理由：卖家超时断开连接时 axum 会丢弃
+    /// handler 的 future。这里模拟「入库耗时 → 写计数」的两段式流程，外层 future 在
+    /// 中途被丢弃后，spawn 出的任务仍必须把计数写完；直接跑在外层 future 里则会丢。
+    #[tokio::test]
+    async fn spawn出的处理任务在外层future被丢弃后仍写完计数() {
+        let spawned = Arc::new(AtomicU32::new(0));
+        let inline = Arc::new(AtomicU32::new(0));
+
+        let work = |counter: Arc<AtomicU32>| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await; // 模拟入库验活
+            counter.fetch_add(1, Ordering::SeqCst); // 模拟 advance_delivery
+        };
+
+        // 修复后的形态：spawn 再 await，外层 future 在等待中被丢弃（连接断开）
+        let c = spawned.clone();
+        let outer = async move {
+            let _ = tokio::spawn(work(c)).await;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(10), outer).await;
+
+        // 修复前的形态：直接在外层 future 里 await，被丢弃即被取消
+        let c = inline.clone();
+        let outer = async move { work(c).await };
+        let _ = tokio::time::timeout(Duration::from_millis(10), outer).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "spawn 的任务必须跑完");
+        assert_eq!(inline.load(Ordering::SeqCst), 0, "直接 await 的会被取消丢计数");
+    }
 }

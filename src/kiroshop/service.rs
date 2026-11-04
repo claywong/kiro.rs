@@ -395,15 +395,37 @@ impl KiroshopService {
             .map(|v| v.clamp(0, u32::MAX as i64) as u32)
             .unwrap_or(tracked.delivered);
 
+        if !contents.is_empty() {
+            // 与下面的「增量拿号完成」成对出现；只有这条没有那条，说明入库中途被打断
+            tracing::info!(
+                order = order_id,
+                after_seq = tracked.last_seq,
+                fetched = contents.len(),
+                "KiroShop 增量拿号开始入库"
+            );
+        }
         let outcome = if contents.is_empty() {
             None
         } else {
             Some(self.import_contents(order_id, &contents).await)
         };
-        let (imported, _duplicated, failed, last_error) = match &outcome {
+        let (imported, duplicated, failed, last_error) = match &outcome {
             Some(o) => (o.imported, o.duplicated, o.failed, o.last_error.clone()),
             None => (0, 0, 0, None),
         };
+        // 每一轮拉号都留痕：成功路径原先完全没日志，订单计数对不上时无从追查
+        // （2608824e 发货 5、凭据 5、入库计数 4，就是因为查不到是哪一轮少计的）。
+        tracing::info!(
+            order = order_id,
+            after_seq = tracked.last_seq,
+            new_max_seq,
+            fetched = contents.len(),
+            imported,
+            duplicated,
+            failed,
+            delivered,
+            "KiroShop 增量拿号完成"
+        );
         // 游标由 last_seq 承担；imported/failed 只是面板展示计数
         let _ = self.store.advance_delivery(order_id, new_max_seq, delivered, imported, failed);
         if let Some(err) = &last_error {
