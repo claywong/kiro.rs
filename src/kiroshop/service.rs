@@ -1119,6 +1119,31 @@ mod tests {
         )
     }
 
+    /// 入库代理选取：空池返回 None（保持回落全局代理的原行为），
+    /// 有池时只会选到池内可用的代理，且多次抽样能覆盖多个出口（不是固定取第一个）。
+    #[tokio::test]
+    async fn 入库随机代理_空池为none_有池只取池内可用() {
+        let svc = service();
+        assert_eq!(svc.admin.pick_random_proxy_url(), None, "空池应回落全局代理");
+
+        let urls: Vec<String> = (1..=5)
+            .map(|i| format!("socks5://u:p@10.0.0.{i}:1080"))
+            .collect();
+        let (added, errors) = svc
+            .admin
+            .batch_add_proxies(crate::admin::types::BatchAddProxyRequest { urls: urls.clone() });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(added.len(), 5);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let picked = svc.admin.pick_random_proxy_url().expect("池非空应有结果");
+            assert!(urls.contains(&picked), "必须取自代理池: {picked}");
+            seen.insert(picked);
+        }
+        assert!(seen.len() > 1, "200 次抽样只命中一个出口，说明不是随机");
+    }
+
     #[test]
     fn hmac与rfc4231向量一致() {
         // RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"

@@ -153,6 +153,10 @@ pub async fn import_keys(
             .or_else(|| api_region.clone());
 
         for credential in credentials {
+            // 每条新凭据各取一个随机出口。不显式带代理会回落到全局代理，一批新账号
+            // 共用同一个出口 IP；而且 import_one_credential 的验活走的就是凭据自己的
+            // 代理，必须在入库前定好，不能入库后再补。代理池为空时为 None，保持原行为。
+            let proxy_url = admin.pick_random_proxy_url();
             let req = match credential {
                 ParsedVendorCredential::ApiKey(key) => AddCredentialRequest {
                     refresh_token: None,
@@ -175,7 +179,7 @@ pub async fn import_keys(
                     api_region: region_for_key.clone(),
                     machine_id: None,
                     email: None,
-                    proxy_url: None,
+                    proxy_url,
                     proxy_username: None,
                     proxy_password: None,
                     kiro_api_key: Some(key),
@@ -225,7 +229,7 @@ pub async fn import_keys(
                     api_region: region_for_key.clone(),
                     machine_id,
                     email,
-                    proxy_url: None,
+                    proxy_url,
                     proxy_username: None,
                     proxy_password: None,
                     kiro_api_key: None,

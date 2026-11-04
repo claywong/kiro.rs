@@ -3067,6 +3067,20 @@ impl AdminService {
         }
     }
 
+    /// 从代理池随机取一个可用代理 URL（已启用且非 Unhealthy）。
+    ///
+    /// 供卖家 Key 自动入库使用：入库时未显式指定代理的凭据会回落到全局代理，
+    /// 导致同一批新账号共用一个出口 IP；这里让每个新凭据各取一个随机出口。
+    /// 代理池为空（或全部不可用）时返回 `None`，调用方保持原行为（走全局代理）。
+    pub fn pick_random_proxy_url(&self) -> Option<String> {
+        let mut urls = self.proxy_pool.assignable_urls();
+        if urls.is_empty() {
+            return None;
+        }
+        let idx = fastrand::usize(..urls.len());
+        Some(urls.swap_remove(idx))
+    }
+
     /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
     ///
     /// - `credential_ids` 为 None 时对全部凭据分配
