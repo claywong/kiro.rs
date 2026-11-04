@@ -1353,16 +1353,10 @@ fn credential_matches_request(
     model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
-    // 模型隔离：只按订阅等级做硬闸门（Opus 需付费订阅）。
-    // 具体某账号是否支持某模型，交由 `cached_model_support` 的三态缓存判定：
+    // 模型隔离不再按订阅名做硬闸门：KIRO FREE 现已开放 Opus。
+    // 某账号是否支持某模型，交由 `cached_model_support` 的三态缓存判定：
     // Confirmed 优先调度、Unsupported 跳过、Unknown 放行（由上游给出最终答案）。
-    let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
-    }
+    let _ = model;
 
     group_matches(&credentials.groups, group)
 }
@@ -8841,8 +8835,8 @@ mod tests {
     }
 
     #[test]
-    fn test_select_next_credential_filters_by_opus_subscription() {
-        // 模型闸门只按订阅等级：Free 账号不得承接 Opus 请求。
+    fn test_select_next_credential_does_not_filter_opus_by_subscription() {
+        // 不再按订阅名拦截 Opus：KIRO FREE 现已开放 Opus。
         // 具体模型支持与否由 model_cache 三态判定，不在此层过滤。
         let mut free_cred = grouped_cred("free", &[]);
         free_cred.subscription_title = Some("KIRO FREE".to_string());
@@ -8859,15 +8853,15 @@ mod tests {
         )
         .unwrap();
 
-        // 请求 opus：Free(id=1) 被订阅闸门挡掉，只能落到 Pro(id=2)
+        // 请求 opus：Free(id=1) 不再被订阅名挡掉，按优先级仍落到 Free
         assert_eq!(
             manager
                 .select_next_credential(Some("claude-opus-4.6"), None)
                 .map(|(id, _)| id),
-            Some(2),
-            "Opus 请求应只落到非 Free 订阅的账号"
+            Some(1),
+            "Free 订阅账号应能承接 Opus 请求"
         );
-        // 非 opus 模型：不受订阅闸门限制，按优先级落到 Free(id=1)
+        // 非 opus 模型：按优先级落到 Free(id=1)
         assert_eq!(
             manager
                 .select_next_credential(Some("claude-sonnet-5"), None)
