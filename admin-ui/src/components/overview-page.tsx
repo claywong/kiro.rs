@@ -35,6 +35,7 @@ import {
 } from '@/components/ui/select'
 
 const RANGES: { label: string; value: StatsRange }[] = [
+  { label: '今天', value: 'today' },
   { label: '24 小时', value: '24h' },
   { label: '7 天', value: '7d' },
   { label: '30 天', value: '30d' },
@@ -61,7 +62,7 @@ function customTimeFilter(
 }
 
 function presetStartDate(range: StatsRange, endDate: string): string {
-  const days = range === '24h' ? 1 : range === '7d' ? 6 : 29
+  const days = range === 'today' ? 0 : range === '24h' ? 1 : range === '7d' ? 6 : 29
   const d = new Date(`${endDate}T00:00:00`)
   d.setDate(d.getDate() - days)
   return toDateInputValue(d)
