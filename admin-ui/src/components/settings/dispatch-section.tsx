@@ -7,6 +7,8 @@ import {
   useSetRateLimitSameCredentialConfig,
   useSpeedCredentialsExcludeConfig,
   useSetSpeedCredentialsExcludeConfig,
+  useBoomCliAllModelsConfig,
+  useSetBoomCliAllModelsConfig,
   useShortSpeedConfig,
   useSetShortSpeedConfig,
   useSpeedCredentialsMinTokensConfig,
@@ -50,6 +52,7 @@ export function DispatchSection() {
       <SpeedCredentialsExcludeGroup />
       <SpeedCredentialsMinTokensGroup />
       <ShortSpeedGroup />
+      <BoomCliAllModelsGroup />
       <RpmLimitGroup />
       <SelfHealGroup />
     </div>
@@ -293,6 +296,41 @@ function SpeedCredentialsMinTokensGroup() {
         pending={saver.isSaving('minTokens')}
         saved={saver.isSaved('minTokens')}
         disabled={isLoading || !enabled}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
+ * 炸弹号专属策略：强制 cli 端点 + 视为支持所有模型。只作用于 metadata.type = boom 的号。
+ *
+ * 上游按客户端身份（IDE / CLI）过滤账号可用的模型：同一个号在 ide 端点上调不了的
+ * opus 等模型，走 cli 端点可以用。而模型缓存取自 IDE 身份的列表，会把这类号漏报成
+ * 「不支持」，所以两条规则要一起开，单开其一没有意义。
+ */
+function BoomCliAllModelsGroup() {
+  const { data, isLoading } = useBoomCliAllModelsConfig()
+  const { mutate } = useSetBoomCliAllModelsConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+
+  return (
+    <SettingGroup
+      title="炸弹号"
+      description="仅作用于炸弹号（metadata.type = boom）。开启后强制走 cli 端点，并视为支持所有模型，不再按模型列表缓存跳过"
+    >
+      <SettingSwitch
+        label="cli 端点 + 全模型"
+        hint={
+          enabled
+            ? '炸弹号一律走 cli 端点（忽略凭据自身的 endpoint），任何模型都会调度到炸弹号，由上游给出最终答案'
+            : '炸弹号按凭据自身端点和模型列表缓存调度'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
       />
     </SettingGroup>
   )

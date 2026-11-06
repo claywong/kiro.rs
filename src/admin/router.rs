@@ -17,7 +17,8 @@ use super::{
         export_credentials, force_refresh_token, get_account_rpm_limit_config,
         get_account_throttle_config, get_all_credentials, get_rate_limit_same_credential_config,
         get_short_speed_config, get_speed_credentials_exclude_config,
-        get_speed_credentials_min_tokens_config,
+        get_speed_credentials_min_tokens_config, get_boom_cli_all_models_config,
+        set_boom_cli_all_models_config,
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_global_proxy, get_custom_models,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
@@ -133,6 +134,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/speed-credentials-exclude",
             get(get_speed_credentials_exclude_config).put(set_speed_credentials_exclude_config),
+        )
+        .route(
+            "/config/boom-cli-all-models",
+            get(get_boom_cli_all_models_config).put(set_boom_cli_all_models_config),
         )
         .route(
             "/config/speed-credentials-min-tokens",

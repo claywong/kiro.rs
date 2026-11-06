@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{BoomEndpoint, CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -138,6 +138,8 @@ async fn main() {
         endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
         let codewhisperer = IdeEndpoint::codewhisperer();
         endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        let boom = BoomEndpoint::new();
+        endpoints.insert(boom.name().to_string(), Arc::new(boom));
     }
 
     // 校验默认端点存在

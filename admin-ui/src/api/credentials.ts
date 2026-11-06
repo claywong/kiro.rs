@@ -529,6 +529,25 @@ export async function setSpeedCredentialsExcludeConfig(
   return data
 }
 
+export interface BoomCliAllModelsConfig {
+  /** boom 号是否强制走 cli 端点并视为支持所有模型 */
+  enabled: boolean
+}
+
+// 获取炸弹号 cli + 全模型配置
+export async function getBoomCliAllModelsConfig(): Promise<BoomCliAllModelsConfig> {
+  const { data } = await api.get<BoomCliAllModelsConfig>('/config/boom-cli-all-models')
+  return data
+}
+
+// 更新炸弹号 cli + 全模型配置
+export async function setBoomCliAllModelsConfig(
+  patch: BoomCliAllModelsConfig,
+): Promise<BoomCliAllModelsConfig> {
+  const { data } = await api.put<BoomCliAllModelsConfig>('/config/boom-cli-all-models', patch)
+  return data
+}
+
 export interface SpeedCredentialsMinTokensConfig {
   /** 是否启用最小 token 门槛 */
   enabled: boolean

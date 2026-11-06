@@ -20,6 +20,8 @@ import {
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
   getSpeedCredentialsExcludeConfig,
+  getBoomCliAllModelsConfig,
+  setBoomCliAllModelsConfig,
   getShortSpeedConfig,
   getSpeedCredentialsMinTokensConfig,
   setRateLimitSameCredentialConfig,
@@ -343,6 +345,25 @@ export function useSetSpeedCredentialsExcludeConfig() {
     mutationFn: setSpeedCredentialsExcludeConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['speedCredentialsExcludeConfig'] })
+    },
+  })
+}
+
+// 获取炸弹号 cli + 全模型配置
+export function useBoomCliAllModelsConfig() {
+  return useQuery({
+    queryKey: ['boomCliAllModelsConfig'],
+    queryFn: getBoomCliAllModelsConfig,
+  })
+}
+
+// 更新炸弹号 cli + 全模型配置
+export function useSetBoomCliAllModelsConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setBoomCliAllModelsConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['boomCliAllModelsConfig'] })
     },
   })
 }

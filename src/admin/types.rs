@@ -638,6 +638,22 @@ pub struct SetShortSpeedConfigRequest {
     pub random_endpoint: Option<bool>,
 }
 
+/// 炸弹号 cli + 全模型配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoomCliAllModelsConfigResponse {
+    /// boom 号是否强制走 cli 端点并视为支持所有模型
+    pub enabled: bool,
+}
+
+/// 更新炸弹号 cli + 全模型配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBoomCliAllModelsConfigRequest {
+    /// 是否启用
+    pub enabled: bool,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

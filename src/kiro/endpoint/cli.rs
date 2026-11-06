@@ -126,7 +126,7 @@ impl KiroEndpoint for CliEndpoint {
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
 /// 4. 注入 profileArn（流式端点强制要求；Enterprise/IdC 账号缺失会 400
 ///    `profileArn is required for this request.`）
-fn set_origin_kiro_cli(body: &str, profile_arn: Option<&str>) -> String {
+pub fn set_origin_kiro_cli(body: &str, profile_arn: Option<&str>) -> String {
     let body = body.replace("\"origin\":\"AI_EDITOR\"", "\"origin\":\"KIRO_CLI\"");
 
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body) else {
