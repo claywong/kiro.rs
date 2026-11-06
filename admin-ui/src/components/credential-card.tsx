@@ -1197,8 +1197,8 @@ export function CredentialCard({
       </CardHeader>
 
           <CardContent className="flex flex-1 flex-col p-4 space-y-3.5">
-            {/* 核心指标 (Metrics Grid) */}
-            <div className="grid grid-cols-4 divide-x divide-border/30 text-center py-1">
+            {/* 核心指标 (Metrics Grid)：3 列 × 2 行，每行首格不画左分隔线 */}
+            <div className="grid grid-cols-3 gap-y-3 text-center py-1 [&>*]:border-l [&>*]:border-border/30 [&>*:nth-child(3n+1)]:border-l-0">
               {/* Priority */}
               <div className="flex flex-col items-center justify-center px-1">
                 <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
@@ -1264,8 +1264,6 @@ export function CredentialCard({
                 </button>
               </div>
 
-              <CredentialCreditUsage credits={credential.totalCredits} />
-
               {/* Failures */}
               <div className="flex flex-col items-center justify-center px-1">
                 <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
@@ -1300,6 +1298,36 @@ export function CredentialCard({
                   <ScrollText className="h-2.5 w-2.5 opacity-50" />
                 </button>
               </div>
+
+              {/* RPM：与列表视图同一数据源（60 秒滑动窗口） */}
+              <div
+                className="flex flex-col items-center justify-center px-1"
+                title="当前 60 秒已用请求数 / 每分钟上限"
+              >
+                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+                  RPM
+                </span>
+                <span className="mt-0.5 font-mono text-xs font-semibold tabular-nums">
+                  {credential.rpmLimit === 0
+                    ? "不限"
+                    : `${credential.rpmCurrent}/${credential.rpmLimit}`}
+                </span>
+              </div>
+
+              {/* 本地扩展：近 1 分钟额度消耗，与 RPM 同为 60 秒窗口 */}
+              <div
+                className="flex flex-col items-center justify-center px-1"
+                title="最近 60 秒内该凭据消耗的额度（上游 credits 计量）"
+              >
+                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+                  1分钟耗
+                </span>
+                <span className="mt-0.5 font-mono text-xs font-semibold tabular-nums">
+                  {formatRecentSpend(recentSpend)}
+                </span>
+              </div>
+
+              <CredentialCreditUsage credits={credential.totalCredits} />
             </div>
 
             {/* Status & Ledger Section */}
