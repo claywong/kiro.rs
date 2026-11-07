@@ -772,19 +772,6 @@ pub struct Config {
     #[serde(default)]
     pub short_speed_random_endpoint: bool,
 
-    /// 炸弹号（`metadata.type = boom`）是否强制走 `cli` 端点并视为支持所有模型（默认 false）。
-    ///
-    /// 开启后对 boom 号生效两条规则：
-    /// - 端点：忽略凭据自身的 `endpoint` 与 `defaultEndpoint`，一律用 `cli`。
-    ///   上游按客户端身份（IDE / CLI）过滤可用模型，同一个号在 `ide` 端点上拿不到的
-    ///   opus 等模型，走 `cli` 端点可以用。
-    /// - 模型：调度时按「已确认支持」处理，不再因模型缓存里没有该模型而跳过。
-    ///   模型缓存取自 IDE 身份的模型列表，对 boom 号会漏报。
-    ///
-    /// 不影响 normal / long_speed / short_speed 号。
-    #[serde(default)]
-    pub boom_cli_all_models: bool,
-
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -1149,7 +1136,6 @@ impl Default for Config {
             short_speed_first_token_timeout_enabled: false,
             short_speed_first_token_timeout_secs: default_short_speed_first_token_timeout_secs(),
             short_speed_random_endpoint: false,
-            boom_cli_all_models: false,
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),

@@ -29,7 +29,7 @@ use super::{
         SetShortSpeedConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest, SetBoomCliAllModelsConfigRequest,
+        SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -625,26 +625,6 @@ pub async fn set_speed_credentials_exclude_config(
     Json(payload): Json<SetSpeedCredentialsExcludeConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_speed_credentials_exclude_config(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/boom-cli-all-models
-/// 获取炸弹号 cli + 全模型配置
-pub async fn get_boom_cli_all_models_config(
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
-    Json(state.service.get_boom_cli_all_models_config())
-}
-
-/// PUT /api/admin/config/boom-cli-all-models
-/// 更新炸弹号 cli + 全模型配置
-pub async fn set_boom_cli_all_models_config(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetBoomCliAllModelsConfigRequest>,
-) -> impl IntoResponse {
-    match state.service.set_boom_cli_all_models_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -11,11 +11,9 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
-pub mod boom;
 pub mod cli;
 pub mod ide;
 
-pub use boom::BoomEndpoint;
 pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 

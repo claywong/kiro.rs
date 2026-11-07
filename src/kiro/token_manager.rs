@@ -1263,8 +1263,6 @@ pub struct MultiTokenManager {
     short_speed_first_token_timeout_secs: AtomicU64,
     /// 短速刷是否在全部端点间随机选择（运行时可修改）
     short_speed_random_endpoint: AtomicBool,
-    /// 炸弹号强制走 cli 端点并视为支持所有模型（运行时可修改）
-    boom_cli_all_models: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1664,7 +1662,6 @@ impl MultiTokenManager {
         let ss_ttft_enabled = config.short_speed_first_token_timeout_enabled;
         let ss_ttft_secs = config.short_speed_first_token_timeout_secs;
         let ss_random_endpoint = config.short_speed_random_endpoint;
-        let boom_cli_all_models = config.boom_cli_all_models;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1702,7 +1699,6 @@ impl MultiTokenManager {
             short_speed_first_token_timeout_enabled: AtomicBool::new(ss_ttft_enabled),
             short_speed_first_token_timeout_secs: AtomicU64::new(ss_ttft_secs),
             short_speed_random_endpoint: AtomicBool::new(ss_random_endpoint),
-            boom_cli_all_models: AtomicBool::new(boom_cli_all_models),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -1862,23 +1858,6 @@ impl MultiTokenManager {
         } else {
             CachedModelSupport::Unsupported
         }
-    }
-
-    /// 调度用的模型支持判定：在 [`Self::cached_model_support`] 之上叠加 boom 规则。
-    ///
-    /// 开关 `boom_cli_all_models` 开启时，boom 号一律按 `Confirmed` 处理。模型缓存取自
-    /// IDE 身份的模型列表，对 boom 号会漏报（实际走 cli 端点可用），按缓存判
-    /// `Unsupported` 会把它错误地挡在调度之外。其它类型的账号不受影响。
-    ///
-    /// 只读原子量和凭据自身字段，不碰 `model_cache` 锁，调用方持有 `entries` 锁时也安全。
-    fn entry_model_support(&self, entry: &CredentialEntry, model: Option<&str>) -> CachedModelSupport {
-        if model.is_some()
-            && entry.credentials.metadata.kind == CredentialType::Boom
-            && self.boom_cli_all_models.load(Ordering::Relaxed)
-        {
-            return CachedModelSupport::Confirmed;
-        }
-        self.cached_model_support(entry.id, model)
     }
 
     async fn refresh_model_cache_for(
@@ -2134,7 +2113,7 @@ impl MultiTokenManager {
                 .map(|until| until > now)
                 .unwrap_or(false)
             || !self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
-            || self.entry_model_support(entry, model) == CachedModelSupport::Unsupported
+            || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
         {
             return false;
         }
@@ -2202,7 +2181,7 @@ impl MultiTokenManager {
                     .map(|until| until > now)
                     .unwrap_or(false)
                 && self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
-                && self.entry_model_support(entry, model) != CachedModelSupport::Unsupported
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
             let fresh_count = entry
                 .rpm_window
@@ -2341,7 +2320,7 @@ impl MultiTokenManager {
                 if !self.entry_available_for_request(e, model, input_tokens, group, now) {
                     return None;
                 }
-                let model_support = self.entry_model_support(e, model);
+                let model_support = self.cached_model_support(e.id, model);
                 Some((e, model_support))
             })
             .collect();
@@ -2530,11 +2509,11 @@ impl MultiTokenManager {
                             && !excluded_ids.contains(&e.id)
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && self.credential_matches_request_local(&e.credentials, model, input_tokens, group)
-                            && self.entry_model_support(e, model)
+                            && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
                     });
                     let is_available = |e: &CredentialEntry| {
-                        let model_support = self.entry_model_support(e, model);
+                        let model_support = self.cached_model_support(e.id, model);
                         !excluded_ids.contains(&e.id)
                             && !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
@@ -3494,7 +3473,7 @@ impl MultiTokenManager {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
                     || !self.credential_matches_request_local(&entry.credentials, model, input_tokens, group)
-                    || self.entry_model_support(entry, model) == CachedModelSupport::Unsupported
+                    || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
                 }
@@ -5446,32 +5425,6 @@ impl MultiTokenManager {
             new_secs,
             new_random
         );
-        Ok(())
-    }
-
-    /// 炸弹号是否强制走 cli 端点并视为支持所有模型（热路径，只读原子量）。
-    pub fn boom_cli_all_models_enabled(&self) -> bool {
-        self.boom_cli_all_models.load(Ordering::Relaxed)
-    }
-
-    /// 设置炸弹号 cli + 全模型开关（Admin API），并持久化到配置文件。
-    pub fn set_boom_cli_all_models(&self, enabled: bool) -> anyhow::Result<()> {
-        let _update_guard = self.runtime_config_update_lock.lock();
-
-        let prev = self.boom_cli_all_models.load(Ordering::Relaxed);
-        if prev == enabled {
-            return Ok(());
-        }
-        self.boom_cli_all_models.store(enabled, Ordering::Relaxed);
-
-        if let Err(err) = self.update_config_file(move |config| {
-            config.boom_cli_all_models = enabled;
-        }) {
-            self.boom_cli_all_models.store(prev, Ordering::Relaxed);
-            return Err(err);
-        }
-
-        tracing::info!("炸弹号 cli + 全模型开关已更新: enabled={}", enabled);
         Ok(())
     }
 
@@ -8682,78 +8635,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(context.id, 1);
-    }
-
-    /// 构造两个号：#1 是 boom，#2 是 normal；模型缓存都只有 glm-5，不含 opus。
-    fn boom_and_normal_manager(boom_cli_all_models: bool) -> MultiTokenManager {
-        let mut config = Config::default();
-        config.boom_cli_all_models = boom_cli_all_models;
-        let mut boom = grouped_cred("boom", &[]);
-        boom.metadata.kind = CredentialType::Boom;
-        let normal = grouped_cred("normal", &[]);
-        let manager =
-            MultiTokenManager::new(config, vec![boom, normal], None, None, false).unwrap();
-        seed_model_cache(&manager, 1, &["glm-5"]);
-        seed_model_cache(&manager, 2, &["glm-5"]);
-        manager
-    }
-
-    #[tokio::test]
-    async fn test_boom_cli_all_models_off_keeps_cache_gate() {
-        let manager = boom_and_normal_manager(false);
-        let entries = manager.entries.lock();
-
-        assert_eq!(
-            manager.entry_model_support(&entries[0], Some("claude-opus-5.5")),
-            CachedModelSupport::Unsupported
-        );
-        assert_eq!(
-            manager.entry_model_support(&entries[1], Some("claude-opus-5.5")),
-            CachedModelSupport::Unsupported
-        );
-    }
-
-    #[tokio::test]
-    async fn test_boom_cli_all_models_on_treats_boom_as_supporting_every_model() {
-        let manager = boom_and_normal_manager(true);
-        let entries = manager.entries.lock();
-
-        // boom：缓存里没有 opus，也按已确认支持处理
-        assert_eq!(
-            manager.entry_model_support(&entries[0], Some("claude-opus-5.5")),
-            CachedModelSupport::Confirmed
-        );
-        // 非 boom 不受影响，仍按缓存判 Unsupported
-        assert_eq!(
-            manager.entry_model_support(&entries[1], Some("claude-opus-5.5")),
-            CachedModelSupport::Unsupported
-        );
-        // 未带模型名时与原行为一致（Unknown），不凭空判 Confirmed
-        assert_eq!(
-            manager.entry_model_support(&entries[0], None),
-            CachedModelSupport::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn test_boom_cli_all_models_on_routes_unlisted_model_to_boom() {
-        let manager = boom_and_normal_manager(true);
-        // 两个号的缓存都不含 opus：只有 boom 被视为支持，应被选中
-        let context = manager
-            .acquire_context(Some("claude-opus-5.5"), None)
-            .await
-            .unwrap();
-        assert_eq!(context.id, 1);
-    }
-
-    #[test]
-    fn test_set_boom_cli_all_models_updates_runtime_flag() {
-        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
-        assert!(!manager.boom_cli_all_models_enabled());
-        manager.set_boom_cli_all_models(true).unwrap();
-        assert!(manager.boom_cli_all_models_enabled());
-        manager.set_boom_cli_all_models(false).unwrap();
-        assert!(!manager.boom_cli_all_models_enabled());
     }
 
     #[tokio::test]

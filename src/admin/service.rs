@@ -36,7 +36,6 @@ use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
-    BoomCliAllModelsConfigResponse, SetBoomCliAllModelsConfigRequest,
     AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
@@ -2459,24 +2458,6 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_speed_credentials_exclude_config())
-    }
-
-    /// 获取炸弹号 cli + 全模型配置
-    pub fn get_boom_cli_all_models_config(&self) -> BoomCliAllModelsConfigResponse {
-        BoomCliAllModelsConfigResponse {
-            enabled: self.token_manager.boom_cli_all_models_enabled(),
-        }
-    }
-
-    /// 更新炸弹号 cli + 全模型配置
-    pub fn set_boom_cli_all_models_config(
-        &self,
-        req: SetBoomCliAllModelsConfigRequest,
-    ) -> Result<BoomCliAllModelsConfigResponse, AdminServiceError> {
-        self.token_manager
-            .set_boom_cli_all_models(req.enabled)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-        Ok(self.get_boom_cli_all_models_config())
     }
 
     /// 获取速刷号最小 token 门槛配置

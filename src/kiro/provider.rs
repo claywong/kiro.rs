@@ -208,27 +208,14 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = self.boom_cli_override(credentials).unwrap_or_else(|| {
-            credentials
-                .endpoint
-                .as_deref()
-                .unwrap_or(&self.default_endpoint)
-        });
+        let name = credentials
+            .endpoint
+            .as_deref()
+            .unwrap_or(&self.default_endpoint);
         self.endpoints
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
-    }
-
-    /// 炸弹号强制端点：`boom_cli_all_models` 开启且凭据类型为 boom 时返回 `boom`，
-    /// 否则返回 `None`，由调用方按凭据 / 默认端点选择。
-    ///
-    /// 所有「按凭据选端点」的入口（`endpoint_for`、`rotated_endpoint_for`）都先过这里，
-    /// 否则原号 429 重试的端点轮换会把 boom 号轮到 `ide` 上去。
-    fn boom_cli_override(&self, credentials: &KiroCredentials) -> Option<&'static str> {
-        (credentials.metadata.kind == CredentialType::Boom
-            && self.token_manager.boom_cli_all_models_enabled())
-        .then_some(crate::kiro::endpoint::boom::BOOM_ENDPOINT_NAME)
     }
 
     // 本地新增：速刷号用户级 429 原号重试时的「端点轮换」支持。
@@ -295,10 +282,6 @@ impl KiroProvider {
         credentials: &KiroCredentials,
         rotation: usize,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        // boom 号强制 cli：不参与端点轮换，固定打 cli。
-        if self.boom_cli_override(credentials).is_some() {
-            return self.endpoint_for(credentials);
-        }
         let names = self.sorted_endpoint_names();
         if names.is_empty() {
             return self.endpoint_for(credentials);
@@ -1784,87 +1767,5 @@ mod endpoint_rotation_tests {
     fn unknown_start_endpoint_falls_back_to_first() {
         assert_eq!(rotated_endpoint_index(&names(), "unknown", 0), 0);
         assert_eq!(rotated_endpoint_index(&names(), "unknown", 1), 1);
-    }
-}
-
-#[cfg(test)]
-mod boom_cli_endpoint_tests {
-    use super::*;
-    use crate::kiro::endpoint::{BoomEndpoint, CliEndpoint, IdeEndpoint};
-    use crate::model::config::Config;
-
-    /// 注册 ide + cli 两个端点，默认端点为 ide。
-    fn provider(boom_cli_all_models: bool) -> KiroProvider {
-        let mut config = Config::default();
-        config.boom_cli_all_models = boom_cli_all_models;
-        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
-        endpoints.insert("cli".to_string(), Arc::new(CliEndpoint::new()));
-        endpoints.insert("boom".to_string(), Arc::new(BoomEndpoint::new()));
-        KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())
-    }
-
-    fn cred(kind: CredentialType, endpoint: Option<&str>) -> KiroCredentials {
-        let mut c = KiroCredentials::default();
-        c.metadata.kind = kind;
-        c.endpoint = endpoint.map(str::to_string);
-        c
-    }
-
-    fn name_of(endpoint: anyhow::Result<Arc<dyn KiroEndpoint>>) -> &'static str {
-        endpoint.unwrap().name()
-    }
-
-    #[test]
-    fn switch_off_boom_uses_credential_or_default_endpoint() {
-        let p = provider(false);
-        assert_eq!(name_of(p.endpoint_for(&cred(CredentialType::Boom, None))), "ide");
-        assert_eq!(
-            name_of(p.endpoint_for(&cred(CredentialType::Boom, Some("cli")))),
-            "cli"
-        );
-    }
-
-    #[test]
-    fn switch_on_boom_is_forced_to_boom_endpoint_even_if_credential_says_ide() {
-        let p = provider(true);
-        assert_eq!(name_of(p.endpoint_for(&cred(CredentialType::Boom, None))), "boom");
-        assert_eq!(
-            name_of(p.endpoint_for(&cred(CredentialType::Boom, Some("ide")))),
-            "boom"
-        );
-        assert_eq!(
-            name_of(p.endpoint_for(&cred(CredentialType::Boom, Some("cli")))),
-            "boom"
-        );
-    }
-
-    #[test]
-    fn switch_on_does_not_touch_other_credential_types() {
-        let p = provider(true);
-        for kind in [
-            CredentialType::Normal,
-            CredentialType::LongSpeed,
-            CredentialType::ShortSpeed,
-        ] {
-            assert_eq!(name_of(p.endpoint_for(&cred(kind, None))), "ide");
-        }
-    }
-
-    #[test]
-    fn switch_on_boom_stays_on_boom_endpoint_across_retry_rotation() {
-        // 原号 429 重试的端点轮换不能把 boom 号轮到 ide 或 cli 上。
-        let p = provider(true);
-        let boom = cred(CredentialType::Boom, None);
-        for rotation in 0..4 {
-            assert_eq!(name_of(p.rotated_endpoint_for(&boom, rotation)), "boom");
-        }
-        // 对照：非 boom 号照常轮换（ide→cli→ide→cli）
-        let normal = cred(CredentialType::Normal, Some("ide"));
-        let seq: Vec<&str> = (0..4)
-            .map(|r| name_of(p.rotated_endpoint_for(&normal, r)))
-            .collect();
-        assert_eq!(seq, vec!["ide", "cli", "ide", "cli"]);
     }
 }
