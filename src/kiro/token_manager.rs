@@ -9009,18 +9009,23 @@ mod tests {
         )
         .unwrap();
 
-        // 预热 current_id 到最高优先级的 Free 账号。
+        // 预热 current_id 到最高优先级的账号（id=1）。
         let current = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
-        // 请求 opus：黏性的 current 不满足订阅要求，必须跳过。
+        // 订阅名不再拦截 Opus（KIRO FREE 已开放），是否支持只看模型缓存。
+        // 这里让缓存表明 Free(id=1) 不含 opus、Pro(id=2) 含 opus。
+        seed_model_cache(&manager, 1, &["claude-sonnet-5"]);
+        seed_model_cache(&manager, 2, &["claude-sonnet-5", "claude-opus-4.6"]);
+
+        // 请求 opus：黏性的 current 在缓存里被判 Unsupported，必须跳过。
         let opus = manager
             .acquire_context(Some("claude-opus-4.6"), None)
             .await
             .unwrap();
         assert_eq!(
             opus.id, 2,
-            "priority current_id must not bypass Opus subscription filtering"
+            "priority current_id must not bypass model-support filtering"
         );
     }
 
