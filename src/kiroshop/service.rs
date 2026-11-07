@@ -1,9 +1,9 @@
-//! KiroShop 服务：在途跟踪、增量拿号入库、事件轮询、自动补货、webhook 验签
+//! KiroShop 服务：在途跟踪、增量拿号入库、事件轮询、补货任务、webhook 验签
 //!
 //! 三条后台节奏（单 Key 限速 60 次/分钟，按此预算设计）：
 //! - 事件轮询（默认 45s）：`GET /events` 追新，`order.delivery` → 增量拿号入库。
 //! - 发货轮询（默认 60s）：对每张未终态的在途单 `GET /delivery?after_seq=`；
-//!   顺带跑自动补货判据（池内可用号 + 在途 < 目标 → 下单）。
+//!   顺带跑补货任务（到期的待处理任务 → `buy()`，建单成功即完成）。
 //! - 账户刷新（约 4.5min 一轮，搭事件轮询的车）：余额告警状态机。
 //!
 //! webhook 与轮询双路径收敛到同一入口 [`KiroshopService::handle_shop_event`]，
@@ -26,12 +26,12 @@ use crate::vendor::protocol::PurchasedKey;
 use crate::vendor::store::PurchaseOutcome;
 
 use super::client::{
-    AccountInfo, KiroshopClient, KiroshopError, Order, OrderDetail, OrderRequest, Product, Quote,
+    AccountInfo, KiroshopClient, KiroshopError, Order, OrderDetail, OrderRequest, Quote,
     Result, ShopEvent,
 };
 use super::config::KiroshopConfig;
 
-use super::store::{KiroshopStore, TrackedOrder};
+use super::store::{KiroshopStore, RestockTask, TrackedOrder};
 
 /// 面板购买参数
 #[derive(Debug, Clone, Default)]
@@ -79,8 +79,6 @@ pub struct KiroshopService {
     last_account: RwLock<Option<AccountInfo>>,
     /// 最近一次后台错误（面板红字）
     last_error: RwLock<Option<String>>,
-    /// 自动补货失败后的冷却截止（unix 秒）
-    autobuy_cooldown_until: RwLock<i64>,
     /// buy 流程串行化：同刻只允许一笔下单在飞（幂等键各不相同，串行只为控预算）
     buy_lock: tokio::sync::Mutex<()>,
 }
@@ -114,7 +112,6 @@ impl KiroshopService {
             persist_config: Mutex::new(None),
             last_account: RwLock::new(None),
             last_error: RwLock::new(None),
-            autobuy_cooldown_until: RwLock::new(0),
             buy_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -736,7 +733,7 @@ impl KiroshopService {
         }
     }
 
-    /// 发货轮询一轮：刷在途单状态 + 增量收货 + 自动补货判据
+    /// 发货轮询一轮：刷在途单状态 + 增量收货 + 补货任务
     pub async fn poll_deliveries_once(&self) {
         if !self.ready() {
             return;
@@ -816,7 +813,7 @@ impl KiroshopService {
         }
     }
 
-    // ============ 自动补货 ============
+    // ============ 池计数（面板展示用） ============
 
     /// 池内可用的 KiroShop 号（来源 kiroshop:、未禁用、未过期）
     pub fn pool_count(&self) -> u32 {
@@ -851,118 +848,176 @@ impl KiroshopService {
             .unwrap_or(0)
     }
 
-    /// 自动补货一轮（由发货轮询搭车调用）
-    pub async fn autobuy_tick(&self) {
-        let cfg = self.config();
-        let ab = &cfg.auto_buy;
-        if !cfg.is_ready() || !ab.enabled || ab.pool_target == 0 {
-            return;
-        }
-        if Utc::now().timestamp() < *self.autobuy_cooldown_until.read() {
-            return;
-        }
-        let pool = self.pool_count();
-        let inflight = self.inflight_count();
-        if pool + inflight >= ab.pool_target {
-            return;
-        }
-        let mut needed = ab.pool_target - pool - inflight;
-        needed = needed.min(ab.max_per_order.max(1));
+    // ============ 补货任务 ============
 
-        let Ok(products) = self.client().products().await else {
-            return;
+    /// 新建补货任务：指定商品 + 数量 + 单价上限，之后由发货轮询重试直到建单成功。
+    ///
+    /// 商品查不到（暂时下架 / 列表接口抖动）不拦创建：补货任务本来就是为了等
+    /// 货，商品名退化成「商品 #id」，档位留空时交给 `buy()` 取默认档。
+    pub async fn restock_create(
+        self: &Arc<Self>,
+        product_id: i64,
+        quantity: u32,
+        max_unit_price: f64,
+        option_key: Option<String>,
+    ) -> Result<i64> {
+        let invalid = |m: &str| KiroshopError {
+            status: Some(400),
+            code: Some("invalid_restock".into()),
+            message: m.to_string(),
         };
-        // 候选：有足够现货、单价在上限内；取最便宜
-        let candidates: Vec<&Product> = products
-            .iter()
-            .filter(|p| p.available() >= needed.min(1))
-            .filter(|p| p.available() >= needed || ab.allow_backorder)
-            .filter(|p| {
-                p.default_option()
-                    .and_then(|o| o.price)
-                    .or(p.price)
-                    .is_some_and(|price| ab.max_unit_price.is_none_or(|m| price <= m))
-            })
-            .collect();
-        let Some(product) = candidates
-            .iter()
-            .min_by(|a, b| {
-                let pa = a.default_option().and_then(|o| o.price).or(a.price);
-                let pb = b.default_option().and_then(|o| o.price).or(b.price);
-                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        else {
-            return;
-        };
-        let unit = product.default_option().and_then(|o| o.price).or(product.price);
-        let Some(unit) = unit else { return };
-        let quantity = needed.min(product.available().max(1)).max(1);
+        if quantity == 0 {
+            return Err(invalid("数量必须 ≥ 1"));
+        }
+        if !(max_unit_price.is_finite() && max_unit_price > 0.0) {
+            return Err(invalid("单价上限必须 > 0"));
+        }
+        let option_key = option_key.filter(|k| !k.trim().is_empty());
 
-        // 每日预算：今日已扣 + 本单金额 不得超
-        if let Some(budget) = ab.daily_budget {
-            let spent = self
-                .last_account()
-                .and_then(|a| a.api_spent_today)
-                .unwrap_or(0.0);
-            if spent + unit * quantity as f64 > budget {
-                let _ = self.store.add_local_event(
-                    "autobuy_budget",
-                    "warn",
-                    &format!(
-                        "自动补货停在预算线：今日已扣 ¥{spent:.2} + 本单 ¥{:.2} > 每日 ¥{budget:.2}",
-                        unit * quantity as f64
-                    ),
-                    None,
-                );
-                *self.autobuy_cooldown_until.write() = Utc::now().timestamp() + 3600;
-                return;
+        let mut name = format!("商品 #{product_id}");
+        let mut resolved_option = option_key.clone().unwrap_or_default();
+        if let Ok(products) = self.client().products().await {
+            if let Some(p) = products.iter().find(|p| p.id == product_id) {
+                if !p.display_name.trim().is_empty() {
+                    name = p.display_name.clone();
+                }
+                if let Some(max) = p.max_quantity_per_order.filter(|m| *m > 0) {
+                    if quantity > max {
+                        return Err(invalid(&format!("数量 {quantity} 超过该商品单笔上限 {max}")));
+                    }
+                }
+                if let Some(min) = p.min_quantity_per_order.filter(|m| *m > 0) {
+                    if quantity < min {
+                        return Err(invalid(&format!("数量 {quantity} 低于该商品单笔下限 {min}")));
+                    }
+                }
+                match &option_key {
+                    Some(k) if !p.options.iter().any(|o| &o.key == k) => {
+                        return Err(invalid(&format!("商品没有档位「{k}」")));
+                    }
+                    // 创建时就把默认档位定死：之后每次重试请求参数完全一致，
+                    // 同一幂等键才不会因上架方改了默认档而撞「参数不一致」
+                    None => {
+                        resolved_option = p.default_option().map(|o| o.key.clone()).unwrap_or_default();
+                    }
+                    _ => {}
+                }
             }
         }
 
-        tracing::info!(
-            product = product.id,
-            quantity,
-            pool,
-            inflight,
-            "KiroShop 自动补货触发"
+        let idem = format!("ks-restock-{}", Uuid::new_v4());
+        let id = self
+            .store
+            .create_restock(product_id, &name, &resolved_option, quantity, max_unit_price, &idem)
+            .map_err(|e| KiroshopError {
+                status: Some(500),
+                code: Some("store_error".into()),
+                message: format!("写入补货任务失败: {e}"),
+            })?;
+        let _ = self.store.add_local_event(
+            "restock_created",
+            "info",
+            &format!("补货任务 #{id}：{name} ×{quantity}，单价上限 ¥{max_unit_price:.2}"),
+            None,
         );
+        // 不等下一轮 60s 才首次尝试。per-task 领取 + buy_lock 保证与后台 tick 不会重复处理
+        let svc = Arc::clone(self);
+        tokio::spawn(async move { svc.restock_tick().await });
+        Ok(id)
+    }
+
+    /// 取消待处理任务。已完成 / 已取消返回 false。
+    pub fn restock_cancel(&self, id: i64) -> Result<bool> {
+        self.store.cancel_restock(id).map_err(|e| KiroshopError {
+            status: Some(500),
+            code: Some("store_error".into()),
+            message: format!("取消补货任务失败: {e}"),
+        })
+    }
+
+    /// 补货任务一轮（由发货轮询搭车调用）：逐个领取到期任务，调 `buy()`，
+    /// 建单成功即完成；任何失败都只记录并退避，任务保持待处理继续等。
+    pub async fn restock_tick(&self) {
+        if !self.ready() {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        let due = match self.store.due_restocks(now) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("KiroShop 补货任务查询失败: {e}");
+                return;
+            }
+        };
+        for task in due {
+            // 租约要盖住一次完整 buy（含取号重试），过长则崩溃后恢复太慢
+            if !self.store.claim_restock(task.id, Utc::now().timestamp(), RESTOCK_LEASE_SECS).unwrap_or(false) {
+                continue;
+            }
+            self.restock_attempt(task).await;
+        }
+    }
+
+    async fn restock_attempt(&self, task: RestockTask) {
+        let qty = task.quantity.max(1);
+        // 价格保护 = 单价上限 × 数量，四舍五入到分，避免 12.3×3=36.900000000000006
+        // 这类浮点尾巴让「恰好等于上限」的报价被误拒
+        let max_amount = (task.max_unit_price * qty as f64 * 100.0).round() / 100.0;
         let outcome = self
             .buy(BuyParams {
-                product_id: product.id,
-                quantity,
-                option_key: product.default_option().map(|o| o.key.clone()),
+                product_id: task.product_id,
+                quantity: qty,
+                option_key: Some(task.option_key.clone()).filter(|k| !k.is_empty()),
                 coupon_code: None,
-                max_amount: None,
-                allow_backorder: ab.allow_backorder,
-                client_ref: Some(format!("autobuy-{}", Utc::now().timestamp())),
-                idempotency_key: None,
+                max_amount: Some(max_amount),
+                allow_backorder: true,
+                client_ref: Some(format!("restock-{}", task.id)),
+                idempotency_key: Some(task.idempotency_key.clone()),
                 source: "auto".into(),
             })
             .await;
         match outcome {
             Ok(o) => {
+                if let Err(e) = self.store.finish_restock(task.id, &o.order_id) {
+                    // 单已建好、钱已扣，只是标记没写进去。租约过期后会带同一幂等键重试，
+                    // 卖家侧返回原订单，不会重复扣款
+                    tracing::error!(task = task.id, order = %o.order_id, "补货任务建单成功但落库失败: {e}");
+                    return;
+                }
                 let _ = self.store.add_local_event(
-                    "autobuy",
+                    "restock_done",
                     "info",
                     &format!(
-                        "自动补货：商品「{}」×{}，金额 ¥{:.2}，入库 {} 条",
-                        product.display_name,
+                        "补货任务 #{} 已下单：{} ×{}，金额 ¥{:.2}，状态 {}",
+                        task.id,
+                        task.product_name,
                         o.quantity,
                         o.amount.unwrap_or(0.0),
-                        o.imported
+                        o.status_text.as_deref().unwrap_or(&o.status),
                     ),
                     Some(&o.order_id),
                 );
+                tracing::info!(task = task.id, order = %o.order_id, "KiroShop 补货任务完成");
             }
             Err(e) => {
-                // 失败冷却 10 分钟，防止每分钟空转打限速
-                *self.autobuy_cooldown_until.write() = Utc::now().timestamp() + 600;
-                let _ = self.store.add_local_event(
-                    "autobuy_failed",
-                    "error",
-                    &format!("自动补货失败（冷却 10 分钟）：{e}"),
-                    None,
-                );
+                let msg = describe_restock_error(&e, task.max_unit_price);
+                let next = Utc::now().timestamp() + restock_backoff_secs(task.attempts + 1);
+                match self.store.fail_restock(task.id, &msg, next) {
+                    Ok(Some((attempts, prev))) => {
+                        tracing::info!(task = task.id, attempts, "KiroShop 补货任务本次未成功: {msg}");
+                        // 同一错误反复出现只在第一次告警，面板任务行始终显示最新的 last_error
+                        if prev.as_deref() != Some(msg.as_str()) {
+                            let _ = self.store.add_local_event(
+                                "restock_failed",
+                                "warn",
+                                &format!("补货任务 #{}（{}）未成功，将持续重试：{msg}", task.id, task.product_name),
+                                None,
+                            );
+                        }
+                    }
+                    Ok(None) => {} // 尝试期间被取消，无需处理
+                    Err(se) => tracing::warn!(task = task.id, "补货任务失败状态落库失败: {se}"),
+                }
             }
         }
     }
@@ -1050,10 +1105,31 @@ impl KiroshopService {
             if dl_tick >= dl_interval {
                 dl_tick = 0;
                 self.poll_deliveries_once().await;
-                self.autobuy_tick().await;
+                self.restock_tick().await;
             }
         }
     }
+}
+
+/// 补货任务单次尝试的租约（秒）。盖住一次完整 `buy()`（含取号重试 + 网络超时）
+const RESTOCK_LEASE_SECS: i64 = 180;
+
+/// 补货任务失败后的退避（秒）：1 分钟起步，逐次翻倍，封顶 5 分钟。
+/// 到货后想尽快抢到，所以封顶不放太长；每次尝试只打 2~3 个接口，远低于限速预算。
+fn restock_backoff_secs(attempts: u32) -> i64 {
+    match attempts {
+        0 | 1 => 60,
+        2 => 120,
+        _ => 300,
+    }
+}
+
+/// 把建单错误翻成面板上看得懂的一句话。价格超限单独点明，其余原样透出卖家文案。
+fn describe_restock_error(e: &KiroshopError, max_unit_price: f64) -> String {
+    if e.code.as_deref() == Some("price_changed") {
+        return format!("当前报价超过单价上限 ¥{max_unit_price:.2}，等待降价：{e}");
+    }
+    e.to_string()
 }
 
 /// 终态判断（与 client::Order::is_terminal 同一套口径，供 store 行使用）
@@ -1266,6 +1342,43 @@ mod tests {
             s.store.advance_delivery(id, 0, delivered, 0, 0).unwrap();
         }
         assert_eq!(s.inflight_count(), (3 - 1) + (5 - 0));
+    }
+
+    #[test]
+    fn 补货退避_一分钟起步翻倍封顶五分钟() {
+        let secs: Vec<i64> = (0..=6).map(restock_backoff_secs).collect();
+        assert_eq!(secs, vec![60, 60, 120, 300, 300, 300, 300]);
+        // 租约必须盖得住最长的一次尝试，又不能长到崩溃后恢复得太慢
+        assert!(RESTOCK_LEASE_SECS >= 120 && RESTOCK_LEASE_SECS <= 300);
+    }
+
+    #[test]
+    fn 超价错误文案点明单价上限_其余原样透出() {
+        let price = KiroshopError {
+            status: Some(409),
+            code: Some("price_changed".into()),
+            message: "金额已变化".into(),
+        };
+        let msg = describe_restock_error(&price, 12.5);
+        assert!(msg.contains("单价上限 ¥12.50") && msg.contains("金额已变化"), "{msg}");
+
+        let stock = KiroshopError {
+            status: Some(409),
+            code: Some("waiting_stock".into()),
+            message: "暂无现货".into(),
+        };
+        assert_eq!(describe_restock_error(&stock, 12.5), stock.to_string());
+    }
+
+    #[tokio::test]
+    async fn 创建补货任务_非法参数在联网前就被拒且不落库() {
+        let s = service();
+        for (qty, price) in [(0u32, 10.0), (1, 0.0), (1, -3.0), (1, f64::NAN), (1, f64::INFINITY)] {
+            let e = s.restock_create(403, qty, price, None).await.unwrap_err();
+            assert_eq!(e.status, Some(400), "qty={qty} price={price}");
+            assert_eq!(e.code.as_deref(), Some("invalid_restock"));
+        }
+        assert!(s.store.list_restocks().unwrap().is_empty(), "被拒的请求不得留下任务");
     }
 }
 

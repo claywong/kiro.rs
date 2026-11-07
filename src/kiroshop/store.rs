@@ -28,7 +28,7 @@ pub struct TrackedOrder {
     pub status_text: String,
     pub eta: Option<String>,
     pub lane: String,
-    /// manual（面板手动）/ auto（自动补货）/ migrated（启动时发现的存量单）
+    /// manual（面板手动）/ auto（补货任务）/ migrated（启动时发现的存量单）
     pub source: String,
     pub client_ref: Option<String>,
     pub last_seq: i64,
@@ -51,6 +51,33 @@ pub struct LocalEvent {
     pub order_id: Option<String>,
     pub acked: bool,
     pub created_at: String,
+}
+
+/// 补货任务。指定商品 + 数量 + 单价上限，提交后由发货轮询定时重试，
+/// 直到**建单成功**为止（成功即 `done`，到货入库交给在途跟踪）。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestockTask {
+    pub id: i64,
+    pub product_id: i64,
+    pub product_name: String,
+    pub option_key: String,
+    pub quantity: u32,
+    /// 单价上限（元）。下单时的价格保护为 `单价上限 × 数量`
+    pub max_unit_price: f64,
+    /// pending / done / cancelled
+    pub status: String,
+    /// 任务创建时生成并落库的幂等键：超时/崩溃后重试复用它，不会重复扣款
+    #[serde(skip_serializing)]
+    pub idempotency_key: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    /// 建单成功后的订单号
+    pub order_id: Option<String>,
+    /// 下次允许尝试的时间（unix 秒）
+    pub next_attempt_at: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 pub struct KiroshopStore {
@@ -122,6 +149,24 @@ impl KiroshopStore {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ks_restock_tasks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id      INTEGER NOT NULL,
+                product_name    TEXT NOT NULL DEFAULT '',
+                option_key      TEXT NOT NULL DEFAULT '',
+                quantity        INTEGER NOT NULL,
+                max_unit_price  REAL NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                idempotency_key TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                order_id        TEXT,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ks_restock_status ON ks_restock_tasks(status);
             "#,
         )?;
         Ok(Self {
@@ -330,6 +375,121 @@ impl KiroshopStore {
         Ok(n)
     }
 
+    // ---- 补货任务 ----
+
+    /// 新建任务，`next_attempt_at = 0` 表示下一轮立即可尝试。返回自增 id。
+    pub fn create_restock(
+        &self,
+        product_id: i64,
+        product_name: &str,
+        option_key: &str,
+        quantity: u32,
+        max_unit_price: f64,
+        idempotency_key: &str,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock();
+        let ts = now();
+        conn.execute(
+            "INSERT INTO ks_restock_tasks (product_id, product_name, option_key, quantity,
+                     max_unit_price, idempotency_key, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![product_id, product_name, option_key, quantity, max_unit_price, idempotency_key, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 到期的待处理任务（按创建顺序）
+    pub fn due_restocks(&self, now_ts: i64) -> rusqlite::Result<Vec<RestockTask>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RESTOCK_COLS} FROM ks_restock_tasks
+             WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![now_ts], row_to_restock)?;
+        rows.collect()
+    }
+
+    /// 原子领取：仅当任务仍是 pending 且已到期时成功，并把 `next_attempt_at` 推到
+    /// `now + lease_secs`。租约既防止两条触发路径并发处理同一任务，也让进程在
+    /// 尝试中途崩溃后，租约一过就能被重新拾起（幂等键保证不会重复扣款）。
+    pub fn claim_restock(&self, id: i64, now_ts: i64, lease_secs: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE ks_restock_tasks SET next_attempt_at = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'pending' AND next_attempt_at <= ?4",
+            params![now_ts + lease_secs, now(), id, now_ts],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 建单成功。已被取消的任务也要落成 done：钱已经扣了，不能让订单失去关联。
+    pub fn finish_restock(&self, id: i64, order_id: &str) -> rusqlite::Result<()> {
+        conn_update(
+            &self.conn,
+            "UPDATE ks_restock_tasks SET status='done', order_id=?1, last_error=NULL,
+                     attempts=attempts+1, updated_at=?2 WHERE id=?3 AND status!='done'",
+            params![order_id, now(), id],
+        )
+    }
+
+    /// 本次尝试失败：记错误、次数 +1、按退避推迟下次尝试。仅对 pending 生效，
+    /// 返回（更新后的尝试次数，上一次的错误文案），供调用方决定是否发告警。
+    pub fn fail_restock(
+        &self,
+        id: i64,
+        error: &str,
+        next_attempt_at: i64,
+    ) -> rusqlite::Result<Option<(u32, Option<String>)>> {
+        let conn = self.conn.lock();
+        let prev: Option<(u32, Option<String>)> = conn
+            .query_row(
+                "SELECT attempts, last_error FROM ks_restock_tasks WHERE id=?1 AND status='pending'",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)? as u32, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((attempts, last_error)) = prev else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE ks_restock_tasks SET attempts=?1, last_error=?2, next_attempt_at=?3,
+                     updated_at=?4 WHERE id=?5 AND status='pending'",
+            params![attempts + 1, error, next_attempt_at, now(), id],
+        )?;
+        Ok(Some((attempts + 1, last_error)))
+    }
+
+    /// 取消待处理任务；非 pending（已完成/已取消）返回 false
+    pub fn cancel_restock(&self, id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE ks_restock_tasks SET status='cancelled', updated_at=?1
+             WHERE id=?2 AND status='pending'",
+            params![now(), id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 全部任务：待处理在前，其余按新到旧，最多 100 条
+    pub fn list_restocks(&self) -> rusqlite::Result<Vec<RestockTask>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RESTOCK_COLS} FROM ks_restock_tasks
+             ORDER BY (status = 'pending') DESC, id DESC LIMIT 100"
+        ))?;
+        let rows = stmt.query_map([], row_to_restock)?;
+        rows.collect()
+    }
+
+    pub fn pending_restock_count(&self) -> rusqlite::Result<u32> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM ks_restock_tasks WHERE status='pending'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u32)
+    }
+
     // ---- KV ----
 
     pub fn kv_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
@@ -381,6 +541,28 @@ fn row_to_tracked(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackedOrder> {
         last_error: r.get(15)?,
         created_at: r.get(16)?,
         updated_at: r.get(17)?,
+    })
+}
+
+const RESTOCK_COLS: &str = "id, product_id, product_name, option_key, quantity, max_unit_price,
+    status, idempotency_key, attempts, last_error, order_id, next_attempt_at, created_at, updated_at";
+
+fn row_to_restock(r: &rusqlite::Row<'_>) -> rusqlite::Result<RestockTask> {
+    Ok(RestockTask {
+        id: r.get(0)?,
+        product_id: r.get(1)?,
+        product_name: r.get(2)?,
+        option_key: r.get(3)?,
+        quantity: r.get::<_, i64>(4)? as u32,
+        max_unit_price: r.get(5)?,
+        status: r.get(6)?,
+        idempotency_key: r.get(7)?,
+        attempts: r.get::<_, i64>(8)? as u32,
+        last_error: r.get(9)?,
+        order_id: r.get(10)?,
+        next_attempt_at: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
     })
 }
 
@@ -461,6 +643,78 @@ mod tests {
         // 迟到的重复事件重放旧 seq，不得回退
         s.advance_delivery("o1", 2, 3, 0, 0).unwrap();
         assert_eq!(s.tracked_order("o1").unwrap().unwrap().last_seq, 5);
+    }
+
+    fn new_task(s: &KiroshopStore) -> i64 {
+        s.create_restock(403, "Kiro Pro", "normal", 3, 12.0, "idem-1").unwrap()
+    }
+
+    #[test]
+    fn 补货任务新建即到期_领取后租约内不可重复领取() {
+        let s = store();
+        let id = new_task(&s);
+        assert_eq!(s.due_restocks(1_000).unwrap().len(), 1);
+        assert!(s.claim_restock(id, 1_000, 120).unwrap());
+        // 租约期内：既不再出现在到期列表，也不能被第二条触发路径重复领取
+        assert!(s.due_restocks(1_000).unwrap().is_empty());
+        assert!(!s.claim_restock(id, 1_050, 120).unwrap());
+        // 租约过期（模拟崩溃后恢复）：可重新领取
+        assert!(s.claim_restock(id, 1_121, 120).unwrap());
+    }
+
+    #[test]
+    fn 补货任务失败后退避_并带回上次错误供告警去重() {
+        let s = store();
+        let id = new_task(&s);
+        let (n, prev) = s.fail_restock(id, "暂无现货", 2_000).unwrap().unwrap();
+        assert_eq!((n, prev), (1, None));
+        let (n, prev) = s.fail_restock(id, "暂无现货", 2_300).unwrap().unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(prev.as_deref(), Some("暂无现货"), "第二次应能看到上次错误以判断是否重复");
+        assert!(s.due_restocks(2_299).unwrap().is_empty(), "退避期内不应到期");
+        assert_eq!(s.due_restocks(2_300).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 补货任务完成后不再出现_幂等键不外泄() {
+        let s = store();
+        let id = new_task(&s);
+        s.finish_restock(id, "ord-1").unwrap();
+        let t = &s.list_restocks().unwrap()[0];
+        assert_eq!((t.status.as_str(), t.order_id.as_deref(), t.attempts), ("done", Some("ord-1"), 1));
+        assert!(s.due_restocks(i64::MAX).unwrap().is_empty());
+        assert!(!s.cancel_restock(id).unwrap(), "已完成的任务不能取消");
+        assert!(s.fail_restock(id, "x", 0).unwrap().is_none(), "已完成的任务不再记失败");
+        let json = serde_json::to_string(t).unwrap();
+        assert!(!json.contains("idem-1"), "幂等键不应序列化给面板");
+    }
+
+    #[test]
+    fn 取消与在途尝试竞态_钱已扣的订单仍落成done() {
+        let s = store();
+        let id = new_task(&s);
+        assert!(s.claim_restock(id, 1_000, 120).unwrap());
+        // 尝试进行中用户点了取消
+        assert!(s.cancel_restock(id).unwrap());
+        // 失败路径对已取消任务是空操作，不会把它改回 pending
+        assert!(s.fail_restock(id, "x", 0).unwrap().is_none());
+        // 但若这次尝试其实建单成功了，订单号必须落库
+        s.finish_restock(id, "ord-9").unwrap();
+        let t = &s.list_restocks().unwrap()[0];
+        assert_eq!((t.status.as_str(), t.order_id.as_deref()), ("done", Some("ord-9")));
+    }
+
+    #[test]
+    fn 补货任务列表待处理在前() {
+        let s = store();
+        let a = new_task(&s);
+        let b = new_task(&s);
+        let c = new_task(&s);
+        s.finish_restock(b, "o").unwrap();
+        s.cancel_restock(a).unwrap();
+        let ids: Vec<i64> = s.list_restocks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![c, b, a], "pending 置顶，其余新到旧");
+        assert_eq!(s.pending_restock_count().unwrap(), 1);
     }
 
     #[test]

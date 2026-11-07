@@ -9,7 +9,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   AlertTriangle, BadgeCheck, Ban, CheckCheck, CircleDollarSign, Clock, Download, Gift,
-  Loader2, MessageSquareWarning, PackageSearch, RefreshCw, ShoppingCart, Store, Truck, Wallet,
+  Loader2, MessageSquareWarning, PackageSearch, RefreshCw, Repeat, ShoppingCart, Store, Truck, Wallet,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -24,7 +24,7 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import * as ksApi from '@/api/kiroshop'
 import { kiroshopErrorMessage } from '@/api/kiroshop'
-import type { BuyOutcome, KiroProduct, LocalEvent, Quote, ShopOrder, TrackedOrder } from '@/types/kiroshop'
+import type { BuyOutcome, KiroProduct, LocalEvent, Quote, RestockTask, ShopOrder, TrackedOrder } from '@/types/kiroshop'
 
 function formatTime(ts?: string | null): string {
   if (!ts) return '—'
@@ -103,8 +103,13 @@ function StatusBar() {
     { icon: <CircleDollarSign className="h-4 w-4" />, label: '今日已扣', value: money(acc?.api_spent_today) },
     {
       icon: <Store className="h-4 w-4" />,
-      label: '池内号 / 在途 / 目标',
-      value: `${st.pool?.count ?? '—'} / ${st.pool?.inflight ?? '—'}${st.pool?.target ? ` / ${st.pool.target}` : ''}`,
+      label: '池内号 / 在途待交付',
+      value: `${st.pool?.count ?? '—'} / ${st.pool?.inflight ?? '—'}`,
+    },
+    {
+      icon: <Repeat className="h-4 w-4" />,
+      label: '补货任务（重试中）',
+      value: String(st.pendingRestocks ?? 0),
     },
     { icon: <Truck className="h-4 w-4" />, label: '在途订单', value: String(st.trackedCount ?? '—') },
     {
@@ -313,6 +318,199 @@ function ProductsSection() {
       ))}
       {(products ?? []).length === 0 && (
         <div className="py-8 text-center text-sm text-muted-foreground">没有上架商品</div>
+      )}
+    </div>
+  )
+}
+
+// ============ 补货任务 ============
+
+const RESTOCK_STATUS: Record<RestockTask['status'], { text: string; cls: string }> = {
+  pending: { text: '重试中', cls: 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400' },
+  done: { text: '已下单', cls: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' },
+  cancelled: { text: '已取消', cls: 'border-muted bg-muted text-muted-foreground' },
+}
+
+/** 商品默认档位的单价（与后端 default_option 同口径：优先 normal，否则第一项，再回落标价） */
+function defaultUnitPrice(p: KiroProduct, optionKey?: string): number | undefined {
+  const opt = p.options.find((o) => o.key === optionKey)
+    ?? p.options.find((o) => o.key === 'normal')
+    ?? p.options[0]
+  return opt?.price ?? p.price ?? undefined
+}
+
+function RestockForm({ products }: { products: KiroProduct[] }) {
+  const queryClient = useQueryClient()
+  const [productId, setProductId] = useState('')
+  const [optionKey, setOptionKey] = useState('')
+  const [quantity, setQuantity] = useState('1')
+  const [maxPrice, setMaxPrice] = useState('')
+
+  const product = products.find((p) => String(p.id) === productId)
+  const qty = Math.floor(Number(quantity))
+  const cap = num(maxPrice)
+  const valid = !!product && qty >= 1 && cap != null && cap > 0
+
+  const createMut = useMutation({
+    mutationFn: () =>
+      ksApi.createRestock({
+        productId: product!.id,
+        quantity: qty,
+        maxUnitPrice: cap!,
+        optionKey: optionKey || undefined,
+      }),
+    onSuccess: (id) => {
+      toast.success(`补货任务 #${id} 已创建，下单成功前会持续重试`)
+      setQuantity('1')
+      queryClient.invalidateQueries({ queryKey: ['kiroshop'] })
+    },
+    onError: (e) => toast.error(kiroshopErrorMessage(e, '创建失败')),
+  })
+
+  const current = product ? defaultUnitPrice(product, optionKey || undefined) : undefined
+  return (
+    <Card>
+      <CardHeader className="py-3">
+        <CardTitle className="text-sm">新建补货任务</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <div className="mb-1 text-[11px] text-muted-foreground">商品</div>
+            <Select value={productId} onValueChange={(v) => {
+              setProductId(v)
+              setOptionKey('')
+            }}>
+              <SelectTrigger className="h-8 w-56"><SelectValue placeholder="选择商品" /></SelectTrigger>
+              <SelectContent>
+                {products.map((p) => (
+                  <SelectItem key={p.id} value={String(p.id)}>
+                    {p.display_name || `商品 #${p.id}`}（现货 {productAvailable(p)}）
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {product && product.options.length > 1 && (
+            <div>
+              <div className="mb-1 text-[11px] text-muted-foreground">档位</div>
+              <Select
+                value={optionKey || (product.options.find((o) => o.key === 'normal')?.key ?? product.options[0].key)}
+                onValueChange={setOptionKey}
+              >
+                <SelectTrigger className="h-8 w-32"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {product.options.map((o) => (
+                    <SelectItem key={o.key} value={o.key}>
+                      {o.label ?? o.key}{o.price != null ? ` ¥${o.price}` : ''}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          <div>
+            <div className="mb-1 text-[11px] text-muted-foreground">数量</div>
+            <Input type="number" min={1} className="h-8 w-20" value={quantity}
+                   onChange={(e) => setQuantity(e.target.value)} />
+          </div>
+          <div>
+            <div className="mb-1 text-[11px] text-muted-foreground">
+              单价上限（元）{current != null && <span>· 当前 ¥{current}</span>}
+            </div>
+            <Input type="number" min={0} step="0.01" className="h-8 w-32" value={maxPrice}
+                   placeholder="必填" onChange={(e) => setMaxPrice(e.target.value)} />
+          </div>
+          <Button size="sm" disabled={!valid || createMut.isPending} onClick={() => createMut.mutate()}>
+            {createMut.isPending
+              ? <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+              : <Repeat className="mr-1 h-3 w-3" />}
+            提交任务
+          </Button>
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          提交后立即尝试一次，之后约每 1~5 分钟重试，直到<b>建单成功</b>为止（允许转预定排队，到货由在途订单自动入库）。
+          建单即从余额扣款，价格保护为「单价上限 × 数量」，超出则不下单、继续等降价。
+          {cap != null && cap > 0 && qty >= 1 && <> 本任务最多扣款 <b>{money(cap * qty)}</b>。</>}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function RestockSection() {
+  const queryClient = useQueryClient()
+  const { data: tasks, isLoading } = useQuery({
+    queryKey: ['kiroshop', 'restock'],
+    queryFn: ksApi.getRestocks,
+    refetchInterval: 15_000,
+  })
+  const { data: products } = useQuery({
+    queryKey: ['kiroshop', 'products'],
+    queryFn: ksApi.getProducts,
+    refetchInterval: 60_000,
+  })
+  const cancelMut = useMutation({
+    mutationFn: (id: number) => ksApi.cancelRestock(id),
+    onSuccess: () => {
+      toast.success('任务已取消')
+      queryClient.invalidateQueries({ queryKey: ['kiroshop'] })
+    },
+    onError: (e) => toast.error(kiroshopErrorMessage(e, '取消失败')),
+  })
+
+  return (
+    <div className="space-y-3">
+      <RestockForm products={products ?? []} />
+      {isLoading ? (
+        <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> 加载任务…
+        </div>
+      ) : (tasks ?? []).length === 0 ? (
+        <div className="py-8 text-center text-sm text-muted-foreground">还没有补货任务</div>
+      ) : (
+        <div className="space-y-2">
+          {(tasks ?? []).map((t) => {
+            const meta = RESTOCK_STATUS[t.status]
+            return (
+              <Card key={t.id}>
+                <CardContent className="space-y-1.5 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge className={meta.cls}>{meta.text}</Badge>
+                      <span className="font-medium">{t.productName}</span>
+                      <span className="text-sm">×{t.quantity}</span>
+                      <span className="text-xs text-muted-foreground">
+                        单价上限 {money(t.maxUnitPrice)}{t.optionKey ? ` · ${t.optionKey}` : ''} · 最多扣 {money(t.maxUnitPrice * t.quantity)}
+                      </span>
+                      <Badge variant="secondary">#{t.id}</Badge>
+                    </div>
+                    {t.status === 'pending' && (
+                      <Button variant="outline" size="sm" disabled={cancelMut.isPending}
+                              onClick={() => cancelMut.mutate(t.id)}>
+                        <Ban className="mr-1 h-3 w-3" /> 取消
+                      </Button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] text-muted-foreground">
+                    <span>创建 {formatTime(t.createdAt)}</span>
+                    <span>已尝试 {t.attempts} 次</span>
+                    {t.status === 'pending' && t.nextAttemptAt > 0 && (
+                      <span>下次尝试 {new Date(t.nextAttemptAt * 1000).toLocaleTimeString('zh-CN', { hour12: false })}</span>
+                    )}
+                    {t.status === 'done' && t.orderId && <span>订单 {t.orderId.slice(0, 12)}（到货后在「订单」页跟踪）</span>}
+                    {t.status !== 'pending' && <span>结束 {formatTime(t.updatedAt)}</span>}
+                  </div>
+                  {t.status === 'pending' && t.lastError && (
+                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-700 dark:text-amber-400">
+                      最近一次：{t.lastError}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )
+          })}
+        </div>
       )}
     </div>
   )
@@ -576,7 +774,7 @@ function EventsSection() {
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <div className="text-xs text-muted-foreground">
-          未确认 {data?.unacked ?? 0} 条（余额低 / 补号可领 / 售后回复 / 自动补货 …）
+          未确认 {data?.unacked ?? 0} 条（余额低 / 补号可领 / 售后回复 / 补货任务 …）
         </div>
         <Button size="sm" variant="outline" onClick={() => ackMut.mutate(undefined)}>
           <CheckCheck className="mr-1 h-3 w-3" /> 全部确认
@@ -691,34 +889,6 @@ function SettingsSection() {
       </Card>
 
       <Card>
-        <CardHeader className="py-3"><CardTitle className="text-sm">自动补货</CardTitle></CardHeader>
-        <CardContent className="space-y-3 text-sm">
-          <div className="flex flex-wrap items-center gap-4">
-            <label className="flex items-center gap-2">
-              <Switch checked={cfg.autoBuy.enabled}
-                      onCheckedChange={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, enabled: v } })} />
-              启用（池内号 + 在途 &lt; 目标时自动下单）
-            </label>
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Checkbox checked={cfg.autoBuy.allowBackorder}
-                        onCheckedChange={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, allowBackorder: v === true } })} />
-              允许转预定排队
-            </label>
-          </div>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <SettingNumberField label="池目标数" value={cfg.autoBuy.poolTarget}
-                                 onCommit={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, poolTarget: v ?? 0 } })} />
-            <SettingNumberField label="单笔上限（个）" value={cfg.autoBuy.maxPerOrder}
-                                 onCommit={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, maxPerOrder: v ?? 5 } })} />
-            <SettingNumberField label="单价上限（元）" value={cfg.autoBuy.maxUnitPrice ?? 0} allowEmpty placeholder="不限"
-                                 onCommit={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, maxUnitPrice: v ?? 0 } })} />
-            <SettingNumberField label="每日预算（元）" value={cfg.autoBuy.dailyBudget ?? 0} allowEmpty placeholder="不限"
-                                 onCommit={(v) => saveMut.mutate({ autoBuy: { ...cfg.autoBuy, dailyBudget: v ?? 0 } })} />
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
         <CardHeader className="py-3"><CardTitle className="text-sm">到货回调（webhook）</CardTitle></CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div className="text-xs text-muted-foreground">
@@ -790,11 +960,13 @@ export function KiroshopPage() {
       <Tabs defaultValue="products">
         <TabsList>
           <TabsTrigger value="products">商品</TabsTrigger>
+          <TabsTrigger value="restock">补货</TabsTrigger>
           <TabsTrigger value="orders">订单</TabsTrigger>
           <TabsTrigger value="events">事件</TabsTrigger>
           <TabsTrigger value="settings">设置</TabsTrigger>
         </TabsList>
         <TabsContent value="products" className="mt-3"><ProductsSection /></TabsContent>
+        <TabsContent value="restock" className="mt-3"><RestockSection /></TabsContent>
         <TabsContent value="orders" className="mt-3"><OrdersSection /></TabsContent>
         <TabsContent value="events" className="mt-3"><EventsSection /></TabsContent>
         <TabsContent value="settings" className="mt-3"><SettingsSection /></TabsContent>

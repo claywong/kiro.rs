@@ -6,7 +6,7 @@
 //! - [`client`]：客户 API v1.2 全量端点的类型化客户端
 //! - [`config`]：config.json 顶层 `kiroshop` 段（含从旧 vendors 条目的迁移）
 //! - [`store`]：SQLite 在途跟踪 / 事件去重 / 面板告警
-//! - [`service`]：购买主流程、增量收货入库、事件与发货轮询、自动补货、HMAC 验签
+//! - [`service`]：购买主流程、增量收货入库、事件与发货轮询、补货任务、HMAC 验签
 //! - [`handlers`]：`/api/admin/kiroshop/*` 管理接口与 `/webhook/kiroshop/{token}` 入站
 //!
 //! 唯一复用的旧设施是 [`crate::vendor::import`] 的凭据解析入库

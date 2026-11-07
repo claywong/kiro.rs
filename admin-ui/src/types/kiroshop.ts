@@ -136,13 +136,22 @@ export interface LocalEvent {
   createdAt: string
 }
 
-export interface AutoBuyConfig {
-  enabled: boolean
-  poolTarget: number
-  maxUnitPrice?: number | null
-  maxPerOrder: number
-  dailyBudget?: number | null
-  allowBackorder: boolean
+/** 补货任务：指定商品 + 数量 + 单价上限，后台重试直到建单成功 */
+export interface RestockTask {
+  id: number
+  productId: number
+  productName: string
+  optionKey: string
+  quantity: number
+  maxUnitPrice: number
+  status: 'pending' | 'done' | 'cancelled'
+  attempts: number
+  lastError?: string | null
+  orderId?: string | null
+  /** 下次尝试时间（unix 秒） */
+  nextAttemptAt: number
+  createdAt: string
+  updatedAt: string
 }
 
 export interface KiroshopSettings {
@@ -158,7 +167,6 @@ export interface KiroshopSettings {
   eventsPollIntervalSecs: number
   deliveryPollIntervalSecs: number
   balanceAlertThreshold?: number | null
-  autoBuy: AutoBuyConfig
   webhookPath: string
   webhookSecretSet: boolean
 }
@@ -169,8 +177,8 @@ export interface KiroshopStatus {
   baseUrl?: string
   account?: AccountInfo | null
   products?: { id: number; displayName: string; price?: number | null; available: number; backorder?: boolean | null }[]
-  pool?: { count: number; inflight: number; target: number }
-  autoBuy?: AutoBuyConfig
+  pool?: { count: number; inflight: number }
+  pendingRestocks?: number
   unackedAlerts?: number
   trackedCount?: number
   lastError?: string | null

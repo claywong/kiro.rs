@@ -7,7 +7,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   AccountInfo, BuyOutcome, KiroProduct, KiroshopSettings, KiroshopStatus, LocalEvent,
-  OrderDetailResponse, Quote, ShopOrder, TrackedOrder,
+  OrderDetailResponse, Quote, RestockTask, ShopOrder, TrackedOrder,
 } from '@/types/kiroshop'
 
 const api = axios.create({
@@ -91,6 +91,32 @@ export async function buy(p: BuyParams): Promise<BuyOutcome> {
     idempotencyKey: p.idempotencyKey || undefined,
   })
   return data.data
+}
+
+export interface RestockParams {
+  productId: number
+  quantity: number
+  maxUnitPrice: number
+  optionKey?: string
+}
+
+export async function getRestocks(): Promise<RestockTask[]> {
+  const r = await getJson<{ data: RestockTask[] }>('/restock')
+  return r.data
+}
+
+export async function createRestock(p: RestockParams): Promise<number> {
+  const { data } = await api.post<{ id: number }>('/restock', {
+    productId: p.productId,
+    quantity: p.quantity,
+    maxUnitPrice: p.maxUnitPrice,
+    optionKey: p.optionKey || undefined,
+  })
+  return data.id
+}
+
+export async function cancelRestock(id: number): Promise<void> {
+  await api.post(`/restock/${id}/cancel`)
 }
 
 export async function getOrders(): Promise<{ tracked: TrackedOrder[]; shop: ShopOrder[] }> {

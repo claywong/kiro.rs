@@ -90,9 +90,8 @@ async fn status(State(st): State<KiroshopState>) -> Response {
         "pool": {
             "count": service.pool_count(),
             "inflight": service.inflight_count(),
-            "target": if cfg.auto_buy.enabled { cfg.auto_buy.pool_target } else { 0 },
         },
-        "autoBuy": cfg.auto_buy,
+        "pendingRestocks": service.store().pending_restock_count().unwrap_or(0),
         "unackedAlerts": service.store().unacked_local_count().unwrap_or(0),
         "trackedCount": service.store().tracked_orders().map(|t| t.len()).unwrap_or(0),
         "lastError": service.last_error(),
@@ -135,6 +134,58 @@ async fn quote(State(st): State<KiroshopState>, Json(b): Json<QuoteBody>) -> Res
     };
     match st.service.api().quote(&req).await {
         Ok(q) => ok_json(json!({ "data": q })),
+        Err(e) => err(e),
+    }
+}
+
+// ============ 补货任务 ============
+
+/// GET /restock：全部任务（待处理置顶）
+async fn restock_list(State(st): State<KiroshopState>) -> Response {
+    match st.service.store().list_restocks() {
+        Ok(tasks) => ok_json(json!({ "data": tasks })),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("读取补货任务失败: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestockBody {
+    product_id: i64,
+    quantity: u32,
+    max_unit_price: f64,
+    #[serde(default)]
+    option_key: Option<String>,
+}
+
+/// POST /restock：新建补货任务（立即尝试一次，之后随发货轮询重试直到建单成功）
+async fn restock_create(State(st): State<KiroshopState>, Json(b): Json<RestockBody>) -> Response {
+    if !st.service.config().is_ready() {
+        return not_configured();
+    }
+    match st
+        .service
+        .restock_create(b.product_id, b.quantity, b.max_unit_price, b.option_key)
+        .await
+    {
+        Ok(id) => ok_json(json!({ "ok": true, "id": id })),
+        Err(e) => err(e),
+    }
+}
+
+/// POST /restock/{id}/cancel：取消待处理任务。已完成/已取消返回 409。
+async fn restock_cancel(State(st): State<KiroshopState>, Path(id): Path<i64>) -> Response {
+    match st.service.restock_cancel(id) {
+        Ok(true) => ok_json(json!({ "ok": true })),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "任务不是待处理状态（已完成或已取消）" })),
+        )
+            .into_response(),
         Err(e) => err(e),
     }
 }
@@ -556,7 +607,6 @@ async fn settings_get(State(st): State<KiroshopState>) -> Response {
             "eventsPollIntervalSecs": cfg.events_poll_interval_secs,
             "deliveryPollIntervalSecs": cfg.delivery_poll_interval_secs,
             "balanceAlertThreshold": cfg.balance_alert_threshold,
-            "autoBuy": cfg.auto_buy,
             "webhookPath": format!("/webhook/kiroshop/{}", cfg.webhook_path_token),
             "webhookSecretSet": !cfg.webhook_secret.is_empty(),
         }
@@ -596,8 +646,6 @@ struct SettingsUpdate {
     delivery_poll_interval_secs: Option<u64>,
     #[serde(default)]
     balance_alert_threshold: Option<f64>,
-    #[serde(default)]
-    auto_buy: Option<super::config::AutoBuyConfig>,
     #[serde(default)]
     webhook_secret: Option<String>,
 }
@@ -645,9 +693,6 @@ async fn settings_put(State(st): State<KiroshopState>, Json(b): Json<SettingsUpd
         Some(v) if v > 0.0 => cfg.balance_alert_threshold = Some(v),
         Some(_) => cfg.balance_alert_threshold = None,
         None => {}
-    }
-    if let Some(v) = b.auto_buy {
-        cfg.auto_buy = v;
     }
     if let Some(v) = b.webhook_secret.map(|s| s.trim().to_string()) {
         cfg.webhook_secret = v;
@@ -736,6 +781,8 @@ pub fn create_kiroshop_admin_router(state: KiroshopState) -> Router {
         .route("/products", get(products))
         .route("/quote", post(quote))
         .route("/buy", post(buy))
+        .route("/restock", get(restock_list).post(restock_create))
+        .route("/restock/{id}/cancel", post(restock_cancel))
         .route("/orders", get(orders))
         .route("/orders/{id}", get(order_detail))
         .route("/orders/{id}/pay", post(pay))

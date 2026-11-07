@@ -38,38 +38,11 @@ fn default_delivery_poll_secs() -> u64 {
     60
 }
 
-fn default_max_per_order() -> u32 {
-    5
-}
-
-/// 自动补货规则。默认关；打开后按「池内可用号 + 在途订单 < 目标」补货。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoBuyConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// 池内可用 KiroShop 号 + 在途数量低于该值时触发补货（0 = 关闭判据）
-    #[serde(default)]
-    pub pool_target: u32,
-    /// 单价超过该值的商品不参与自动补货（None = 不限）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_unit_price: Option<f64>,
-    /// 单笔订单数量上限（卖家单量限制之外的自我约束）
-    #[serde(default = "default_max_per_order")]
-    pub max_per_order: u32,
-    /// 每日经 API 扣款预算（元；None = 不限，仅受卖家侧每日限额约束）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daily_budget: Option<f64>,
-    /// 现货不足时是否允许转预定排队。自动补货默认拒（deny），避免无人值守挂单。
-    #[serde(default)]
-    pub allow_backorder: bool,
-}
-
 /// KiroShop 顶层配置段
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroshopConfig {
-    /// 关闭后停一切出站轮询与自动补货，面板仍可手动操作
+    /// 关闭后停一切出站轮询与补货任务，面板仍可手动操作
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_base_url")]
@@ -107,29 +80,11 @@ pub struct KiroshopConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_alert_threshold: Option<f64>,
 
-    #[serde(default)]
-    pub auto_buy: AutoBuyConfig,
 }
 
 fn default_webhook_path_token() -> String {
     // 每次启动随机（仅当配置里没写时）；保存一次后固定
     format!("ks{:016x}", fastrand::u64(..))
-}
-
-/// 手写而非 derive：与 serde 的 `#[serde(default = "default_max_per_order")]`
-/// 保持同值（5）。derive Default 会给 maxPerOrder 填 0，迁移与 Default::default()
-/// 两条路径都会踩到，语义上「单笔上限 0」再靠运行时 max(1) 兜底太绕。
-impl Default for AutoBuyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            pool_target: 0,
-            max_unit_price: None,
-            max_per_order: default_max_per_order(),
-            daily_budget: None,
-            allow_backorder: false,
-        }
-    }
 }
 
 impl Default for KiroshopConfig {
@@ -179,7 +134,6 @@ pub fn migrate_from_vendors(config: &mut Config) -> bool {
         events_poll_interval_secs: default_events_poll_secs(),
         delivery_poll_interval_secs: default_delivery_poll_secs(),
         balance_alert_threshold: None,
-        auto_buy: AutoBuyConfig::default(),
     };
     config.kiroshop = Some(migrated);
     // 移除旧条目：新模块接管后，旧面板再对着同一家下单会绕过在途跟踪与增量拿号
@@ -209,11 +163,7 @@ mod tests {
         assert_eq!(c.rpm_limit, 5);
         assert_eq!(c.priority, 15);
         assert_eq!(c.events_poll_interval_secs, 45);
-        assert!(!c.auto_buy.enabled);
         assert!(!c.webhook_path_token.is_empty());
-        // serde 路径与 Default 路径必须同值（迁移走 Default，曾出现过 0 与 5 分叉）
-        assert_eq!(c.auto_buy.max_per_order, 5);
-        assert_eq!(AutoBuyConfig::default().max_per_order, 5);
     }
 
     #[test]
