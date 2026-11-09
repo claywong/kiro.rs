@@ -106,7 +106,8 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // 同 ide.rs：BuilderID 占位符 ARN 也必须发送，否则 MCP 返回 400。
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if let Some(token_type) = ctx.credentials.token_type_header() {

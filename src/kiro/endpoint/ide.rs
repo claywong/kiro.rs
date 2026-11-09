@@ -140,7 +140,9 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // MCP（含 WebSearch）与流式端点一样强制要求 profileArn；BuilderID 账号要原样
+        // 带占位符，用 effective_profile_arn 会剥掉它，上游回 400 "profileArn is required"。
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if let Some(token_type) = ctx.credentials.token_type_header() {
@@ -210,6 +212,53 @@ mod tests {
                 "UA 的 SDK 版本应与用量链路统一: {ua}"
             );
         }
+    }
+
+    /// MCP（含 WebSearch）要求 profileArn：BuilderID 占位符账号必须原样带上
+    /// `x-amzn-kiro-profile-arn` 头，否则上游回 400 "profileArn is required"；
+    /// API Key 凭证没有 profileArn 概念，不应发送该头。
+    #[test]
+    fn test_decorate_mcp_sends_profile_arn_header_including_placeholder() {
+        use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+        use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, KiroCredentials};
+        use crate::model::config::Config;
+
+        let config = Config::default();
+        let endpoint = super::IdeEndpoint::new();
+        let client = reqwest::Client::new();
+
+        let header_of = |credentials: &KiroCredentials| -> Option<String> {
+            let ctx = RequestContext {
+                credentials,
+                token: "t",
+                machine_id: "m",
+                config: &config,
+            };
+            let req = endpoint
+                .decorate_mcp(client.post("https://example.invalid/mcp"), &ctx)
+                .build()
+                .unwrap();
+            req.headers()
+                .get("x-amzn-kiro-profile-arn")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let mut placeholder = KiroCredentials::default();
+        placeholder.auth_method = Some("idc".to_string());
+        placeholder.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(header_of(&placeholder).as_deref(), Some(BUILDER_ID_PROFILE_ARN));
+
+        let mut real = KiroCredentials::default();
+        real.auth_method = Some("idc".to_string());
+        real.profile_arn = Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/REAL".to_string());
+        assert_eq!(
+            header_of(&real).as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/REAL")
+        );
+
+        let mut api_key = KiroCredentials::default();
+        api_key.kiro_api_key = Some("ksk_test".to_string());
+        assert_eq!(header_of(&api_key), None);
     }
 
     #[test]
