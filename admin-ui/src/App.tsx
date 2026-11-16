@@ -2,7 +2,6 @@ import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
 import {
   applyTheme,
-  applyThemeWithTransition,
   resolveDarkMode,
   type ThemeId,
   type ThemeMode,
@@ -10,13 +9,10 @@ import {
 } from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
-import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
-import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, Store, SlidersHorizontal } from "lucide-react";
-import { TopbarTools } from "@/components/topbar-tools";
-import { ThemePicker } from "@/components/theme-picker";
+import { ConfirmProvider } from "@/components/ui/confirm-dialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
-import { useVendorUnackedCount } from "@/hooks/use-vendor";
+import { AppLayout, type TabKey as Tab } from "@/components/layout/app-layout";
 
 const Dashboard = lazy(() =>
   import("@/components/dashboard").then((m) => ({ default: m.Dashboard })),
@@ -41,6 +37,7 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
+// 本地独有：卖家 / Key 供应商面板
 const VendorPage = lazy(() =>
   import("@/components/vendor-page").then((m) => ({
     default: m.VendorPage,
@@ -52,57 +49,6 @@ const SettingsPage = lazy(() =>
   })),
 );
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "vendor" | "settings";
-
-const TABS: {
-  key: Tab;
-  label: string;
-  mobileLabel: string;
-  icon: React.ReactNode;
-}[] = [
-  {
-    key: "overview",
-    label: "概览",
-    mobileLabel: "概览",
-    icon: <Activity className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "credentials",
-    label: "凭据管理",
-    mobileLabel: "凭据",
-    icon: <Server className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "keys",
-    label: "客户端 Key",
-    mobileLabel: "Key",
-    icon: <KeyRound className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "groups",
-    label: "分组管理",
-    mobileLabel: "分组",
-    icon: <FolderTree className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "traces",
-    label: "请求日志",
-    mobileLabel: "日志",
-    icon: <ScrollText className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "vendor",
-    label: "供应商",
-    mobileLabel: "供应商",
-    icon: <Store className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "settings",
-    label: "设置",
-    mobileLabel: "设置",
-    icon: <SlidersHorizontal className="h-3.5 w-3.5" />,
-  },
-];
 
 function readTabFromHash(): Tab {
   // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
@@ -126,7 +72,7 @@ interface AppHeaderProps {
   isDarkMode: boolean;
   tab: Tab;
   onLogout: () => void;
-  onSwitchTab: (next: Tab) => void;
+  onSwitchTab: (next: Tab, subKey?: string) => void;
   onSelectPalette: (palette: ThemeId) => void;
   onSelectMode: (mode: ThemeMode) => void;
 }
@@ -152,14 +98,10 @@ function App() {
 }
 
 function useAppShell() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(() => !!storage.getApiKey());
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
   const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
-
-  useEffect(() => {
-    if (storage.getApiKey()) setIsLoggedIn(true);
-  }, []);
 
   useEffect(() => {
     const onHash = () => setTab(readTabFromHash());
@@ -170,11 +112,7 @@ function useAppShell() {
   useEffect(() => {
     storage.setThemeSelection(theme);
     const resolved = resolveDarkMode(theme);
-    const root = document.documentElement;
-    const alreadyApplied =
-      root.dataset.theme === theme.palette && root.classList.contains("dark") === resolved;
-    setIsDarkMode(alreadyApplied ? resolved : applyThemeWithTransition(theme, resolved));
-    if (alreadyApplied) applyTheme(theme, resolved);
+    setIsDarkMode(applyTheme(theme, resolved));
   }, [theme]);
 
   useEffect(() => {
@@ -182,14 +120,18 @@ function useAppShell() {
 
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const onSystemThemeChange = (event: MediaQueryListEvent) => {
-      setIsDarkMode(applyThemeWithTransition(theme, event.matches));
+      setIsDarkMode(applyTheme(theme, event.matches));
     };
     media.addEventListener("change", onSystemThemeChange);
     return () => media.removeEventListener("change", onSystemThemeChange);
   }, [theme]);
 
-  const switchTab = (next: Tab) => {
-    window.location.hash = `#/${next}`;
+  const switchTab = (next: Tab, subKey?: string) => {
+    const targetHash = subKey ? `#/${next}?s=${subKey}` : `#/${next}`;
+    if (window.location.hash !== targetHash) {
+      window.location.hash = targetHash;
+      window.dispatchEvent(new Event("hashchange"));
+    }
     setTab(next);
   };
 
@@ -237,221 +179,42 @@ function LoggedInApp({
   tab,
 }: AppHeaderProps) {
   return (
-    <ConfirmProvider>
-      <AppHeader
-        theme={theme}
-        isDarkMode={isDarkMode}
-        tab={tab}
-        onLogout={onLogout}
-        onSwitchTab={onSwitchTab}
-        onSelectPalette={onSelectPalette}
-        onSelectMode={onSelectMode}
-      />
-      <AppMain tab={tab} onLogout={onLogout} />
-      <Toaster position="top-center" />
-    </ConfirmProvider>
-  );
-}
-
-function AppHeader({
-  theme,
-  isDarkMode,
-  onLogout,
-  onSwitchTab,
-  onSelectPalette,
-  onSelectMode,
-  tab,
-}: AppHeaderProps) {
-  return (
-    <header className="sticky top-0 z-50 w-full glass">
-      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 2xl:px-8">
-        <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
-        <HeaderActions
+    <TooltipProvider delayDuration={150}>
+      <ConfirmProvider>
+        <AppLayout
+          currentTab={tab}
+          onSelectTab={onSwitchTab}
           theme={theme}
           isDarkMode={isDarkMode}
-          onLogout={onLogout}
           onSelectPalette={onSelectPalette}
           onSelectMode={onSelectMode}
-        />
-      </div>
-      <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
-    </header>
-  );
-}
-
-function HeaderBrand({
-  onSwitchTab,
-  tab,
-}: {
-  onSwitchTab: (next: Tab) => void;
-  tab: Tab;
-}) {
-  return (
-    <div className="flex min-w-0 flex-1 items-center gap-2 lg:gap-3">
-      <img
-        src="/admin/kirors.png"
-        alt="Kiro"
-        className="size-8 shrink-0 object-contain lg:size-9"
-        draggable={false}
-      />
-      {/* 品牌名在 lg~xl 让位给 Tab，避免与工具栏挤在一起 */}
-      <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base lg:hidden 2xl:inline">
-        Kiro Admin
-      </span>
-      <DesktopTabs tab={tab} onSwitchTab={onSwitchTab} />
-    </div>
-  );
-}
-
-function DesktopTabs({
-  onSwitchTab,
-  tab,
-}: {
-  onSwitchTab: (next: Tab) => void;
-  tab: Tab;
-}) {
-  const { data: vendorUnacked } = useVendorUnackedCount();
-  return (
-    <div className="hidden items-center gap-1 rounded-full border border-border/60 p-0.5 lg:ml-2 lg:flex 2xl:ml-4">
-      {TABS.map((t) => (
-        <TabButton
-          key={t.key}
-          active={tab === t.key}
-          badge={t.key === "vendor" ? vendorUnacked : undefined}
-          tab={t}
-          onSwitchTab={onSwitchTab}
-        />
-      ))}
-    </div>
-  );
-}
-
-function HeaderActions({
-  theme,
-  isDarkMode,
-  onLogout,
-  onSelectPalette,
-  onSelectMode,
-}: {
-  theme: ThemeSelection;
-  isDarkMode: boolean;
-  onLogout: () => void;
-  onSelectPalette: (palette: ThemeId) => void;
-  onSelectMode: (mode: ThemeMode) => void;
-}) {
-  const confirm = useConfirm();
-
-  const handleLogout = async () => {
-    const confirmed = await confirm({
-      title: "退出登录？",
-      description: "退出后需要重新输入管理面板密钥才能继续使用。",
-      confirmText: "退出登录",
-      destructive: true,
-    });
-    if (confirmed) onLogout();
-  };
-
-  return (
-    <div className="flex shrink-0 items-center gap-1">
-      <div className="lg:hidden">
-        <TopbarTools compact />
-      </div>
-      <div className="hidden items-center gap-1 lg:flex">
-        <TopbarTools />
-      </div>
-      <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
-      <ThemePicker
-        theme={theme}
-        isDarkMode={isDarkMode}
-        onSelectPalette={onSelectPalette}
-        onSelectMode={onSelectMode}
-      />
-      <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
-        <LogOut className="h-4 w-4" />
-      </Button>
-    </div>
-  );
-}
-
-function MobileTabs({
-  onSwitchTab,
-  tab,
-}: {
-  onSwitchTab: (next: Tab) => void;
-  tab: Tab;
-}) {
-  const { data: vendorUnacked } = useVendorUnackedCount();
-  return (
-    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-7 items-center gap-0.5 overflow-hidden px-2 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-      {TABS.map((t) => (
-        <TabButton
-          key={t.key}
-          active={tab === t.key}
-          badge={t.key === "vendor" ? vendorUnacked : undefined}
-          mobile
-          tab={t}
-          onSwitchTab={onSwitchTab}
-        />
-      ))}
-    </div>
-  );
-}
-
-function TabButton({
-  active,
-  badge,
-  mobile = false,
-  onSwitchTab,
-  tab,
-}: {
-  active: boolean;
-  /** 未处理数量，> 0 时在标签右侧挂红点 */
-  badge?: number;
-  mobile?: boolean;
-  onSwitchTab: (next: Tab) => void;
-  tab: (typeof TABS)[number];
-}) {
-  const className = mobile
-    ? "h-8 w-full min-w-0 overflow-hidden rounded-full px-0.5 text-[10px] min-[360px]:px-1 min-[360px]:text-[11px] min-[390px]:px-1.5 min-[390px]:text-xs md:w-auto md:min-w-0 md:px-3"
-    : "h-7 rounded-full px-3 text-xs";
-  const label = mobile ? tab.mobileLabel : tab.label;
-
-  return (
-    <Button
-      size="sm"
-      variant={active ? "default" : "ghost"}
-      className={className}
-      onClick={() => onSwitchTab(tab.key)}
-    >
-      {tab.icon}
-      <span className={mobile ? "min-w-0 truncate" : undefined}>
-        {label}
-      </span>
-      {badge != null && badge > 0 && (
-        <span
-          className="ml-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-medium text-destructive-foreground"
-          title={`${badge} 条未处理`}
+          onLogout={onLogout}
         >
-          {badge > 99 ? "99+" : badge}
-        </span>
-      )}
-    </Button>
+          <AppMain tab={tab} onLogout={onLogout} />
+        </AppLayout>
+        <Toaster position="top-center" />
+      </ConfirmProvider>
+    </TooltipProvider>
   );
 }
 
 function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
   return (
-    <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
-      <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
-        {tab === "overview" && <OverviewPage />}
-        {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
-        {tab === "keys" && <ClientKeysPage />}
-        {tab === "groups" && <GroupsPage />}
-        {tab === "traces" && <TraceLogPage />}
-        {tab === "vendor" && <VendorPage />}
-        {tab === "settings" && <SettingsPage />}
-      </Suspense>
-    </main>
+    <Suspense
+      fallback={
+        <div className="flex h-64 items-center justify-center text-xs font-mono text-muted-foreground">
+          Loading Console Module...
+        </div>
+      }
+    >
+      {tab === "overview" && <OverviewPage />}
+      {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
+      {tab === "keys" && <ClientKeysPage />}
+      {tab === "groups" && <GroupsPage />}
+      {tab === "traces" && <TraceLogPage />}
+      {tab === "vendor" && <VendorPage />}
+      {tab === "settings" && <SettingsPage />}
+    </Suspense>
   );
 }
 

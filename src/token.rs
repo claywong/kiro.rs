@@ -154,6 +154,7 @@ async fn call_remote_count_tokens(
         messages: messages.clone(),
         system: system.clone(),
         tools: tools.clone(),
+        output_config: None,
     };
 
     // 构建请求
@@ -183,74 +184,40 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
-/// 统计单个 content 块的 token。
-///
-/// Anthropic 消息 content 数组里除 `text` 块外，长会话/编码场景的大头是
-/// `tool_use`（参数在 `input`）和 `tool_result`（返回在 `content`，常是整段文件）。
-/// 旧实现只数 `text`，把这两类漏掉，导致 tool 密集请求估值虚低（够不到速刷号
-/// token 门槛）。这里按块类型分别取对应字段计入，逼近真实上下文量级。
-fn count_content_block(item: &serde_json::Value) -> u64 {
-    let block_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match block_type {
-        // 文本块：直接数 text。
-        "text" => item
+/// 本地计算请求的输入 tokens
+/// 本地估算时单张图片的 token 数：取 Anthropic 文档给出的单图上限（约 1600）。
+const IMAGE_TOKEN_ESTIMATE: u64 = 1600;
+
+/// 本地估算单个内容块的 token（M4）：text、thinking、tool_use 名称和入参、
+/// tool_result 内容（字符串或块数组，递归）、图片。
+fn count_content_block_tokens(item: &serde_json::Value) -> u64 {
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("tool_use") => {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let input = item.get("input").map(|v| v.to_string()).unwrap_or_default();
+            count_tokens(name) + count_tokens(&input)
+        }
+        Some("tool_result") => match item.get("content") {
+            Some(serde_json::Value::String(s)) => count_tokens(s),
+            Some(serde_json::Value::Array(blocks)) => {
+                blocks.iter().map(count_content_block_tokens).sum()
+            }
+            _ => 0,
+        },
+        Some("thinking") => item
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+        Some("image") => IMAGE_TOKEN_ESTIMATE,
+        _ => item
             .get("text")
             .and_then(|v| v.as_str())
             .map(count_tokens)
             .unwrap_or(0),
-        // tool_use：参数 JSON（input）+ 工具名。
-        "tool_use" => {
-            let mut n = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(count_tokens)
-                .unwrap_or(0);
-            if let Some(input) = item.get("input") {
-                n += count_json_value(input);
-            }
-            n
-        }
-        // tool_result：返回内容（content 可能是字符串或块数组）。
-        "tool_result" => item.get("content").map(count_json_value).unwrap_or(0),
-        // 其它块（image 等无文本、或未知类型）：回退到通用 JSON 计数，
-        // 至少把可能存在的 text 字段数进去，避免再次漏计。
-        _ => {
-            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                count_tokens(text)
-            } else {
-                0
-            }
-        }
     }
 }
 
-/// 递归统计任意 JSON 值里的文本量（字符串字面量 + 结构键名近似）。
-///
-/// 对 `tool_use.input` / `tool_result.content` 这类嵌套结构，按其序列化字符数
-/// 估算——与上游把整个结构编码进请求体的实际发送量口径一致。
-fn count_json_value(value: &serde_json::Value) -> u64 {
-    match value {
-        serde_json::Value::String(s) => count_tokens(s),
-        serde_json::Value::Array(arr) => {
-            // 数组常见于 tool_result.content = [{type:text,text:...}, ...]，
-            // 逐块复用 content 块计数；非块结构则退回整体序列化。
-            let mut n = 0;
-            for item in arr {
-                if item.is_object() && item.get("type").is_some() {
-                    n += count_content_block(item);
-                } else {
-                    n += count_tokens(&item.to_string());
-                }
-            }
-            n
-        }
-        serde_json::Value::Object(_) => count_tokens(&value.to_string()),
-        // 数字 / 布尔 / null：贡献极小，按其字面量长度粗算即可。
-        other => count_tokens(&other.to_string()),
-    }
-}
-
-/// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -271,7 +238,7 @@ fn count_all_tokens_local(
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                total += count_content_block(item);
+                total += count_content_block_tokens(item);
             }
         }
     }
@@ -315,6 +282,31 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     total.max(1)
 }
 
+/// 从 contextUsage 换算出的上下文总量里扣掉本轮输出，得到真正的 input 口径。
+///
+/// 上游 `metadataEvent.tokenUsage` 实测从未下发，100% 走 `contextUsageEvent`
+/// 回退路径；而 `contextUsageEvent` 在流末尾才到达，其百分比覆盖的是
+/// 「生成结束后」的整个上下文（Kiro 注入的 system prompt + 本轮 prompt +
+/// **本轮输出**）。直接当 `input_tokens` 上报会把输出重复计一次
+/// （另一次已经在 `output_tokens` 里）。
+///
+/// - `context_total`：`contextUsagePercentage × window / 100` 的换算值。
+/// - `fallback_input`：无 `contextUsageEvent` 时的 prompt 估算（来自
+///   `count_all_tokens`，只统计客户端发来的 prompt，本就不含输出），不做扣减。
+/// - `output_tokens`：本轮输出的 token 数（精确值或本地估算）。
+pub(crate) fn input_tokens_excluding_output(
+    context_total: Option<i32>,
+    fallback_input: i32,
+    output_tokens: i32,
+) -> i32 {
+    match context_total {
+        // 输出估算与 contextUsage 换算是两套口径，极端情况下前者可能超过后者；
+        // 下限 clamp 到 0（不是 1）——宁可少报，也不凭空造出 input token。
+        Some(total) => total.max(0).saturating_sub(output_tokens.max(0)).max(0),
+        None => fallback_input.max(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,46 +337,48 @@ mod tests {
     }
 
     #[test]
-    fn count_content_block_counts_tool_use_input() {
-        // tool_use 的参数在 input 里，旧实现完全漏数。
-        let block = json!({
-            "type": "tool_use",
-            "id": "toolu_1",
-            "name": "write_file",
-            "input": {"path": "/a/b.rs", "content": "fn main() { println!(\"hello world\"); }"}
-        });
-        assert!(count_content_block(&block) > 0);
+    fn input_tokens_excluding_output_subtracts_output_from_context_total() {
+        // 实测样本：contextUsage 换算 8404，本轮输出估算 1514。
+        assert_eq!(input_tokens_excluding_output(Some(8404), 25, 1514), 6890);
     }
 
     #[test]
-    fn count_content_block_counts_tool_result_string_and_array() {
-        let as_string = json!({
-            "type": "tool_result",
-            "tool_use_id": "toolu_1",
-            "content": "这是一整段被当作工具返回的文件内容 ".repeat(50)
-        });
-        let as_array = json!({
-            "type": "tool_result",
-            "tool_use_id": "toolu_1",
-            "content": [{"type": "text", "text": "同样长度的返回内容 ".repeat(50)}]
-        });
-        assert!(count_content_block(&as_string) > 0);
-        assert!(count_content_block(&as_array) > 0);
+    fn input_tokens_excluding_output_keeps_fallback_untouched() {
+        // 无 contextUsageEvent 时的回退值来自 count_all_tokens，只统计客户端
+        // 发来的 prompt，本就不含输出，再减会偏低，因此原样返回（仅做负值保护）。
+        assert_eq!(input_tokens_excluding_output(None, 25, 1514), 25);
+        assert_eq!(input_tokens_excluding_output(None, -3, 10), 0);
     }
 
     #[test]
-    fn tool_heavy_message_beats_text_only_estimate() {
-        // 回归：tool 密集消息的估算应显著高于只数 text 块的旧口径。
-        let long = "x".repeat(4000);
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: json!([
-                {"type": "text", "text": "run it"},
-                {"type": "tool_result", "tool_use_id": "t1", "content": long}
-            ]),
-        }];
+    fn input_tokens_excluding_output_clamps_when_output_estimate_exceeds_total() {
+        // 输出估算与 contextUsage 换算是两套口径，前者可能超过后者。
+        // 下限取 0（不是 1）：宁可少报，也不凭空造出 input token。
+        assert_eq!(input_tokens_excluding_output(Some(10), 25, 999), 0);
+        // 负的 output 不得反向放大 total。
+        assert_eq!(input_tokens_excluding_output(Some(10), 25, -5), 10);
+        // 负的 context_total 也 clamp 到 0。
+        assert_eq!(input_tokens_excluding_output(Some(-7), 25, 0), 0);
+    }
+
+    #[test]
+    fn fixresp_m4_local_count_includes_tool_blocks_and_images() {
+        let code = "import os\n".repeat(200);
+        let output = "line of tool output\n".repeat(300);
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan the work", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "run_code", "input": {"code": code}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": output}]},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}
+        ]))
+        .unwrap();
         let total = count_all_tokens_local(None, messages, None);
-        // 旧实现只会数到 "run it"（≈个位数 token）；补全后应远大于它。
-        assert!(total > 500, "tool_result 内容未被计入: total={}", total);
+        let floor = count_tokens("hi") + count_tokens(&code) + count_tokens(&output) + IMAGE_TOKEN_ESTIMATE;
+        assert!(total >= floor, "total={total} floor={floor}");
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Tags, Settings2 } from 'lucide-react'
 import {
@@ -44,7 +44,7 @@ const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'metadata', label: 'Metadata', icon: <Tags className="h-3.5 w-3.5" /> },
 ]
 
-export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
+function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
   const [activeTab, setActiveTab] = useState<TabKey>('general')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
@@ -65,6 +65,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
   const [sourceChannel, setSourceChannel] = useState('')
   const [rpmLimit, setRpmLimit] = useState('300')
   const [priority, setPriority] = useState('0')
+  const [loadFactor, setLoadFactor] = useState<number>(10)
   const [metadata, setMetadata] = useState<CredentialMetadata>({
     type: 'normal',
     saleStatus: 'not_for_sale',
@@ -101,6 +102,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     setSourceChannel('')
     setRpmLimit('300')
     setPriority('0')
+    setLoadFactor(10)
     setMetadata(metadataDefaults(metadataSchema))
   }
 
@@ -167,6 +169,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
         sourceChannel: sourceChannel.trim() || undefined,
         rpmLimit: parsedRpmLimit,
         priority: parsedPriority,
+        loadFactor: Number.isFinite(loadFactor) && loadFactor >= 1 ? loadFactor : 10,
         metadata,
       },
       {
@@ -213,7 +216,30 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
           ))}
         </nav>
 
-        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col min-h-0 flex-1"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck="false"
+        >
+          {/* 阻止浏览器与密码管理器自动填充账号密码 */}
+          <input
+            type="text"
+            name="prevent_autofill_user"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="off"
+          />
+          <input
+            type="password"
+            name="prevent_autofill_pwd"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="new-password"
+          />
+
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {activeTab === 'general' && (<>
             {/* 认证方式 */}
@@ -251,6 +277,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -268,6 +297,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -317,6 +349,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -330,6 +365,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -348,6 +386,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -360,6 +401,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={tokenEndpoint}
                     onChange={(e) => setTokenEndpoint(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                   <p className="text-xs text-muted-foreground">
                     仅允许 *.microsoftonline.com / .us / .cn 主机（https）
@@ -375,6 +419,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={issuerUrl}
                     onChange={(e) => setIssuerUrl(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -387,6 +434,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -403,6 +453,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={machineId}
                 onChange={(e) => setMachineId(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
@@ -420,6 +473,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
@@ -451,6 +507,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
@@ -494,6 +553,28 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
               </p>
             </div>
 
+            {/* 负载因子（均衡模式下的调度权重） */}
+            <div className="space-y-2">
+              <label htmlFor="loadFactor" className="text-sm font-medium">
+                负载因子（调度权重）
+              </label>
+              <Input
+                id="loadFactor"
+                type="number"
+                min="1"
+                placeholder="默认 10"
+                value={loadFactor}
+                onChange={(e) =>
+                  setLoadFactor(Math.max(1, parseInt(e.target.value, 10) || 10))
+                }
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。均衡负载模式下按该权重平滑轮询，数值越大被调度频次越高，默认为 10。
+              </p>
+            </div>
+
+
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
@@ -503,6 +584,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -511,6 +595,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
                 <Input
                   id="proxyPassword"
@@ -519,6 +606,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
@@ -555,3 +645,8 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     </Dialog>
   )
 }
+
+export const AddCredentialDialog = memo(function AddCredentialDialog(props: AddCredentialDialogProps) {
+  if (!props.open) return null
+  return <AddCredentialDialogInner {...props} />
+})

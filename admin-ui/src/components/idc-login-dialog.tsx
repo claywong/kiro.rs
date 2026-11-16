@@ -171,6 +171,9 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
                 placeholder="https://your-org.awsapps.com/start"
                 value={startUrl}
                 onChange={(e) => setStartUrl(e.target.value)}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
             </div>
             <div className="space-y-1.5">
@@ -198,6 +201,9 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
                 placeholder="https://view.awsapps.com/start"
                 value={startUrl}
                 onChange={(e) => setStartUrl(e.target.value)}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
             </div>
             <div className="space-y-1.5">
@@ -207,6 +213,9 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
                 placeholder="user@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
             </div>
           </div>

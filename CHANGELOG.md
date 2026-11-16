@@ -4,6 +4,696 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- 修复 #169：四个管理接口遵循运行时 apiDomain，kiro 使用 management 域；保留域内区域回退，不跨域回退。
+- 域切换及持久化失败回滚使模型缓存失效；兼容管理响应中的 null 数组。
+- 保留已存储的 Profile ARN；真实上游多账号/区域验证尚未执行。本修复不宣称解决 #170。
+
+## [0.9.9] - 2026-11-13
+
+主题：**Grok 4.7 的 500K 上下文与原生推理、历史 reasoning 安全回传，以及隔离的 PR 测试流水线**。本版汇总 `v0.9.8` 之后合并的 3 个 PR（#159、#166、#167），不包含仍未合并的 #165 强制禁用 thinking 配置。
+
+### 🧠 Grok 4.7 上下文与原生推理
+
+> 来源：[PR #159](https://github.com/ZyphrZero/kiro.rs/pull/159)，提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+- 将 `grok-4.7` 的上下文窗口从默认的 `200_000` 修正为 `500_000`，用于把上游 `ContextUsage` 百分比换算为 Token 数；README 同步列出窗口大小，模型 ID 继续原样透传。
+- 原生推理强度经 `additionalModelRequestFields.reasoning.effort` 下发，不发送 Grok schema 不接受的 `output_config`；覆盖 `low / medium / high / xhigh`。
+- 客户端指定 `max` 时映射为 `xhigh`，GPT-5.6 的 `max` 保持不变。`none` 沿用非 GPT 模型的 `high` 回退，不宣称 Grok 支持关闭推理。
+- PR 作者报告 `medium / xhigh` 实际请求成功、未经映射的 `max` 被上游拒绝。模型仍为 Experimental preview，可用性以账号与上游服务为准；未据此宣称完整 500K 输入已通过端到端验收。
+
+### 🔐 原生 reasoning 历史回传与安全降级
+
+> 来源：[PR #167](https://github.com/ZyphrZero/kiro.rs/pull/167)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)；方案讨论见 [#165](https://github.com/ZyphrZero/kiro.rs/pull/165)。
+
+- assistant 历史使用独立的 `reasoningContent` union，不再把 thinking 拼成普通正文中的标签。符合原有历史保留条件时，仅回传单个带非空、非占位签名的 thinking 块，或单个有效且解码后非空的 base64 redacted 块；签名与载荷原样保留。
+- 连续 assistant 消息中的多个推理块、无签名或占位签名、无效 redacted 数据保守省略，不选择性拼接签名片段；压缩用途不回传 reasoning，正文、工具与原有历史裁剪策略保留。
+- 请求实际下发原生 effort 时去掉重复的 thinking prompt；legacy 模型与 Opus 4.6 enabled 模式保留原有路径。
+- HTTP 400 明确返回 `THINKING_SIGNATURE_INVALID` 且仍有重试预算时，只移除 assistant 历史的 `reasoningContent` 后重试一次。保留当前输入、effort、工具与路由字段，重新执行端点转换，不把此错误作为凭据失效处理，也不增加原有重试总预算。普通签名错误、无相关历史或再次失败不触发该降级重试。
+- thinking 关闭时，流式与非流式响应均不再把原生推理伪装成普通 text 输出；只有推理、没有可见正文或工具输出的响应可以为空，不用推理内容兜底。
+- **验证边界：未使用真实 Kiro 凭据验证服务端对历史签名的接受行为。** 协议结构参考 AWS 官方实现；要求非空签名是本项目的保守策略，不是协议硬性要求。多块省略策略也不保证保留所有思考质量。
+
+### 🧪 隔离的 PR 检查
+
+> 来源：[PR #166](https://github.com/ZyphrZero/kiro.rs/pull/166)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)。
+
+- 新增 PR Checks，分别检验明确的 PR head 与对应合并版本，执行前端单元测试、类型检查与生产构建，以及 Rust tests、Clippy 和 release 构建。
+- 解析修订的任务不执行 PR 代码；测试任务不持久化 checkout 凭据，不使用发布 secrets、写权限、共享缓存或部署步骤。手动触发要求 PR 编号与完整 head SHA，拒绝过期请求。
+- #167 最终 head `7e79811` 及对应 merge 的 [CI 验证](https://github.com/ZyphrZero/kiro.rs/actions/runs/43273454556) 已通过；PR 记录为 Rust 1,220 通过、0 失败、2 ignored，前端 5 项通过，Clippy 仍有原有 warnings。合并提交 `1fa535b` 与该 head 代码树一致。这是合并前的验证记录，不替代发布准备提交自身的检查。
+
+### 🔧 发布维护
+
+- 发布工作流使用仓库内共用并发组，保留 `cancel-in-progress: false`，避免不同版本同时更新 Docker `latest`。该机制不保证排队版本顺序，发布入口仍需检查重复版本、未完成发布与目标提交。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@yeeyon](https://github.com/yeeyon) | [#159](https://github.com/ZyphrZero/kiro.rs/pull/159) |
+| [@ZyphrZero](https://github.com/ZyphrZero) | [#166](https://github.com/ZyphrZero/kiro.rs/pull/166)、[#167](https://github.com/ZyphrZero/kiro.rs/pull/167) |
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 统一为 `0.9.9`；没有新增依赖，无需手动迁移配置或用量日志。
+- Grok 客户端可继续指定 `max`，服务端会转换为 `xhigh`。关闭 thinking 的客户端应接受没有可见输出时的空响应，不再依赖推理转正文的旧兜底。
+- 本版没有新增 `disableThinkingModels` 配置，也不修复 0.9.8 已说明的在线更新器独立代理凭据百分号限制。
+- Docker 部署拉取 `0.9.9` 或 `latest` 后重建容器；仅重启旧容器不会更新二进制。不改写已发布的 `v0.9.8` 标签或产物。
+
+完整变更：[v0.9.8...v0.9.9](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.8...v0.9.9)。
+
+## [0.9.8] - 2026-11-07
+
+主题：**账号缓存用量与加权命中率、在线更新代理认证修复、通用 HTTP 客户端的代理密码百分号保真，以及缓存计量排查文档校正**。本版汇总 `v0.9.7` 之后合并的 4 个 PR。缓存指标来自现有用量记录，可能包含本地估算，不代表上游真实 KV cache 命中或积分折扣；在线更新器的独立代理凭据仍有下述百分号兼容边界。
+
+### 📊 账号缓存用量与加权命中率
+
+> 来源：[PR #154](https://github.com/ZyphrZero/kiro.rs/pull/154)，提交人：[@cyx0215](https://github.com/cyx0215)，感谢贡献。
+
+- 凭据卡片与紧凑列表新增可展开的缓存指标，展示普通输入、缓存写入、缓存读取 Token 和调用 / 失败次数；页面新增全部调用账号汇总及逐账号明细，共用近 24 小时、7 天、30 天选择。
+- 命中率按 `缓存读取 ÷（普通输入 + 缓存写入 + 缓存读取）` 计算，先合计 Token 再计算整体比例，不平均各账号百分比，也不把输出 Token 放入分母。
+- 区分无可用输入的 `—` 与确实零命中的 `0.0%`；极小和接近全命中的比例显示 `<0.1%` 与 `>99.9%`，避免舍入后误报完全未命中或完全命中。
+- 汇总不受凭据列表筛选结果为空影响，支持隐私模式、卡片 / 列表布局和键盘展开。全部组件共用一次统计查询，每 30 秒刷新；后台刷新失败保留上次数据并标记，首次失败或旧后端缺失缓存字段时明确显示不可用。
+- `/api/admin/stats/by-credential` 新增 `cacheCreationTokens` 与 `cacheReadTokens`，沿用已有时间窗、客户端 Key、分组和小时 / 天聚合。成功与失败用量记录继续计入；缺少上游用量的失败请求可能使用本地输入估算，从而拉低比例。
+- 补充后端缓存字段聚合、前端计算与格式边界测试，以及使用合成 API 数据的可选浏览器回归脚本；运行方式见 `admin-ui/scripts/README.md`。
+
+### 🔐 在线更新保留全局代理认证
+
+> 来源：[PR #152](https://github.com/ZyphrZero/kiro.rs/pull/152)，提交人：[@cyx0215](https://github.com/cyx0215)。
+
+- 在线更新的版本查询、GitHub 配额查询、发布包和校验和下载传递完整 `ProxyConfig`，不再只保留代理 URL 而丢失单独配置的用户名与密码，修复这类认证代理返回 CONNECT 407 的问题。
+- URL 内嵌认证继续保留；只有 `proxyUsername` 与 `proxyPassword` 同时设置时，才使用它们覆盖 URL 凭据。
+- 最新版本查询现在与配额和下载路径一致：配置全局代理时显式使用该代理，无法解析的代理 URL 返回错误，不静默直连；未配置全局代理时保留原有默认代理行为。
+- 增加回环代理回归，覆盖 HTTP CONNECT、SOCKS5 / SOCKS5H、认证优先级、服务入口与发布包 / 校验和请求。测试在代理握手阶段拒绝连接，不向外部转发，也不证明完整下载、二进制替换或重启链路已通过端到端验收。
+
+### 🔤 通用 HTTP 客户端保留代理凭据中的字面百分号
+
+> 来源：[PR #153](https://github.com/ZyphrZero/kiro.rs/pull/153)，提交人：[@cyx0215](https://github.com/cyx0215)。
+
+- 通用 HTTP 客户端对独立代理用户名与密码中的 `%` 做必要转义，避免锁定版本的 reqwest 在连接时把字面 `p%40ss` 错误解码成 `p@ss`；适用于该客户端的 HTTP(S) CONNECT 和 SOCKS 代理。
+- URL 内嵌凭据仍按 URL 规则解码一次。此前为绕过问题而在独立字段中预编码密码的用户，应改回真实字面值；不要把 URL 编码规则直接套用到独立字段。
+- **已知限制：本版在线更新器仍直接调用 `basic_auth`，尚未接入通用客户端的百分号转义辅助函数。** 更新器的独立用户名 / 密码含字面 `%xx` 时仍可能认证失败；此项不宣称已由 #152 或 #153 联合修复。相关部署升级前应核对凭据配置，不要把通用客户端修复理解为所有更新请求均已覆盖。
+
+### 📖 缓存计量排查说明校正
+
+> 来源：[PR #155](https://github.com/ZyphrZero/kiro.rs/pull/155)，提交人：[@cyx0215](https://github.com/cyx0215)。关联 [#113](https://github.com/ZyphrZero/kiro.rs/issues/113)、[#76](https://github.com/ZyphrZero/kiro.rs/issues/76)、[#44](https://github.com/ZyphrZero/kiro.rs/issues/44)。
+
+- README 对齐已包含于 `v0.9.7` 的派生会话种子逻辑：系统 Key 缺少可识别的 `metadata.user_id` 时会回退派生隔离种子，不能再把缺少该字段直接当作 `miss_no_seed` 原因。
+- 分开说明无有效 `cache_control` 断点、未写入匹配前缀、TTL 过期及容量不足等排查方向，并校正诊断计数示例。
+- 明确 CacheMeter 与 Redis 共享的是本地计量条目，不等于共享上游 KV cache，也不保证 Kiro credits 折扣；本项仅修正文档，不重复计入旧版功能，也不据此宣布相关报告者的 0% 现象已经解决。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@cyx0215](https://github.com/cyx0215) | [#152](https://github.com/ZyphrZero/kiro.rs/pull/152)、[#153](https://github.com/ZyphrZero/kiro.rs/pull/153)、[#154](https://github.com/ZyphrZero/kiro.rs/pull/154)、[#155](https://github.com/ZyphrZero/kiro.rs/pull/155) |
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.8`；前后端同步更新，以获得完整缓存字段与统计展示。没有新增依赖，也无需手动迁移配置或用量日志。
+- 缓存比例反映所选时间范围内已有用量记录，不回写上游缓存结果，不修改缓存计量机制或计费规则。统计按小时或天分桶，不能理解为逐请求精确滑动窗口。
+- 使用代理的部署请区分通用 HTTP 客户端与在线更新器的独立凭据百分号行为，具体边界见上文。
+- Docker 部署拉取 `0.9.8` 或 `latest` 后重建容器；仅重启旧容器不会更新二进制。独立新版本不改写已发布的 `v0.9.7` 标签或产物。
+
+完整变更：[v0.9.7...v0.9.8](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.7...v0.9.8)。
+
+## [0.9.7] - 2026-11-05
+
+主题：**客户端 Key 按有效调用次数计费、独立次数配额，以及成功请求结算与管理界面配套支持**。本版包含 `v0.9.6` 之后的 1 笔功能直接提交，没有新增合并 PR。旧 Key 默认继续按积分计费；新增有效调用统计从升级后开始累积，不根据历史鉴权放行次数推算。
+
+### 💳 可选择的客户端 Key 计费方式
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [有效调用次数计费 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 新增 `billingMode`（`credits` / `calls`）、`maxCalls` 和 `totalSuccessfulCalls`，持久化在与凭据文件同目录的 `client_api_keys.json`；旧数据缺少这些字段时使用积分模式、无次数上限和零有效调用数。
+- 按积分模式继续使用 `totalCredits / maxCredits`；按次数模式使用 `totalSuccessfulCalls / maxCalls`。只检查当前模式对应的上限，不叠加两种额度限制，Token、缓存用量和上游 credits 统计仍保留。
+- 次数上限留空或 `null` 表示不限制，`0` 表示立即禁止调用；达到上限时返回 HTTP 429 `rate_limit_error`，明确提示有效调用次数已用量和上限。
+- 两种模式都会累积升级后的成功请求数。切换模式或轮换 Key 保留统计，重置统计会清零有效调用数及原有用量，但保留计费方式和额度配置；系统 Key `id=0` 与普通 Key 均适用。
+
+### ✅ 在请求成功结算时计次
+
+> 来源：[成功请求结算与回归 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 普通 Messages、`/cc/v1/messages`、Chat Completions 和 Responses 的流式、非流式请求，在网关正常完成并成功结算后计 1 次；普通工具调用回复属于有效请求。
+- 鉴权失败、参数错误、上游错误、生成过程中断和取消不计有效调用；流式响应先返回 HTTP 200 不代表最终成功。模型列表查询、Token 计数等非生成接口不计有效调用。
+- 内部重试、多轮 WebSearch 与压缩恢复不会按内部轮次重复计费；压缩请求只有最终生成有效摘要才计 1 次，各轮 Token / credits 仍按原有用量路径记录。
+- 保留 `totalCalls` 的原始鉴权放行统计语义，管理端将其与「有效调用」分开展示，不能把旧的总调用量直接视作可计费成功次数。
+
+### 🖥️ 管理界面与 Admin API
+
+> 来源：[计费配置入口 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 「客户端 Key」的新建、编辑弹窗新增计费方式选择及对应额度输入；列表新增「有效调用」列，「计费 / 上限」列按当前模式显示积分或次数，并保留上游 credits 的查看信息。
+- 前端拒绝负数、非整数及超出 JavaScript 安全整数范围的次数上限，说明零额度、无限额度、切换保留统计与并发请求的边界。
+- `POST /api/admin/client-keys` 支持 `billingMode` 和 `maxCalls`；`PUT /api/admin/client-keys/{id}` 可更新计费配置，仅修改名称、描述或分组时不会改变现有计费方式。
+- 更新时提供 `billingMode` 而省略 `maxCalls`，或显式传入 `null`，均表示取消次数上限；单独提交数值 `maxCalls` 而没有 `billingMode` 返回 400。积分额度继续通过已有 `/max-credits` 接口管理。
+- 补充成功 / 失败 / 取消、配额拦截、模式切换、持久化重载、旧数据默认值、Key 轮换与统计重置、系统 Key、多轮搜索和压缩计次的回归测试；管理页面完成本地真实后台的创建、切换、清空上限和重启保持验证。
+
+### 🙏 本版贡献者
+
+| 贡献者 | 直接提交 |
+| --- | --- |
+| [@ZyphrZero](https://github.com/ZyphrZero) | 客户端 Key 有效调用计费 [`d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac) |
+
+本版没有新增合并 PR，以上直接提交不计入 PR 数量。
+
+### 🤝 Collaborators — 整合与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：整合计费模式、请求结算、Admin API 与管理界面，完成多协议回归和本地浏览器验收，维护升级说明与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.7`；前后端需同步更新，旧 Key 默认保持积分模式，无需手动改写数据文件。
+- 升级前建议备份 `client_api_keys.json`。新字段会在后续保存时落盘；回退到不支持次数计费的旧版本时，旧程序可能忽略并在写回时丢弃这些字段，不应把降级视为保留新计费配置的迁移方案。
+- 有效调用数从升级后的成功请求开始累积，历史 `totalCalls` 不会回填；切换到次数模式前请确认当前累计值，如需开始新的计费周期，按业务需要显式重置统计。
+- 配额在请求进入时检查，不预占在途请求额度；已放行的并发请求仍会结算，可能超过上限。此实现不是跨进程共享额度或严格并发硬限额，也不处理货币单价、订单或支付。
+- Docker 部署需拉取 `0.9.7` 或 `latest` 并重建容器；仅重启旧容器不会更新二进制。本次为独立新版本，不改写已发布的 `v0.9.6` 标签或产物。
+
+完整变更：[v0.9.6...v0.9.7](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.6...v0.9.7)。
+
+## [0.9.6] - 2026-11-05
+
+主题：**工具原生透传默认值、工具参数实时流式输出、管理端工具模式热切换、重复凭据治理，以及缓存与系统 Key 用量统计修复**。本版汇总 `v0.9.5` 之后合并的 1 个 PR 与 5 笔功能、修复和测试直接提交，覆盖 Issue #151 的重复凭据修复与 Issue #98 的流式回归验证。现有配置、凭据与用量日志格式保持兼容；请留意工具模式默认值、历史重复项的离线清理步骤，以及旧模式和结构化输出仍然存在的缓冲边界。
+
+### 🔧 工具兼容默认使用 raw
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [工具透传修复 `247bf16`](https://github.com/ZyphrZero/kiro.rs/commit/247bf16)。
+
+- `toolCompatibilityMode` 默认由 `claude-code` 改为 `raw`，保留客户端声明的工具名、描述、schema 和参数，不再给 raw 工具追加旧版 Write / Edit / Bash 说明或分块写入策略。
+- 已显式配置 `"toolCompatibilityMode": "claude-code"` 的部署保持原模式；旧模式继续提供 Claude Code 内置工具名、schema 与入参的双向映射，仅在确认需要该映射时使用。
+- raw 仍执行 Kiro 上游要求的工具名长度限制、描述长度限制与 JSON Schema 规范化，不是请求字节级透传，也不承诺上游接受任意 schema。
+
+### 🌊 工具参数增量输出与完整性校验
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [流式工具参数修复 `247bf16`](https://github.com/ZyphrZero/kiro.rs/commit/247bf16)。
+
+- 不需要参数改写的原生工具调用逐片发送 `input_json_delta`，不再等待完整 JSON 后才一次性返回参数；按 `tool_use_id` 隔离并行调用，并处理迟到工具名、空结束片段和长工具名还原。
+- 转发分片的同时累积并校验最终 JSON。非法 JSON、流截断、传输失败或工具参数输出途中发生拒答时，不发送让半截工具调用正常完成的标记；拒答使用 `permission_error` 终止，客户端应丢弃不完整参数，不执行工具。
+- 工具参数的本地输出 Token 估算按累计字符数计算，避免相同内容因为分片更多而被重复高估；上游精确用量仍优先使用。
+- 需要完整参数才能改写的旧兼容工具、从文本恢复的 `<invoke>` 调用仍在参数完整后发送；结构化输出继续按设计缓冲到结束。本次不保证消除模型长时间仅推理、上游未产生正文，或客户端自身显示缓冲造成的等待。
+- 补充并行工具、分片 JSON、旧模式改写、拒答、断流与用量估算回归，以及验证首片参数在上游结束前到达客户端的 HTTP/SSE 测试；另提供显式启用的真实 Kiro 诊断测试，不执行返回的工具、不持久化凭据，但会消耗上游额度。
+
+### 🖥️ 管理端工具模式热切换
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [前端切换入口 `5b597cd`](https://github.com/ZyphrZero/kiro.rs/commit/5b597cd)。
+
+- 在「系统设置 → 模型配置 → 工具兼容模式」新增 `raw（推荐）` 与 `claude-code（旧版兼容）` 按钮，显示当前生效模式、保存状态和失败原因；读取失败时禁用切换并提供重试，不用默认值冒充真实运行状态。
+- 新增需要 Admin API Key 的 `GET/PUT /api/admin/config/tool-compatibility`，更新请求体为 `{"mode":"raw"}` 或 `{"mode":"claude-code"}`；拒绝未知模式、缺失字段及额外字段。
+- 先成功写入 `config.json`，再发布到运行时；保存失败保留原模式，并串行化并发更新，避免持久化值与内存模式错位。切换后新请求立即生效，无需重启，已经开始的请求保持自己的模式快照。
+- 覆盖普通 Messages、`/cc`、Chat Completions、Responses 与压缩路径的模式读取，补充鉴权、配置校验、持久化失败、重启保持、并发发布和多协议流式/非流式回归测试。
+
+### 📊 全缓存覆盖时避免客户端重复统计输入
+
+> 来源：[PR #150](https://github.com/ZyphrZero/kiro.rs/pull/150)，提交人：[@XIUDENBENNY](https://github.com/XIUDENBENNY)，感谢贡献。关联 [Issue #111](https://github.com/ZyphrZero/kiro.rs/issues/111)。
+
+- 修复最深 `cache_control` 断点覆盖整个 prompt，或比例舍入使未缓存输入为 0 时，Claude Code 保留 `message_start` 非零估算值、再叠加缓存用量，导致上下文统计偏大与提前压缩的问题。
+- 在本地模拟分摊的总输入大于 0、算出的 `input_tokens` 为 0 时，保留 1 个 input Token，优先从 `cache_creation` 扣除，creation 为 0 时再从 `cache_read` 扣除；三个字段之和保持不变，总输入为 0 时仍全部为 0。
+- 不修改初始 `message_start`、缓存命中判定、发往上游的请求或 credits；共享分摊函数同时影响相关非流式、WebSearch 和本地统计字段。上游精确 usage 的 `input=0` 仍优先原样使用，因此不是对所有可能的零值合并情形的完整修复。
+
+### 🧾 系统客户端 Key 用量统计
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [系统 Key 统计修复 `cba46ea`](https://github.com/ZyphrZero/kiro.rs/commit/cba46ea)。
+
+- 移除成功请求结算中对客户端 Key `id=0` 的错误排除，修复由 `config.json` 的 `apiKey` 同步生成的系统 Key，其输入、输出、缓存读写 Token 和 credits 一直未累积到 Key 统计的问题。
+- 此问题与是否绑定分组无关，未绑定分组仍表示可以使用全部账号；补充系统 Key 与普通未分组 Key 在 Messages、`/cc`、Chat Completions、Responses 的流式和非流式、持久化重载回归。
+- 修复仅影响升级后的成功请求结算，不清零现有统计，也不自动回填此前漏记的历史用量。
+
+### 🔁 Chat Completions 真流式回归与文档校正
+
+> 对应：[Issue #98](https://github.com/ZyphrZero/kiro.rs/issues/98)，报告者：[@lifeibo](https://github.com/lifeibo)；本版验收与文档校正：[提交 `8df8af7`](https://github.com/ZyphrZero/kiro.rs/commit/8df8af7)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)。基础真流式链路已由既有提交 [`14f9b6c`](https://github.com/ZyphrZero/kiro.rs/commit/14f9b6c) 引入，并已包含在 `v0.9.2` 至 `v0.9.5`，不将旧修复重复算作新功能。
+
+- 使用真实 HTTP 连接与分阶段放行的上游验证：上游尚不允许继续生成或结束时，客户端已收到独立正文段落、工具调用名称和首片参数；完整正文不再等待结束后合成一个 SSE 内容帧。
+- 补充 UTF-8 / CRLF 跨分片解析、并行工具参数索引、最终 Token / credits、无需等待连接 EOF 的完成事件，以及损坏帧和断流不得输出正常 `[DONE]` 的回归；移除仅用于测试的旧整包合成 SSE 辅助函数，改为验证生产流式适配器。
+- 修正 README 仍将 OpenAI 端点描述为「合成 SSE」的过时说明，补充 `curl -N`、反向代理缓冲、上游推理阶段与 TCP 包数量不能等同于 SSE 分片数量的诊断边界。
+
+### 🧹 凭据重复注入与历史清理
+
+> 问题反馈：[Issue #151](https://github.com/ZyphrZero/kiro.rs/issues/151)，报告者：[@gujunxiang](https://github.com/gujunxiang)，感谢提供现象与排查线索。修复来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [`dbc2b05`](https://github.com/ZyphrZero/kiro.rs/commit/dbc2b05)。
+
+- 修复启动时无条件将 `KIRO_API_KEY` 追加到凭据池的路径：新分配 ID 后回写文件、下次启动再次追加，会持续产生同 Key、添加时间未知的副本。现在存在相同完整 Key 时沿用原记录，不覆盖其 ID、分组、代理、优先级或禁用状态；真正新增的环境 Key 会填写添加时间。
+- 增加离线 `--deduplicate-credentials` 预览；只有显式添加 `--apply-credential-dedup` 才清理历史重复项。按完整 API Key 或 refreshToken、区分认证类型去重，不按邮箱、余额或 Key 脱敏尾号判断。
+- 优先保留有使用记录的条目，再考虑合法添加时间、成功次数和稳定 ID；保留选中记录的完整配置与未知扩展字段，不合并权限分组、不伪造历史时间。写入前备份凭据及已有统计文件，原子替换失败时明确报错。
+- 通过 `.id-watermark` 侧车文件保留旧 ID 上界，防止清理高 ID 副本后新账号复用其历史身份；不重写或合并原统计、trace 和用量日志，旧记录仍按原 ID 归属。
+- 补充连续重启、原配置保护、添加时间、完整密钥匹配、只读预览、备份、写入失败、ID 保留，以及单条 / 并发批量导入重复校验回归。历史清理必须先停止所有共享文件的写入进程，升级不会自动删除历史记录。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@XIUDENBENNY](https://github.com/XIUDENBENNY) | [#150](https://github.com/ZyphrZero/kiro.rs/pull/150) |
+
+以上按 GitHub PR 作者列出；系统 Key 用量、工具流式修复、管理端模式切换、凭据重复修复与 Chat Completions 流式回归为直接提交，不计入 PR 数量。
+
+另感谢 [@gujunxiang](https://github.com/gujunxiang) 报告重复凭据问题并提供截图与复现线索，以及 [@lifeibo](https://github.com/lifeibo) 提供 Chat Completions 流式问题的最小复现与排查建议。
+
+### 🤝 Collaborators — 整合与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：完成系统 Key 统计修复、工具契约与流式参数修复、前端热切换、重复凭据治理与 Chat Completions 流式专项验证，审查并合并 PR #150，维护升级说明与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.6`，无需手动转换现有配置、凭据或用量日志。
+- 前后端应同步更新，并在升级二进制后重启服务；Docker 部署需重新拉取 `0.9.6` 或 `latest` 并重建容器，仅重启旧容器不会载入新版二进制。升级完成后，工具模式切换本身无需再次重启。
+- 未设置 `toolCompatibilityMode` 的配置升级后使用 `raw`；已显式设置 `claude-code` 的配置不会被覆盖，需要在新管理页面主动切换，或修改配置后重启。
+- 已有重复凭据需停服后先运行 `--deduplicate-credentials` 预览，再按需加 `--apply-credential-dedup` 清理；备份文件包含敏感信息，请限制访问，并随原凭据文件保留 `.id-watermark` 侧车文件。
+- 工具参数流式输出不等于工具已经完成；客户端必须处理错误事件，不执行未正常完成、校验失败或被拒答中断的工具调用。旧模式参数改写和结构化输出仍可能一次性返回。
+- 本版没有修复或取消上游 429 限流，也不保证所有客户端的普通正文都以相同方式实时显示；相关行为需要结合上游输出与客户端实现判断。
+
+完整变更：[v0.9.5...v0.9.6](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.5...v0.9.6)。
+
+## [0.9.5] - 2026-11-04
+
+主题：**凭据管理卡片优化、页面隐私防护、单账号请求活跃度统计、模型权限判定修正，以及前端构建工具迁移**。本版包含 `v0.9.4` 之后的 4 笔功能、修复与构建直接提交，没有新增合并 PR；现有配置、凭据与用量日志无需手动迁移。请留意隐私开关的保护范围、RPM 的统计口径，以及源码构建命令的变化。
+
+### 🖥️ 凭据卡片与信息布局
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [凭据管理优化 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)。
+
+- 重新整理凭据卡片的信息层级，将账号、订阅与认证方式、启停状态、调度优先级或权重、失败与成功次数集中展示，余额与额度进度放在卡片底部，便于对比多个账号。
+- 卡片网格按可用宽度自适应排列并保持等高，优化分组、来源、自定义备注、代理状态与添加时间的展示；保留紧凑列表、拖拽调度、优先级编辑及原有管理操作。
+
+### 🛡️ 凭据页面隐私防护
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [隐私开关 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)。
+
+- 凭据管理工具栏新增「隐私」开关，默认关闭，偏好保存在当前浏览器；开启后，卡片、列表及相关悬浮提示会遮蔽邮箱、API Key、代理地址、Profile ARN、分组、来源与自定义备注，搜索输入也切换为遮蔽显示。
+- 开启防护时关闭已打开的单账号编辑、重登、Token 导入与失败日志弹窗，并限制这些明文入口；需要查看或修改时先关闭防护。浏览器无法保存偏好时明确提示，当前页面的开关仍然生效。
+- 该功能仅做页面展示脱敏，不修改凭据原始数据、接口返回或导出内容，不替代管理端鉴权；其他页面和管理弹窗不在保护范围内。
+
+### 📊 今日请求数与实时 RPM
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [请求活跃度统计 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、[并发 RPM 计数修复 `a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)。
+
+- 新增 `GET /api/admin/stats/credential-activity`，按凭据批量返回 `todayCalls` 与 `rpm`；管理端卡片和列表每 5 秒刷新一次，不为每张卡片单独发起统计请求。
+- 统计沿用用量日志的请求完成口径，包含成功与失败，归属最终记录的凭据，不把同一次请求的内部重试重复计数；没有归属凭据的记录不计入单账号统计。
+- 「今日」按服务端本地日期计算，RPM 为最近 60 秒完成的请求数，与单账号 RPM 限流开关无关；长请求在结束后计入，窗口内无新增请求时 RPM 也会随时间归零，重启后从保留的用量日志重建。
+- 加载中、开发预览或查询失败时显示「—」，失败会展示原因并提供手动重试与后续定时刷新，不将失败伪装成零请求；补充时间窗口、跨日、乱序记录与日志重建回归测试。
+- 修复并发请求乱序写入时，较早取得时间戳的请求误删已写入的较新 RPM 记录的问题；清理窗口兼顾已记录的最新时间，保留窗口内的新记录，同时继续拒绝本次写入中的未来时间戳，并补充回归测试。
+
+### 🔧 模型权限以上游模型列表为准
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [模型筛选修复 `59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)。
+
+- 移除仅凭订阅名称包含 `FREE` 就排除 Opus 请求的硬编码规则，改为依据上游可用模型列表缓存判断；缓存明确不支持的模型仍会排除对应凭据，尚无明确缓存结论时保留尝试机会。
+- 优先级与均衡调度、当前凭据复用、账号冷却候选及自愈筛选使用一致的模型支持判断；修正限流故障转移中的剩余候选计数，不再把缓存已明确不支持模型的账号算作可用候选。
+- 分组隔离、禁用状态、本地 RPM 限制与上游账号冷却继续生效。此修复只移除本地错误推断，不授予额外模型权限，也不保证所有 Free 账号都能调用 Opus，实际可用性仍由上游决定。
+
+### 🛠️ 前端构建迁移到 pnpm
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [构建工具迁移 `4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261)。
+
+- 前端包管理器固定为 `pnpm@12.11.2`，以 `admin-ui/pnpm-lock.yaml` 替代 `bun.lock`；源码构建使用 `pnpm install --frozen-lockfile` 与 `pnpm run build`。
+- 常规构建、Release 工作流与 Docker 前端构建阶段同步切换到 Node.js 24 和 pnpm，项目声明的 Node.js 最低版本为 `22.12.0`；同步更新开发说明与未构建 Admin UI 时的错误提示。
+- 预编译二进制和发布镜像仍内嵌 Admin UI，使用这些产物的部署无需额外安装 Node.js 或 pnpm；多平台二进制、Docker 多架构镜像与校验文件的发布方式不变。
+
+### 🙏 本版贡献者
+
+| 贡献者 | 直接提交 |
+| --- | --- |
+| [@ZyphrZero](https://github.com/ZyphrZero) | 凭据管理与统计 [`2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、并发 RPM 修复 [`a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)、模型筛选 [`59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)、构建迁移 [`4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261) |
+
+本版没有新增合并 PR，以上直接提交不计入 PR 数量。
+
+### 🤝 Collaborators — 维护与发布
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：整合凭据管理、模型路由与构建调整，补充统计和调度回归测试，维护升级文档与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.5`，无需手动转换现有配置、凭据或用量日志。
+- 前后端应同步更新并重启后端，以提供新的请求活跃度接口；只更新管理端静态文件而保留旧后端会导致统计查询失败。
+- 隐私开关默认关闭且仅对当前浏览器生效，不能当作服务端数据脱敏或访问控制；截图、演示前仍应检查当前页面和弹窗是否包含敏感内容。
+- RPM 展示的是最近 60 秒已完成请求，不是请求进入速率或在途并发量；「今日」边界遵循服务端时区，可能与浏览器所在时区不同。
+- 从源码或自定义镜像构建时，请将原有 Bun 安装和构建命令改为 pnpm，并提交、使用新的锁文件；直接下载 Release 二进制或使用发布镜像的部署不受包管理器迁移影响。
+- 本次发布在纳入并发 RPM 修复后重新构建，`v0.9.5` 标签已更新。若在流水线重启前已获取该标签或拉取 `0.9.5` / `latest` 镜像，请以本次 Release 对应提交为准更新源码，或重新拉取镜像并重建容器；此前的镜像不含该修复，仅比较版本号无法识别这次更新。
+
+完整变更：[v0.9.4...v0.9.5](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.4...v0.9.5)。
+
+## [0.9.4] - 2026-11-02
+
+主题：**结构化输出与原生推理、会话和缓存兼容、流式响应修复、凭据调度与代理故障转移，以及管理端治理和额度告警**。本版汇总 `v0.9.3` 之后合并的 17 个 PR，并包含余额刷新、额度告警与整合修复的直接提交；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。请留意均衡调度策略、总超时默认值和无可用凭据时的响应变化。
+
+### ✨ 结构化输出与模型推理
+
+> 来源：[PR #128](https://github.com/ZyphrZero/kiro.rs/pull/128)，提交人：[@d0zingcat](https://github.com/d0zingcat)；[PR #129](https://github.com/ZyphrZero/kiro.rs/pull/129)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #149](https://github.com/ZyphrZero/kiro.rs/pull/149)，提交人：[@xxy94125-sketch](https://github.com/xxy94125-sketch)。感谢贡献。
+
+- `/v1/messages` 与 `/cc/v1/messages` 支持 `output_config.format = {"type":"json_schema","schema":{...}}`。Kiro 没有原生结构化输出字段，网关通过系统提示注入 schema，并从回复中提取最后一个符合所支持校验规则的 JSON；`format` 不转发上游，不带该字段的请求行为不变。
+- 非流式回复将正文整理为单个 JSON text 块，保留 thinking 与 tool_use；流式结构化输出在 `message_start` 后缓冲内容（包括 thinking）到结束再发送，首字耗时按实际发出内容计算。未找到合规 JSON 时原样返回并警告；纯 WebSearch 与混合 WebSearch 工具循环暂不应用结构化输出，并明确记录警告。
+- schema 校验和 JSON 提取设有复杂度边界，支持部分常用 JSON Schema 规则及本地 `$ref`，不是完整 JSON Schema 实现；不能作为上游原生严格结构化输出的等价保证。`count_tokens` 估算包含注入的 schema 指令。
+- 将 `claude-haiku-5.5` 纳入 1M 上下文估算与原生 reasoning 模型族，修复回退到 200K 后低估输入用量的问题；该窗口取值为项目估算，后续以上游公布为准。
+- 所有支持原生推理的 `-thinking` 模型统一使用 adaptive 模式，系统提示与上游 reasoning 字段保持一致；优先保留显式 `output_config.effort`，否则根据 `thinking.budget_tokens` 推导档位，避免强制写入固定 20,000 Token 预算。
+
+### 🔧 请求转换、会话与缓存兼容
+
+> 来源：[PR #135](https://github.com/ZyphrZero/kiro.rs/pull/135)、[PR #136](https://github.com/ZyphrZero/kiro.rs/pull/136)、[PR #137](https://github.com/ZyphrZero/kiro.rs/pull/137) 与 [PR #145](https://github.com/ZyphrZero/kiro.rs/pull/145)，提交人：[@leinasi2014](https://github.com/leinasi2014)；[PR #139](https://github.com/ZyphrZero/kiro.rs/pull/139)，提交人：[@bestK](https://github.com/bestK)。感谢贡献。另含 [@ZyphrZero](https://github.com/ZyphrZero) 的 prefill 计量修复（[提交 `7f965a9`](https://github.com/ZyphrZero/kiro.rs/commit/7f965a9)，关联 [Issue #101](https://github.com/ZyphrZero/kiro.rs/issues/101)）。
+
+- 合并末尾连续 user 消息，不再向历史中插入伪造的 assistant `OK`，避免模型把假回复当作已发生的对话。分块写入策略仅在声明相关写入工具时追加，不再给无关客户端注入写作限制。
+- 按模型语义处理历史 thinking，保留内容顺序；原位置的 system 消息转为 system-reminder，不再静默丢失。改进孤立工具调用与结果的配对、图片归属和 raw 模式工具参数处理。
+- `/v1/messages` 与 `/cc/v1/messages` 在请求体未提供会话标识时，从 `x-session-affinity`、`x-session-id` 等请求头补充；兼容 `session-<uuid>`，不覆盖客户端已有的 `metadata.user_id`。
+- 无显式会话时按系统提示和首条 user 消息派生稳定会话 ID，供粘性路由与主 Key 的模拟缓存隔离共用；纯字符串与等价 text 块写法保持一致，修复 pi-ai / DeepSeek Harness 多轮请求的会话漂移和缓存长期为 0。
+- Chat Completions 支持消息与内容块的 `cache_control` 断点，未显式禁用时默认启用自动缓存；顶层 `null`、`false` 或 `{"type":"none"}` 可禁用自动缓存。
+- 修复消息级断点的转换边界：纯工具调用的 assistant 消息保留断点，含正文与工具调用时断点落在完整消息末尾；system/developer 数组只在末尾补充消息级断点，不再复制到每个 text 块导致超出断点上限，显式块级设置优先。
+- 缓存指纹排除转换时被丢弃的 assistant prefill，将其断点转移到保留的前缀，避免对上游未收到的内容计量。以上为网关模拟缓存口径修复，不保证上游实际缓存命中或 credits 节省。
+
+### 🌊 流式响应、结束原因与错误结算
+
+> 来源：[PR #130](https://github.com/ZyphrZero/kiro.rs/pull/130)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #138](https://github.com/ZyphrZero/kiro.rs/pull/138)，提交人：[@leinasi2014](https://github.com/leinasi2014)。感谢贡献。
+
+- 纯 thinking 回复不再被强制标为 `max_tokens`，也不再补空白 text 块；优先使用上游 `MAX_TOKENS`、`STOP_SEQUENCE` 等结束原因，不覆盖拒答和已判定的上下文溢出。
+- 收紧从文本恢复 `<invoke>` 工具调用的条件：仅在没有原生工具调用、位于回复末尾且不在代码格式中、工具已声明、参数可按 schema 解析时转换，否则保留正文；流式、非流式和 WebSearch 共用规则。
+- 正文中的 `<thinking>`、未闭合 `<tool_use>` 与孤立 `<` 不再误吞或卡住后续文本；保留文本与工具调用顺序，流式遵循 `extractThinking` 设置。
+- 流中断按限流、过载、输入过长、权限等原因分类，非流式返回对应错误，不再把解析失败或重复熔断当作正常完成；统一相关路径的用量与 trace 收尾，本地 Token 估算补入工具、thinking 和图片。
+- `upstreamTotalTimeoutSecs` 默认由 `720` 改为 `0`：正常持续输出的长回复不再默认被 12 分钟总期限切断，静默仍受 `upstreamReadTimeoutSecs` 限制；已显式配置的总超时继续生效。
+
+### ⚖️ 凭据调度与限流可观测性
+
+> 来源：[PR #147](https://github.com/ZyphrZero/kiro.rs/pull/147) 与 [PR #141](https://github.com/ZyphrZero/kiro.rs/pull/141)，提交人：[@bestK](https://github.com/bestK)；[PR #148](https://github.com/ZyphrZero/kiro.rs/pull/148)，提交人：[@leinasi2014](https://github.com/leinasi2014)。感谢贡献。
+
+- `balanced` 从随机选号改为先避让在途并发，再在并发最少的候选中执行平滑加权轮询（SWRR）。凭据负载因子默认 `10`，管理端支持编辑与权重展示；流式与 MCP 请求在响应体生命周期内持有并发守卫。
+- 新增全局 `invertPriority` 开关，支持分组独立设置调度模式与优先级方向；默认仍为 `priority`，优先级数字小的优先，已有会话粘性规则保留。
+- 无可用凭据时返回 401 `authentication_error`，不写入对应的 Trace/Usage 记录；入口预检查保留自愈和请求校验逻辑，临时 RPM 冷却不会被误判成凭据耗尽。
+- 单账号本地 RPM 限流在日志与管理端中单独标为「本地限流」，仍返回 429 与 `Retry-After`；模型与 MCP 路径均与上游真实 429 区分，避免误把本地调度限制当作 Kiro 限流。
+
+### 🌐 代理自动探测、轮换与恢复
+
+> 来源：[PR #142](https://github.com/ZyphrZero/kiro.rs/pull/142)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。另含 [@ZyphrZero](https://github.com/ZyphrZero) 的恢复状态整合修复（[提交 `8dca7cf`](https://github.com/ZyphrZero/kiro.rs/commit/8dca7cf)）。
+
+- 自动发现凭据实际使用但未登记到池内的代理，健康探测支持认证；连续失败后自动禁用的代理恢复连通时可自动启用，手动禁用的条目不会被自动恢复。
+- 新增 `proxyAutoRotateEnabled`（默认 `true`）与 `proxyDirectFallbackEnabled`（默认 `false`）。不可用代理可轮换到池内可用代理；默认无可用代理时保留原配置，不擅自直连。
+- 显式允许直连回退后，临时直连会保留原代理及认证，原代理恢复或出现其它可用代理时自动切回；管理端展示临时直连状态。轮换跳过已禁用凭据，无可用代理的告警合并输出。
+- 新增代理故障转移设置与立即轮换接口，代理池弹窗展示自动检测、自动恢复与轮换结果；手动修改代理会清除自动分配状态，避免旧探测结果覆盖用户新配置。
+
+### 🛡️ 封禁治理与历史排查
+
+> 来源：[PR #146](https://github.com/ZyphrZero/kiro.rs/pull/146)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 封禁检测不再仅限 403，补充 `TEMPORARILY_SUSPENDED` 等上游文案，优先于普通鉴权失败和限流处理；支持 `suspendedBanKeywords` 自定义规则，大小写不敏感，并规范化、丢弃空关键词，避免空串误判所有账号。
+- 管理端新增封号排查弹窗，支持已禁用、全部或选中凭据范围的历史 trace 扫描与批量标记；排查失败明确报错，不伪装成未命中。
+- 控制台区分封禁与普通禁用的状态色、徽章和统计，设置页展示内置与自定义规则。历史排查依赖已保留的请求日志，不等价于对上游账号状态的实时验证。
+
+### 🖥️ 管理端分页与自定义响应头
+
+> 来源：[PR #144](https://github.com/ZyphrZero/kiro.rs/pull/144) 与 [PR #143](https://github.com/ZyphrZero/kiro.rs/pull/143)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 凭据、客户端 Key 与分组列表支持服务端分页、搜索和筛选，凭据与 Key 列表支持排序；不带查询参数时保留旧版全量接口。状态统计与分页结果分开，管理端修正页码越界，并安全处理跨页选择和批量操作。
+- 新增 `customHeaders` 与管理端网络设置编辑器，支持启停、热更新及 `{trace_id}`、`{request_id}`、`{model}`、`{key_id}`、`{group}`、`{credential_id}`、`{client_ip}` 变量；默认提供 `X-Oneapi-Request-Id` 与 `X-Request-Id`，便于 NewAPI / OneAPI 关联请求。
+- 自定义响应头覆盖 Anthropic、Chat Completions、Responses 与 WebSearch 的相关流式、非流式及错误路径；保存时校验名称、重复项、长度与 CRLF 注入，OpenAI 协议转换保留内层响应头。
+- 串行化自定义响应头的配置写盘与内存热更新，修复并发保存时两个请求都成功、实际规则却与重启后规则不一致的问题。
+
+### 📊 后台余额刷新与飞书额度告警
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交：[余额刷新间隔 `f62afef`](https://github.com/ZyphrZero/kiro.rs/commit/f62afef)（解决 [Issue #99](https://github.com/ZyphrZero/kiro.rs/issues/99)）、[额度阈值告警 `22cbee6`](https://github.com/ZyphrZero/kiro.rs/commit/22cbee6)（解决 [Issue #140](https://github.com/ZyphrZero/kiro.rs/issues/140)）。
+
+- 新增 `balanceRefreshIntervalSecs`，默认每轮后台余额刷新完成后等待 `300` 秒再开始下一轮；`0` 完全关闭该任务，包括启动首次刷新和由其执行的月度额度恢复检查，面板/API 按需查询仍可使用。
+- 支持环境变量 `KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS`，优先级为配置文件显式值、环境变量、默认值；无效值报错，修改后需重启。间隔不包含每轮刷新耗时，余额缓存 TTL 不随之改变。
+- 管理端新增「额度告警」，单账号与账号池模式分别启用，默认均关闭，阈值默认 `80 / 90 / 100`；仅计算有效 CREDIT 额度，不计超额付费额度，已禁用账号不参与。数据不完整时暂停整体判断，正常账号仍可触发单账号告警。
+- 飞书发送由独立后台任务执行，支持单账号按额度周期与阈值去重、账号池跨阈值告警和冷却；只有 HTTP 与飞书业务结果均成功才确认发送，失败保留后续重试机会，去重状态跨重启保存。
+- 渠道使用 `KIRO_RS_FEISHU_WEBHOOK` 与可选的 `KIRO_RS_FEISHU_SECRET`，或通过面板仅保存在内存中；敏感值不回显、不写入配置或数据库。仅接受飞书 / Lark 官方 HTTPS 地址，拒绝重定向。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@bestK](https://github.com/bestK) | [#139](https://github.com/ZyphrZero/kiro.rs/pull/139)、[#141](https://github.com/ZyphrZero/kiro.rs/pull/141)、[#142](https://github.com/ZyphrZero/kiro.rs/pull/142)、[#143](https://github.com/ZyphrZero/kiro.rs/pull/143)、[#144](https://github.com/ZyphrZero/kiro.rs/pull/144)、[#146](https://github.com/ZyphrZero/kiro.rs/pull/146)、[#147](https://github.com/ZyphrZero/kiro.rs/pull/147) |
+| [@leinasi2014](https://github.com/leinasi2014) | [#135](https://github.com/ZyphrZero/kiro.rs/pull/135)、[#136](https://github.com/ZyphrZero/kiro.rs/pull/136)、[#137](https://github.com/ZyphrZero/kiro.rs/pull/137)、[#138](https://github.com/ZyphrZero/kiro.rs/pull/138)、[#145](https://github.com/ZyphrZero/kiro.rs/pull/145)、[#148](https://github.com/ZyphrZero/kiro.rs/pull/148) |
+| [@ayakolin](https://github.com/ayakolin) | [#129](https://github.com/ZyphrZero/kiro.rs/pull/129)、[#130](https://github.com/ZyphrZero/kiro.rs/pull/130) |
+| [@d0zingcat](https://github.com/d0zingcat) | [#128](https://github.com/ZyphrZero/kiro.rs/pull/128) |
+| [@xxy94125-sketch](https://github.com/xxy94125-sketch) | [#149](https://github.com/ZyphrZero/kiro.rs/pull/149) |
+
+以上按 GitHub PR 作者列出；余额刷新间隔、额度告警、prefill 计量与整合修复为直接提交，不计入 PR 数量。
+
+### 🤝 Collaborators — PR 合并与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：合并本版 17 个 PR，补充结构化输出校验边界、错误结算、认证代理探测、跨页操作与并发生命周期等整合修复，并实现余额刷新间隔、额度阈值告警及 prefill 缓存计量修复。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.4`，无需手动转换现有配置、凭据、客户端 Key 或请求日志数据库。
+- 默认 `priority` 调度及优先级方向不变；已使用 `balanced` 的部署将从随机选号切换为并发避让与加权轮询，负载因子只在并发最少的候选集中参与分配，不代表任意负载下都严格按权重比例分流。
+- 未配置 `upstreamTotalTimeoutSecs` 时默认取消总时长上限；希望保留旧版 12 分钟限制的部署可显式设为 `720`，读超时仍独立生效。
+- 代理自动发现与轮换默认开启，直连回退默认关闭；对固定出口有严格要求的部署应检查 `proxyAutoRotateEnabled`，不要在未评估出口暴露风险时开启 `proxyDirectFallbackEnabled`。
+- 额度告警默认关闭；启用后需持久化凭据目录中的 `quota_alerts.db` 及 SQLite 边车文件。多副本仅指定一个通知实例，其它实例设置 `KIRO_RS_QUOTA_ALERT_NOTIFIER=false`，不要让多个通知实例共用同一状态文件。
+- `balanceRefreshIntervalSecs=0` 会同时停止后台余额刷新、月度额度恢复检查与自动额度告警；面板/API 按需查询和告警测试发送不受影响。告警不能保证 exactly-once，超时或落盘前崩溃可能重复投递。
+- 无可用凭据现在返回 401 而非笼统上游错误；客户端应区分凭据池不可用与 429 限流，不要仅凭状态码判断客户端 Key 已失效。
+- 多人共用主 Key 且不传会话 ID 时，相同系统提示和首条 user 消息会派生相同会话标识，共用模拟缓存；需要严格区分会话时应提供显式会话标识。系统提示包装格式调整也可能使升级后的首次请求无法复用旧上游缓存。
+
+完整变更：[v0.9.3...v0.9.4](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.3...v0.9.4)。
+
+## [0.9.3] - 2026-10-26
+
+主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。
+
+### 🌐 全局代理热更新
+
+> 来源：[PR #120](https://github.com/ZyphrZero/kiro.rs/pull/120)。提交人：[@cyx0215](https://github.com/cyx0215)，感谢贡献。
+
+- 修复管理端修改全局代理后，模型生成和 MCP（WebSearch）请求仍使用启动时代理的问题；代理地址、用户名或密码的修改，以及启用、清除代理，均在下一次请求或重试时生效，无需重启服务。
+- 切换代理时释放旧全局代理的连接池缓存引用，保留缓存容量上限；已开始的响应继续完成，账号专属代理与显式直连仍优先于全局代理。
+- 热更新范围为模型生成和 MCP 请求；后台版本刷新与外部 `count_tokens` 仍使用启动时代理，修改后需要重启才能对这两条路径生效。
+
+### 🔧 模型过载仅影响当前请求
+
+> 来源：[PR #125](https://github.com/ZyphrZero/kiro.rs/pull/125)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- 移除跨请求的模型级冷却，修复单次上游 `MODEL_TEMPORARILY_UNAVAILABLE` 导致冷却期内同模型的其他请求未经上游便直接返回 503 的问题；后续请求正常尝试上游。
+- 保留单次请求的快速失败行为：模型过载时返回 503 `overloaded_error` 与 `Retry-After`，不在网关内连续重试三次；客户端仍应遵循 `Retry-After` 重试。
+
+### 📊 Sonnet 5.5 上下文计量
+
+> 来源：[PR #126](https://github.com/ZyphrZero/kiro.rs/pull/126)。提交人：[@d0zingcat](https://github.com/d0zingcat)，感谢贡献。
+
+- 将 `claude-sonnet-5.5` 及映射到该模型的 `claude-sonnet-5-5` 等别名纳入 1M 上下文窗口估算，修复此前回退到 200K、按上游上下文占比换算时将输入 Token 低估约 5 倍的问题。
+- 上下文进度、自动压缩判断与基于 Token 的用量统计使用修正后的估算；1M 取值来自本项目测试推断，后续以上游公布的窗口为准。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@cyx0215](https://github.com/cyx0215) | [#120](https://github.com/ZyphrZero/kiro.rs/pull/120) |
+| [@childe](https://github.com/childe) | [#125](https://github.com/ZyphrZero/kiro.rs/pull/125) |
+| [@d0zingcat](https://github.com/d0zingcat) | [#126](https://github.com/ZyphrZero/kiro.rs/pull/126) |
+
+以上按 GitHub PR 作者列出。感谢 [@childe](https://github.com/childe) 合并 PR #120、#125，以及 [@ZyphrZero](https://github.com/ZyphrZero) 合并 PR #126。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.3`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- 模型级过载冷却已移除，客户端可能更快再次访问上游；请继续按服务端返回的 `Retry-After` 安排重试。
+
+完整变更：[v0.9.2...v0.9.3](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.2...v0.9.3)。
+
+## [0.9.2] - 2026-10-18
+
+主题：**流式首字延迟与上游超时、上游域名切换、Codex / WebSearch 缓存与费用计量，以及内容过滤拒答透传**。本版汇总 `v0.9.1` 之后合并的 8 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
+
+### ⚡ 流式首字延迟与上游超时
+
+> 来源：[PR #110](https://github.com/ZyphrZero/kiro.rs/pull/110)，提交人：[@yeeyon](https://github.com/yeeyon)；[PR #117](https://github.com/ZyphrZero/kiro.rs/pull/117)，提交人：[@childe](https://github.com/childe)。感谢贡献。
+
+- `/cc/v1/messages` 与 `/v1/chat/completions` 改为边收边发，不再等上游生成完毕才输出；Chat Completions 增量转换文本、分片工具参数和最终用量。CC 的初始用量为估算值，最终 `message_delta` 给出上游用量，客户端应以最终用量为准。
+- 去掉强制的 `Connection: close`，复用上游连接；本地对照测试中首个内容 P50 从约 235 ms 降到约 31 ms，总完成时间不变。网关只去掉了缓冲，不会加快上游模型生成。复现方法见 `docs/gateway-performance.md`。
+- 新增 `upstreamConnectTimeoutSecs`（默认 `15`）与 `upstreamReadTimeoutSecs`（默认 `120`）。读超时限制上游静默时长，有数据到达即重置，不限制正在输出的回答；等待响应头或读取错误体超时返回 504，不再重复等待。
+- 新增 `upstreamTotalTimeoutSecs`（默认 `720`，即原来写死的值）。活跃流不会重置该期限，因此它同时是单轮回答的时长上限：长 agentic 轮次在 12 分钟被截断时可调大，设为 `0` 则取消上限，仅依赖读超时。
+- 上游精确返回 `MODEL_TEMPORARILY_UNAVAILABLE` 时直接返回 503 与 `Retry-After`，不再内部重试三次后返回笼统的 502；该模型短暂冷却（默认 5 秒，优先采用上游 `Retry-After`），其他模型不受影响。
+- 非流式响应逐帧解码，修复完整响应超过 16 MB 解码缓冲时返回空成功的问题；空响应体、损坏或截断的帧、上游错误事件与连接中断都明确报错，不再当作正常完成。
+- trace 首字耗时从首个文本、思考或工具调用开始计算，不再把上游元数据计为首字。
+
+### 🌐 上游域名切换与 BuilderID 延迟优化
+
+> 来源：[PR #122](https://github.com/ZyphrZero/kiro.rs/pull/122)。提交人：[@XIUDENBENNY](https://github.com/XIUDENBENNY)，感谢贡献。
+
+- 新增 `apiDomain`：`amazonaws`（默认，`q.{region}.amazonaws.com`）或 `kiro`（`runtime.{region}.kiro.dev`，新版 Kiro IDE / CLI 使用的域名），作用于对话与 MCP（WebSearch）请求；Token 刷新、用量查询等 REST 接口不受影响。
+- 管理端「调度设置 → 上游域名」与 `GET` / `PUT /api/admin/config/api-domain` 可在运行时切换，立即生效并写回 `config.json`，写盘失败时回滚内存状态。
+- BuilderID 账号查询 profile 遇到「AWS Builder ID is not supported」403 时直接按无 Enterprise profile 处理，不再每次请求串行查询两个区域，降低首字延迟。
+- `web_search_tool_result` 补充 `tool_use_id`，兼容 Claude Code Desktop、AI SDK 等严格解析 Anthropic 格式的客户端。
+- 每个请求在日志中记录 thinking 类型、预算，以及客户端请求与实际发给上游的强度，便于核对 effort 设置。
+- 新增 `tools/kiro-tray`：Windows 系统托盘管理器，后台无窗口运行 kiro-rs，提供状态图标、崩溃自动重启、日志滚动与开机自启；用 Windows 自带的 `csc.exe` 编译，使用方法见 `tools/kiro-tray/README.md`。Release 产物暂不包含托盘程序，需要自行编译。
+
+### 📊 缓存计量与 WebSearch 费用
+
+> 来源：[PR #112](https://github.com/ZyphrZero/kiro.rs/pull/112) 与 [PR #115](https://github.com/ZyphrZero/kiro.rs/pull/115)，提交人：[@childe](https://github.com/childe)；[PR #116](https://github.com/ZyphrZero/kiro.rs/pull/116)，提交人：[@hyzhengdl](https://github.com/hyzhengdl)。感谢贡献。
+
+- 识别 OpenAI / Codex 形如 `session_<uuid>` 的会话标识（同时兼容 Claude Code 的 `..._session_<uuid>`），修复 Codex 请求退回 Key 粒度隔离、共享主 Key 时完全不模拟缓存的问题；JSON 中 `session_id` 为空时不再误判为会话。
+- Responses 请求在能解析出合法会话时启用模拟缓存计量，修复 Codex 经 `/v1/responses` 访问时缓存读写长期为 0。
+- WebSearch 多轮 agentic loop 逐轮计量缓存；最终响应的 `credit_usage` 改为所有轮次的累计费用，不再只返回最后一轮，与管理端统计一致。
+- 管理端缓存命中率改为 `cache_read / (input + cache_creation + cache_read)`，修复工具续轮时命中率被误显示为 100%。
+- 新增 `cacheMeteringCapacity`，默认容量从 `4096` 提高到 `262144`，修复共享部署在约 3.4 req/s 以上时缓存命中因容量不足而无声衰减；淘汰改为 O(n) 水位清理。容量选型公式见 README「计量容量选型」。
+- 新增 `cacheMeteringPersistEnabled`（默认 `false`）、`cacheMeteringFlushIntervalSecs`（默认 `300`）与 `cacheMeteringMissDiagnostics`（默认 `true`），以及 hit / miss 归因统计和对应的管理端接口。
+
+### 🔧 会话兼容与内容过滤
+
+> 来源：[PR #114](https://github.com/ZyphrZero/kiro.rs/pull/114)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #123](https://github.com/ZyphrZero/kiro.rs/pull/123)，提交人：[@beiqi7](https://github.com/beiqi7)。感谢贡献。
+
+- 历史中包含 Claude Code `Read` 调用的 `pages` 字段时不再返回 400（`工具映射不支持: Claude Code Read.pages has no Kiro read_file equivalent`）。该字段没有 Kiro `read_file` 对应项，且只出现在客户端无法修改的历史回放中，现改为丢弃。
+- 透传上游内容过滤拒答：Kiro 以 `metadataEvent.stopReason = CONTENT_FILTERED` 结束对话时，原先被当作正常的空回答（`end_turn`，或上下文用量满时的 `model_context_window_exceeded`），导致客户端反复重发同一段被拦截的历史。现在 `/v1/messages` 与 `/cc/v1/messages` 返回 `stop_reason: "refusal"`，Chat Completions 返回 `finish_reason: "content_filter"`，Responses 返回 `incomplete_details.reason: "content_filter"`，压缩请求返回 `content_filter` 失败，并在日志中记录上游类别与说明。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@childe](https://github.com/childe) | [#112](https://github.com/ZyphrZero/kiro.rs/pull/112)、[#115](https://github.com/ZyphrZero/kiro.rs/pull/115)、[#117](https://github.com/ZyphrZero/kiro.rs/pull/117) |
+| [@yeeyon](https://github.com/yeeyon) | [#110](https://github.com/ZyphrZero/kiro.rs/pull/110) |
+| [@ayakolin](https://github.com/ayakolin) | [#114](https://github.com/ZyphrZero/kiro.rs/pull/114) |
+| [@hyzhengdl](https://github.com/hyzhengdl) | [#116](https://github.com/ZyphrZero/kiro.rs/pull/116) |
+| [@XIUDENBENNY](https://github.com/XIUDENBENNY) | [#122](https://github.com/ZyphrZero/kiro.rs/pull/122) |
+| [@beiqi7](https://github.com/beiqi7) | [#123](https://github.com/ZyphrZero/kiro.rs/pull/123) |
+
+以上按 GitHub PR 作者列出。
+
+### 🤝 Collaborators — PR 合并与维护
+
+- [@childe](https://github.com/childe)：合并 PR #110、#112、#114–#117，协助整合社区改动。
+- [@ZyphrZero](https://github.com/ZyphrZero)：合并 PR #122 与 #123。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.2`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- `apiDomain` 默认 `amazonaws`，保持原有上游域名；`upstreamTotalTimeoutSecs` 默认 `720`，与原来写死的值一致。
+- `cacheMeteringPersistEnabled` 默认 `false`：升级后默认不再读写 `cache_metering.json`，重启后模拟缓存从空开始；需要保留时显式设为 `true`。
+- 默认计量容量提高到 `262144`，内存占用约 16–24 MB；内存受限的部署可通过 `cacheMeteringCapacity` 调小。
+- 模型过载现在会立即返回 503 与 `Retry-After`，不再隐藏在三次内部重试之后：客户端等待更短，但可能更早看到失败，请按 `Retry-After` 重试。
+
+完整变更：[v0.9.1...v0.9.2](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.1...v0.9.2)。
+
+## [0.9.1] - 2026-10-08
+
+主题：**凭据调度与额度恢复、账号级 429 故障转移、Codex 压缩缓存复用，以及模型上下文、Token 计量和流式链路修复**。本版汇总 `v0.9.0` 之后合并的 9 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
+
+### ✨ 凭据调度与月度额度恢复
+
+> 来源：[PR #107](https://github.com/ZyphrZero/kiro.rs/pull/107) 与 [PR #109](https://github.com/ZyphrZero/kiro.rs/pull/109)。提交人：[@childe](https://github.com/childe)，感谢贡献。PR #107 的原始提交作者为 [@hyzhengdl](https://github.com/hyzhengdl)。
+
+- `balanced` 模式在可用凭据中均匀随机选号，修复未知模型缓存凭据长期得不到流量、新凭据追平历史成功次数期间独占流量，以及持续失败凭据反复困住请求的问题。
+- 会话粘性命中时仍沿用绑定凭据；未命中时才随机选号。`priority` 模式及禁用、冷却、RPM、分组和模型支持筛选规则保持原有行为。
+- 单条添加、批量导入和登录新增凭据后，后台立即拉取模型列表并更新缓存，不阻塞添加操作；复用单飞锁、并发上限与删除后的结果校验，减少新凭据被分配不支持模型的请求。
+- 新增 `quotaResetRecoveryEnabled` 与管理端「月度额度恢复」开关，默认关闭；支持 `GET` / `PUT /api/admin/config/quota-reset-recovery`，运行时修改会持久化，写盘失败时回滚内存状态。
+- 开启后按凭据自己的 `nextResetAt` 复查额度，仅在订阅剩余额度恢复为正数时重新启用 `QuotaExceeded` 凭据，并清零失败计数、限流冷却和自愈连续轮数；手动禁用、封禁和 Token 失效等状态不受影响。
+
+### 🔧 上游 429 处理与 Codex 压缩缓存复用
+
+> 来源：[PR #102](https://github.com/ZyphrZero/kiro.rs/pull/102)。提交人：[@lijmyeah](https://github.com/lijmyeah)，感谢贡献。
+
+- 区分账号级与容量类模型 API 429：`USER_REQUEST_RATE_EXCEEDED`、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED` 等账号级限流在故障转移开启时冷却当前凭据并尝试其他可用凭据。
+- `INSUFFICIENT_MODEL_CAPACITY`、`MODEL_TEMPORARILY_UNAVAILABLE` 等容量类 429 保持当前凭据退避重试；新增 `modelApi429RetryEnabled` 配置与管理端独立开关，默认开启，关闭后首次容量类 429 即返回客户端。
+- 账号级 429 仍由现有故障转移开关控制；无法转移时返回上游 `Retry-After` 或本地冷却时间，便于客户端安排重试。
+- Codex Responses compact 请求尽量保留普通请求的 system、工具定义和历史结构，把摘要指令放在末尾用户轮次，提高缓存前缀复用机会；实际命中与 credits 消耗仍取决于上游。
+- 仅在压缩响应意外返回工具调用时，使用不可执行的历史工具占位方案重试，保留工具调用与结果配对并累计尝试用量；保留上下文溢出时限量历史工具输出的重试路径。
+- 新增 `scripts/probe_compaction_cache.sh`，用于对照普通请求与 compact 请求的用量和缓存表现。
+
+### 📊 模型上下文与 Token 计量
+
+> 来源：[PR #102](https://github.com/ZyphrZero/kiro.rs/pull/102)，提交人：[@lijmyeah](https://github.com/lijmyeah)；[PR #105](https://github.com/ZyphrZero/kiro.rs/pull/105) 与 [PR #106](https://github.com/ZyphrZero/kiro.rs/pull/106)，提交人：[@childe](https://github.com/childe)。感谢贡献。
+
+- 将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的上下文窗口估算调整为 1M，其他 GPT 模型沿用原有估算。
+- 支持 Claude Opus 5.5 及其别名、后缀形式，纳入 1M 上下文模型族，修正上下文进度与自动压缩时机。
+- 修复 `contextUsageEvent` 回退计量把本轮输出重复计入 `input_tokens`：流式、非流式和多轮 WebSearch 在缓存分摊前逐轮扣除输出，极端情况下下限为零。
+- 没有上下文用量事件时保留原有输入估算；上游精确 Token 用量仍优先采用。Chat Completions、Responses、Admin 统计和 trace 同步获得修正后的用量，credits 计费继续使用上游 metering 数据。
+
+### 🔧 流式工具调用、反向代理与中断追踪
+
+> 来源：[PR #103](https://github.com/ZyphrZero/kiro.rs/pull/103)、[PR #104](https://github.com/ZyphrZero/kiro.rs/pull/104) 与 [PR #108](https://github.com/ZyphrZero/kiro.rs/pull/108)。提交人：[@childe](https://github.com/childe)，原始提交作者：[@hyzhengdl](https://github.com/hyzhengdl)。感谢贡献。
+
+- 上游结束时，参数缓冲为空的无参工具调用按 `{}` 还原，覆盖流式与非流式路径；非空但截断的 JSON 仍报错，避免把不完整调用误当成功。
+- 所有 SSE 响应增加 `x-accel-buffering: no`，提示支持该响应头的反向代理关闭缓冲，改善流式事件交付。
+- 记录上游响应头到达前被取消的请求，trace 状态为 `interrupted`、错误类型为 `abandoned_before_headers`；响应头已到达后的中断继续使用 `stream_interrupted`，管理端支持展示和筛选。
+- 请求 trace 收尾改为幂等；`/cc/v1/messages` 缓冲期间客户端断开时，按已观测的用量快照完成记账和追踪，避免漏记或重复入账。
+- 中断类型只描述响应头是否到达，不推断客户端超时、网关超时或用户取消的具体原因，排查时需结合耗时与下游日志。
+
+### 🔧 Enterprise / IdC 凭据区域兼容
+
+> 来源：[PR #95](https://github.com/ZyphrZero/kiro.rs/pull/95)。提交人：[@gujunxiang](https://github.com/gujunxiang)，感谢贡献。修复 [Issue #93](https://github.com/ZyphrZero/kiro.rs/issues/93)。
+
+- 未显式设置凭据 `apiRegion` 时，优先使用真实 CodeWhisperer `profileArn` 中的区域，避免 Enterprise / IdC 数据面请求访问错误端点。
+- API 区域优先级为 `credential.apiRegion → profileArn region → credential.region → config.apiRegion → config.region`；占位 ARN、缺失或格式异常的 ARN 不参与区域推断。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@childe](https://github.com/childe) | [#103](https://github.com/ZyphrZero/kiro.rs/pull/103)、[#104](https://github.com/ZyphrZero/kiro.rs/pull/104)、[#105](https://github.com/ZyphrZero/kiro.rs/pull/105)、[#106](https://github.com/ZyphrZero/kiro.rs/pull/106)、[#107](https://github.com/ZyphrZero/kiro.rs/pull/107)、[#108](https://github.com/ZyphrZero/kiro.rs/pull/108)、[#109](https://github.com/ZyphrZero/kiro.rs/pull/109) |
+| [@gujunxiang](https://github.com/gujunxiang) | [#95](https://github.com/ZyphrZero/kiro.rs/pull/95) |
+| [@lijmyeah](https://github.com/lijmyeah) | [#102](https://github.com/ZyphrZero/kiro.rs/pull/102) |
+
+以上按 GitHub PR 作者列出；另感谢 [@hyzhengdl](https://github.com/hyzhengdl) 的原始代码贡献。
+
+### 🤝 Collaborators — PR 合并与维护
+
+感谢协助合并本版 PR 的 Collaborators 开发者：
+
+- [@childe](https://github.com/childe)：合并本版 PR #102–#109，协助整合社区改动。
+- [@stormrise](https://github.com/stormrise)：合并 [PR #95](https://github.com/ZyphrZero/kiro.rs/pull/95)，推进凭据区域兼容修复。
+
+同时感谢仓库的其他 Collaborators [@bestK](https://github.com/bestK)、[@yeeyon](https://github.com/yeeyon)、[@zhuinfra](https://github.com/zhuinfra) 的支持。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.1`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- `quotaResetRecoveryEnabled` 默认 `false`，需主动开启；`modelApi429RetryEnabled` 默认 `true`，延续容量类 429 自动重试行为。
+- `balanced` 的分配依据从历史成功次数调整为随机选择；会话粘性优先，短时间或少量请求的分布不保证完全均匀。
+- 新凭据的模型缓存预热完成前仍可能收到不支持模型的 400；预热失败时保持 Unknown，需通过模型发现、管理端刷新或重启再次触发。
+
+完整变更：[v0.9.0...v0.9.1](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.0...v0.9.1)。
+
+## [0.9.0] - 2026-09-17
+
+主题：**控制台主题与表格体验、Prompt Cache 计量与会话粘性路由、Codex 远程上下文压缩，以及凭据区域兼容性修复**。本版汇总 `v0.8.0` 之后的变更；新增配置提供默认值，请求日志数据库在启动时自动补齐新增字段。
+
+### 🎨 Admin UI — 主题、布局与操作体验
+
+> 来源：[PR #86](https://github.com/ZyphrZero/kiro.rs/pull/86)、[PR #89](https://github.com/ZyphrZero/kiro.rs/pull/89) 与 [PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。后续主题、表格可用性与移动端调整由 [@ZyphrZero](https://github.com/ZyphrZero) 补充。
+
+- 控制台采用固定侧栏与独立内容滚动区域，统一六个业务页面的标题、面包屑和操作区；窄屏使用紧凑操作菜单，避免快捷按钮挤掉页面标题。
+- 提供清透青、石墨灰、海洋蓝、松林绿和琥珀金五套完整配色，主题同时作用于页面背景、侧栏、选中态、悬停色与焦点色；分别校准深浅模式，主题菜单加入配色预览，并保留偏好记忆与跟随系统。
+- 统一常用控件圆角，弱化卡片边框和分隔线，使用轻量阴影区分层次；图表坐标文字跟随主题，提高深色模式下的可读性。
+- 客户端 Key、分组等表格的操作按钮常驻显示，点击区域增大到 `32 × 32px`；共用表格数据行至少 `48px`，表头 `36px`，改善阅读与点击体验。
+- 移除凭据、分组、请求日志和客户端 Key 标题旁的数量徽标；统计卡片说明支持换行，修复手机端数值与说明重叠。
+- 客户端 Key、分组与日志统一表格、批量选择和操作布局；批量删除展示进度与结果，日志支持行内展开详情。
+- 优化弹窗按需挂载、表格与表单组件记忆化、框选和滚动处理；移除背景模糊滤镜及无效的主题切换强制布局读取。
+- 修复新增凭据后的优先级选择刷新，并减少添加凭据对话框受到浏览器自动填充的干扰。
+
+### 📊 Prompt Cache — 计量语义与来源区分
+
+> 来源：[PR #86](https://github.com/ZyphrZero/kiro.rs/pull/86)、[PR #88](https://github.com/ZyphrZero/kiro.rs/pull/88) 与 [PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。PR #88 中的计费折扣映射已由 PR #90 移除，下文描述本版最终行为。
+
+- 本地缓存计量支持顶层自动 `cache_control` 与显式块级断点，按已声明断点匹配前缀；未声明缓存控制时不模拟缓存命中。
+- 支持最多四个断点、20 个块位置的回溯匹配，以及 `5m` / `1h` 独立 TTL 与命中续期；校验混合 TTL 顺序、无效断点和缓存隔离，保持输入、缓存创建与读取 Token 总量一致。
+- 增加可选 Redis 共享计量元数据与并发协调，用于多实例部署；该机制只参与计量估算，不存储模型 KV Cache。
+- 新增 `cacheMeteringEnabled` 配置与管理端运行时开关。关闭后停止本地缓存计量模拟；上游提供的真实 Token 用量仍优先采用，不受此开关影响。
+- 缓存读取与未缓存输入按对应来源的用量上报，不再为适配下游计费折扣改写 Token 拆分；请求日志区分 `provider`、`simulated` 与 `none`。
+
+### ✨ 会话路由与请求追踪
+
+> 来源：[PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 新增会话粘性路由：同一 `conversationId` 优先沿用上一轮成功的凭据；凭据禁用、冷却、限流、模型或分组不匹配时，回到现有调度策略。
+- 提供 `sessionAffinityEnabled`、`sessionAffinityTtlSecs` 配置与管理端开关、有效期及命中统计；仅在上游成功后建立或续期绑定。
+- 请求日志新增会话 ID、粘性命中结果、上一凭据、计量来源和客户端 IP，支持按会话、换号与 IP 筛选；凭据页面补充 Profile 信息，便于排查缓存与路由行为。
+- 日志 Token 列展示未缓存输入、输出、缓存读取与写入明细；首 Token 延迟和总耗时合并展示，并按各自阈值着色。
+
+### 🔧 Responses / Codex — 远程压缩与工具兼容
+
+> 来源：[PR #81](https://github.com/ZyphrZero/kiro.rs/pull/81)、[PR #82](https://github.com/ZyphrZero/kiro.rs/pull/82)，提交人：[@lijmyeah](https://github.com/lijmyeah)；[PR #83](https://github.com/ZyphrZero/kiro.rs/pull/83)，提交人：[@stormrise](https://github.com/stormrise)。感谢贡献。远程压缩的合并适配与测试修复由 [@ZyphrZero](https://github.com/ZyphrZero) 补充。
+
+- 接入并加固 Codex 远程上下文压缩流程（PR #81）：识别末尾 `compaction_trigger`，将历史转换为摘要请求，返回可在后续请求中恢复的 `compaction` 项，支持 JSON 与 SSE 响应。
+- 压缩路径保留最新用户输入和历史工具调用结构，处理未完成的工具结果；遇到上下文溢出时，对过大的历史工具输出限量后重试一次。
+- 区分摘要完成、输出截断、空摘要、意外工具调用和上下文溢出，正确返回完成、不完整或失败状态，并累计尝试中的用量。
+- 修复上游返回裸工具名时的 namespace 还原：精确匹配优先，仅在声明唯一时恢复命名空间及 custom / function 工具类型，避免同名工具误路由。
+- `GET /v1/models` 新增 `context_window`，由上游 `maxInputTokens` 提供，与管理端模型元数据保持一致。
+
+### 🔧 Kiro 凭据与区域兼容
+
+> 来源：[PR #78](https://github.com/ZyphrZero/kiro.rs/pull/78)。提交人：[@gujunxiang](https://github.com/gujunxiang)，感谢贡献。[Issue #91](https://github.com/ZyphrZero/kiro.rs/issues/91) 的凭据区域修复由 [@ZyphrZero](https://github.com/ZyphrZero) 完成。
+
+- 修复仅配置凭据 `region` 时推理请求仍使用全局区域的问题（#91）；API 区域优先级调整为 `credential.apiRegion → credential.region → config.apiRegion → config.region`，同时覆盖 IDE / CLI 的推理、MCP URL 与 Host。
+- 用量和模型列表请求携带 `profileArn` 遇到特定租户兼容错误时，可重试不带 ARN 的请求，并保留已有区域回退逻辑；普通客户端错误不会无条件重复发送。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.0`。
+- 会话粘性路由默认开启，绑定有效期默认 `3600` 秒；有效绑定优先于优先级调度的立即回切，需要原有逐请求选号行为时可关闭该选项。
+- 本地缓存计量开关依次读取 `cacheMeteringEnabled`、`KIRO_RS_CACHE_METERING`，均未设置时默认开启。本地估算不代表上游实际缓存命中或计费折扣，应结合日志中的用量来源判断。
+- 请求日志 SQLite 新字段自动迁移；现有配置、凭据和客户端 Key 文件无需手动转换。
+
 ## [0.8.0] - 2026-08-26
 
 主题：**Responses / Codex 流式链路稳定性、客户端 Key 配额治理、运维控制台与凭据元数据管理，以及 Enterprise / IdC 兼容性修复**。本版合并 PR #66、#67、#70、#71、#74、#75，并补充后续的控制台主题、刷新和移动端布局改进。新增字段均提供默认值，升级无需迁移现有配置、凭据或客户端 Key 文件。

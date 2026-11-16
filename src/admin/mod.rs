@@ -19,6 +19,7 @@
 mod error;
 mod handlers;
 mod middleware;
+mod quota_alerts;
 pub mod proxy_pool;
 mod router;
 mod service;
@@ -33,14 +34,12 @@ pub mod recent_spend;
 pub mod session_affinity_switch;
 
 pub use client_keys::ClientKeyManager;
-pub use groups::GroupManager;
+pub use groups::{GroupManager, SharedGroupManager};
 pub use middleware::AdminState;
 /// 供卖家对接路由复用同一套 adminApiKey 认证
 pub use middleware::admin_auth_middleware;
 pub use router::create_admin_router;
 pub use service::AdminService;
-/// 余额后台刷新周期，main 启动调度器时使用
-pub use service::BALANCE_REFRESH_INTERVAL_SECS;
 /// 供卖家对接模块复用凭据入库（去重 / 验活 / 回滚）的结果分类
 pub(crate) use service::ImportStatus;
 pub use usage_stats::{UsageAggregator, UsageRecorder};

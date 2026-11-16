@@ -40,6 +40,7 @@ impl KiroProvider {
             credentials,
             token,
             affinity: crate::kiro::token_manager::AffinityOutcome::None,
+            _in_flight: None,
         };
         // Enterprise / IdC 账号需要真实 profileArn，与账号池路径保持一致
         self.ensure_profile_arn(&mut ctx).await?;
@@ -53,6 +54,7 @@ impl KiroProvider {
             token: &ctx.token,
             machine_id: &machine_id,
             config,
+            api_domain: self.token_manager().api_domain(),
         };
 
         let url = endpoint.api_url(&rctx);
@@ -75,6 +77,7 @@ impl KiroProvider {
         Ok(KiroCallResult {
             response,
             credential_id,
+            _in_flight: None,
         })
     }
 }

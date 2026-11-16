@@ -36,6 +36,7 @@ fn credit_stats_search_rounds_charge_actual_credentials_once_on_cancel() {
         effort: None,
         started_at: std::time::Instant::now(),
         tracer: None,
+        count_call: true,
     };
 
     {

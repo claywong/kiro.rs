@@ -10,6 +10,7 @@ use axum::{
 use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
+        audit_suspended_credentials,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
         check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
@@ -19,9 +20,14 @@ use super::{
         get_short_speed_config, get_speed_credentials_exclude_config,
         get_speed_credentials_min_tokens_config,
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
-        get_current_models, get_global_proxy, get_custom_models,
-        get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
-        get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
+        get_current_models, get_global_proxy, get_custom_models, get_custom_headers,
+        get_api_domain, get_cache_metering_config,
+        get_tool_compatibility_mode, set_tool_compatibility_mode,
+        get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
+        get_proxy_failover_config, get_proxy_pool, get_quota_reset_recovery_config,
+        get_self_heal_config, rotate_credential_proxies, set_proxy_failover_config,
+        get_update_config, list_client_keys, list_groups,
+        list_traces, poll_idc_login,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, set_account_rpm_limit_config,
@@ -29,15 +35,19 @@ use super::{
         set_rate_limit_same_credential_config, set_speed_credentials_exclude_config,
         set_short_speed_config, set_speed_credentials_min_tokens_config,
         set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
-        set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
-        set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
-        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
+        set_credential_load_factor, set_credential_priority, set_custom_models, set_custom_headers, set_global_proxy,
+        set_load_balancing_mode, set_api_domain, set_cache_metering_config,
+        set_log_governance_config, set_model_api_retry_config, set_proxy_enabled, set_quota_reset_recovery_config,
+        set_self_heal_config, set_update_config, start_idc_login, start_idc_relogin,
+        start_social_login, start_social_relogin,
+        stats_by_credential, stats_by_key, stats_by_model, stats_credential_activity, stats_overview,
+        stats_timeseries,
         test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
+    quota_alerts::{get_alerts, test_alerts, update_alerts},
 };
 // 本地新增 handler 单独成行，不并入上游按字母排序的 use 块，避免上游改动时反复冲突。
 use super::recent_spend::credential_recent_spend;
@@ -72,6 +82,8 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
+        .route("/config/quota-alerts", get(get_alerts).put(update_alerts))
+        .route("/config/quota-alerts/test", post(test_alerts))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
@@ -83,6 +95,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route(
+            "/credentials/{id}/load-factor",
+            post(set_credential_load_factor),
+        )
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/clear-throttle", post(clear_throttle))
         .route("/credentials/{id}/reset-stats", post(reset_success_count))
@@ -91,6 +107,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/disable-quota-exceeded",
             post(disable_quota_exceeded),
+        )
+        .route(
+            "/credentials/audit-suspended",
+            post(audit_suspended_credentials),
         )
         .route("/credentials/overage/enable-all", post(enable_overage_all))
         .route("/credentials/{id}/overage", post(set_credential_overage))
@@ -106,6 +126,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))
         .route("/proxy-pool/check-all", post(check_all_proxies))
+        .route("/proxy-pool/rotate", post(rotate_credential_proxies))
         .route(
             "/proxy-pool/assign-round-robin",
             post(assign_proxies_round_robin),
@@ -116,6 +137,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/api-domain",
+            get(get_api_domain).put(set_api_domain),
+        )
+        .route(
+            "/config/tool-compatibility",
+            get(get_tool_compatibility_mode).put(set_tool_compatibility_mode),
         )
         .route(
             "/config/account-throttle",
@@ -144,16 +173,33 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_short_speed_config).put(set_short_speed_config),
         )
         .route(
+
+            "/config/model-api-retry",
+            get(get_model_api_retry_config).put(set_model_api_retry_config),
+        )
+        .route(
             "/config/account-rpm-limit",
             get(get_account_rpm_limit_config).put(set_account_rpm_limit_config),
+        )
+        .route(
+            "/config/quota-reset-recovery",
+            get(get_quota_reset_recovery_config).put(set_quota_reset_recovery_config),
         )
         .route(
             "/config/self-heal",
             get(get_self_heal_config).put(set_self_heal_config),
         )
         .route(
+            "/config/proxy-failover",
+            get(get_proxy_failover_config).put(set_proxy_failover_config),
+        )
+        .route(
             "/config/log-governance",
             get(get_log_governance_config).put(set_log_governance_config),
+        )
+        .route(
+            "/config/cache-metering",
+            get(get_cache_metering_config).put(set_cache_metering_config),
         )
         .route(
             "/config/credential-metadata-schema",
@@ -166,6 +212,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/custom-models",
             get(get_custom_models).put(set_custom_models),
+        )
+        .route(
+            "/config/custom-headers",
+            get(get_custom_headers).put(set_custom_headers),
         )
         .route(
             "/config/update",
@@ -229,6 +279,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
+        .route("/stats/credential-activity", get(stats_credential_activity))
         .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))

@@ -86,7 +86,7 @@ async fn network_error_with_own_proxy_fails_over_without_disabling() {
         Arc::new(MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap());
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("stub".to_string(), Arc::new(StubEndpoint { base }));
-    let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "stub".to_string());
+    let provider = KiroProvider::new(manager.clone(), endpoints, "stub".to_string());
 
     // 连续多次（超过 MAX_FAILURES_PER_CREDENTIAL=3）都应换号成功
     for _ in 0..5 {

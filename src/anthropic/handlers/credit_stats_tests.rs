@@ -36,6 +36,7 @@ fn credit_stats_accumulate_actual_usage_per_credential_without_logs() {
         effort: None,
         started_at: Instant::now(),
         tracer: None,
+        count_call: true,
     };
 
     hook.record(1, 0, 0, 0, 0, 0.25, "success");

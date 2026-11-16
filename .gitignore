@@ -47,6 +47,9 @@ proxy_pool.json
 # 配置/凭据的自动备份（.bak、.bak-<时间戳>）
 *.bak
 *.bak-*
+/quota_alerts.db
+/quota_alerts.db-shm
+/quota_alerts.db-wal
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
@@ -56,3 +59,11 @@ proxy_pool.json
 # Python 工具脚本的字节码缓存
 __pycache__/
 *.pyc
+
+# 本地调研用的外部仓库克隆与草稿，不应进版本库
+.research/
+
+# 本地缓存/粘性测试沙箱（含凭据副本，绝对不能提交）
+/.local-test/
+/aab822_*.json
+/jac0991_*.json

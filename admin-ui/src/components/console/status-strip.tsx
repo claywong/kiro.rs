@@ -35,8 +35,9 @@ export function StatusStrip({
               {s.tone !== 'none' && (
                 <span
                   className={cn(
-                    'h-2 w-2 shrink-0 rounded-full',
-                    s.active ? 'bg-current' : railDotClass(s.tone),
+                    'h-2 w-2 shrink-0 rounded-full transition-all',
+                    railDotClass(s.tone),
+                    s.active && 'ring-2 ring-primary/40 ring-offset-1 ring-offset-background scale-110',
                     !s.active && s.count === 0 && 'opacity-30',
                   )}
                 />
@@ -68,11 +69,11 @@ export function StatusStrip({
               title={s.hint}
               aria-pressed={s.active}
               className={cn(
-                'inline-flex items-center gap-1.5 px-3 h-8 text-xs font-medium rounded-full border transition-all duration-200 select-none cursor-pointer',
-                'focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
+                'inline-flex items-center gap-1.5 px-2.5 h-7 text-xs font-medium rounded-md border transition-colors select-none cursor-pointer',
+                'focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                 s.active
-                  ? 'bg-card border-border text-foreground shadow-sm'
-                  : 'bg-card/60 border-border text-muted-foreground backdrop-blur hover:bg-card hover:text-foreground',
+                  ? 'bg-accent border-primary/15 text-accent-foreground font-semibold'
+                  : 'bg-transparent border-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
               )}
             >
               {inner}

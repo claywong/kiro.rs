@@ -25,9 +25,10 @@ http = "1.0"
 httpdate = "1.0"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
+uuid = { version = "1.10", features = ["v1", "v4", "v5", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 crc = "3"           # CRC32C 计算
 bytes = "1"         # 高效的字节缓冲区
@@ -52,6 +53,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持
 aes = "0.8"        # kiro.red 响应解密（AES-128-CBC）
 cbc = "0.1"        # CBC 分组模式 + PKCS7 填充
 md-5 = "0.10"      # kiro.red 请求签名（双重 MD5）与解密密钥派生
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 
 [profile.fast]
 inherits = "release"
@@ -59,3 +61,8 @@ lto = false
 codegen-units = 256
 incremental = true
 strip = true
+
+[dev-dependencies]
+# 时间调度测试用虚拟时钟（#[tokio::test(start_paused = true)]）；
+# test-util 不在 tokio 的 "full" 里，必须显式打开。
+tokio = { version = "1.0", features = ["full", "test-util"] }

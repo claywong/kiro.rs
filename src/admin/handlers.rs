@@ -19,20 +19,25 @@ use super::{
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
-        BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, ModelTestRequest,
+        AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        ClientKeyItem, ClientKeysQuery, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialsQuery, GroupsQuery,
+        ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetRateLimitSameCredentialConfigRequest, SetSpeedCredentialsExcludeConfigRequest,
         SetShortSpeedConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
         SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetCacheMeteringConfigRequest,
+        SetLoadBalancingModeRequest, SetLoadFactorRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetModelApiRetryConfigRequest, SetProxyFailoverConfigRequest,
+        SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        ToolCompatibilityConfig, UpdateRefreshTokenRequest,
+        SetCustomHeadersRequest,
         SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
@@ -41,9 +46,12 @@ use super::{
 type CredSessionPath = (u64, String);
 
 /// GET /api/admin/credentials
-/// 获取所有凭据状态
-pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+/// 获取凭据状态（支持分页、搜索、分组、状态、排序）
+pub async fn get_all_credentials(
+    State(state): State<AdminState>,
+    Query(query): Query<CredentialsQuery>,
+) -> impl IntoResponse {
+    let response = state.service.get_credentials_paged(&query);
     Json(response)
 }
 
@@ -126,6 +134,24 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/load-factor
+/// 设置凭据负载因子（均衡模式下的调度权重）
+pub async fn set_credential_load_factor(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetLoadFactorRequest>,
+) -> impl IntoResponse {
+    match state.service.set_load_factor(id, payload.load_factor) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 负载因子已设置为 {}",
+            id,
+            payload.load_factor.max(1)
+        )))
+        .into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -143,13 +169,13 @@ pub async fn reset_failure_count(
 }
 
 /// POST /api/admin/credentials/:id/clear-throttle
-/// 手动解除凭据的账号级风控冷却
+/// 手动解除凭据的账号级限流冷却
 pub async fn clear_throttle(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 限流冷却已解除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -204,6 +230,19 @@ pub async fn test_model(
 pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {
     let result = state.service.disable_quota_exceeded();
     Json(result).into_response()
+}
+
+/// POST /api/admin/credentials/audit-suspended
+/// 通过历史请求日志排查封号账号并标记为 Suspended
+pub async fn audit_suspended_credentials(
+    State(state): State<AdminState>,
+    payload: Option<Json<super::types::AuditSuspendedRequest>>,
+) -> impl IntoResponse {
+    let req = payload.map(|Json(p)| p);
+    match state.service.audit_suspended_credentials(req) {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/overage
@@ -343,6 +382,7 @@ pub async fn batch_import_credentials(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(body))
         .unwrap()
@@ -533,9 +573,33 @@ pub async fn check_proxy(
 }
 
 /// POST /api/admin/proxy-pool/check-all
-/// 触发全部代理的健康检查
+/// 触发一轮完整巡检：自动检测在用代理 → 健康探测 → 凭据代理自动轮换
 pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.check_all_proxies().await)
+}
+
+/// POST /api/admin/proxy-pool/rotate
+/// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+pub async fn rotate_credential_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.rotate_credential_proxies())
+}
+
+/// GET /api/admin/config/proxy-failover
+/// 获取代理故障转移配置
+pub async fn get_proxy_failover_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_failover_config())
+}
+
+/// PUT /api/admin/config/proxy-failover
+/// 更新代理故障转移配置
+pub async fn set_proxy_failover_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProxyFailoverConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_failover_config(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/proxy-pool/assign-round-robin
@@ -572,14 +636,46 @@ pub async fn set_load_balancing_mode(
     }
 }
 
+/// GET /api/admin/config/api-domain
+/// 获取对话 / MCP 上游域名
+pub async fn get_api_domain(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_api_domain())
+}
+
+/// PUT /api/admin/config/api-domain
+/// 设置对话 / MCP 上游域名
+pub async fn set_api_domain(
+    State(state): State<AdminState>,
+    Json(payload): Json<ApiDomainConfig>,
+) -> impl IntoResponse {
+    match state.service.set_api_domain(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_tool_compatibility_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_tool_compatibility_mode())
+}
+
+pub async fn set_tool_compatibility_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<ToolCompatibilityConfig>,
+) -> impl IntoResponse {
+    match state.service.set_tool_compatibility_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/account-throttle
-/// 获取账号级风控故障转移配置
+/// 获取账号级 429 限流故障转移配置
 pub async fn get_account_throttle_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_account_throttle_config())
 }
 
 /// PUT /api/admin/config/account-throttle
-/// 更新账号级风控故障转移配置
+/// 更新账号级 429 限流故障转移配置
 pub async fn set_account_throttle_config(
     State(state): State<AdminState>,
     Json(payload): Json<SetAccountThrottleConfigRequest>,
@@ -671,6 +767,24 @@ pub async fn set_short_speed_config(
     }
 }
 
+/// GET /api/admin/config/model-api-retry
+/// 获取普通模型 API 429 自动重试配置
+pub async fn get_model_api_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_api_retry_config())
+}
+
+/// PUT /api/admin/config/model-api-retry
+/// 更新普通模型 API 429 自动重试配置
+pub async fn set_model_api_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelApiRetryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_api_retry_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/account-rpm-limit
 /// 获取单账号 RPM 限流配置
 pub async fn get_account_rpm_limit_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -686,6 +800,22 @@ pub async fn set_account_rpm_limit_config(
     match state.service.set_account_rpm_limit_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/quota-reset-recovery
+pub async fn get_quota_reset_recovery_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
+}
+
+/// PUT /api/admin/config/quota-reset-recovery
+pub async fn set_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_reset_recovery_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
@@ -720,6 +850,24 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-metering
+/// 获取 prompt cache 本地计量模拟开关
+pub async fn get_cache_metering_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering_config())
+}
+
+/// PUT /api/admin/config/cache-metering
+/// 切换 prompt cache 本地计量模拟开关（运行时生效 + 持久化 config.json）
+pub async fn set_cache_metering_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheMeteringConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_metering_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -832,6 +980,24 @@ pub async fn set_custom_models(
     Json(payload): Json<SetCustomModelsRequest>,
 ) -> impl IntoResponse {
     match state.service.set_custom_models(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/custom-headers
+/// 获取自定义响应头规则配置
+pub async fn get_custom_headers(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_custom_headers())
+}
+
+/// PUT /api/admin/config/custom-headers
+/// 批量替换自定义响应头规则配置（运行时热更新 + 持久化 config.json）
+pub async fn set_custom_headers(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCustomHeadersRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_headers(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1017,6 +1183,9 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         created_at: k.created_at.clone(),
         last_used_at: k.last_used_at.clone(),
         total_calls: k.total_calls,
+        total_successful_calls: k.total_successful_calls,
+        billing_mode: k.billing_mode,
+        max_calls: k.max_calls,
         total_input_tokens: k.total_input_tokens,
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
@@ -1029,12 +1198,118 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
 }
 
 /// GET /api/admin/client-keys
-pub async fn list_client_keys(State(state): State<AdminState>) -> impl IntoResponse {
+/// 获取客户端 Key 列表（支持分页、搜索、状态筛选、分组筛选、排序）
+pub async fn list_client_keys(
+    State(state): State<AdminState>,
+    Query(query): Query<ClientKeysQuery>,
+) -> impl IntoResponse {
     let keys = state.client_keys.list();
-    let items: Vec<ClientKeyItem> = keys.iter().map(key_to_item).collect();
+    let total = keys.len();
+
+    // 1. 过滤
+    let mut filtered: Vec<ClientKeyItem> = keys
+        .into_iter()
+        .map(|k| key_to_item(&k))
+        .filter(|k| {
+            if let Some(search) = query.effective_search() {
+                let q = search.to_lowercase();
+                let match_name = k.name.to_lowercase().contains(&q);
+                let match_id = k.id.to_string().contains(&q);
+                let match_group = k
+                    .group
+                    .as_deref()
+                    .map(|g| g.to_lowercase().contains(&q))
+                    .unwrap_or(false);
+                let match_desc = k
+                    .description
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false);
+                if !match_name && !match_id && !match_group && !match_desc {
+                    return false;
+                }
+            }
+
+            if let Some(status) = query.effective_status() {
+                match status {
+                    "enabled" | "active" if k.disabled => return false,
+                    "disabled" if !k.disabled => return false,
+                    _ => {}
+                }
+            }
+
+            if let Some(group) = query.effective_group() {
+                if group == "__none__" {
+                    if k.group.is_some() {
+                        return false;
+                    }
+                } else if k.group.as_deref() != Some(group) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect();
+
+    let filtered_total = filtered.len();
+
+    // 2. 排序
+    let sort_dir_asc = query.effective_sort_dir().eq_ignore_ascii_case("asc");
+    if let Some(sort_by) = query.effective_sort_by() {
+        filtered.sort_by(|a, b| {
+            let cmp = match sort_by {
+                "id" => a.id.cmp(&b.id),
+                "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                "totalCalls" | "total_calls" => a.total_calls.cmp(&b.total_calls),
+                "totalCredits" | "total_credits" => a
+                    .total_credits
+                    .partial_cmp(&b.total_credits)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                "lastUsedAt" | "last_used_at" => match (&a.last_used_at, &b.last_used_at) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (Some(ta), Some(tb)) => ta.cmp(tb),
+                },
+                "createdAt" | "created_at" => a.created_at.cmp(&b.created_at),
+                _ => a.id.cmp(&b.id),
+            };
+            let ordered = if sort_dir_asc { cmp } else { cmp.reverse() };
+            if ordered == std::cmp::Ordering::Equal {
+                a.id.cmp(&b.id)
+            } else {
+                ordered
+            }
+        });
+    }
+
+    // 3. 分页
+    let page_size = query.effective_page_size();
+    let (page, page_size_opt, paged_keys) = if page_size > 0 {
+        let page = query.effective_page();
+        let start = page.saturating_sub(1).saturating_mul(page_size);
+        let items = filtered.into_iter().skip(start).take(page_size).collect();
+        (Some(page), Some(page_size), items)
+    } else {
+        (None, None, filtered)
+    };
+
     Json(ClientKeysResponse {
-        total: items.len(),
-        keys: items,
+        total,
+        filtered_total: if page_size > 0
+            || query.effective_search().is_some()
+            || query.effective_status().is_some()
+            || query.effective_group().is_some()
+            || query.effective_sort_by().is_some()
+        {
+            Some(filtered_total)
+        } else {
+            None
+        },
+        page,
+        page_size: page_size_opt,
+        keys: paged_keys,
     })
 }
 
@@ -1078,6 +1353,13 @@ pub async fn create_client_key(
             .filter(|g| !g.is_empty()),
     );
     // 创建后若指定了上限则应用
+    state.client_keys.update_meta(
+        entry.id,
+        None,
+        None,
+        None,
+        Some((payload.billing_mode, payload.max_calls)),
+    );
     if let Some(v) = payload.max_credits {
         state.client_keys.set_max_credits(entry.id, Some(v));
     }
@@ -1163,6 +1445,15 @@ pub async fn update_client_key(
     Json(payload): Json<UpdateClientKeyRequest>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if payload.max_calls.is_some() && payload.billing_mode.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "设置 maxCalls 时必须同时提供 billingMode",
+            )),
+        )
+            .into_response();
+    }
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
@@ -1176,7 +1467,13 @@ pub async fn update_client_key(
     });
     if state
         .client_keys
-        .update_meta(id, payload.name, description, group)
+        .update_meta(
+            id,
+            payload.name,
+            description,
+            group,
+            payload.billing_mode.map(|mode| (mode, payload.max_calls)),
+        )
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
@@ -1409,6 +1706,10 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
+pub async fn stats_credential_activity(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.usage_aggregator.query_credential_activity())
+}
+
 /// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
 pub async fn stats_timeseries(
     State(state): State<AdminState>,
@@ -1478,6 +1779,8 @@ pub async fn stats_by_credential(
                 "calls": d.calls,
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
                 "errors": d.errors,
             })
         })
@@ -1531,7 +1834,8 @@ pub async fn stats_by_key(
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
 /// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed /
-///            startTime / endTime（Unix 秒）/ q（关键字）/ limit / offset
+///            sessionId / onlySwitched / clientIp / startTime / endTime（Unix 秒）/ q（关键字）/
+///            limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1568,6 +1872,18 @@ pub async fn list_traces(
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        session_id: params
+            .get("sessionId")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        only_switched: params
+            .get("onlySwitched")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        client_ip: params
+            .get("clientIp")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         credential_ids,
         // startTime / endTime 为 Unix 秒，与 traces.ts_epoch 同单位
         start_ts: params.get("startTime").and_then(|s| s.parse::<i64>().ok()),
@@ -1661,6 +1977,11 @@ pub async fn list_traces(
                 "thinkingChars": r.thinking_chars,
                 "effort": r.effort,
                 "affinity": r.affinity,
+                "sessionId": r.session_id,
+                "stickyOutcome": r.sticky_outcome,
+                "previousCredentialId": r.previous_credential_id,
+                "usageSource": r.usage_source,
+                "clientIp": r.client_ip,
                 "attempts": attempts,
             })
         })
@@ -1701,17 +2022,59 @@ fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::
             .token_manager()
             .count_credentials_with_group(&g.name),
         client_key_count: state.client_keys.count_with_group(&g.name),
+        load_balancing_mode: g.load_balancing_mode.clone(),
+        invert_priority: g.invert_priority,
     }
 }
 
 /// GET /api/admin/groups
-pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
+/// 获取分组列表（支持搜索、分页）
+pub async fn list_groups(
+    State(state): State<AdminState>,
+    Query(query): Query<GroupsQuery>,
+) -> impl IntoResponse {
     let groups = state.groups.list();
-    let items: Vec<super::types::GroupItem> =
+    let total = groups.len();
+    let mut items: Vec<super::types::GroupItem> =
         groups.iter().map(|g| group_to_item(g, &state)).collect();
+
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let q = search.to_lowercase();
+        items.retain(|g| {
+            g.name.to_lowercase().contains(&q)
+                || g.description
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        });
+    }
+
+    let filtered_total = items.len();
+    let page_size = query.page_size.unwrap_or(0);
+    let (page, page_size_opt, paged_groups) = if page_size > 0 {
+        let page = query.page.unwrap_or(1).max(1);
+        let start = page.saturating_sub(1).saturating_mul(page_size);
+        let paged = items.into_iter().skip(start).take(page_size).collect();
+        (Some(page), Some(page_size), paged)
+    } else {
+        (None, None, items)
+    };
+
     Json(super::types::GroupsResponse {
-        total: items.len(),
-        groups: items,
+        total,
+        filtered_total: if page_size > 0 || query.search.is_some() {
+            Some(filtered_total)
+        } else {
+            None
+        },
+        page,
+        page_size: page_size_opt,
+        groups: paged_groups,
     })
 }
 
@@ -1720,7 +2083,12 @@ pub async fn create_group(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
-    match state.groups.create(payload.name, payload.description) {
+    match state.groups.create_with_dispatch(
+        payload.name,
+        payload.description,
+        payload.load_balancing_mode,
+        payload.invert_priority,
+    ) {
         Ok(g) => Json(group_to_item(&g, &state)).into_response(),
         Err(e) => {
             let msg = e.to_string();
@@ -1819,6 +2187,31 @@ pub async fn update_group(
             )
                 .into_response();
         }
+    }
+
+    // 3. 改调度策略（负载均衡模式与优先级反转）
+    let reset_lbm = payload.reset_load_balancing_mode.unwrap_or(false);
+    let reset_inv = payload.reset_invert_priority.unwrap_or(false);
+    let dispatch_changed = payload.load_balancing_mode.is_some()
+        || reset_lbm
+        || payload.invert_priority.is_some()
+        || reset_inv;
+    if dispatch_changed
+        && let Err(e) = state.groups.update_dispatch_mode(
+            &current_name,
+            payload.load_balancing_mode,
+            reset_lbm,
+            payload.invert_priority,
+            reset_inv,
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                e.to_string(),
+            )),
+        )
+            .into_response();
     }
 
     let group = match state.groups.get(&current_name) {

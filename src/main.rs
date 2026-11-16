@@ -9,6 +9,9 @@ mod model;
 pub mod token;
 mod vendor;
 
+#[cfg(test)]
+mod credential_startup_tests;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,6 +44,20 @@ async fn main() {
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
 
+    if args.deduplicate_credentials {
+        match kiro::credential_dedup::run(
+            std::path::Path::new(&credentials_path),
+            args.apply_credential_dedup,
+        ) {
+            Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+            Err(error) => {
+                eprintln!("凭据去重失败：{error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // 文件不存在时自动初始化（Docker 首次部署友好）
     ensure_config_files(&config_path, &credentials_path);
 
@@ -49,6 +66,12 @@ async fn main() {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+    let balance_refresh_interval = config
+        .resolve_balance_refresh_interval(std::env::var("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS"))
+        .unwrap_or_else(|error| {
+            tracing::error!("余额后台刷新配置无效: {}", error);
+            std::process::exit(1);
+        });
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
@@ -64,18 +87,15 @@ async fn main() {
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if kiro_api_key.is_empty() {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-        } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
-            let api_key_cred = KiroCredentials {
-                kiro_api_key: Some(kiro_api_key),
-                auth_method: Some("api_key".to_string()),
-                priority: 0,
-                ..Default::default()
-            };
-            credentials_list.insert(0, api_key_cred);
-        }
+        merge_environment_api_key(&mut credentials_list, kiro_api_key);
+    }
+
+    let duplicate_groups = kiro::credential_dedup::duplicate_groups(&credentials_list);
+    if !duplicate_groups.is_empty() {
+        tracing::warn!(
+            groups = duplicate_groups.len(),
+            "发现历史重复凭据；停止服务后使用 --deduplicate-credentials 预览，确认后加 --apply-credential-dedup 清理"
+        );
     }
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
@@ -100,7 +120,8 @@ async fn main() {
         .filter(|url| !url.trim().is_empty())
         .map(|url| {
             let mut proxy = http_client::ProxyConfig::new(url);
-            if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password)
+            if let (Some(username), Some(password)) =
+                (&config.proxy_username, &config.proxy_password)
             {
                 proxy = proxy.with_auth(username, password);
             }
@@ -168,9 +189,8 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     token_manager.start_model_cache_warmer();
-    let kiro_provider = Arc::new(KiroProvider::with_proxy(
+    let kiro_provider = Arc::new(KiroProvider::new(
         token_manager.clone(),
-        proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
     ));
@@ -229,6 +249,8 @@ async fn main() {
             tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
         }
     }
+    // 让调度器能解析分组级负载均衡 / 优先级反转覆盖。
+    token_manager.set_group_manager(group_manager.clone());
 
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
@@ -283,12 +305,72 @@ async fn main() {
         );
     }
 
-    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
+    // 容量 / 落盘 / 落盘间隔 / miss 诊断四项均为「config.json > 环境变量 > 内置默认」，
+    // 在这里解析一次后通过 builder 注入，运行时不可改（改 = 改配置 + 重启）。
+    use anthropic::cache_metering::CacheMeter;
+    let cache_metering_enabled = config
+        .cache_metering_enabled
+        .or_else(CacheMeter::metering_enabled_from_env)
+        .unwrap_or(true);
+    let cache_metering_capacity = CacheMeter::resolve_capacity(
+        config.cache_metering_capacity,
+        CacheMeter::capacity_from_env(),
+    );
+    let cache_metering_persist = config
+        .cache_metering_persist_enabled
+        .or_else(CacheMeter::persist_enabled_from_env)
+        .unwrap_or(false);
+    let cache_metering_flush_interval = CacheMeter::resolve_flush_interval_secs(
+        config.cache_metering_flush_interval_secs,
+        CacheMeter::flush_interval_from_env(),
+    );
+    let cache_metering_miss_diagnostics = config
+        .cache_metering_miss_diagnostics
+        .or_else(CacheMeter::miss_diagnostics_from_env)
+        .unwrap_or(true);
+
+    let cache_metering_snapshot = cache_dir.join("cache_metering.json");
+    let cache_metering_persist_path = if cache_metering_persist {
+        Some(cache_metering_snapshot.clone())
+    } else {
+        // 关闭时不读、不写，也不删除已有文件（留给回滚）
+        if let Ok(meta) = std::fs::metadata(&cache_metering_snapshot) {
+            tracing::info!(
+                "prompt cache 快照持久化已关闭，忽略 {}（{} 字节）",
+                cache_metering_snapshot.display(),
+                meta.len()
+            );
+        }
+        None
+    };
+
+    let cache_meter = std::sync::Arc::new(
+        CacheMeter::from_env(cache_metering_persist_path)
+            .await
+            .with_enabled(cache_metering_enabled)
+            .with_capacity(cache_metering_capacity)
+            .with_flush_interval_secs(cache_metering_flush_interval)
+            .with_miss_diagnostics(cache_metering_miss_diagnostics),
+    );
     cache_meter.clone().spawn_background();
+    if !cache_metering_enabled {
+        tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
+    } else {
+        tracing::info!(
+            "本地 prompt cache 计量模拟已开启：capacity={}（约 {} req/s @ 4 断点 / 300s TTL），\
+             persist={}，flush_interval={}s，miss_diagnostics={}",
+            cache_metering_capacity,
+            cache_metering_capacity / (4 * 300),
+            cache_metering_persist,
+            cache_metering_flush_interval,
+            cache_metering_miss_diagnostics
+        );
+    }
+
+    let custom_headers_manager = model::custom_headers::CustomHeadersManager::new(
+        config.custom_headers.clone(),
+    );
 
     // conversationId 来源占比（session / 随机），每 10 分钟汇总一行 INFO
     anthropic::conversation_id_stats::spawn_reporter();
@@ -307,8 +389,11 @@ async fn main() {
     // 后台调度器仍只在 Admin API 启用时才启动，不会多跑任务。
     let admin_service = std::sync::Arc::new(
         admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+            .with_quota_alerts(balance_refresh_interval)
             .with_kiro_provider(kiro_provider.clone())
-            .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone())),
+            .with_log_governance(Some(admin_trace_store.clone()), Some(usage_recorder.clone()))
+            .with_cache_meter(cache_meter.clone())
+            .with_custom_headers(Some(custom_headers_manager.clone())),
     );
 
     // 卖家对接：事件库 + 服务。事件库打开失败时用内存兜底，保证服务正常启动。
@@ -352,6 +437,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(custom_headers_manager.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -370,13 +456,9 @@ async fn main() {
                 group_manager.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次；缓存 TTL 刻意比它宽一轮半，
-            // 详见 BALANCE_CACHE_TTL_SECS）
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(
-                    admin::BALANCE_REFRESH_INTERVAL_SECS,
-                ));
+                .start_balance_refresher(balance_refresh_interval);
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state
@@ -407,6 +489,10 @@ async fn main() {
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)
+                .route(
+                    "/admin/",
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/admin") }),
+                )
         }
     } else {
         anthropic_app
@@ -443,7 +529,32 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
+}
+
+fn merge_environment_api_key(credentials: &mut Vec<KiroCredentials>, api_key: String) {
+    if api_key.trim().is_empty() {
+        tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        return;
+    }
+    if credentials.iter().any(|credential| credential.kiro_api_key.as_deref() == Some(&api_key)) {
+        tracing::info!("KIRO_API_KEY 已存在于凭据文件，沿用原记录及其配置");
+        return;
+    }
+    tracing::info!("检测到新的 KIRO_API_KEY，添加 API Key 凭据");
+    credentials.insert(0, KiroCredentials {
+        kiro_api_key: Some(api_key),
+        auth_method: Some("api_key".to_string()),
+        priority: 0,
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
+    });
 }
 
 /// 文件不存在时初始化配置/凭证文件

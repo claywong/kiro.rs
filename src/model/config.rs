@@ -17,16 +17,46 @@ impl Default for TlsBackend {
     }
 }
 
+/// 对话 / MCP 请求使用的上游域名。
+///
+/// - `Amazonaws`（默认）：`q.{region}.amazonaws.com`
+/// - `Kiro`：`runtime.{region}.kiro.dev`，新版 Kiro IDE / Kiro CLI 使用的域名，
+///   官方客户端仅内置 us-east-1、eu-central-1 等少数区域
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiDomain {
+    #[default]
+    Amazonaws,
+    Kiro,
+}
+
+impl ApiDomain {
+    /// Management APIs use a separate host from streaming requests on Kiro.
+    pub fn management_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("management.{}.kiro.dev", region),
+        }
+    }
+
+    pub fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+}
+
 /// 工具兼容模式。
 ///
-/// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
+/// - `ClaudeCode`：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
 ///   的工具名与入参双向适配为 Kiro 内置工具（fs_write/str_replace/... ），并替换为 Kiro 内置 schema。
-/// - `Raw`：保留旧行为，直接透传客户端工具名/schema，用于排障。
+/// - `Raw`（默认）：保留客户端工具名、描述和参数，仅做上游要求的名称长度与 schema 规范化。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolCompatibilityMode {
-    #[default]
     ClaudeCode,
+    #[default]
     Raw,
 }
 
@@ -567,6 +597,22 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// Deadline for establishing an upstream API connection.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Maximum silence while waiting for headers or the next upstream body read.
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to 0 (disabled): a stream that is still delivering tokens is
+    /// never cut mid-answer, and stalled upstreams are cut by
+    /// `upstream_read_timeout_secs`. Set a positive value to cap request time.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -595,6 +641,11 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 后台余额刷新完成后的等待秒数；0 表示不启动后台刷新。
+    /// 优先级：配置文件 > KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS > 300。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_refresh_interval_secs: Option<u64>,
 
     /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
     /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
@@ -625,15 +676,19 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 优先级反转开关（默认 false：数字小的优先；true：数字大的优先）
+    #[serde(default = "default_invert_priority")]
+    pub invert_priority: bool,
+
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
@@ -771,6 +826,12 @@ pub struct Config {
     /// 同一请求内不会连续打同一个端点。关闭时沿用凭据自身端点。
     #[serde(default)]
     pub short_speed_random_endpoint: bool,
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个普通 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -785,16 +846,25 @@ pub struct Config {
     #[serde(default = "default_account_rpm_limit")]
     pub account_rpm_limit: u32,
 
-    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    /// 是否识别账号封禁响应并立即禁用凭据（默认 true）。
     ///
-    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
-    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
-    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    /// 开启后：某凭据收到的响应体命中内置封禁检测（JSON `reason` 为
+    /// `TEMPORARILY_SUSPENDED`，或同时含 "suspended" 与 "locked" 等文案）
+    /// 或命中 `suspended_ban_keywords` 中任一自定义关键词时，立即标记为
+    /// `Suspended` 并禁用。**不限 HTTP 状态码**（403、429 等均可触发）。
+    /// 被封禁的凭据**不参与自愈**，需人工核实后手动重置。
     ///
-    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
-    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    /// 关闭后：完全回退旧行为，封禁响应按普通错误处理。
     #[serde(default = "default_suspended_detection_enabled")]
     pub suspended_detection_enabled: bool,
+
+    /// 自定义封禁文案关键词列表（默认空）。
+    ///
+    /// 响应体中包含列表中任一关键词（大小写不敏感）时，视为账号被封禁，
+    /// 立即禁用凭据。与内置检测（`TEMPORARILY_SUSPENDED` reason 等）叠加生效。
+    /// 例如 `["temporarily suspended", "account has been locked"]`。
+    #[serde(default)]
+    pub suspended_ban_keywords: Vec<String>,
 
     /// 是否启用凭据自愈（默认 true）。
     ///
@@ -818,6 +888,30 @@ pub struct Config {
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
+    /// 是否启用凭据代理的自动检测与轮换（默认 true）。
+    ///
+    /// 开启后，代理池健康检查会把凭据实际在用的代理（含全局代理、凭据级代理中
+    /// 未登记到池内的地址）纳入探测范围；探测判定不可用的代理会被标记，使用该
+    /// 代理的凭据自动轮换到池内其它可用代理。
+    #[serde(default = "default_proxy_auto_rotate_enabled")]
+    pub proxy_auto_rotate_enabled: bool,
+
+    /// 无可用代理时是否允许凭据回退直连（默认 false）。
+    ///
+    /// 关闭时，代理全部不可用的凭据保持原代理配置不变，请求继续失败直至代理恢复，
+    /// 避免真实出口 IP 意外暴露；开启时这些凭据临时改为 `direct`，并在池内重新出现
+    /// 可用代理后自动改回代理。
+    #[serde(default)]
+    pub proxy_direct_fallback_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -829,14 +923,56 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
-    /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
+    /// 工具兼容模式。默认 `raw` 保留客户端工具定义与参数；`claude-code` 显式启用旧映射。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
+
+    /// 对话 / MCP 请求的上游域名：`amazonaws`（默认）或 `kiro`。
+    /// 仅影响 ide / cli 端点的 generateAssistantResponse 与 mcp，不影响 token 刷新和用量查询
+    #[serde(default)]
+    pub api_domain: ApiDomain,
+
+    /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
+    /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后：不查不写任何缓存态，usage 全量计入 `input_tokens`、
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0。
+    /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_enabled: Option<bool>,
+
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -926,6 +1062,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
 
+    /// 自定义响应头规则列表。
+    ///
+    /// 允许用户在 UI / config.json 配置下发给客户端的自定义响应头。
+    /// 键（header name）完全自定义；值（header value）支持变量插值（如 `{trace_id}`, `{model}` 等）。
+    #[serde(default = "crate::model::custom_headers::default_custom_headers")]
+    pub custom_headers: Vec<crate::model::custom_headers::CustomHeaderRule>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -968,8 +1111,23 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+fn default_upstream_read_timeout_secs() -> u64 {
+    120
+}
+fn default_upstream_total_timeout_secs() -> u64 {
+    // M6：不设整请求截止时间，静默由 read timeout（默认 120 秒）负责。
+    0
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_invert_priority() -> bool {
+    false
 }
 
 fn default_account_throttle_failover() -> bool {
@@ -1020,6 +1178,10 @@ fn default_short_speed_first_token_timeout_secs() -> u64 {
     10
 }
 
+fn default_model_api_429_retry_enabled() -> bool {
+    true
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -1044,6 +1206,10 @@ fn default_self_heal_max_consecutive_rounds() -> u32 {
     5
 }
 
+fn default_proxy_auto_rotate_enabled() -> bool {
+    true
+}
+
 fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
@@ -1057,7 +1223,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
-    ToolCompatibilityMode::ClaudeCode
+    ToolCompatibilityMode::Raw
 }
 
 fn default_endpoint() -> String {
@@ -1095,6 +1261,9 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -1102,12 +1271,14 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            balance_refresh_interval_secs: None,
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            invert_priority: default_invert_priority(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             rate_limit_same_credential_retries: std::collections::BTreeMap::new(),
@@ -1129,16 +1300,27 @@ impl Default for Config {
             short_speed_first_token_timeout_enabled: false,
             short_speed_first_token_timeout_secs: default_short_speed_first_token_timeout_secs(),
             short_speed_random_endpoint: false,
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
+            suspended_ban_keywords: Vec::new(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
+            proxy_auto_rotate_enabled: default_proxy_auto_rotate_enabled(),
+            proxy_direct_fallback_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            api_domain: ApiDomain::default(),
+            cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -1150,6 +1332,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             credential_metadata_schema: None,
+            custom_headers: crate::model::custom_headers::default_custom_headers(),
             config_path: None,
         }
     }
@@ -1199,6 +1382,28 @@ impl Config {
             out.push(cfg.clone());
         }
         out
+    }
+
+    pub fn resolve_balance_refresh_interval(
+        &self,
+        env_value: Result<String, std::env::VarError>,
+    ) -> anyhow::Result<std::time::Duration> {
+        let seconds = if let Some(seconds) = self.balance_refresh_interval_secs {
+            seconds
+        } else {
+            match env_value {
+                Ok(value) => value.trim().parse::<u64>().context(
+                    "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是非负整数（秒，0 表示关闭）",
+                )?,
+                Err(std::env::VarError::NotPresent) => 300,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    anyhow::bail!(
+                        "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是有效的 Unicode 字符串"
+                    )
+                }
+            }
+        };
+        Ok(std::time::Duration::from_secs(seconds))
     }
 
     /// 获取默认配置文件路径
@@ -1266,6 +1471,167 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn tool_mode_defaults_to_raw_without_overriding_explicit_compatibility() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.tool_compatibility_mode, super::ToolCompatibilityMode::Raw);
+        }
+        assert_eq!(super::ToolCompatibilityMode::default(), super::ToolCompatibilityMode::Raw);
+        let explicit: Config = serde_json::from_str(r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
+        assert_eq!(explicit.tool_compatibility_mode, super::ToolCompatibilityMode::ClaudeCode);
+    }
+
+    #[test]
+    fn balance_refresh_interval_defaults_for_existing_configs() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.balance_refresh_interval_secs, None);
+            let interval = config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                .unwrap();
+            assert_eq!(interval.as_secs(), 300);
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert!(serialized.get("balanceRefreshIntervalSecs").is_none());
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_accepts_explicit_values_and_round_trips() {
+        for seconds in [0, 1, 300, 1800, 3600] {
+            let value = serde_json::json!({"balanceRefreshIntervalSecs": seconds});
+            let config: Config = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.balance_refresh_interval_secs, Some(seconds));
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serialized["balanceRefreshIntervalSecs"],
+                value["balanceRefreshIntervalSecs"]
+            );
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_uses_environment_when_unconfigured() {
+        let config = Config::default();
+        for (value, seconds) in [("0", 0), ("1800", 1800), (" 3600 ", 3600)] {
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Ok(value.to_string()))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+        }
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("balanceRefreshIntervalSecs")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_config_takes_precedence_over_environment() {
+        for seconds in [0, 1800] {
+            let mut config = Config::default();
+            config.balance_refresh_interval_secs = Some(seconds);
+            for value in ["0", "3600", "invalid"] {
+                assert_eq!(
+                    config
+                        .resolve_balance_refresh_interval(Ok(value.to_string()))
+                        .unwrap()
+                        .as_secs(),
+                    seconds
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_environment_values() {
+        let config = Config::default();
+        for value in ["", " ", "-1", "1.5", "invalid", "18446744073709551616"] {
+            let error = config
+                .resolve_balance_refresh_interval(Ok(value.to_string()))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS")
+            );
+        }
+        assert!(
+            config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotUnicode(
+                    std::ffi::OsString::new()
+                )))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_config_values() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1800"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<Config>(serde_json::json!({
+                    "balanceRefreshIntervalSecs": value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_deadlines_default_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 15);
+        assert_eq!(config.upstream_read_timeout_secs, 120);
+        assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
+        assert_eq!(Config::default().upstream_read_timeout_secs, 120);
+    }
+
+    /// M6：默认不设整请求截止时间，仍在输出的长回复不会被切断。
+    #[test]
+    fn upstream_total_timeout_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 0);
+    }
+
+    #[test]
+    fn upstream_deadlines_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 7);
+        assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+    }
+
+    #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.model_cache_ttl_secs, 3600);
@@ -1311,6 +1677,14 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
+    }
+
+    #[test]
     fn account_rpm_limit_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(!config.account_rpm_limit_enabled);
@@ -1319,6 +1693,19 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]
@@ -1332,6 +1719,19 @@ mod tests {
         .unwrap();
         assert!(config.account_rpm_limit_enabled);
         assert_eq!(config.account_rpm_limit, 120);
+    }
+
+    #[test]
+    fn invert_priority_defaults_and_explicit_values() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.invert_priority);
+
+        let default = Config::default();
+        assert!(!default.invert_priority);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"invertPriority": true}"#).unwrap();
+        assert!(explicit.invert_priority);
     }
 }
 

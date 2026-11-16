@@ -104,7 +104,7 @@ fn build_provider(base: String, n: usize) -> KiroProvider {
     let manager = Arc::new(MultiTokenManager::new(config, creds, None, None, false).unwrap());
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("stub".to_string(), Arc::new(StubEndpoint { base }));
-    KiroProvider::with_proxy(manager, None, endpoints, "stub".to_string())
+    KiroProvider::new(manager, endpoints, "stub".to_string())
 }
 
 const BODY: &str = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-sonnet-5"}}}}"#;

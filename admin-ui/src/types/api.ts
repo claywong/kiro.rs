@@ -1,12 +1,45 @@
+// 凭据状态统计（后端全量统计，不受分页/筛选影响）
+export interface CredentialStateCounts {
+  healthy: number
+  throttled: number
+  quota: number
+  dead: number
+  suspended?: number
+  total: number
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
+  /** 搜索/分组/状态筛选后的条目总数；仅在带筛选或分页参数时返回 */
+  filteredTotal?: number
   available: number
+  /** 当前页码（1-based）；未分页时不返回 */
+  page?: number
+  /** 每页数量；未分页时不返回 */
+  pageSize?: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
+  /** 各状态凭据全量统计 */
+  stateCounts?: CredentialStateCounts
   /** 描述 metadata 字段、值类型和选项的 JSON Schema */
   metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]
+}
+
+/** 排序方向 */
+export type SortDir = 'asc' | 'desc'
+
+// 凭据查询参数（服务端分页、搜索、过滤、排序）
+export interface CredentialQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
+  group?: string
+  status?: string
+  tier?: string
+  sortField?: string
+  sortDir?: SortDir
 }
 
 export type CredentialType = 'normal' | 'boom' | 'long_speed' | 'short_speed'
@@ -71,6 +104,8 @@ export interface CredentialStatusItem {
   rpmLimit: number
   /** 当前 60 秒滑动窗口内已使用的请求数 */
   rpmCurrent: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
@@ -81,6 +116,8 @@ export interface CredentialStatusItem {
   authMethod: string | null
   provider?: string | null
   hasProfileArn: boolean
+  /** Profile ARN 原文。上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存 */
+  profileArn?: string | null
   email?: string
   /** 后端持久化的最近一次订阅等级；封禁时仍可显示。 */
   subscriptionTitle?: string | null
@@ -92,10 +129,11 @@ export interface CredentialStatusItem {
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
+  proxyTemporaryDirect?: boolean
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
-  /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
+  /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
@@ -180,6 +218,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetLoadFactorRequest {
+  loadFactor: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -200,6 +242,8 @@ export interface AddCredentialRequest {
   priority?: number
   /** 每分钟请求数上限（默认 10；0 表示不限速） */
   rpmLimit?: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -234,6 +278,8 @@ export interface UpdateCredentialRequest {
   sourceChannel?: string
   /** 每分钟请求数上限（undefined 表示不修改，0 表示不限速） */
   rpmLimit?: number
+  /** 负载因子（均衡模式下的调度权重，>= 1，undefined 表示不修改） */
+  loadFactor?: number
   /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
   metadata?: CredentialMetadata
 }
@@ -260,6 +306,8 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  /** 由自动检测登记（凭据或全局配置在用、但此前未登记到池内） */
+  autoDetected: boolean
 }
 
 // 代理池列表响应
@@ -302,11 +350,43 @@ export interface ProxyCheckResponse {
   autoDisabled: boolean
 }
 
+// 凭据代理自动轮换结果
+export interface ProxyRotationResponse {
+  /** 从不可用代理轮换到其它可用代理的凭据数 */
+  rotated: number
+  /** 因无可用代理而回退直连的凭据数 */
+  switchedToDirect: number
+  /** 已恢复可用代理、从直连改回代理的凭据数 */
+  restoredToProxy: number
+  /** 代理不可用但无处可换、保持原配置的凭据数 */
+  unresolved: number
+}
+
 // 全量健康检查响应
 export interface ProxyCheckAllResponse {
   healthy: number
   unhealthy: number
   autoDisabled: number
+  /** 从自动禁用状态恢复启用的代理数 */
+  autoRecovered: number
+  /** 本轮自动检测新登记进池的代理数 */
+  detected: number
+  /** 本轮代理自动轮换结果 */
+  rotation: ProxyRotationResponse
+}
+
+// 代理故障转移配置
+export interface ProxyFailoverConfig {
+  /** 是否启用凭据代理的自动检测与轮换 */
+  autoRotateEnabled: boolean
+  /** 无可用代理时是否允许凭据回退直连 */
+  directFallbackEnabled: boolean
+}
+
+// 代理故障转移配置更新请求
+export interface ProxyFailoverConfigPatch {
+  autoRotateEnabled?: boolean
+  directFallbackEnabled?: boolean
 }
 
 // 轮询批量分配请求
@@ -452,6 +532,8 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
+export type ClientKeyBillingMode = 'credits' | 'calls'
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -462,6 +544,9 @@ export interface ClientKeyItem {
   createdAt: string
   lastUsedAt?: string
   totalCalls: number
+  totalSuccessfulCalls: number
+  billingMode: ClientKeyBillingMode
+  maxCalls?: number
   totalInputTokens: number
   totalOutputTokens: number
   totalCacheCreationTokens: number
@@ -478,7 +563,20 @@ export interface ClientKeyItem {
 
 export interface ClientKeysResponse {
   total: number
+  filteredTotal?: number
+  page?: number
+  pageSize?: number
   keys: ClientKeyItem[]
+}
+
+export interface ClientKeyQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
+  status?: string
+  group?: string
+  sortBy?: string
+  sortDir?: SortDir
 }
 
 export interface CreateClientKeyRequest {
@@ -487,6 +585,8 @@ export interface CreateClientKeyRequest {
   group?: string
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -501,6 +601,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number | null
 }
 
 // ============ 用量统计 ============
@@ -562,12 +664,22 @@ export interface ModelDistribution {
   outputTokens: number
 }
 
+export interface CredentialActivity {
+  todayCalls: number
+  rpm: number
+}
+
+export type CredentialActivityResponse = Record<string, CredentialActivity>
+
 export interface CredentialDistribution {
   credentialId: number
   email?: string
   calls: number
   inputTokens: number
   outputTokens: number
+  /** Older servers may not provide cache counters. Missing values mean unknown. */
+  cacheCreationTokens?: number
+  cacheReadTokens?: number
   errors: number
 }
 
@@ -593,7 +705,7 @@ export interface TraceAttempt {
   endpoint: string
   /** 上游 HTTP 状态码；null = 网络层失败 */
   httpStatus: number | null
-  /** success / quota_exhausted / account_throttled / auth_failed / transient / network_error / bad_request / unknown */
+  /** success / quota_exhausted / account_throttled / local_rate_limited / auth_failed / transient / network_error / bad_request / unknown */
   outcome: string
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
@@ -645,8 +757,21 @@ export interface TraceRecord {
   effort?: string | null
   /** 会话亲和选号结果（hit / bind / rebind / overflow / none；上线前的老记录为 null） */
   affinity?: string | null
+  /** 发给上游的 conversationId；同一会话多轮共享，可据此串起整个会话 */
+  sessionId?: string | null
+  /** 会话粘性路由结果：hit / miss_first / miss_unavailable / off；老记录为 null */
+  stickyOutcome?: StickyOutcome | null
+  /** 本次请求前该会话绑定的凭据；与 finalCredentialId 不同即为「换号」 */
+  previousCredentialId?: number | null
+  /** token/cache 三项来源：provider（上游真值）/ simulated（本地估算）/ none（无断点） */
+  usageSource?: UsageSource | null
+  /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */
+  clientIp?: string | null
   attempts: TraceAttempt[]
 }
+
+export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
+export type UsageSource = 'provider' | 'simulated' | 'none'
 
 /** 链路查询参数 */
 export interface TraceQuery {
@@ -661,11 +786,17 @@ export interface TraceQuery {
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** 会话 id 精确匹配：把同一会话的全部轮次拉出来 */
+  sessionId?: string
+  /** 仅返回换号请求（previousCredentialId 非空且 != finalCredentialId） */
+  onlySwitched?: boolean
+  /** 客户端 IP 精确匹配 */
+  clientIp?: string
   /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */
   startTime?: number
   /** 时间窗口终点（Unix 秒，含） */
   endTime?: number
-  /** 关键字模糊匹配：模型名 / traceId / 错误信息 */
+  /** 关键字模糊匹配：模型名 / traceId / 错误信息 / sessionId / clientIp */
   q?: string
   limit?: number
   offset?: number
@@ -677,7 +808,7 @@ export interface TracePage {
   total: number
 }
 
-/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+/** 单凭据失败分类计数（鉴权 / 账号限流 / 其他） */
 export interface FailureStats {
   auth: number
   throttle: number
@@ -700,6 +831,23 @@ export interface CustomModelItem {
   ownedBy?: string
 }
 
+// ============ 自定义响应头 ============
+
+/** 单条自定义响应头规则（与 config.json customHeaders 数组一一对应） */
+export interface CustomHeaderItem {
+  key: string
+  value: string
+  enabled: boolean
+}
+
+export interface CustomHeadersConfigResponse {
+  headers: CustomHeaderItem[]
+}
+
+export interface SetCustomHeadersRequest {
+  headers: CustomHeaderItem[]
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {
@@ -710,16 +858,36 @@ export interface GroupItem {
   credentialCount: number
   /** 引用计数：有多少把客户端 Key 绑定这个分组 */
   clientKeyCount: number
+  /** 分组级负载均衡模式（null/undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode | null
+  /** 分组级优先级反转（null/undefined 表示继承全局） */
+  invertPriority?: boolean | null
 }
+
+/** 负载均衡模式：priority = 按优先级顺序耗尽，balanced = 加权平滑轮询 */
+export type LoadBalancingMode = 'priority' | 'balanced'
 
 export interface GroupsResponse {
   total: number
+  filteredTotal?: number
+  page?: number
+  pageSize?: number
   groups: GroupItem[]
+}
+
+export interface GroupQueryParams {
+  page?: number
+  pageSize?: number
+  search?: string
 }
 
 export interface CreateGroupRequest {
   name: string
   description?: string
+  /** 分组级负载均衡模式（undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode
+  /** 分组级优先级反转（undefined 表示继承全局） */
+  invertPriority?: boolean
 }
 
 export interface UpdateGroupRequest {
@@ -727,6 +895,14 @@ export interface UpdateGroupRequest {
   newName?: string
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
+  /** 分组级负载均衡模式 */
+  loadBalancingMode?: LoadBalancingMode
+  /** 重置负载均衡模式为继承全局 */
+  resetLoadBalancingMode?: boolean
+  /** 分组级优先级反转 */
+  invertPriority?: boolean
+  /** 重置优先级反转为继承全局 */
+  resetInvertPriority?: boolean
 }
 
 // ============ 卖家（Key 供应商）对接 ============

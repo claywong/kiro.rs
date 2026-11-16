@@ -45,9 +45,8 @@ fn ceil_secs(d: Duration) -> u64 {
 }
 
 fn capped_error(wait: Duration) -> anyhow::Error {
-    anyhow::Error::new(UpstreamRateLimitError::new(Some(
-        ceil_secs(wait).to_string(),
-    )))
+    // 亲和触顶是网关自己的 RPM 限流，标成本地限流（上游 `local_rpm_limit`）。
+    anyhow::Error::new(UpstreamRateLimitError::local_rpm_limit(ceil_secs(wait)))
 }
 
 impl MultiTokenManager {

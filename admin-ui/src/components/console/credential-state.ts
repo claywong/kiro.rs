@@ -18,7 +18,7 @@ import type { RailTone } from './rail'
  */
 export type CredentialState =
   | 'current' // 当前优先，正在服务
-  | 'throttled' // 账号级风控冷却中，会自行恢复
+  | 'throttled' // 账号级限流冷却中，会自行恢复
   | 'quotaDisabled' // 因超额被禁用
   | 'quotaExceeded' // 已超额但仍启用
   | 'authFailed' // 鉴权 / token 失效类禁用
@@ -89,8 +89,8 @@ export function getDisposition(
     if (reason === 'Suspended') {
       return {
         state: 'suspended',
-        tone: 'dead',
-        stateLabel: '已禁用 · 账号封禁',
+        tone: 'banned',
+        stateLabel: '已封禁 · 账号锁定',
         actionLabel: '重新登录',
         action: 'relogin',
       }
@@ -98,7 +98,7 @@ export function getDisposition(
     if (reason && AUTH_REASONS.has(reason)) {
       return {
         state: 'authFailed',
-        tone: 'dead',
+        tone: 'disabled',
         stateLabel:
           reason === 'InvalidRefreshToken'
             ? '已禁用 · Token 失效'
@@ -112,7 +112,7 @@ export function getDisposition(
     if (reason === 'TooManyFailures') {
       return {
         state: 'otherDisabled',
-        tone: 'dead',
+        tone: 'disabled',
         stateLabel: '已禁用 · 失败过多',
         // 失败原因未必是凭据本身的问题，先看失败日志再决定要不要放回去
         actionLabel: '查看失败',
@@ -122,7 +122,7 @@ export function getDisposition(
     if (reason === 'Manual' || !reason) {
       return {
         state: 'manualDisabled',
-        tone: 'dead',
+        tone: 'disabled',
         stateLabel: reason ? '已禁用 · 手动禁用' : '已禁用',
         actionLabel: '启用',
         action: 'enable',
@@ -130,19 +130,19 @@ export function getDisposition(
     }
     return {
       state: 'otherDisabled',
-      tone: 'dead',
+      tone: 'disabled',
       stateLabel: `已禁用 · ${reason}`,
       actionLabel: '启用',
       action: 'enable',
     }
   }
 
-  // 未禁用但在风控冷却中：会自己恢复，所以是 cool 而非 warn
+  // 未禁用但在限流冷却中：会自己恢复，所以是 cool 而非 warn
   if (throttleRemaining > 0) {
     return {
       state: 'throttled',
       tone: 'cool',
-      stateLabel: '风控冷却中',
+      stateLabel: '限流冷却中',
       actionLabel: '解除冷却',
       action: 'clearThrottle',
     }
@@ -195,6 +195,7 @@ export interface CredentialCounts {
   throttled: number
   quota: number
   dead: number
+  suspended: number
   total: number
 }
 
@@ -208,6 +209,7 @@ export function countByState(
     throttled: 0,
     quota: 0,
     dead: 0,
+    suspended: 0,
     total: credentials.length,
   }
   for (const c of credentials) {
@@ -228,6 +230,9 @@ export function countByState(
       case 'quotaDisabled':
         counts.quota += 1
         break
+      case 'suspended':
+        counts.suspended += 1
+        break
       default:
         counts.dead += 1
     }
@@ -236,7 +241,7 @@ export function countByState(
 }
 
 /** 状态账条各段对应的筛选键 */
-export type StateFilter = '' | 'healthy' | 'throttled' | 'quota' | 'dead'
+export type StateFilter = '' | 'healthy' | 'throttled' | 'quota' | 'dead' | 'suspended'
 
 /** 某凭据是否命中状态筛选 */
 export function matchesStateFilter(
@@ -253,10 +258,11 @@ export function matchesStateFilter(
       return state === 'throttled'
     case 'quota':
       return state === 'quotaExceeded' || state === 'quotaDisabled'
+    case 'suspended':
+      return state === 'suspended'
     case 'dead':
       return (
         state === 'authFailed' ||
-        state === 'suspended' ||
         state === 'manualDisabled' ||
         state === 'otherDisabled'
       )

@@ -8,9 +8,8 @@
 //! 这样只会说 OpenAI 协议的客户端（如 Codex CLI，`wire_api = "chat"`）也能
 //! 直接走 Kiro 后端，无需额外的翻译代理进程。
 //!
-//! 说明：内部调用始终以非流式方式执行，`stream: true` 的请求在拿到完整结果后
-//! 合成为 OpenAI 的 `chat.completion.chunk` SSE 序列。对 Codex 这类"拿到结果再
-//! 展示"的客户端，语义与逐 token 流式一致；正确性（含工具调用）完全保留。
+//! Streaming requests translate Anthropic events as they arrive, including
+//! tool arguments, final usage, and abnormal termination.
 
 use std::collections::BTreeMap;
 
@@ -21,19 +20,28 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
-use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
+use super::stream::REFUSAL_STOP_REASON;
+use super::types::{
+    CacheControl, Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool,
+};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 
 /// 未显式给出 max_tokens 时的默认输出上限
 const DEFAULT_MAX_TOKENS: i32 = 32000;
+
+#[cfg(test)]
+#[path = "chat_stream_tests.rs"]
+mod stream_tests;
 
 // ============================ 请求类型 ============================
 
@@ -56,6 +64,15 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_cache_control")]
+    pub cache_control: Option<Value>,
+}
+
+fn deserialize_present_cache_control<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// 从 OpenAI 请求体或会话亲和请求头中提取并规范化 Kiro 会话 UUID。
@@ -68,6 +85,10 @@ pub(super) fn resolve_session_metadata(
         headers
             .get("x-session-affinity")
             .and_then(|value| value.to_str().ok()),
+        // pi-ai 在 compat.sessionAffinityFormat = "openrouter" 时改用 x-session-id
+        headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok()),
         headers
             .get("x-client-request-id")
             .and_then(|value| value.to_str().ok()),
@@ -77,7 +98,11 @@ pub(super) fn resolve_session_metadata(
     ];
 
     candidates.into_iter().flatten().find_map(|candidate| {
-        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        // Claude Code/Codex 写 "session_<uuid>"；pi-ai 系客户端（x-session-affinity / x-session-id）写 "session-<uuid>"
+        let raw_uuid = candidate
+            .strip_prefix("session_")
+            .or_else(|| candidate.strip_prefix("session-"))
+            .unwrap_or(candidate);
         let uuid = Uuid::parse_str(raw_uuid).ok()?;
         Some(Metadata {
             user_id: Some(format!("session_{uuid}")),
@@ -113,59 +138,131 @@ pub async fn post_chat_completions(
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    // 2. Reuse the Anthropic chain with the client's streaming preference.
+    let inner = post_messages(State(state.clone()), Extension(key_ctx), Json(anthropic_req)).await;
+
+    // 把内层 Anthropic 响应上的自定义响应头透传到 OpenAI 响应。
+    let mut configured_names = state
+        .custom_headers
+        .as_ref()
+        .map(|mgr| mgr.get_active_header_names())
+        .unwrap_or_default();
+    configured_names.push(header::HeaderName::from_static("x-oneapi-request-id"));
+    configured_names.push(header::HeaderName::from_static("x-request-id"));
+
+    let trace_headers: Vec<(header::HeaderName, header::HeaderValue)> = inner
+        .headers()
+        .iter()
+        .filter(|(name, _)| configured_names.iter().any(|cfg| cfg == *name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let attach_trace = |resp: &mut Response| {
+        for (name, val) in &trace_headers {
+            resp.headers_mut().insert(name.clone(), val.clone());
+        }
+    };
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
+    if status.is_success() && want_stream {
+        let mut resp = chat_streaming_response(inner.into_body(), model);
+        attach_trace(&mut resp);
+        return resp;
+    }
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            return openai_error(
+            let mut resp = openai_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to read upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
     // 上游非 2xx：原样透传（Anthropic 错误体已是 {"error":{type,message}} 形状）
     if !status.is_success() {
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        attach_trace(&mut response);
+        return response;
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return openai_error(
+            let mut resp = openai_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to parse upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
     // 3. Anthropic -> OpenAI 响应翻译
     let parsed = parse_anthropic_message(&anthropic, &model);
 
-    if want_stream {
-        let sse = build_stream_sse(&parsed);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(sse))
-            .unwrap()
-    } else {
-        let body = build_completion_json(&parsed);
-        (StatusCode::OK, Json(body)).into_response()
-    }
+    let body = build_completion_json(&parsed);
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    attach_trace(&mut resp);
+    resp
 }
 
 // ============================ 请求翻译 ============================
+
+/// 解析任意 JSON 值的 CacheControl
+fn parse_cache_control(val: Option<&Value>) -> Option<CacheControl> {
+    let val = val?;
+    if let Ok(cc) = serde_json::from_value::<CacheControl>(val.clone()) {
+        return Some(cc);
+    }
+    if let Some(true) = val.as_bool() {
+        return Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        });
+    }
+    None
+}
+
+/// 解析顶层 cache_control。未显式禁用时，OpenAI 协议默认开启自动提示词缓存（Auto-caching）
+fn resolve_top_cache_control(val: Option<&Value>) -> Option<CacheControl> {
+    match val {
+        None => Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }),
+        Some(Value::Null) => None,
+        Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }),
+        Some(v @ Value::Object(_)) => {
+            if let Ok(cc) = serde_json::from_value::<CacheControl>(v.clone()) {
+                if cc.cache_type.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    Some(cc)
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 fn openai_to_anthropic(
     req: ChatCompletionRequest,
@@ -177,6 +274,8 @@ fn openai_to_anthropic(
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
+    let top_cache_control = resolve_top_cache_control(req.cache_control.as_ref());
+
     let mut system: Vec<SystemMessage> = Vec::new();
     // 合并后的对话消息：(role, content blocks)
     let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
@@ -185,19 +284,53 @@ fn openai_to_anthropic(
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
         match role {
             "system" | "developer" => {
-                for text in collect_text_strings(m.get("content")) {
-                    system.push(SystemMessage {
-                        text,
-                        cache_control: None,
-                    });
+                let msg_cc = parse_cache_control(m.get("cache_control"));
+                match m.get("content") {
+                    Some(Value::String(s)) => {
+                        if !s.is_empty() {
+                            system.push(SystemMessage {
+                                text: s.clone(),
+                                cache_control: msg_cc,
+                            });
+                        }
+                    }
+                    Some(Value::Array(parts)) => {
+                        let first_system_block = system.len();
+                        for part in parts {
+                            let text = match part {
+                                Value::String(s) => s.clone(),
+                                Value::Object(obj) => obj
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                _ => String::new(),
+                            };
+                            if !text.is_empty() {
+                                let block_cc = parse_cache_control(part.get("cache_control"));
+                                system.push(SystemMessage {
+                                    text,
+                                    cache_control: block_cc,
+                                });
+                            }
+                        }
+                        if let Some(last) = system[first_system_block..].last_mut()
+                            && last.cache_control.is_none()
+                        {
+                            last.cache_control = msg_cc;
+                        }
+                    }
+                    _ => {}
                 }
             }
             "user" => {
-                let blocks = content_blocks(m.get("content"));
+                let msg_cc = parse_cache_control(m.get("cache_control"));
+                let blocks = content_blocks(m.get("content"), msg_cc);
                 push_merged(&mut merged, "user", blocks);
             }
             "assistant" => {
-                let mut blocks = content_blocks(m.get("content"));
+                let msg_cc = parse_cache_control(m.get("cache_control"));
+                let mut blocks = content_blocks(m.get("content"), None);
                 if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
                     for call in calls {
                         let id = call
@@ -225,6 +358,7 @@ fn openai_to_anthropic(
                         }));
                     }
                 }
+                apply_message_cache_control(&mut blocks, msg_cc);
                 push_merged(&mut merged, "assistant", blocks);
             }
             "tool" => {
@@ -234,11 +368,16 @@ fn openai_to_anthropic(
                     .unwrap_or("")
                     .to_string();
                 let content = collect_text_strings(m.get("content")).join("\n");
-                let block = json!({
+                let mut block = json!({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": content,
                 });
+                if let Some(cc) = parse_cache_control(m.get("cache_control")) {
+                    if let Ok(v) = serde_json::to_value(cc) {
+                        block["cache_control"] = v;
+                    }
+                }
                 // Anthropic 里 tool_result 属于 user 轮
                 push_merged(&mut merged, "user", vec![block]);
             }
@@ -265,13 +404,16 @@ fn openai_to_anthropic(
     let output_config = req
         .reasoning_effort
         .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
+        .map(|effort| OutputConfig {
+            effort,
+            format: None,
+        });
 
     Ok(MessagesRequest {
         model: req.model,
         max_tokens,
         messages,
-        stream: false, // 内部始终非流式
+        stream: req.stream,
         system: if system.is_empty() {
             None
         } else {
@@ -282,6 +424,7 @@ fn openai_to_anthropic(
         thinking: None,
         output_config,
         metadata,
+        cache_control: top_cache_control,
     })
 }
 
@@ -300,7 +443,7 @@ pub(super) fn push_merged(merged: &mut Vec<(String, Vec<Value>)>, role: &str, bl
 }
 
 /// 把 OpenAI message.content（字符串或数组）转成 Anthropic content blocks
-fn content_blocks(content: Option<&Value>) -> Vec<Value> {
+fn content_blocks(content: Option<&Value>, msg_cache_control: Option<CacheControl>) -> Vec<Value> {
     let mut out = Vec::new();
     match content {
         Some(Value::String(s)) => {
@@ -311,14 +454,26 @@ fn content_blocks(content: Option<&Value>) -> Vec<Value> {
         Some(Value::Array(parts)) => {
             for part in parts {
                 let ty = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let part_cc = parse_cache_control(part.get("cache_control"));
                 match ty {
                     "text" | "input_text" => {
                         if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            out.push(json!({"type": "text", "text": t}));
+                            let mut block = json!({"type": "text", "text": t});
+                            if let Some(cc) = &part_cc {
+                                if let Ok(v) = serde_json::to_value(cc) {
+                                    block["cache_control"] = v;
+                                }
+                            }
+                            out.push(block);
                         }
                     }
                     "image_url" => {
-                        if let Some(block) = image_block(part) {
+                        if let Some(mut block) = image_block(part) {
+                            if let Some(cc) = &part_cc {
+                                if let Ok(v) = serde_json::to_value(cc) {
+                                    block["cache_control"] = v;
+                                }
+                            }
                             out.push(block);
                         }
                     }
@@ -328,7 +483,17 @@ fn content_blocks(content: Option<&Value>) -> Vec<Value> {
         }
         _ => {}
     }
+    apply_message_cache_control(&mut out, msg_cache_control);
     out
+}
+
+fn apply_message_cache_control(blocks: &mut [Value], cache_control: Option<CacheControl>) {
+    if let Some(cache_control) = cache_control
+        && let Some(last) = blocks.last_mut()
+        && last.get("cache_control").is_none()
+    {
+        last["cache_control"] = json!(cache_control);
+    }
 }
 
 /// 仅收集纯文本（system / tool 内容用）
@@ -396,13 +561,15 @@ pub(super) fn convert_tools(tools: &[Value]) -> Vec<Tool> {
                 input_schema.insert(k.clone(), v.clone());
             }
         }
+        let cache_control = parse_cache_control(t.get("cache_control"))
+            .or_else(|| parse_cache_control(func.get("cache_control")));
         out.push(Tool {
             tool_type: None,
             name,
             description,
             input_schema,
             max_uses: None,
-            cache_control: None,
+            cache_control,
         });
     }
     out
@@ -433,6 +600,9 @@ pub(super) struct ParsedResponse {
     pub(super) model: String,
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
+    /// Anthropic/Kiro 的原始停止原因。`finish_reason` 是面向 OpenAI
+    /// completion 兼容层的归一化值，不能用于区分输出耗尽和上下文溢出。
+    pub(super) upstream_stop_reason: String,
     pub(super) finish_reason: String,
     /// OpenAI 口径的输入总量：**含**缓存部分。
     ///
@@ -583,6 +753,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         model: model.to_string(),
         text,
         tool_calls,
+        upstream_stop_reason: stop_reason.to_string(),
         finish_reason,
         prompt_tokens,
         completion_tokens,
@@ -597,6 +768,8 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
 
 fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
+        // 拒答优先于工具调用：被拦截的轮次不应让客户端去执行半截的 tool_calls。
+        REFUSAL_STOP_REASON => "content_filter",
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ if has_tool_calls => "tool_calls",
@@ -638,69 +811,165 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
     })
 }
 
-/// 把完整结果合成为 OpenAI chat.completion.chunk SSE 序列
-fn build_stream_sse(p: &ParsedResponse) -> String {
-    let id = new_id();
-    let created = now_ts();
-    let mut out = String::new();
+struct ChatStreamContext {
+    id: String,
+    created: i64,
+    model: String,
+    tools: BTreeMap<u64, usize>,
+    usage: serde_json::Map<String, Value>,
+    stop_reason: String,
+    terminal: bool,
+}
 
-    let mut push_chunk = |delta: Value, finish: Option<&str>| {
-        let chunk = json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": p.model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish,
-            }],
+impl ChatStreamContext {
+    fn chunk(&self, delta: Value, finish: Option<&str>, usage: Option<Value>) -> Bytes {
+        let mut value = json!({
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created,
+            "model": self.model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         });
-        out.push_str("data: ");
-        out.push_str(&chunk.to_string());
-        out.push_str("\n\n");
+        if let Some(usage) = usage {
+            value["usage"] = usage;
+        }
+        Bytes::from(format!("data: {value}\n\n"))
+    }
+
+    fn fail(&mut self, error: Value) -> Vec<Bytes> {
+        self.terminal = true;
+        vec![Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"error": error})
+        ))]
+    }
+
+    fn handle(&mut self, event: &str, data: Value) -> Vec<Bytes> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if let Some(usage) = data
+            .get("usage")
+            .or_else(|| data.pointer("/message/usage"))
+            .and_then(Value::as_object)
+        {
+            self.usage.extend(usage.clone());
+        }
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        match event {
+            "ping" => vec![Bytes::from_static(b": ping\n\n")],
+            "message_start" => vec![self.chunk(json!({"role": "assistant"}), None, None)],
+            "content_block_start" => {
+                let block = &data["content_block"];
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        let tool_index = self.tools.len();
+                        self.tools.insert(index, tool_index);
+                        let input = block
+                            .get("input")
+                            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(Value::to_string)
+                            .unwrap_or_default();
+                        vec![self.chunk(
+                            json!({"tool_calls": [{
+                                "index": tool_index, "id": block["id"], "type": "function",
+                                "function": {"name": block["name"], "arguments": input}
+                            }]}),
+                            None,
+                            None,
+                        )]
+                    }
+                    Some("text") if block["text"].as_str().is_some_and(|s| !s.is_empty()) => vec![self.chunk(json!({"content": block["text"]}), None, None)],
+                    _ => Vec::new(),
+                }
+            }
+            "content_block_delta" => match data["delta"]["type"].as_str() {
+                Some("text_delta") => vec![self.chunk(json!({"content": data["delta"]["text"]}), None, None)],
+                Some("input_json_delta") => match self.tools.get(&index) {
+                    Some(tool_index) => vec![self.chunk(json!({"tool_calls": [{"index": tool_index, "function": {"arguments": data["delta"]["partial_json"]}}]}), None, None)],
+                    None => self.fail(json!({"type": "api_error", "message": "Upstream tool delta has no matching tool"})),
+                },
+                _ => Vec::new(),
+            },
+            "message_delta" => {
+                if let Some(reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop_reason = reason.to_owned();
+                }
+                Vec::new()
+            }
+            "message_stop" => {
+                let parsed = parse_anthropic_message(&json!({"usage": self.usage}), &self.model);
+                let finish = map_finish_reason(&self.stop_reason, !self.tools.is_empty());
+                let chunks = vec![
+                    self.chunk(json!({}), Some(finish), Some(build_usage_json(&parsed))),
+                    Bytes::from_static(b"data: [DONE]\n\n"),
+                ];
+                self.terminal = true;
+                chunks
+            }
+            "error" => self.fail(data.get("error").cloned().unwrap_or_else(|| json!({"type":"api_error", "message":"Upstream stream failed"}))),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn chat_streaming_response(body: Body, model: String) -> Response {
+    let context = ChatStreamContext {
+        id: new_id(),
+        created: now_ts(),
+        model,
+        tools: BTreeMap::new(),
+        usage: serde_json::Map::new(),
+        stop_reason: "end_turn".to_owned(),
+        terminal: false,
     };
-
-    // 角色帧
-    push_chunk(json!({ "role": "assistant" }), None);
-
-    // 文本帧
-    if !p.text.is_empty() {
-        push_chunk(json!({ "content": p.text }), None);
-    }
-
-    // 工具调用帧
-    for (i, tc) in p.tool_calls.iter().enumerate() {
-        let delta = json!({
-            "tool_calls": [{
-                "index": i,
-                "id": tc.get("id").cloned().unwrap_or(Value::Null),
-                "type": "function",
-                "function": tc.get("function").cloned().unwrap_or(json!({})),
-            }]
-        });
-        push_chunk(delta, None);
-    }
-
-    // 结束帧（带 usage）
-    let final_chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": p.model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": p.finish_reason,
-        }],
-        "usage": build_usage_json(p),
-    });
-    out.push_str("data: ");
-    out.push_str(&final_chunk.to_string());
-    out.push_str("\n\n");
-    out.push_str("data: [DONE]\n\n");
-
-    out
+    let output = stream::unfold(
+        (
+            body.into_data_stream(),
+            Vec::new(),
+            context,
+            std::collections::VecDeque::new(),
+        ),
+        |(mut body, mut buffer, mut context, mut pending)| async move {
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(chunk),
+                        (body, buffer, context, pending),
+                    ));
+                }
+                if context.terminal {
+                    return None;
+                }
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        for frame in super::responses::take_sse_frames(&mut buffer) {
+                            if context.terminal {
+                                break;
+                            }
+                            match super::responses::parse_sse_frame(&frame) {
+                                Ok(Some((event, data))) => {
+                                    pending.extend(context.handle(&event, data))
+                                }
+                                Ok(None) => {}
+                                Err(_) => pending.extend(context.fail(json!({
+                                    "type": "api_error", "message": "Invalid upstream SSE frame"
+                                }))),
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => pending.extend(context.fail(json!({
+                        "type": "api_error", "message": "Upstream response stream was interrupted"
+                    }))),
+                }
+            }
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(output))
+        .unwrap()
 }
 
 /// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
@@ -712,7 +981,9 @@ fn build_usage_json(p: &ParsedResponse) -> Value {
         "prompt_tokens": p.prompt_tokens,
         "completion_tokens": p.completion_tokens,
         "total_tokens": p.prompt_tokens + p.completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
+        "prompt_tokens_details": {
+            "cached_tokens": p.cached_tokens,
+        },
     });
     if let Some(credit_usage) = p.credit_usage {
         usage["credit_usage"] = json!(credit_usage);
@@ -816,6 +1087,29 @@ mod tests {
     }
 
     #[test]
+    fn session_metadata_accepts_openrouter_style_x_session_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", format!("session-{UUID_B}").parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    #[test]
+    fn session_metadata_accepts_dsh_hyphen_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            format!("session-{UUID_B}").parse().unwrap(),
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    #[test]
     fn session_metadata_skips_non_utf8_and_invalid_candidates() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -862,6 +1156,7 @@ mod tests {
             model: "gpt-5.6-sol".to_string(),
             text: "hi".to_string(),
             tool_calls: Vec::new(),
+            upstream_stop_reason: "end_turn".to_string(),
             finish_reason: "stop".to_string(),
             prompt_tokens: 7,
             completion_tokens: 11,
@@ -899,29 +1194,6 @@ mod tests {
         assert_eq!(usage["credit_usage"], json!(0.5));
         assert_eq!(usage["credit_unit"], json!("credit"));
         assert_eq!(usage["credit_unit_plural"], json!("credits"));
-    }
-
-    #[test]
-    fn build_stream_sse_carries_credit_fields_in_final_chunk() {
-        let mut p = base_parsed();
-        p.credit_usage = Some(0.33);
-        p.credit_unit = Some("credit".to_string());
-        p.credit_unit_plural = Some("credits".to_string());
-        let sse = build_stream_sse(&p);
-        assert!(sse.contains("\"credit_usage\":0.33"));
-        assert!(sse.contains("\"credit_unit\":\"credit\""));
-        assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
-        // 结束帧的 usage 必须出现在最后一个 data 块里
-        assert!(sse.contains("\"usage\""));
-    }
-
-    #[test]
-    fn build_stream_sse_omits_credit_fields_without_metering() {
-        let p = base_parsed();
-        let sse = build_stream_sse(&p);
-        assert!(!sse.contains("credit_usage"));
-        assert!(!sse.contains("credit_unit"));
-        assert!(!sse.contains("credit_unit_plural"));
     }
 
     #[test]
@@ -971,6 +1243,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_anthropic_message_preserves_upstream_stop_reason() {
+        for reason in ["max_tokens", "model_context_window_exceeded"] {
+            let anthropic = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": reason,
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            });
+            let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+            assert_eq!(parsed.upstream_stop_reason, reason);
+            assert_eq!(parsed.finish_reason, "length");
+        }
+    }
+
+    #[test]
     fn parse_anthropic_message_sanitizes_negative_and_missing_usage() {
         let anthropic = json!({
             "content": [],
@@ -1007,6 +1293,232 @@ mod tests {
         assert!(p.credit_usage.is_none());
         assert!(p.credit_unit.is_none());
         assert!(p.credit_unit_plural.is_none());
+    }
+
+    #[test]
+    fn openai_to_anthropic_enables_auto_cache_by_default() {
+        let req = chat_request(None);
+        let anthropic = openai_to_anthropic(req, None).unwrap();
+        assert!(anthropic.cache_control.is_some());
+        let cc = anthropic.cache_control.unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert!(cc.ttl.is_none());
+    }
+
+    #[test]
+    fn openai_to_anthropic_respects_explicit_cache_control_and_disable() {
+        let mut req_val = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_control": {
+                "type": "ephemeral",
+                "ttl": "1h"
+            }
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(req_val.clone()).unwrap();
+        let anthropic = openai_to_anthropic(req, None).unwrap();
+        let cc = anthropic.cache_control.unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert_eq!(cc.ttl.as_deref(), Some("1h"));
+
+        for disabled in [json!(false), json!(null), json!({"type": "none"})] {
+            req_val["cache_control"] = disabled;
+            let req_disabled: ChatCompletionRequest = serde_json::from_value(req_val.clone()).unwrap();
+            let anthropic_disabled = openai_to_anthropic(req_disabled, None).unwrap();
+            assert!(anthropic_disabled.cache_control.is_none());
+        }
+    }
+
+    #[test]
+    fn openai_to_anthropic_preserves_block_and_tool_cache_control() {
+        let req_val = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "you are an assistant",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cached query",
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "test tool"
+                    },
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(req_val).unwrap();
+        let anthropic = openai_to_anthropic(req, None).unwrap();
+
+        let sys = anthropic.system.unwrap();
+        assert_eq!(sys[0].text, "you are an assistant");
+        assert!(sys[0].cache_control.is_some());
+
+        let msg = &anthropic.messages[0];
+        let blocks = msg.content.as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0].get("cache_control").is_some());
+
+        let tools = anthropic.tools.unwrap();
+        assert_eq!(tools[0].name, "lookup");
+        assert!(tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn system_message_cache_control_only_marks_last_text_block() {
+        for role in ["system", "developer"] {
+            let request = serde_json::from_value(json!({
+                "model": "claude-sonnet-5.5",
+                "cache_control": null,
+                "messages": [
+                    {
+                        "role": role,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        "content": [
+                            {"type": "text", "text": "first"},
+                            {"type": "text", "text": "second"},
+                            {"type": "text", "text": "third"},
+                            {"type": "text", "text": "fourth"},
+                            {"type": "text", "text": "fifth"},
+                            {"type": "text", "text": ""}
+                        ]
+                    },
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .unwrap();
+            let translated = openai_to_anthropic(request, None).unwrap();
+            assert!(translated.cache_control.is_none());
+            let system = translated.system.unwrap();
+            assert_eq!(system.len(), 5);
+            assert_eq!(
+                system.iter().filter(|block| block.cache_control.is_some()).count(),
+                1
+            );
+            assert_eq!(
+                system[4].cache_control.as_ref().unwrap().ttl.as_deref(),
+                Some("1h")
+            );
+        }
+    }
+
+    #[test]
+    fn system_message_cache_control_preserves_explicit_blocks_and_empty_boundaries() {
+        let request = serde_json::from_value(json!({
+            "model": "claude-sonnet-5.5",
+            "messages": [
+                {
+                    "role": "system",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "content": [
+                        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                        {"type": "text", "text": "second", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+                    ]
+                },
+                {"role": "developer", "content": "uncached"},
+                {"role": "system", "content": [], "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let translated = openai_to_anthropic(request, None).unwrap();
+        let system = translated.system.unwrap();
+        assert_eq!(system.len(), 3);
+        assert_eq!(
+            system[0].cache_control.as_ref().unwrap().ttl.as_deref(),
+            Some("5m")
+        );
+        assert_eq!(
+            system[1].cache_control.as_ref().unwrap().ttl.as_deref(),
+            Some("5m")
+        );
+        assert!(system[2].cache_control.is_none());
+    }
+
+    #[test]
+    fn assistant_message_cache_control_includes_tool_calls() {
+        for content in [
+            Value::Null,
+            json!("checking"),
+            json!([{"type": "text", "text": "checking"}]),
+        ] {
+            let request = serde_json::from_value(json!({
+                "model": "claude-sonnet-5.5",
+                "cache_control": null,
+                "messages": [
+                    {"role": "user", "content": "look up the value"},
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                            {"id": "call_2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "one"},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "two"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }))
+            .unwrap();
+            let translated = openai_to_anthropic(request, None).unwrap();
+            assert!(translated.cache_control.is_none());
+            let blocks = translated.messages[1].content.as_array().unwrap();
+            assert_eq!(
+                blocks.iter().filter(|block| block.get("cache_control").is_some()).count(),
+                1
+            );
+            let last = blocks.last().unwrap();
+            assert_eq!(last["id"], "call_2");
+            assert_eq!(last["cache_control"]["ttl"], "1h");
+        }
+    }
+
+    #[test]
+    fn assistant_message_cache_control_preserves_explicit_content_breakpoint() {
+        let request = serde_json::from_value(json!({
+            "model": "claude-sonnet-5.5",
+            "messages": [
+                {"role": "user", "content": "look up the value"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "checking", "cache_control": {"type": "ephemeral", "ttl": "5m"}}],
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "one"},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap();
+        let translated = openai_to_anthropic(request, None).unwrap();
+        let blocks = translated.messages[1].content.as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "5m");
+        assert_eq!(blocks[1]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn build_usage_json_includes_prompt_tokens_details_cached_tokens() {
+        let mut p = base_parsed();
+        p.prompt_tokens = 100;
+        p.cached_tokens = 80;
+        let usage = build_usage_json(&p);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 80);
     }
 }
 
@@ -1071,12 +1583,5 @@ mod cache_usage_tests {
         assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(300));
         // cached 是 prompt 的子集，total 不能重复累加。
         assert_eq!(usage["total_tokens"], json!(1011));
-    }
-
-    #[test]
-    fn stream_sse_carries_cached_tokens() {
-        let p = parse_anthropic_message(&anthropic_with_cache(200, 500, 300), "claude-opus-4-7");
-        let sse = build_stream_sse(&p);
-        assert!(sse.contains("\"cached_tokens\":300"), "SSE 结束帧应带 cached_tokens: {sse}");
     }
 }

@@ -7,7 +7,7 @@
 
 | 领域 | 本地曾经的做法 | 现在 | 原因 |
 |---|---|---|---|
-| 模型闸门 | 凭据 `supported_models` 白名单硬过滤，空清单也跳过 | 上游语义：调度层只按订阅等级（Opus 需非 Free），具体支持与否交由 `model_cache` 三态（Confirmed 优先 / Unsupported 跳过 / Unknown 放行） | 上游列表临时不可用时不该退化成本地硬白名单；新模型新账号不必等清单回填 |
+| 模型闸门 | 凭据 `supported_models` 白名单硬过滤，空清单也跳过 | 上游语义：调度层**不再**按订阅名称过滤（上游 `59b6d48` 连 Opus 的 Free 订阅闸门也删了），具体支持与否完全交由 `model_cache` 三态（Confirmed 优先 / Unsupported 跳过 / Unknown 放行） | 上游列表临时不可用时不该退化成本地硬白名单；新模型新账号不必等清单回填 |
 | 模型映射 | `NON_CLAUDE_MODELS` 白名单 + 逐版本 if-else | 上游的开放透传 + 通用 Claude 规范化 | 白名单注定被上游取代，维护成本高 |
 | `GET /v1/models` | 280 行静态 Model 清单 | 上游动态目录（按分组查上游、合并去重、按 ID 排序） | 静态清单每次新模型都要改，且与上游必然冲突 |
 | 凭据级模型测试 | `POST /api/admin/credentials/{id}/test-model` + 独立弹窗 + `call_api_with_credential` / `acquire_context_for_credential` | 上游 `POST /api/admin/models/test`，入口在上游「查看可用模型」弹窗的逐行测试按钮 | 上游弹窗已含模型列表 + 逐行测试，本地那套是它的功能子集，只多一个自定义消息框，不值得为此维护一条平行链路 |
@@ -397,6 +397,75 @@ IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
   `healthGate` / `concurrencyGate` / `trafficIngress` 块会被静默忽略，不会因未知字段启动失败。
 - 需要找回时从对应提交的父提交捞（流量入口从本次提交的父提交），别重写。
 - 合并时若上游改动落在这几个文件上，直接取删除。
+
+### 2026-11-16 合并上游 ZyphrZero v0.9.9（`c37fe5a`，169 个提交，基点 v0.8.0）
+
+规模：36 个冲突文件。上游这一轮在调度、会话粘性、流式处理、缓存计量上都做了大改，
+与本地并行实现撞上了好几处，下面是每处的取舍。
+
+**用户拍板的两个决策**
+
+1. **会话亲和：保留本地，上游粘性只留 trace 字段。**
+   上游新增了自己的「会话粘性路由」（`src/kiro/session_affinity.rs` 绑定表、`/config/session-affinity`
+   接口与设置页、`acquire_context_routed` / `bind_session`）。本地的亲和（RPM 放宽、触顶短等、溢出、
+   `AtomicBool` 总开关）更完整，所以整套删掉上游的绑定表、接口与类型。
+   为保住上游新增的链路页 / 命中统计，`RequestTracer` 在 finalize 时把本地 `affinity` 映射到上游 trace 列：
+   hit→`HIT`、bind→`MISS_FIRST`、rebind/overflow→`MISS_UNAVAILABLE`、其余→`OFF`（`sticky_from_affinity`）。
+   `TraceSink::on_route` 保留但无调用方。
+2. **调度：保留本地 least-used，上游调度仅留元数据。**
+   上游 balanced 改成 SWRR + `load_factor` 加权 + 在途并发避让。本地 balanced / priority 都按 success_count
+   + 使用率 least-used（号池寿命，见记忆 `scheduling-least-used-intent`），所以：
+   - `load_factor` 字段、Admin 接口、前端编辑 UI 保留，**调度不读它**；
+   - `in_flight` / `current_weight` / `InFlightGuard` 不接入（`CallContext._in_flight` 与
+     `KiroCallResult._in_flight` 恒为 `None`，仅为字段兼容；`InFlightGuard::new` 标了 `allow(dead_code)`）；
+   - 上游依赖这些的测试已删：SWRR 分布 / 交错、`load_factor` 生效、balanced 随机均衡类
+     （`balanced_*`、`test_balanced_mode_independent_per_group`、`switching_from_balanced_to_priority_*`）、
+     在途并发类（含 `mcp_in_flight_guard_covers_response_body`）、粘性路由类。均衡类断言的恰好是
+     「新凭据不独占 / 老凭据也分到流量」，与本地 least-used 意图相反，是明确的语义分歧，不是漏改。
+   - `add_credential_warms_model_cache_*` 的末尾「随机选到新凭据」断言改为「预热后标为 Confirmed」。
+   - **上游的分组级均衡覆盖与优先级反转**（`resolve_load_balancing_for_group`、`invert_priority`）已接进本地选号：
+     `select_next_credential_excluding` 与 `acquire_context_impl` 用它取模式，
+     `pick_by_discovery_priority_least_used` 多了 `invert_priority` 参数（用 `priority_key`）。
+
+**让位给上游（冲突时直接取上游，勿恢复）**
+
+| 领域 | 本地曾经的做法 | 现在 | 原因 |
+|---|---|---|---|
+| 上游错误帧暴露 | `StreamContext.upstream_error` / `mark_upstream_error` / `UpstreamEventError`，非流式与 websearch 里 `DecoderStopped` 专门处理 | 上游 `upstream_event_error` + `settlement.interrupt` + `StreamFailure`；websearch 用 `stream_error` | 上游重写了整个流式收尾，目标相同（不把截断响应记成 success） |
+| `/cc/v1/messages` 缓冲流 | `BufferedStreamContext`（缓冲到流尾修正 `message_start.input_tokens`） | 直接走 `handle_stream_request` | 上游已移除缓冲路径（`14f9b6c`） |
+| 本地 token 估算 | `count_content_block` / `count_json_value` | 上游 `count_content_block_tokens`（还计 thinking / image） | 上游是超集 |
+| 缓存计量容量 | 默认 1M 条（`1ea5b0a`） | 上游默认 262144，`config.json` 的 `cacheMeteringCapacity` 或环境变量 `KIRO_RS_CACHE_CAPACITY` 可调（1024 ~ 8388608，启动时生效） | 上游改成可配置，压测要更大值请在配置里设 |
+| HTTP Client | `build_streaming_client` + 固定读超时 | 上游 `build_client_with_timeouts`（`upstreamConnect/Read/TotalTimeoutSecs` 可配） | 同上 |
+| Opus 订阅闸门 | `credential_matches_request` 里 `supports_opus()` | 删除，只剩分组匹配 | 上游 `59b6d48` |
+| `usage_api_attempts` 矩阵 | 本地早已丢弃（2026-09-08 一节） | 依然丢弃，用量接口只加 `api_domain.management_host(region)` | 上游仍用 `effective_profile_arn`，BuilderID 在新口径下必然被拒 |
+
+**本地独有、这次保住的**
+
+- `http_client::build_client` 仍统一带 50s 建连超时（上游没有）。
+- `credential_matches_request_local`（速刷号小模型闸门）、速刷号 / 短速刷 / 原号 429 重试、凭据 `credit_limit`、
+  `alive_duration_secs`、卖家 / vendor 全套、`recent_spend`、TTFT EWMA、思考观测、effort 记录、
+  `UsageRecordHook.tracer`（web_search 补 trace）。
+- 429 路径组合：用户级 429（`USER_REQUEST_RATE_EXCEEDED`）**先**走本地的「亲和原号重试 → 速刷号原号重试 → 临时排除换号」，
+  剩下的（账号级风控等）再进上游的 `ModelApi429Action` 分流。本地 RPM 限流错误改用上游的
+  `UpstreamRateLimitError::local_rpm_limit`（标成本地限流，trace 不记成上游 429）。
+- 只剩「被限流冷却」的凭据时，`acquire_context_impl` 回 429 + Retry-After（上游语义），不再报「所有凭据已禁用」。
+- `converter.rs` 的 reasoning 键名判定：本地 `ReasoningFieldStyle` 保留，吸收了 grok-4.7（走 `reasoning` 键，
+  `max` 映射为 `xhigh`）与 haiku-5；上游的 `model_supports_native_reasoning` 保留为
+  `model_reasoning_field_style(..).is_some()` 的薄包装。`is_claude_5_plus_1m_family` 继续作为
+  上游窗口清单的补充（覆盖 fable-5.1 等未登记小版本）。
+- `IdeEndpoint::LegacyQ` 的 host 改为 `ctx.runtime_host()`，跟随上游的 apiDomain 热切换；
+  `Runtime` / `CodeWhisperer` 仍是固定主机（短速刷随机端点用）。
+- `main.rs`：`AdminService` 仍在顶层构建，新增 `.with_quota_alerts` / `.with_cache_meter` / `.with_custom_headers`。
+
+**已知行为变化 / 遗留**
+
+- **TTFT 口径变了**：上游把 `first_token_ms` 改成「首个可发送内容」（`mark_first_content`），不再是首个上游 chunk。
+  本地 TTFT EWMA 读的就是它，带思考的请求会偏大。这是上游设计，未保留旧口径。
+- `gateway_reuses_upstream_connection` 在**上游原样代码**上也失败（服务端回 `connection: close`，3 次请求 3 条连接），
+  与本次合并无关，本机环境问题，未处理。
+- 版本号保持本地 `2026.10.1`（上游 `0.9.9`）。上游在线更新按版本比较，二者格式不同，别指望对齐。
+- 上游 `usage_api_attempts` / `is_builder_id_unsupported` / `should_retry_usage_api_without_profile_arn` 的测试因函数不存在而未带入；
+  `test_usage_rest_urls_omit_builder_id_placeholder` 是上游测试，断言与本地「BuilderID 必须带占位符」相反，取本地。
 
 ## 四、降低未来冲突的约定
 

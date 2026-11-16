@@ -54,8 +54,11 @@ use super::openai::{
     resolve_session_metadata,
 };
 use super::types::{
-    Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
+    CacheControl, Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
 };
+
+#[path = "responses_compaction.rs"]
+mod compaction;
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -110,9 +113,32 @@ fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
+/// 将上游返回的工具名映射回请求里的声明。
+///
+/// Kiro 偶尔会把 namespaced 工具的展平名（如 `functions__exec`）返回为原名
+/// `exec`。精确匹配始终优先；仅当原名在本次请求中唯一时才接受裸名，避免在
+/// 多个 namespace 声明同名工具时猜错目标。
+fn resolve_declared_tool<'a>(
+    kinds: &'a ToolKindMap,
+    upstream_name: &str,
+) -> Option<(&'a DeclaredTool, bool)> {
+    if let Some(declared) = kinds.get(upstream_name) {
+        return Some((declared, false));
+    }
+
+    let mut matches = kinds
+        .values()
+        .filter(|declared| declared.name == upstream_name);
+    let declared = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((declared, true))
+}
+
 // ============================ 请求类型 ============================
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
     #[serde(default)]
@@ -142,7 +168,7 @@ fn default_parallel_tool_calls() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ReasoningConfig {
     #[serde(default)]
     pub effort: Option<String>,
@@ -194,6 +220,16 @@ pub async fn post_responses(
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
+    let operation = match compaction::classify(&req.input) {
+        Ok(operation) => operation,
+        Err(message) => {
+            return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    };
+    if operation == compaction::Operation::RemoteCompact {
+        return compaction::handle(state, key_ctx, headers, req).await;
+    }
+
     let want_stream = req.stream;
     let model = req.model.clone();
     let response_config = ResponsesResponseConfig::from_request(&req);
@@ -214,50 +250,87 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state.clone()), Extension(key_ctx), Json(anthropic_req)).await;
+
+    // 把内层 Anthropic 响应上的自定义响应头透传到 Responses 响应。
+    let mut configured_names = state
+        .custom_headers
+        .as_ref()
+        .map(|mgr| mgr.get_active_header_names())
+        .unwrap_or_default();
+    configured_names.push(header::HeaderName::from_static("x-oneapi-request-id"));
+    configured_names.push(header::HeaderName::from_static("x-request-id"));
+
+    let trace_headers: Vec<(header::HeaderName, header::HeaderValue)> = inner
+        .headers()
+        .iter()
+        .filter(|(name, _)| configured_names.iter().any(|cfg| cfg == *name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let attach_trace = |resp: &mut Response| {
+        for (name, val) in &trace_headers {
+            resp.headers_mut().insert(name.clone(), val.clone());
+        }
+    };
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     if !status.is_success() {
         let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
             Ok(b) => b,
             Err(e) => {
-                return responses_error(
+                let mut resp = responses_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
                     &format!("failed to read upstream response: {e}"),
                 );
+                attach_trace(&mut resp);
+                return resp;
             }
         };
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        attach_trace(&mut response);
+        return response;
     }
 
     if want_stream {
-        return responses_streaming_response(inner.into_body(), model, tool_kinds, response_config);
+        let mut resp =
+            responses_streaming_response(inner.into_body(), model, tool_kinds, response_config);
+        attach_trace(&mut resp);
+        return resp;
     }
 
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            return responses_error(
+            let mut resp = responses_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to read upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return responses_error(
+            let mut resp = responses_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to parse upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
@@ -265,7 +338,9 @@ pub async fn post_responses(
     let parsed = parse_anthropic_message(&anthropic, &model);
 
     let body = build_responses_object_with_config(&parsed, &tool_kinds, &response_config);
-    (StatusCode::OK, Json(body)).into_response()
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    attach_trace(&mut resp);
+    resp
 }
 
 // ============================ 请求翻译 ============================
@@ -274,6 +349,16 @@ fn responses_to_anthropic(
     req: ResponsesRequest,
     metadata: Option<Metadata>,
 ) -> Result<(MessagesRequest, ToolKindMap), String> {
+    // OpenAI Responses 默认采用隐式 prompt caching，但 Codex 当前只发送稳定的
+    // prompt_cache_key，不会发送 Anthropic 风格的 block 断点。metadata 只会在
+    // prompt_cache_key / 会话请求头成功解析为 UUID 后存在；此时为 Responses 路径
+    // 合成顶层自动断点。这里按协议而不是模型厂商判断，因此 Codex 通过 Responses
+    // 调用 GPT 或 Claude 都能恢复本地模拟计量；原生 /v1/messages 路径不受影响。
+    // 该字段不会被 converter 转发给 Kiro provider。
+    let cache_control = metadata.as_ref().map(|_| CacheControl {
+        cache_type: "ephemeral".to_string(),
+        ttl: None,
+    });
     let max_tokens = req
         .max_output_tokens
         .filter(|v| *v > 0)
@@ -401,7 +486,10 @@ fn responses_to_anthropic(
         .as_ref()
         .and_then(|r| r.effort.clone())
         .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
+        .map(|effort| OutputConfig {
+            effort,
+            format: None,
+        });
     let thinking = req.reasoning.and_then(|reasoning| {
         reasoning
             .effort
@@ -428,6 +516,7 @@ fn responses_to_anthropic(
             thinking,
             output_config,
             metadata,
+            cache_control,
         },
         tool_kinds,
     ))
@@ -678,8 +767,21 @@ fn translate_input_item(
             });
             push_merged(merged, "user", vec![block]);
         }
-        // 推理项 / 已完成的搜索展示项 / 压缩项：对 Anthropic 请求无意义，忽略
-        "reasoning" | "web_search_call" | "compaction" => {}
+        // 本代理生成的 compaction 项可还原为上一窗口的摘要；其它服务生成的
+        // opaque payload 无法解释，保持忽略。compaction_trigger 已由 handler 消费。
+        "compaction" => {
+            if let Some(summary) = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(compaction::decode_payload)
+            {
+                system.push(SystemMessage {
+                    text: compaction::restored_context(&summary),
+                    cache_control: None,
+                });
+            }
+        }
+        "reasoning" | "web_search_call" | "compaction_trigger" => {}
         // "message" 或未标注 type 但带 role 的项
         _ => {
             let role = item.get("role").and_then(|v| v.as_str());
@@ -823,7 +925,6 @@ fn new_ctc_id() -> String {
 fn new_rs_id() -> String {
     format!("rs_{}", Uuid::new_v4().to_string().replace('-', ""))
 }
-
 /// 从自由文本工具的 arguments JSON 里解出原始 input 字符串。
 ///
 /// 回退链：`{"input": <string>}` → 单字段字符串对象 → 原样返回 arguments。
@@ -857,8 +958,26 @@ struct ResponsesView {
     usage: Value,
 }
 
+/// `finish_reason`（OpenAI 口径）→ Responses `incomplete_details.reason`；`None` 表示正常完成。
+fn incomplete_reason(finish_reason: &str) -> Option<&'static str> {
+    match finish_reason {
+        "length" => Some("max_output_tokens"),
+        "content_filter" => Some("content_filter"),
+        _ => None,
+    }
+}
+
+/// 上游 Anthropic `stop_reason` → Responses `incomplete_details.reason`；`None` 表示正常完成。
+fn incomplete_reason_for_stop(stop_reason: Option<&str>) -> Option<&'static str> {
+    match stop_reason? {
+        "max_tokens" | "model_context_window_exceeded" => Some("max_output_tokens"),
+        super::stream::REFUSAL_STOP_REASON => Some("content_filter"),
+        _ => None,
+    }
+}
+
 fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
-    let status = if p.finish_reason == "length" {
+    let status = if incomplete_reason(&p.finish_reason).is_some() {
         "incomplete".to_string()
     } else {
         "completed".to_string()
@@ -916,7 +1035,14 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
             .and_then(|v| v.as_str())
             .unwrap_or("{}")
             .to_string();
-        let decl = kinds.get(flat_name.as_str());
+        let resolution = resolve_declared_tool(kinds, flat_name.as_str());
+        if matches!(resolution, Some((_, true))) {
+            tracing::debug!(
+                upstream_tool_name = %flat_name,
+                "responses: resolved bare upstream tool name to a unique declaration"
+            );
+        }
+        let decl = resolution.map(|(declared, _)| declared);
         // 展平名还原：namespace 工具应答时用原名 + namespace 字段
         let (name, namespace) = match decl {
             Some(d) => (d.name.clone(), d.namespace.clone()),
@@ -1000,8 +1126,8 @@ fn build_response_object_from(
         "tool_choice": config.tool_choice,
         "tools": config.tools,
     });
-    if view.status == "incomplete" {
-        obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let Some(reason) = incomplete_reason(&p.finish_reason) {
+        obj["incomplete_details"] = json!({ "reason": reason });
     }
     obj
 }
@@ -1523,7 +1649,27 @@ impl ResponsesStreamContext {
             arguments = "{}".to_string();
         }
         let output_index = self.allocate_output_index();
-        let decl = self.tool_kinds.get(&flat_name);
+        let resolution = resolve_declared_tool(&self.tool_kinds, &flat_name);
+        let decl = resolution.map(|(declared, _)| declared);
+        match decl {
+            Some(declared) if matches!(resolution, Some((_, true))) => tracing::debug!(
+                upstream_tool_name = %flat_name,
+                declared_tool_name = %declared.name,
+                namespace = ?declared.namespace,
+                kind = ?declared.kind,
+                "responses: resolved bare upstream tool name to a unique declaration"
+            ),
+            Some(_) => {}
+            None => {
+                let mut known_tools = self.tool_kinds.keys().cloned().collect::<Vec<_>>();
+                known_tools.sort();
+                tracing::warn!(
+                    upstream_tool_name = %flat_name,
+                    known_tools = ?known_tools,
+                    "responses: upstream tool call was not present in the request registry"
+                );
+            }
+        }
         let (name, namespace, kind) = match decl {
             Some(d) => (d.name.clone(), d.namespace.clone(), d.kind),
             None => (flat_name, None, DeclaredToolKind::Function),
@@ -1670,7 +1816,7 @@ impl ResponsesStreamContext {
     }
 
     fn response_object(&self, status: &str) -> Value {
-        let mut response = json!({
+        json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
@@ -1681,11 +1827,7 @@ impl ResponsesStreamContext {
             "parallel_tool_calls": self.response_config.parallel_tool_calls,
             "tool_choice": self.response_config.tool_choice,
             "tools": self.response_config.tools,
-        });
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
-        }
-        response
+        })
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
@@ -1695,22 +1837,18 @@ impl ResponsesStreamContext {
         if !self.saw_message_stop {
             return vec![self.fail("server_error", "upstream stream ended before message_stop")];
         }
-        let incomplete = matches!(
-            self.stop_reason.as_deref(),
-            Some("max_tokens" | "model_context_window_exceeded")
-        );
-        let status = if incomplete {
-            "incomplete"
+        let incomplete = incomplete_reason_for_stop(self.stop_reason.as_deref());
+        let (status, event) = if incomplete.is_some() {
+            ("incomplete", "response.incomplete")
         } else {
-            "completed"
-        };
-        let event = if incomplete {
-            "response.incomplete"
-        } else {
-            "response.completed"
+            ("completed", "response.completed")
         };
         self.terminal = true;
-        vec![self.emit(event, json!({ "response": self.response_object(status) }))]
+        let mut response = self.response_object(status);
+        if let Some(reason) = incomplete {
+            response["incomplete_details"] = json!({ "reason": reason });
+        }
+        vec![self.emit(event, json!({ "response": response }))]
     }
 
     fn fail(&mut self, error_type: &str, message: &str) -> Bytes {
@@ -1796,12 +1934,13 @@ fn responses_streaming_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
 }
 
-fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+pub(super) fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     loop {
         let lf = buffer.windows(2).position(|window| window == b"\n\n");
@@ -1825,7 +1964,7 @@ fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     frames
 }
 
-fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
+pub(super) fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
     let text = std::str::from_utf8(frame)
         .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
     let mut event = None;
@@ -2123,6 +2262,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_payload_round_trips_into_system_context() {
+        let summary = "implemented parser; next run integration tests";
+        let payload = compaction::encode_payload(summary);
+        let req = req_with(
+            json!([]),
+            json!([
+                {
+                    "id": "cmp_1",
+                    "type": "compaction",
+                    "encrypted_content": payload
+                },
+                { "type": "message", "role": "user", "content": "continue" }
+            ]),
+        );
+        let (anthropic, _) = responses_to_anthropic(req, None).unwrap();
+        let system = anthropic.system.unwrap();
+        assert!(system.iter().any(|part| part.text.contains(summary)));
+    }
+
+    #[test]
     fn responses_body_session_metadata_is_forwarded() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
@@ -2136,10 +2295,16 @@ mod tests {
         assert_eq!(
             anthropic
                 .metadata
-                .and_then(|value| value.user_id)
-                .as_deref(),
+                .as_ref()
+                .and_then(|value| value.user_id.as_deref()),
             Some("session_550e8400-e29b-41d4-a716-446655440000")
         );
+        let cache_control = anthropic
+            .cache_control
+            .as_ref()
+            .expect("合法 Codex session 应开启内部自动缓存计量");
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl, None);
     }
 
     #[test]
@@ -2157,10 +2322,11 @@ mod tests {
         assert_eq!(
             anthropic
                 .metadata
-                .and_then(|value| value.user_id)
-                .as_deref(),
+                .as_ref()
+                .and_then(|value| value.user_id.as_deref()),
             Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
         );
+        assert!(anthropic.cache_control.is_some());
 
         let req = req_with(json!([]), simple_input());
         headers.insert("x-client-request-id", "invalid".parse().unwrap());
@@ -2168,6 +2334,67 @@ mod tests {
         assert!(metadata.is_none());
         let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
         assert!(anthropic.metadata.is_none());
+        assert!(
+            anthropic.cache_control.is_none(),
+            "无合法 session 时不得跨请求模拟缓存"
+        );
+    }
+
+    #[test]
+    fn responses_session_enables_cache_meter_first_write_then_read() {
+        use super::super::cache_metering::{CacheMeter, compute_cache_usage_sync};
+
+        fn converted_request(input: Value) -> MessagesRequest {
+            let req: ResponsesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.6-sol",
+                "instructions": "stable developer context ".repeat(100),
+                "input": input,
+                "prompt_cache_key": "550e8400-e29b-41d4-a716-446655440000"
+            }))
+            .unwrap();
+            let metadata =
+                resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+            responses_to_anthropic(req, metadata).unwrap().0
+        }
+
+        let cache = CacheMeter::new(None);
+        let first_request = converted_request(json!([
+            {"type": "message", "role": "user", "content": "question one"}
+        ]));
+        let first = compute_cache_usage_sync(&cache, &first_request, 0);
+        assert!(first.cache_covered_est > 0);
+        assert_eq!(first.cache_read, 0);
+
+        let second_request = converted_request(json!([
+            {"type": "message", "role": "user", "content": "question one"},
+            {"type": "message", "role": "assistant", "content": "answer one"},
+            {"type": "message", "role": "user", "content": "question two"}
+        ]));
+        let second = compute_cache_usage_sync(&cache, &second_request, 0);
+        assert_eq!(second.cache_read, first.cache_covered_est);
+        assert!(
+            second.cache_covered_est > second.cache_read,
+            "第二轮应读取旧前缀并写入新增历史，而不是把当前提问计入缓存"
+        );
+    }
+
+    #[test]
+    fn responses_session_enables_top_level_cache_for_claude_too() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "input": simple_input(),
+            "prompt_cache_key": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+        let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
+
+        assert!(anthropic.metadata.is_some());
+        let cache_control = anthropic
+            .cache_control
+            .expect("Codex 通过 Responses 调用 Claude 时也应启用内部模拟缓存");
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl, None);
     }
 
     fn parsed_with_tool_calls(tool_calls: Vec<Value>) -> ParsedResponse {
@@ -2175,6 +2402,7 @@ mod tests {
             model: "gpt-5.6-sol".to_string(),
             text: String::new(),
             tool_calls,
+            upstream_stop_reason: "tool_use".to_string(),
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             completion_tokens: 5,
@@ -2201,6 +2429,22 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn namespaced_kind(
+        flat_name: &str,
+        name: &str,
+        namespace: &str,
+        kind: DeclaredToolKind,
+    ) -> ToolKindMap {
+        HashMap::from([(
+            flat_name.to_string(),
+            DeclaredTool {
+                kind,
+                name: name.to_string(),
+                namespace: Some(namespace.to_string()),
+            },
+        )])
     }
 
     fn system_texts(req: &MessagesRequest) -> Vec<String> {
@@ -2700,6 +2944,61 @@ mod tests {
     }
 
     #[test]
+    fn build_view_resolves_unique_bare_name_to_namespaced_custom_tool() {
+        let kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        let p = parsed_with_tool_calls(vec![json!({
+            "id": "toolu_1",
+            "type": "function",
+            "function": { "name": "exec", "arguments": "{\"input\":\"pwd\"}" },
+        })]);
+
+        let view = build_view(&p, &kinds);
+        let item = view
+            .output
+            .iter()
+            .find(|item| item["type"] == "custom_tool_call")
+            .expect("the unique declared custom tool must be restored");
+        assert_eq!(item["name"], "exec");
+        assert_eq!(item["namespace"], "functions");
+        assert_eq!(item["input"], "pwd");
+    }
+
+    #[test]
+    fn declared_tool_resolution_prefers_exact_and_rejects_ambiguous_bare_names() {
+        let mut kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        kinds.insert(
+            "exec".into(),
+            DeclaredTool {
+                kind: DeclaredToolKind::Function,
+                name: "exec".into(),
+                namespace: None,
+            },
+        );
+        let (exact, used_bare_fallback) = resolve_declared_tool(&kinds, "exec").unwrap();
+        assert_eq!(exact.kind, DeclaredToolKind::Function);
+        assert!(!used_bare_fallback);
+
+        kinds.remove("exec");
+        kinds.extend(namespaced_kind(
+            "other__exec",
+            "exec",
+            "other",
+            DeclaredToolKind::Custom,
+        ));
+        assert!(resolve_declared_tool(&kinds, "exec").is_none());
+    }
+
+    #[test]
     fn build_view_emits_function_call_for_function_and_unknown_kinds() {
         let kinds = kinds_of(&[("shell", DeclaredToolKind::Function)]);
         let p = parsed_with_tool_calls(vec![
@@ -2909,6 +3208,51 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tool_resolves_unique_bare_name_to_namespaced_custom_tool() {
+        let kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            kinds,
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        feed_event(
+            &mut context,
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {
+                    "type": "tool_use", "id": "toolu_1", "name": "exec", "input": {}
+                },
+            }),
+        );
+        feed_event(
+            &mut context,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"input\":\"pwd\"}" },
+            }),
+        );
+
+        let completed = feed_event(
+            &mut context,
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 1 }),
+        );
+        assert!(completed.contains("response.custom_tool_call_input.done"));
+        assert!(completed.contains("\"name\":\"exec\""));
+        assert!(completed.contains("\"namespace\":\"functions\""));
+        assert!(completed.contains("\"input\":\"pwd\""));
+        assert!(!completed.contains("response.function_call_arguments.done"));
+    }
+
+    #[test]
     fn streaming_error_maps_to_failed_without_completed() {
         let mut context = ResponsesStreamContext::new(
             "gpt-5.6-sol".into(),
@@ -2948,6 +3292,12 @@ mod tests {
         let usage = context.usage();
         assert_eq!(usage["input_tokens"], json!(14));
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(7));
+        assert!(
+            usage["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none(),
+            "暂不扩展 Responses usage 的 cache-write 字段"
+        );
         assert_eq!(usage["output_tokens"], json!(5));
         assert_eq!(usage["total_tokens"], json!(19));
     }
@@ -3177,6 +3527,11 @@ mod tests {
             view.usage["input_tokens_details"]["cached_tokens"],
             json!(7)
         );
+        assert!(
+            view.usage["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none()
+        );
         assert_eq!(view.usage["output_tokens"], json!(5));
         assert_eq!(view.usage["total_tokens"], json!(19));
 
@@ -3187,6 +3542,11 @@ mod tests {
             .expect("response.completed data line");
         let event: Value = serde_json::from_str(completed.trim_start_matches("data: ")).unwrap();
         assert_eq!(event["response"]["usage"], view.usage);
+        assert!(
+            event["response"]["usage"]["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none()
+        );
     }
 
     // ---- credit_usage 透传 ----
@@ -3252,6 +3612,7 @@ mod cache_usage_tests {
             credit_usage: None,
             credit_unit: None,
             credit_unit_plural: None,
+            upstream_stop_reason: "end_turn".to_string(),
         }
     }
 

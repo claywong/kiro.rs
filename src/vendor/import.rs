@@ -169,6 +169,7 @@ pub async fn import_keys(
                     scopes: None,
                     priority,
                     rpm_limit,
+                    load_factor: 10, // 上游 balanced 权重：本地调度不读，仅元数据，取上游默认值
                     credit_limit,
                     region: None,
                     auth_region: None,
@@ -219,6 +220,7 @@ pub async fn import_keys(
                     scopes: None,
                     priority,
                     rpm_limit,
+                    load_factor: 10, // 上游 balanced 权重：本地调度不读，仅元数据，取上游默认值
                     credit_limit,
                     region: None,
                     auth_region,

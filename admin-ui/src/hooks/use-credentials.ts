@@ -1,8 +1,9 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialLoadFactor,
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
@@ -16,6 +17,10 @@ import {
   updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getApiDomain,
+  setApiDomain,
+  getToolCompatibilityMode,
+  setToolCompatibilityMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
@@ -26,16 +31,24 @@ import {
   setSpeedCredentialsExcludeConfig,
   setShortSpeedConfig,
   setSpeedCredentialsMinTokensConfig,
+  getModelApiRetryConfig,
+  setModelApiRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
+  getQuotaResetRecoveryConfig,
+  setQuotaResetRecoveryConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getCacheMeteringConfig,
+  setCacheMeteringConfig,
   getGlobalProxy,
   setGlobalProxy,
   getCustomModels,
   setCustomModels,
+  getCustomHeaders,
+  setCustomHeaders,
   getUpdateConfig,
   setUpdateConfig,
   resetSuccessCount,
@@ -48,18 +61,21 @@ import { getRecentSpend } from '@/api/credentials'
 import type {
   AddCredentialRequest,
   CustomModelItem,
+  SetCustomHeadersRequest,
   SetGlobalProxyRequest,
   SetUpdateConfigRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   CredentialMetadataSchemaConfig,
+  CredentialQueryParams,
 } from '@/types/api'
 
-// 查询凭据列表
-export function useCredentials() {
+// 查询凭据列表（支持分页、搜索、过滤、排序）
+export function useCredentials(params?: CredentialQueryParams) {
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', params],
+    queryFn: () => getCredentials(params),
+    placeholderData: keepPreviousData,
     refetchInterval: 30000, // 每 30 秒刷新一次
   })
 }
@@ -168,6 +184,18 @@ export function useSetPriority() {
   })
 }
 
+// 设置负载因子（均衡模式下的调度权重）
+export function useSetLoadFactor() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, loadFactor }: { id: number; loadFactor: number }) =>
+      setCredentialLoadFactor(id, loadFactor),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 重置失败计数
 export function useResetFailure() {
   const queryClient = useQueryClient()
@@ -190,7 +218,7 @@ export function useForceRefreshToken() {
   })
 }
 
-// 解除账号级风控冷却
+// 解除账号级限流冷却
 export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -290,7 +318,44 @@ export function useSetLoadBalancingMode() {
   })
 }
 
-// 获取账号级风控故障转移配置
+// 获取上游域名
+export function useApiDomain() {
+  return useQuery({
+    queryKey: ['apiDomain'],
+    queryFn: getApiDomain,
+  })
+}
+
+// 设置上游域名
+export function useSetApiDomain() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setApiDomain,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiDomain'] })
+    },
+  })
+}
+
+export function useToolCompatibilityMode() {
+  return useQuery({
+    queryKey: ['toolCompatibilityMode'],
+    queryFn: getToolCompatibilityMode,
+  })
+}
+
+export function useSetToolCompatibilityMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setToolCompatibilityMode,
+    onSuccess: async (data) => {
+      await queryClient.cancelQueries({ queryKey: ['toolCompatibilityMode'] })
+      queryClient.setQueryData(['toolCompatibilityMode'], data)
+    },
+  })
+}
+
+// 获取账号级 429 限流故障转移配置
 export function useAccountThrottleConfig() {
   return useQuery({
     queryKey: ['accountThrottleConfig'],
@@ -298,7 +363,7 @@ export function useAccountThrottleConfig() {
   })
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export function useSetAccountThrottleConfig() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -385,6 +450,25 @@ export function useSetShortSpeedConfig() {
   })
 }
 
+// 获取普通模型 API 429 自动重试配置
+export function useModelApiRetryConfig() {
+  return useQuery({
+    queryKey: ['modelApiRetryConfig'],
+    queryFn: getModelApiRetryConfig,
+  })
+}
+
+// 更新普通模型 API 429 自动重试配置
+export function useSetModelApiRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelApiRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelApiRetryConfig'] })
+    },
+  })
+}
+
 // 获取单账号 RPM 限流配置
 export function useAccountRpmLimitConfig() {
   return useQuery({
@@ -400,6 +484,23 @@ export function useSetAccountRpmLimitConfig() {
     mutationFn: setAccountRpmLimitConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
+export function useQuotaResetRecoveryConfig() {
+  return useQuery({
+    queryKey: ['quotaResetRecoveryConfig'],
+    queryFn: getQuotaResetRecoveryConfig,
+  })
+}
+
+export function useSetQuotaResetRecoveryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaResetRecoveryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
     },
   })
 }
@@ -443,6 +544,25 @@ export function useSetLogGovernanceConfig() {
   })
 }
 
+// 获取 prompt cache 计量模拟开关
+export function useCacheMeteringConfig() {
+  return useQuery({
+    queryKey: ['cacheMeteringConfig'],
+    queryFn: getCacheMeteringConfig,
+  })
+}
+
+// 切换 prompt cache 计量模拟开关
+export function useSetCacheMeteringConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheMeteringConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheMeteringConfig'] })
+    },
+  })
+}
+
 // 全局出站代理。此前只在代理池弹窗里内联查询，设置页需要独立入口，
 // 抽成 hook 后两处共用同一份缓存（queryKey 与弹窗保持一致：'global-proxy'）。
 export function useGlobalProxy() {
@@ -477,6 +597,24 @@ export function useSetCustomModels() {
       setCustomModels(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-models'] })
+    },
+  })
+}
+
+// 自定义响应头配置
+export function useCustomHeaders() {
+  return useQuery({
+    queryKey: ['custom-headers'],
+    queryFn: getCustomHeaders,
+  })
+}
+
+export function useSetCustomHeaders() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetCustomHeadersRequest) => setCustomHeaders(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-headers'] })
     },
   })
 }

@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getByCredential, getByKey, getByModel, getOverview, getTimeSeries } from '@/api/stats'
-import type { StatsFilter, StatsTimeFilter } from '@/types/api'
+import { getByCredential, getByKey, getByModel, getCredentialActivity, getOverview, getTimeSeries } from '@/api/stats'
+import type { StatsFilter, StatsRange, StatsTimeFilter } from '@/types/api'
 
 /**
  * 统计接口共用配置
@@ -42,6 +42,17 @@ export function useRecentHealth() {
   })
 }
 
+export function useCredentialActivity() {
+  return useQuery({
+    queryKey: ['stats', 'credential-activity'],
+    queryFn: getCredentialActivity,
+    staleTime: 5_000,
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
+    retry: false,
+  })
+}
+
 function timeKey(time: StatsTimeFilter) {
   return [
     time.range ?? 'custom',
@@ -72,6 +83,18 @@ export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
     queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByCredential(time, filter),
     ...COMMON,
+  })
+}
+
+/** One shared request supplies the summary and every credential card. */
+export function useCredentialCacheStats(range: StatsRange) {
+  return useQuery({
+    queryKey: ['stats', 'credential-cache', range],
+    queryFn: () => getByCredential({ range, granularity: range === '30d' ? 'day' : 'hour' }),
+    staleTime: 25_000,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: false,
+    retry: 1,
   })
 }
 

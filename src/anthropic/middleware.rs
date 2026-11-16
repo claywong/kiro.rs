@@ -28,6 +28,8 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+    /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
+    pub client_ip: Option<String>,
 }
 
 /// 应用共享状态
@@ -50,9 +52,18 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 自定义响应头管理器（热重载）
+    pub custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 }
 
 impl AppState {
+    pub fn snapshot_tool_compatibility_mode(mut self) -> Self {
+        if let Some(provider) = &self.kiro_provider {
+            self.tool_compatibility_mode = provider.token_manager().tool_compatibility_mode();
+        }
+        self
+    }
+
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
     #[allow(dead_code)]
     pub fn new(
@@ -68,6 +79,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            custom_headers: None,
         }
     }
 
@@ -101,6 +113,15 @@ impl AppState {
         self.trace_store = store;
         self
     }
+
+    /// 注入自定义响应头管理器
+    pub fn with_custom_headers(
+        mut self,
+        custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    ) -> Self {
+        self.custom_headers = custom_headers;
+        self
+    }
 }
 
 /// API Key 认证中间件
@@ -124,10 +145,12 @@ pub async fn auth_middleware(
         match mgr.verify_and_touch_ex(&presented) {
             KeyAuth::Ok(id) => {
                 let group = mgr.group_of(id);
+                let client_ip = auth::extract_client_ip(&request);
                 request.extensions_mut().insert(KeyContext {
                     key_id: id,
                     group,
                     key_source: TraceKeySource::ClientKey,
+                    client_ip,
                 });
                 return next.run(request).await;
             }
@@ -136,6 +159,16 @@ pub async fn auth_middleware(
                     "rate_limit_error",
                     format!(
                         "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            KeyAuth::CallsOverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到有效调用次数上限（已用 {} / 上限 {}），请联系管理员调整额度或重置统计",
                         used, limit
                     ),
                 );

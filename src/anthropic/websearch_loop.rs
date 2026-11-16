@@ -6,6 +6,10 @@
 //!
 //! Reuses: converter::convert_request (feedback), provider.call_api_stream, EventStreamDecoder,
 //! websearch::{create_mcp_request, call_mcp_api, parse_search_results, generate_search_summary}。
+//!
+//! Cache metering is computed independently for every internal model round. Provider
+//! tokenUsage remains authoritative; otherwise the round's total prompt is split by
+//! CacheMeter and the mutually exclusive input/write/read values are aggregated.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -34,11 +38,13 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
+use super::cache_metering::{CacheUsage, SharedCacheMeter};
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::handlers::{
-    RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
+    RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
+    map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent};
+use super::stream::{CompletedToolUse, REFUSAL_STOP_REASON, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
@@ -89,20 +95,16 @@ struct RoundOutcome {
     /// 在 run_web_search_loop 出口处透传到响应 usage 字段；如果上游多次下发
     /// 则取最后一次（与 /v1/messages 非流 / 流式路径一致）。
     last_metering: Option<MeteringEvent>,
-    /// stop_reason override (max_tokens / model_context_window_exceeded)
+    /// stop_reason override (refusal / max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
     /// Upstream body-read error, if any. Content decoded before this error is
     /// partial and must not be treated as a successful round.
     stream_error: Option<String>,
-    /// Set when the upstream emitted an `error` / `exception` frame (other than the
-    /// whitelisted ContentLengthExceededException). Like `stream_error`, the round's
-    /// decoded content is untrustworthy and the caller returns 502.
-    upstream_error: Option<String>,
-    /// Tool names declared to the upstream this round (original + shortened),
-    /// taken from `ConversionResult::known_tool_names`. Used by the shared
-    /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
-    /// reclaimed when its name is a real declared tool.
-    known_tool_names: std::collections::HashSet<String>,
+    /// Tools declared to the upstream this round with their input_schema (Kiro-side names).
+    /// Used by the shared `<invoke>` text fault tolerance (H2): a text `<invoke name=...>`
+    /// is only turned into a tool call when its name is declared here and its parameters
+    /// parse against that schema.
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
     /// Short-name -> original-name map for this round, taken from
     /// `ConversionResult::tool_name_map`. Used to restore the original tool name when a
     /// leaked `<invoke>` carries a shortened (>63 char) tool name.
@@ -110,10 +112,15 @@ struct RoundOutcome {
 }
 
 impl RoundOutcome {
-    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时只回退本轮。
-    fn resolved_token_usage(&self, fallback_input_tokens: i32) -> TokenUsage {
+    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时，使用本轮
+    /// CacheMeter 结果把总 prompt 拆成互斥的 input / cache-write / cache-read。
+    fn resolved_token_usage(
+        &self,
+        fallback_input_tokens: i32,
+        cache_usage: CacheUsage,
+    ) -> (TokenUsage, UsageSource) {
         if let Some(usage) = self.provider_token_usage {
-            return usage.sanitized();
+            return (usage.sanitized(), UsageSource::Provider);
         }
 
         let mut output = Vec::new();
@@ -129,15 +136,32 @@ impl RoundOutcome {
                 .map(CompletedToolUse::to_anthropic_block),
         );
 
-        TokenUsage {
-            uncached_input_tokens: self
-                .context_input_tokens
-                .unwrap_or(fallback_input_tokens)
-                .max(0),
-            output_tokens: token::estimate_output_tokens(&output),
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
-        }
+        // contextUsage 覆盖生成结束后的整个上下文（含本轮输出）。这里逐轮
+        // saturating_add 累加，不扣的话 N 轮会把输出重复放大 N 次。
+        let output_tokens = token::estimate_output_tokens(&output);
+        let total_input_tokens = token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            fallback_input_tokens,
+            output_tokens,
+        );
+        (
+            split_simulated_usage(total_input_tokens, output_tokens, cache_usage),
+            UsageSource::resolve(false, &cache_usage),
+        )
+    }
+}
+
+fn split_simulated_usage(
+    total_input_tokens: i32,
+    output_tokens: i32,
+    cache_usage: CacheUsage,
+) -> TokenUsage {
+    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input_tokens);
+    TokenUsage {
+        uncached_input_tokens: input,
+        output_tokens: output_tokens.max(0),
+        cache_read_input_tokens: cache_read,
+        cache_write_input_tokens: cache_write,
     }
 }
 
@@ -264,12 +288,11 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
+    let mut native_stop_reason: Option<String> = None;
+    let mut context_window_full = false;
     let mut stream_error = None;
-    // 上游 error / exception 帧（白名单 ContentLengthExceededException 除外）：
-    // 与 stream_error 同口径，本轮内容视为不可信，收尾返回 502。
-    let mut upstream_error: Option<String> = None;
 
-    while let Some(chunk) = body_stream.next().await {
+    'read: while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
             Ok(c) => {
                 tracer.mark_first_token();
@@ -282,24 +305,24 @@ async fn decode_round(
             }
         };
         if let Err(e) = decoder.feed(&chunk) {
-            // 缓冲区溢出：后续字节被丢弃，本轮内容不可信，收尾返回 502。
-            tracing::error!("buffer overflow, aborting round: {}", e);
-            if upstream_error.is_none() {
-                upstream_error = Some(format!("Upstream returned BufferOverflow: {}", e));
-            }
-            break;
+            // L10：帧损坏说明本轮流不完整，不能当成正常结束。
+            stream_error = Some(format!("malformed event frame: {e}"));
+            break 'read;
         }
         for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("failed to decode event: {}", e);
-                    continue;
+                    stream_error = Some(format!("malformed event frame: {e}"));
+                    break 'read;
                 }
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
-                Err(_) => continue,
+                Err(e) => {
+                    stream_error = Some(format!("malformed event: {e}"));
+                    break 'read;
+                }
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
@@ -319,9 +342,16 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
+                    if let Some(reason) = metadata.stop_reason.as_ref() {
+                        native_stop_reason = Some(reason.to_ascii_uppercase());
+                    }
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
+                    }
+                    if let Some(refusal) = metadata.content_filter_refusal() {
+                        tracing::warn!("上游内容过滤拒答: {}", refusal);
+                        stop_reason_override = Some(REFUSAL_STOP_REASON.to_string());
                     }
                 }
                 Event::ContextUsage(cu) => {
@@ -329,42 +359,33 @@ async fn decode_round(
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
-                        stop_reason_override = Some("model_context_window_exceeded".to_string());
+                        context_window_full = true;
                     }
                 }
                 Event::Metering(m) => {
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
-                Event::Exception { exception_type, message } => {
+                Event::Exception {
+                    exception_type,
+                    message,
+                } => {
                     if exception_type == "ContentLengthExceededException" {
-                        stop_reason_override = Some("max_tokens".to_string());
-                    } else {
-                        tracing::warn!(
-                            "web_search loop received an exception event: {} - {}",
-                            exception_type,
-                            message
-                        );
-                        if upstream_error.is_none() {
-                            upstream_error = Some(format!(
-                                "Upstream returned {}: {}",
-                                exception_type, message
-                            ));
+                        if !is_refusal(&stop_reason_override) {
+                            stop_reason_override = Some("max_tokens".to_string());
                         }
+                    } else {
+                        // L10：与普通流式路径一致，上游异常让本轮失败，不当成正常结束。
+                        stream_error = Some(format!("upstream exception {exception_type}: {message}"));
+                        break 'read;
                     }
                 }
-                Event::Error { error_code, error_message } => {
-                    tracing::error!(
-                        "web_search loop received an error event: {} - {}",
-                        error_code,
-                        error_message
-                    );
-                    if upstream_error.is_none() {
-                        upstream_error = Some(format!(
-                            "Upstream returned {}: {}",
-                            error_code, error_message
-                        ));
-                    }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    stream_error = Some(format!("upstream error {error_code}: {error_message}"));
+                    break 'read;
                 }
                 _ => {}
             }
@@ -372,13 +393,25 @@ async fn decode_round(
 
         // 解码器因连续错误过多而停机：上游数据严重损坏，本轮内容不可信，收尾返回 502。
         if decoder.is_stopped() {
-            if upstream_error.is_none() {
-                upstream_error = Some(
+            if stream_error.is_none() {
+                stream_error = Some(
                     "Upstream returned DecoderStopped: 上游事件流连续解析错误过多，解码器已停机"
                         .to_string(),
                 );
             }
             break;
+        }
+    }
+
+    if !is_refusal(&stop_reason_override) {
+        match native_stop_reason.as_deref() {
+            Some("MAX_TOKENS") => stop_reason_override = Some("max_tokens".to_string()),
+            Some("MODEL_CONTEXT_WINDOW_EXCEEDED") => stop_reason_override = Some("model_context_window_exceeded".to_string()),
+            Some("STOP_SEQUENCE") => stop_reason_override = Some("stop_sequence".to_string()),
+            None if context_window_full && stop_reason_override.is_none() => {
+                stop_reason_override = Some("model_context_window_exceeded".to_string());
+            }
+            _ => {}
         }
     }
 
@@ -388,10 +421,17 @@ async fn decode_round(
             let input: Value = if buf.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tool input JSON: {}", e);
-                    json!({})
-                })
+                match serde_json::from_str(&buf) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // L10：半截参数不能以 `{}` 交给客户端执行。拒答时上游本来就可能
+                        // 截断工具调用，此时丢弃该调用、保留拒答终态。
+                        if stream_error.is_none() && !is_refusal(&stop_reason_override) {
+                            stream_error = Some(format!("invalid tool input JSON for {name}: {e}"));
+                        }
+                        continue;
+                    }
+                }
             };
             // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
             tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
@@ -400,6 +440,10 @@ async fn decode_round(
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
+    // L5：stray token 复读洪泛会在 flush 时被截断，本轮输出不完整，必须以错误让客户端可见。
+    if stream_error.is_none() && super::stream::stray_token_flood_detected(&text) {
+        stream_error = Some(super::stream::REPEAT_GUARD_ERROR_MESSAGE.to_string());
+    }
 
     RoundOutcome {
         text,
@@ -411,9 +455,8 @@ async fn decode_round(
         last_metering,
         stop_reason_override,
         stream_error,
-        upstream_error,
-        // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
-        known_tool_names: std::collections::HashSet::new(),
+        // Populated by the caller (run_round) from the conversation state sent upstream.
+        invoke_tool_schemas: super::stream::InvokeToolSchemas::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
         tool_name_map: std::collections::HashMap::new(),
     }
@@ -426,6 +469,7 @@ struct RoundFailure {
     error_message: String,
     credential_id: u64,
     token_usage: Option<TokenUsage>,
+    usage_source: UsageSource,
     credits: f64,
 }
 
@@ -437,6 +481,7 @@ async fn run_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
+    cache_usage: CacheUsage,
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -452,6 +497,10 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("invalid message sequence: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("unsupported tool mapping: {}", reason),
@@ -465,11 +514,17 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_source: UsageSource::Unknown,
                 credits: 0.0,
             });
         }
     };
 
+    // H2: schemas of the tools declared upstream, taken before conversation_state is moved.
+    let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
+        &conversion.conversation_state,
+        &conversion.known_tool_names,
+    );
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
@@ -489,6 +544,7 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_source: UsageSource::Unknown,
                 credits: 0.0,
             });
         }
@@ -504,20 +560,24 @@ async fn run_round(
         Err(e) => {
             let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
             let error_message = e.to_string();
+            let token_usage = split_simulated_usage(fallback_input_tokens, 0, cache_usage);
             return Err(RoundFailure {
                 response: map_provider_error(e),
                 error_type,
                 error_message,
                 credential_id: 0,
-                token_usage: Some(TokenUsage {
-                    uncached_input_tokens: fallback_input_tokens.max(0),
-                    ..TokenUsage::default()
-                }),
+                token_usage: Some(token_usage),
+                usage_source: UsageSource::resolve(false, &cache_usage),
                 credits: 0.0,
             });
         }
     };
+    // `call_api_stream` 成功返回即已收到上游 HTTP response headers；在 decode_round
+    // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
+    tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
+    // 在途守卫需覆盖本轮响应体的完整读取；绑定到局部变量避免提前释放。
+    let _in_flight = call_result._in_flight;
     let mut outcome = decode_round(
         call_result.response,
         &payload.model,
@@ -525,15 +585,16 @@ async fn run_round(
         tracer,
     )
     .await;
-    // Carry the declared tool names (original + shortened) so the flush step can run the
-    // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
-    outcome.known_tool_names = conversion.known_tool_names;
+    // Carry the declared tool schemas so the flush step runs the shared `<invoke>` text
+    // fault tolerance with the same rules as the streaming path (H2).
+    outcome.invoke_tool_schemas = invoke_tool_schemas;
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
-        let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
+        let (token_usage, usage_source) =
+            outcome.resolved_token_usage(fallback_input_tokens, cache_usage);
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
@@ -548,23 +609,7 @@ async fn run_round(
             error_message,
             credential_id,
             token_usage: Some(token_usage),
-            credits: outcome.credits,
-        });
-    }
-    if let Some(message) = outcome.upstream_error.take() {
-        // The upstream emitted a business error/exception frame; the round's content is
-        // untrustworthy, so fail instead of feeding truncated text/tool_use back in.
-        let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
-        return Err(RoundFailure {
-            response: (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new("upstream_error", message.clone())),
-            )
-                .into_response(),
-            error_type: outcome::TRANSIENT,
-            error_message: message,
-            credential_id,
-            token_usage: Some(token_usage),
+            usage_source,
             credits: outcome.credits,
         });
     }
@@ -609,9 +654,9 @@ fn append_search_round(
             "type": "server_tool_use", "id": srv_id, "name": "web_search",
             "input": {"query": query}
         }));
-        // Contract A: web_search_tool_result has only type + content (no tool_use_id), consistent with generate_websearch_events
         presentation.push(json!({
             "type": "web_search_tool_result",
+            "tool_use_id": srv_id,
             "content": build_result_block(results)
         }));
     }
@@ -700,6 +745,11 @@ fn resolve_flush_stop_reason(
     }
 }
 
+/// `refusal` 是终态：同一轮里后到的 contextUsage / exception 不得覆盖它。
+fn is_refusal(override_reason: &Option<String>) -> bool {
+    override_reason.as_deref() == Some(REFUSAL_STOP_REASON)
+}
+
 /// Builds the final flush content with the web_search invariant baked in:
 /// - any web_search tool_use becomes a `server_tool_use` + `web_search_tool_result`
 ///   presentation pair (NEVER a raw `tool_use`, which the Codex host rejects);
@@ -716,78 +766,40 @@ fn resolve_flush_stop_reason(
 /// we reclaim it into a structured `tool_use` instead of passing the raw XML through.
 /// The web_search loop builds its own SSE/content and historically bypassed that
 /// fault tolerance entirely — this is the fix.
-/// Canonical, order-independent key for a tool_use `input` JSON value, used to
-/// detect that a reclaimed-from-text tool_use is identical to a structured one.
-/// `serde_json::Value`'s `Map` is a BTreeMap (or preserves order when the
-/// `preserve_order` feature is on); to be robust we serialize via a BTreeMap so
-/// key order never affects equality.
-fn canonical_input_key(input: &Value) -> String {
-    match input {
-        Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
-            serde_json::to_string(&sorted).unwrap_or_else(|_| input.to_string())
-        }
-        _ => input.to_string(),
-    }
-}
-
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
     tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
-    known_tool_names: &std::collections::HashSet<String>,
+    invoke_tool_schemas: &super::stream::InvokeToolSchemas,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
     let mut content: Vec<Value> = presentation;
     if !text.is_empty() {
-        // Run the shared one-shot `<invoke>` sniffer: splits `text` into a sequence of
-        // text blocks + reclaimed structured tool_use blocks (same safety gates as the
-        // streaming fault tolerance). For clean text with no leaked `<invoke>`, this
-        // returns a single text block identical to the old behavior.
-        //
-        // INVARIANT GUARD: `web_search` must NEVER be reclaimed as a raw client `tool_use`
-        // — the Codex host has no web_search executor and rejects it with
-        // "unsupported call: web_search". `known_tool_names` is copied verbatim from
-        // req.tools and (since we are in the web_search loop) always contains "web_search",
-        // so we strip it from the reclamation tool-table here. A leaked
-        // `<invoke name="web_search">` then fails the tool-table gate and stays as plain
-        // text (ugly but protocol-safe), instead of being upgraded into a raw tool_use that
-        // breaks the loop's core invariant.
-        let reclaim_tools: std::collections::HashSet<String> = known_tool_names
-            .iter()
-            .filter(|n| n.as_str() != "web_search")
-            .cloned()
-            .collect();
-        // DEDUP GUARD: a degraded model can emit BOTH a leaked literal `<invoke>` in the
-        // text AND the matching structured tool_use in `tool_uses`. Emitting both would
-        // make the host execute the same command twice. Suppress any reclaimed-from-text
-        // tool_use whose (name + canonical input) already appears in the structured
-        // `tool_uses` for this round. Text blocks (and distinct tool_uses) are kept as-is.
-        let structured_keys: std::collections::HashSet<(String, String)> = tool_uses
-            .iter()
-            .filter(|t| t.name != "web_search")
-            .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
-            .collect();
-        for block in
-            super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
-        {
-            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let key = (
-                    name.to_string(),
-                    block
-                        .get("input")
-                        .map(canonical_input_key)
-                        .unwrap_or_default(),
-                );
-                if structured_keys.contains(&key) {
-                    // identical to a structured tool_use already emitted below -> drop the
-                    // reclaimed duplicate (avoid double execution).
-                    continue;
-                }
-            }
-            content.push(block);
+        if tool_uses.is_empty() {
+            // Shared one-shot `<invoke>` recognizer, same rules as the streaming path (H2):
+            // only a trailing, line-start, out-of-code block for a declared tool whose
+            // parameters parse against its schema becomes a tool_use.
+            //
+            // INVARIANT GUARD: `web_search` must NEVER be synthesized as a raw client
+            // `tool_use` — the host has no web_search executor and rejects it with
+            // "unsupported call: web_search". It is always declared on requests that enter
+            // this loop, so it is removed from the table here and a text
+            // `<invoke name="web_search">` stays plain text.
+            let reclaim: super::stream::InvokeToolSchemas = invoke_tool_schemas
+                .iter()
+                .filter(|(name, _)| name.as_str() != "web_search")
+                .map(|(name, schema)| (name.clone(), schema.clone()))
+                .collect();
+            content.extend(super::stream::extract_invoke_content_blocks(
+                text,
+                &reclaim,
+                tool_name_map,
+            ));
+        } else {
+            // H2: this round has native tool_use, so text is never turned into calls
+            // (this also rules out executing the same command twice).
+            content.push(json!({"type": "text", "text": text}));
         }
     }
     for (idx, tu) in tool_uses.iter().enumerate() {
@@ -803,6 +815,7 @@ fn build_flush_content(
             let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
             content.push(json!({
                 "type": "web_search_tool_result",
+                "tool_use_id": srv_id,
                 "content": build_result_block(results)
             }));
         } else {
@@ -844,6 +857,9 @@ struct WebSearchUsageSettlement {
     usage: TokenUsage,
     credits: f64,
     settled: bool,
+    /// 多轮聚合后的 usage 来源：全部轮次都有上游精确值才算 provider；任一轮
+    /// 使用 CacheMeter 则标 simulated；其余混合回退标 none。
+    source: UsageSource,
 }
 
 #[cfg(test)]
@@ -859,6 +875,7 @@ impl WebSearchUsageSettlement {
             usage: TokenUsage::default(),
             credits: 0.0,
             settled: false,
+            source: UsageSource::Unknown,
         }
     }
 
@@ -872,6 +889,7 @@ impl WebSearchUsageSettlement {
             usage: TokenUsage::default(),
             credits: 0.0,
             settled: false,
+            source: UsageSource::Unknown,
         }
     }
 
@@ -889,8 +907,35 @@ impl WebSearchUsageSettlement {
         }
     }
 
+    /// 合并本轮 usage 来源。聚合值只要包含模拟缓存就不能标成 provider 真值。
+    fn note_source(&mut self, round_source: UsageSource) {
+        self.source = match (self.source, round_source) {
+            (UsageSource::Unknown, next) => next,
+            (current, UsageSource::Unknown) => current,
+            (UsageSource::Provider, UsageSource::Provider) => UsageSource::Provider,
+            (UsageSource::Simulated, _) | (_, UsageSource::Simulated) => UsageSource::Simulated,
+            _ => UsageSource::None,
+        };
+    }
+
     fn usage(&self) -> TokenUsage {
         self.usage.sanitized()
+    }
+
+    fn discard(&mut self) {
+        if let Some(tracer) = &self.tracer {
+            tracer.discard();
+        }
+        self.settled = true;
+    }
+
+    /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
+    /// meteringEvent 累计值，单位沿用最近一次上游事件。
+    fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
+        latest.map(|metering| MeteringEvent {
+            usage: self.credits,
+            ..metering.clone()
+        })
     }
 
     fn finish(
@@ -918,6 +963,7 @@ impl WebSearchUsageSettlement {
                 error_message,
                 self.usage,
                 self.credits,
+                self.source,
             );
         }
         self.settled = true;
@@ -940,6 +986,7 @@ impl Drop for WebSearchUsageSettlement {
 #[derive(Debug)]
 struct PendingWebSearch {
     block_index: i32,
+    tool_use_id: String,
 }
 
 /// Emits one coherent Anthropic SSE message while the agentic loop runs in a
@@ -993,7 +1040,10 @@ impl WebSearchSseEmitter {
             }),
         ))
         .await;
-        PendingWebSearch { block_index }
+        PendingWebSearch {
+            block_index,
+            tool_use_id,
+        }
     }
 
     /// Closes a search block that was opened via `begin_search` but must not be
@@ -1039,6 +1089,7 @@ impl WebSearchSseEmitter {
                 "index": result_index,
                 "content_block": {
                     "type": "web_search_tool_result",
+                    "tool_use_id": pending.tool_use_id,
                     "content": build_result_block(results)
                 }
             }),
@@ -1210,6 +1261,7 @@ fn render_channel_sse(initial_event: SseEvent, receiver: mpsc::Receiver<Bytes>) 
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(initial.chain(updates)))
         .unwrap()
@@ -1308,7 +1360,7 @@ async fn execute_web_search(
     Ok(result)
 }
 
-fn aggregated_trace_usage(usage: TokenUsage, credits: f64) -> TraceUsage {
+fn aggregated_trace_usage(usage: TokenUsage, credits: f64, source: UsageSource) -> TraceUsage {
     let usage = usage.sanitized();
     TraceUsage {
         input_tokens: usage.uncached_input_tokens as u64,
@@ -1320,6 +1372,7 @@ fn aggregated_trace_usage(usage: TokenUsage, credits: f64) -> TraceUsage {
         } else {
             0.0
         },
+        source,
     }
 }
 
@@ -1330,13 +1383,14 @@ fn finalize_aggregated_trace(
     error_message: Option<&str>,
     usage: TokenUsage,
     credits: f64,
+    source: UsageSource,
 ) {
     tracer.finalize(
         status,
         error_type,
         error_message,
         None,
-        aggregated_trace_usage(usage, credits),
+        aggregated_trace_usage(usage, credits, source),
     );
 }
 
@@ -1351,18 +1405,29 @@ pub(super) async fn run_web_search_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_meter: Option<SharedCacheMeter>,
+    key_id: u64,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Response {
     if !stream_client {
-        return run_web_search_loop_inner(
+        let mut resp = run_web_search_loop_inner(
             provider,
             payload,
             hook,
-            tracer,
-            group,
+            tracer.clone(),
+            group.clone(),
             tool_compatibility_mode,
+            cache_meter,
+            key_id,
             None,
         )
         .await;
+        super::handlers::attach_custom_headers(
+            &mut resp,
+            custom_headers.as_ref(),
+            &tracer.header_context(None, group.as_deref()),
+        );
+        return resp;
     }
 
     let initial_input_tokens = token::count_all_tokens(
@@ -1373,6 +1438,8 @@ pub(super) async fn run_web_search_loop(
     ) as i32;
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
+    let tracer_inner = tracer.clone();
+    let group_inner = group.clone();
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
         let mut emitter = WebSearchSseEmitter::new(sender);
@@ -1386,9 +1453,11 @@ pub(super) async fn run_web_search_loop(
                 provider,
                 payload,
                 hook,
-                tracer,
-                group,
+                tracer_inner,
+                group_inner,
                 tool_compatibility_mode,
+                cache_meter,
+                key_id,
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1419,7 +1488,13 @@ pub(super) async fn run_web_search_loop(
         }
     });
 
-    render_channel_sse(initial_event, receiver)
+    let mut resp = render_channel_sse(initial_event, receiver);
+    super::handlers::attach_custom_headers(
+        &mut resp,
+        custom_headers.as_ref(),
+        &tracer.header_context(None, group.as_deref()),
+    );
+    resp
 }
 
 async fn run_web_search_loop_inner(
@@ -1429,6 +1504,8 @@ async fn run_web_search_loop_inner(
     tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_meter: Option<SharedCacheMeter>,
+    key_id: u64,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
@@ -1438,17 +1515,24 @@ async fn run_web_search_loop_inner(
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
-        let round = loop {
+        let mut round = loop {
             let round_fallback_input_tokens = token::count_all_tokens(
                 payload.model.clone(),
                 payload.system.clone(),
                 payload.messages.clone(),
                 payload.tools.clone(),
             ) as i32;
+            let round_cache_usage = match cache_meter.as_ref() {
+                Some(cache) => {
+                    super::cache_metering::compute_cache_usage(cache, &payload, key_id).await
+                }
+                None => CacheUsage::default(),
+            };
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,
                 round_fallback_input_tokens,
+                round_cache_usage,
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
@@ -1457,8 +1541,17 @@ async fn run_web_search_loop_inner(
             {
                 Ok(v) => v,
                 Err(failure) => {
+                    if failure.response.status() == StatusCode::UNAUTHORIZED && round_idx == 0 && empty_retries == 0 {
+                        settlement.discard();
+                        return failure.response;
+                    }
+                    if failure.response.status() == StatusCode::UNAUTHORIZED {
+                        settlement.finish("error", "error", Some(failure.error_type), Some(&failure.error_message));
+                        return failure.response;
+                    }
                     if let Some(usage) = failure.token_usage {
                         settlement.add(failure.credential_id, usage, failure.credits);
+                        settlement.note_source(failure.usage_source);
                     } else {
                         settlement.add(
                             failure.credential_id,
@@ -1475,12 +1568,12 @@ async fn run_web_search_loop_inner(
                     return failure.response;
                 }
             };
-            settlement.add(
-                credential_id,
-                round.resolved_token_usage(round_fallback_input_tokens),
-                round.credits,
-            );
-            // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
+            let (round_usage, usage_source) =
+                round.resolved_token_usage(round_fallback_input_tokens, round_cache_usage);
+            settlement.add(credential_id, round_usage, round.credits);
+            settlement.note_source(usage_source);
+            // 跨 round 保留最近一次 meteringEvent 的单位字段；最终响应中的 usage
+            // 会替换为 settlement 累计的所有模型调用费用。
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
             if let Some(ref m) = round.last_metering {
                 latest_metering = Some(m.clone());
@@ -1535,7 +1628,17 @@ async fn run_web_search_loop_inner(
             break round;
         };
 
-        if should_search_round(round_idx, &round.tool_uses) {
+        if is_refusal(&round.stop_reason_override) {
+            // Cancel this round's calls before either search path runs. Clearing
+            // the recovery table also prevents text leaks from becoming calls.
+            round.tool_uses.clear();
+            round.invoke_tool_schemas.clear();
+        }
+
+        // 拒答是终态：即便本轮带了 web_search，也不再续跑搜索轮次，直接带 refusal 收尾。
+        if !is_refusal(&round.stop_reason_override)
+            && should_search_round(round_idx, &round.tool_uses)
+        {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
@@ -1616,7 +1719,7 @@ async fn run_web_search_loop_inner(
             &round.text,
             &round.tool_uses,
             &searched,
-            &round.known_tool_names,
+            &round.invoke_tool_schemas,
             &round.tool_name_map,
         );
         // stop_reason must be computed from the FINAL flushed content, not just
@@ -1630,6 +1733,7 @@ async fn run_web_search_loop_inner(
         );
 
         let final_usage = settlement.usage();
+        let final_metering = settlement.response_metering(latest_metering.as_ref());
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {
@@ -1639,7 +1743,7 @@ async fn run_web_search_loop_inner(
                     &stop_reason,
                     final_usage,
                     &all_thinking,
-                    latest_metering.as_ref(),
+                    final_metering.as_ref(),
                 )
                 .await;
             StatusCode::OK.into_response()
@@ -1650,7 +1754,7 @@ async fn run_web_search_loop_inner(
                 &stop_reason,
                 final_usage,
                 &all_thinking,
-                latest_metering.as_ref(),
+                final_metering.as_ref(),
             )
         };
     }
@@ -2053,6 +2157,16 @@ mod tests {
             1,
             "the final flush must not repeat an already streamed result"
         );
+        let srv_id = &starts
+            .iter()
+            .find(|data| data["content_block"]["type"] == "server_tool_use")
+            .unwrap()["content_block"]["id"];
+        let result_ref = &starts
+            .iter()
+            .find(|data| data["content_block"]["type"] == "web_search_tool_result")
+            .unwrap()["content_block"]["tool_use_id"];
+        assert!(srv_id.is_string());
+        assert_eq!(result_ref, srv_id, "streamed result must reference its server_tool_use");
 
         let stops: Vec<i64> = events
             .iter()
@@ -2140,6 +2254,7 @@ mod tests {
             effort: None,
             started_at: std::time::Instant::now(),
             tracer: None,
+            count_call: true,
         };
         let (sender, receiver) = mpsc::channel::<Bytes>(1);
         let in_flight = async move {
@@ -2261,9 +2376,11 @@ mod tests {
         );
     }
 
-    /// Build a known-tool-names set for build_flush_content tests.
-    fn names(ns: &[&str]) -> std::collections::HashSet<String> {
-        ns.iter().map(|s| s.to_string()).collect()
+    /// Build a permissive declared-tool schema table for build_flush_content tests.
+    fn names(ns: &[&str]) -> super::super::stream::InvokeToolSchemas {
+        ns.iter()
+            .map(|s| (s.to_string(), json!({"type": "object"})))
+            .collect()
     }
 
     /// Empty short->original tool name map for build_flush_content tests.
@@ -2309,8 +2426,7 @@ mod tests {
             last_metering: None,
             stop_reason_override: None,
             stream_error: None,
-            upstream_error: None,
-            known_tool_names: std::collections::HashSet::new(),
+            invoke_tool_schemas: super::super::stream::InvokeToolSchemas::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
     }
@@ -2330,6 +2446,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         }
     }
 
@@ -2599,6 +2716,15 @@ mod tests {
                 .any(|c| c["type"] == "web_search_tool_result"),
             "web_search must carry a web_search_tool_result block"
         );
+        let srv = content
+            .iter()
+            .find(|c| c["type"] == "server_tool_use")
+            .unwrap();
+        let res = content
+            .iter()
+            .find(|c| c["type"] == "web_search_tool_result")
+            .unwrap();
+        assert_eq!(res["tool_use_id"], srv["id"], "result must reference its server_tool_use");
         assert!(
             content
                 .iter()
@@ -2818,7 +2944,8 @@ mod tests {
         // Reviewer (v3) #2: stripping web_search from the reclamation table must NOT hurt
         // other tools. A text with BOTH a leaked exec_command and a leaked web_search:
         // exec_command MUST be reclaimed; web_search MUST stay text (never raw tool_use).
-        let leaked = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>\n<invoke name=\"web_search\">\n<parameter name=\"query\">news</parameter>\n</invoke>";
+        // H2: only the trailing block can become a call, so the leaked web_search comes first.
+        let leaked = "<invoke name=\"web_search\">\n<parameter name=\"query\">news</parameter>\n</invoke>\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
             leaked,
@@ -3061,9 +3188,9 @@ mod tests {
     }
 
     #[test]
-    fn flush_content_keeps_distinct_reclaimed_and_structured() {
-        // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
-        // different input than the structured one is a distinct action and must be kept.
+    fn flush_content_native_tool_use_disables_text_reclaim() {
+        // H2: once the round has a native tool_use, a text `<invoke>` (even one with a
+        // different input) is kept as text and never becomes a second tool call.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
         let structured = vec![CompletedToolUse {
             id: "toolu_other".to_string(),
@@ -3083,8 +3210,14 @@ mod tests {
             .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
             .count();
         assert_eq!(
-            exec_calls, 2,
-            "distinct inputs must both be kept. content={:?}",
+            exec_calls, 1,
+            "only the native tool_use may be emitted. content={:?}",
+            content
+        );
+        assert!(
+            content.iter().any(|c| c["type"] == "text"
+                && c["text"].as_str().is_some_and(|t| t.contains("<invoke"))),
+            "text invoke must stay as text. content={:?}",
             content
         );
     }
@@ -3099,7 +3232,13 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         });
-        let provider_usage = provider_round.resolved_token_usage(888);
+        let simulated = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+        let (provider_usage, provider_source) = provider_round.resolved_token_usage(888, simulated);
+        assert_eq!(provider_source, UsageSource::Provider);
         assert_eq!(
             provider_usage,
             TokenUsage {
@@ -3112,17 +3251,204 @@ mod tests {
 
         let mut fallback_round = round_outcome("fallback output", vec![]);
         fallback_round.context_input_tokens = Some(20);
-        let fallback_usage = fallback_round.resolved_token_usage(500);
-        assert_eq!(fallback_usage.uncached_input_tokens, 20);
+        let (fallback_usage, fallback_source) =
+            fallback_round.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(fallback_source, UsageSource::None);
+        // "fallback output" = 15 个西文字符 → count_tokens 得 5 个输出 token。
+        assert_eq!(fallback_usage.output_tokens, 5);
+        // context 20 - output 5 = 15。
+        assert_eq!(fallback_usage.uncached_input_tokens, 15);
         assert_eq!(fallback_usage.cache_write_input_tokens, 0);
         assert_eq!(fallback_usage.cache_read_input_tokens, 0);
         assert!(fallback_usage.output_tokens > 0);
 
         let total = provider_usage.saturating_add(fallback_usage);
-        assert_eq!(total.uncached_input_tokens, 23);
+        // provider 轮 3（精确值不扣） + fallback 轮 15 = 18
+        assert_eq!(total.uncached_input_tokens, 18);
         assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
         assert_eq!(total.cache_write_input_tokens, 4);
         assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn round_usage_without_context_usage_does_not_subtract_output() {
+        let round = round_outcome("fallback output", vec![]);
+        // round_outcome 辅助函数默认不带 contextUsage。
+        assert_eq!(round.context_input_tokens, None);
+
+        let (usage, source) = round.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(source, UsageSource::None);
+        // 回退值 500 来自 count_all_tokens 的 prompt 估算，本就不含输出，原样返回。
+        assert_eq!(usage.uncached_input_tokens, 500);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn multiple_fallback_rounds_each_subtract_their_own_output() {
+        // 两轮都走 contextUsage 回退分支，输出文本相同（"fallback output"
+        // = 15 个西文字符 → count_tokens 得 5 个输出 token），contextUsage 不同。
+        let mut round_a = round_outcome("fallback output", vec![]);
+        round_a.context_input_tokens = Some(20);
+        let mut round_b = round_outcome("fallback output", vec![]);
+        round_b.context_input_tokens = Some(30);
+
+        let (usage_a, source_a) = round_a.resolved_token_usage(500, CacheUsage::default());
+        let (usage_b, source_b) = round_b.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(source_a, UsageSource::None);
+        assert_eq!(source_b, UsageSource::None);
+        assert_eq!(usage_a.output_tokens, 5);
+        assert_eq!(usage_b.output_tokens, 5);
+        // 逐轮扣减：20-5=15，30-5=25。
+        assert_eq!(usage_a.uncached_input_tokens, 15);
+        assert_eq!(usage_b.uncached_input_tokens, 25);
+
+        let total = usage_a.saturating_add(usage_b);
+        // 累计必须等于两轮各自 (context - output) 之和 = 15 + 25 = 40。
+        // 若实现只在累加后扣一次输出，这里会得到 (20+30) - 5 = 45；
+        // 若完全不扣，会得到 50。两种错法都会在这条断言上失败。
+        assert_eq!(
+            usage_a.uncached_input_tokens + usage_b.uncached_input_tokens,
+            40
+        );
+        assert_eq!(total.uncached_input_tokens, 40);
+        assert_eq!(total.output_tokens, 10);
+        // 无断点时不做 cache 分摊，两项恒为 0。
+        assert_eq!(total.cache_write_input_tokens, 0);
+        assert_eq!(total.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn fallback_round_splits_total_with_cache_metering() {
+        let mut round = round_outcome("fallback output", vec![]);
+        round.context_input_tokens = Some(105);
+        let cache_usage = CacheUsage {
+            cache_read: 60,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+
+        let (usage, source) = round.resolved_token_usage(999, cache_usage);
+
+        // context 105 includes 5 output tokens, leaving a 100-token prompt.
+        // CacheMeter covers 80%: 60 read + 20 write + 20 ordinary input.
+        assert_eq!(usage.uncached_input_tokens, 20);
+        assert_eq!(usage.cache_write_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 60);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(source, UsageSource::Simulated);
+        assert_eq!(usage.total_input_tokens(), 100);
+    }
+
+    #[test]
+    fn websearch_rounds_advance_cache_prefix_and_preserve_token_conservation() {
+        use crate::anthropic::cache_metering::{CacheMeter, compute_cache_usage_sync};
+
+        let cache = CacheMeter::new(None);
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "Search for the latest Rust release and summarize it."
+                }]
+            }],
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 8
+                },
+                {
+                    "name": "exec_command",
+                    "description": "Run a local command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}}
+                    }
+                }
+            ],
+            "metadata": {
+                "user_id": "codex_session_c479866d-b846-4e87-807b-a5ed0d84948c"
+            },
+            "cache_control": {"type": "ephemeral"}
+        }))
+        .unwrap();
+        assert!(websearch::has_web_search_among_tools(&payload));
+
+        let first_total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let first_cache = compute_cache_usage_sync(&cache, &payload, 42);
+        let first_usage = split_simulated_usage(first_total, 0, first_cache);
+        assert_eq!(first_usage.cache_read_input_tokens, 0);
+        assert!(first_usage.cache_write_input_tokens > 0);
+        assert_eq!(first_usage.total_input_tokens(), first_total);
+
+        let search_round = round_outcome(
+            "I will search for the current release.",
+            vec![tu_with_input(json!({"query": "latest Rust release"}))],
+        );
+        let mut presentation = Vec::new();
+        append_search_round(
+            &mut payload,
+            &search_round,
+            &[fake_results("latest Rust release")],
+            &mut presentation,
+        );
+
+        let second_total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let second_cache = compute_cache_usage_sync(&cache, &payload, 42);
+        let second_usage = split_simulated_usage(second_total, 0, second_cache);
+        assert_eq!(
+            second_cache.cache_read, first_cache.cache_covered_est,
+            "the next internal round should reuse the prefix written by round one"
+        );
+        assert!(second_usage.cache_read_input_tokens > 0);
+        assert!(
+            second_usage.cache_write_input_tokens > 0,
+            "the assistant tool call and tool result should extend the cached prefix"
+        );
+        assert_eq!(second_usage.total_input_tokens(), second_total);
+
+        let aggregate = first_usage.saturating_add(second_usage);
+        assert_eq!(
+            aggregate.total_input_tokens(),
+            first_total.saturating_add(second_total)
+        );
+        assert!(aggregate.cache_write_input_tokens > 0);
+        assert!(aggregate.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn settlement_source_marks_any_simulated_round_as_simulated() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            credit_token_manager: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            effort: None,
+            started_at: std::time::Instant::now(),
+            tracer: None,
+            count_call: true,
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.note_source(UsageSource::Provider);
+        settlement.note_source(UsageSource::Simulated);
+        settlement.note_source(UsageSource::Provider);
+        assert_eq!(settlement.source, UsageSource::Simulated);
+        settlement.settled = true;
     }
 
     #[test]
@@ -3135,12 +3461,14 @@ mod tests {
                 cache_write_input_tokens: 4,
             },
             0.125,
+            UsageSource::Provider,
         );
         assert_eq!(trace.input_tokens, 3);
         assert_eq!(trace.output_tokens, 5);
         assert_eq!(trace.cache_creation_tokens, 4);
         assert_eq!(trace.cache_read_tokens, 7);
         assert_eq!(trace.credits, 0.125);
+        assert_eq!(trace.source, UsageSource::Provider);
 
         let sanitized = aggregated_trace_usage(
             TokenUsage {
@@ -3150,6 +3478,7 @@ mod tests {
                 cache_write_input_tokens: -4,
             },
             f64::NAN,
+            UsageSource::None,
         );
         assert_eq!(sanitized.input_tokens, 0);
         assert_eq!(sanitized.output_tokens, 0);
@@ -3219,6 +3548,96 @@ mod tests {
             output_tokens,
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn final_responses_sum_credit_usage_across_model_rounds() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            credit_token_manager: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            effort: None,
+            started_at: std::time::Instant::now(),
+            tracer: None,
+            count_call: true,
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(1, token_usage(10, 2), 0.25);
+        settlement.add(1, token_usage(20, 3), 0.50);
+        let latest = metering_event(0.50);
+        let metering = settlement
+            .response_metering(Some(&latest))
+            .expect("two metered rounds must produce response metering");
+
+        assert_eq!(metering.usage, 0.75);
+        assert_eq!(metering.unit, latest.unit);
+        assert_eq!(metering.unit_plural, latest.unit_plural);
+
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let response = render_json(
+            "gpt-5.6-sol",
+            content.clone(),
+            "end_turn",
+            settlement.usage(),
+            "",
+            Some(&metering),
+        );
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["usage"]["credit_usage"], json!(0.75));
+
+        let events = build_sse_events(
+            "gpt-5.6-sol",
+            content,
+            "end_turn",
+            settlement.usage(),
+            Some(&metering),
+        );
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("streaming response must contain message_delta");
+        assert_eq!(delta.data["usage"]["credit_usage"], json!(0.75));
+        settlement.settled = true;
+    }
+
+    #[test]
+    fn effective_call_billing_websearch_settles_once_for_multiple_rounds() {
+        use crate::admin::client_keys::ClientKeyManager;
+
+        for status in ["success", "error"] {
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            let hook = UsageRecordHook {
+                recorder: None,
+                aggregator: None,
+                client_keys: Some(manager.clone()),
+                credit_token_manager: None,
+                key_id: entry.id,
+                model: "gpt-5.6-sol".into(),
+                effort: None,
+                started_at: std::time::Instant::now(),
+                tracer: None,
+                count_call: true,
+            };
+            let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+            settlement.add(1, token_usage(10, 2), 0.25);
+            settlement.add(1, token_usage(20, 3), 0.50);
+            assert_eq!(manager.list()[0].total_successful_calls, 0);
+            settlement.finish(status, status, None, None);
+            settlement.finish(status, status, None, None);
+            drop(settlement);
+            let snapshot = manager.list().remove(0);
+            assert_eq!(snapshot.total_successful_calls, u64::from(status == "success"));
+            assert_eq!(snapshot.total_credits, if status == "success" { 0.75 } else { 0.0 });
         }
     }
 

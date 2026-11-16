@@ -4,10 +4,22 @@ import { Cpu, Bot, Sparkles, Wrench, Plus, Trash2, Save, Loader2, AlertCircle } 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { SettingGroup } from '@/components/console/setting-row'
-import { useCustomModels, useSetCustomModels, useCurrentCredentialModels } from '@/hooks/use-credentials'
+import {
+  SettingGroup,
+  SettingSwitch,
+  useFieldSaver,
+} from '@/components/console/setting-row'
+import {
+  useCustomModels,
+  useSetCustomModels,
+  useCurrentCredentialModels,
+  useCacheMeteringConfig,
+  useSetCacheMeteringConfig,
+} from '@/hooks/use-credentials'
+import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
+import { ToolCompatibilitySetting } from '@/components/settings/tool-compatibility-setting'
 
 // ──── 厂商定义 ────────────────────────────────────────────────────────────
 
@@ -77,6 +89,12 @@ function UpstreamModelRow({ model }: { model: AvailableModelItem }) {
 
 export function ModelsSection() {
   const [vendor, setVendor] = useState<VendorKey>('anthropic')
+
+  // Prompt Cache 计量模拟开关
+  const { data: cacheMetering, isLoading: cacheLoading } = useCacheMeteringConfig()
+  const { mutate: mutateCacheMetering } = useSetCacheMeteringConfig()
+  const cacheSaver = useFieldSaver(mutateCacheMetering, reportSaveError)
+  const cacheMeteringEnabled = cacheMetering?.enabled ?? true
 
   // 上游模型
   const upstreamQuery = useCurrentCredentialModels(vendor !== 'custom')
@@ -175,7 +193,27 @@ export function ModelsSection() {
   const customCount = drafts.length
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <ToolCompatibilitySetting />
+      <SettingGroup
+        title="Prompt Cache 提示词缓存"
+        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"
+      >
+        <SettingSwitch
+          label="模拟 prompt cache 计量"
+          hint={
+            cacheMeteringEnabled
+              ? '按客户端声明的 cache_control 断点估算缓存读取与创建，如实上报命中量；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
+              : '输入 Token 全额计入 input tokens，缓存两项恒为 0；彻底关闭缓存计量模拟'
+          }
+          checked={cacheMeteringEnabled}
+          onChange={(next) => cacheSaver.save('cacheMetering', { enabled: next })}
+          pending={cacheSaver.isSaving('cacheMetering')}
+          saved={cacheSaver.isSaved('cacheMetering')}
+          disabled={cacheLoading}
+        />
+      </SettingGroup>
+
       <SettingGroup
         title="可用模型"
         description="按厂商查看上游可用模型，或自定义模型别名与元数据。"

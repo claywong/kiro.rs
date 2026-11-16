@@ -9,6 +9,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "service_credential_dedup_tests.rs"]
+mod credential_dedup_tests;
+
 use crate::admin::types::GlobalProxyResponse;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
@@ -28,35 +32,41 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    priority_key, IdcReloginCredentials, MultiTokenManager, ProxyRotationUpdate, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
-use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::quota_alerts::{BalanceRound, BalanceSample, QuotaAlerts};
+use super::proxy_pool::{mask_proxy_url, GetUrlResult, ProxyAvailability, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
-    AddCredentialResponse, AssignProxyRequest,
-    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
-    CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
-    EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    CredentialMetadataSchemaConfig,
-    LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    RateLimitSameCredentialConfigResponse, SetAccountRpmLimitConfigRequest,
-    SetShortSpeedConfigRequest, ShortSpeedConfigResponse, SetSpeedCredentialsExcludeConfigRequest, SetSpeedCredentialsMinTokensConfigRequest,
+    AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
+    AuditSuspendedRequest, AuditSuspendedResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
+    BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
+    CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
+    CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
+    CredentialsStatusResponse, CustomHeadersConfigResponse, CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult,
+    ExportedAccount, ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelApiRetryConfigResponse,
+    ModelSelectionMode, ModelTestRequest, ModelTestResponse, PollIdcLoginResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyFailoverConfigResponse, ProxyPoolEntry, ProxyPoolResponse, ProxyRotationResponse,
+    QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
+    SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomHeadersRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetProxyFailoverConfigRequest,
+    SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    ToolCompatibilityConfig, UpdateRefreshTokenRequest,
+};
+// 本地新增类型单独成行，避免上游改动该块时反复冲突。
+use super::types::{
+    RateLimitSameCredentialConfigResponse, SetRateLimitSameCredentialConfigRequest,
+    SetShortSpeedConfigRequest, SetSpeedCredentialsExcludeConfigRequest,
+    SetSpeedCredentialsMinTokensConfigRequest, ShortSpeedConfigResponse,
     SpeedCredentialsExcludeConfigResponse, SpeedCredentialsMinTokensConfigResponse,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetRateLimitSameCredentialConfigRequest,
-    SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），7.5 分钟。
@@ -72,7 +82,10 @@ use super::types::{
 /// 可能是 7.5 分钟前的 —— 余额本就是分钟级粒度的参考值，宽限一轮不影响扩容判断。
 const BALANCE_CACHE_TTL_SECS: i64 = 450;
 
-/// 余额后台刷新周期（秒），5 分钟。TTL 必须比它宽，理由见 [`BALANCE_CACHE_TTL_SECS`]。
+/// 余额后台刷新周期的默认值（秒），5 分钟。TTL 必须比它宽，理由见 [`BALANCE_CACHE_TTL_SECS`]。
+/// 实际周期由上游的 `balanceRefreshIntervalSecs` 配置决定（main 里解析），本常量现在
+/// 只剩测试在引用。
+#[allow(dead_code)]
 pub const BALANCE_REFRESH_INTERVAL_SECS: u64 = 300;
 
 /// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
@@ -108,9 +121,10 @@ fn credential_metadata_details(
     keys.into_iter()
         .filter_map(|key| {
             let field = properties.and_then(|fields| fields.get(&key));
-            let value = values.get(&key).cloned().or_else(|| {
-                field.and_then(|schema_field| schema_field.get("default").cloned())
-            })?;
+            let value = values
+                .get(&key)
+                .cloned()
+                .or_else(|| field.and_then(|schema_field| schema_field.get("default").cloned()))?;
             let title = field
                 .and_then(|schema_field| schema_field.get("title"))
                 .and_then(serde_json::Value::as_str)
@@ -334,6 +348,12 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// prompt cache 本地计量模拟句柄（开关运行时可改）
+    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    /// 自定义响应头管理器（热重载）
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    custom_headers_update_lock: Mutex<()>,
+    quota_alerts: Result<Arc<QuotaAlerts>, String>,
 }
 
 /// Social 登录会话状态
@@ -654,26 +674,23 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
-        let credential_metadata_schema = match token_manager
-            .config()
-            .credential_metadata_schema
-            .clone()
-        {
-            Some(schema) => {
-                let schema = normalize_credential_metadata_schema(schema);
-                match validate_credential_metadata_schema(&schema) {
-                    Ok(()) => schema,
-                    Err(error) => {
-                        tracing::warn!(
-                            "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
-                            error
-                        );
-                        credential_metadata_schema()
+        let credential_metadata_schema =
+            match token_manager.config().credential_metadata_schema.clone() {
+                Some(schema) => {
+                    let schema = normalize_credential_metadata_schema(schema);
+                    match validate_credential_metadata_schema(&schema) {
+                        Ok(()) => schema,
+                        Err(error) => {
+                            tracing::warn!(
+                                "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                                error
+                            );
+                            credential_metadata_schema()
+                        }
                     }
                 }
-            }
-            None => credential_metadata_schema(),
-        };
+                None => credential_metadata_schema(),
+            };
 
         let svc = Self {
             token_manager,
@@ -689,6 +706,10 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            cache_meter: None,
+            custom_headers: None,
+            custom_headers_update_lock: Mutex::new(()),
+            quota_alerts: Err("额度告警服务尚未初始化".into()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -707,6 +728,27 @@ impl AdminService {
         }
 
         svc
+    }
+
+    pub fn with_quota_alerts(mut self, interval: std::time::Duration) -> Self {
+        self.quota_alerts = match self.token_manager.cache_dir() {
+            Some(directory) => QuotaAlerts::start(
+                &directory.join("quota_alerts.db"),
+                self.token_manager.clone(),
+                interval,
+            ),
+            None => Err("额度告警需要可持久化的数据目录".into()),
+        };
+        if let Err(error) = &self.quota_alerts {
+            tracing::error!("额度告警不可用（代理服务不受影响）：{error}");
+        }
+        self
+    }
+
+    pub fn quota_alerts(&self) -> Result<&Arc<QuotaAlerts>, AdminServiceError> {
+        self.quota_alerts
+            .as_ref()
+            .map_err(|error| AdminServiceError::InternalError(error.clone()))
     }
 
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
@@ -730,8 +772,112 @@ impl AdminService {
         self
     }
 
-    /// 获取所有凭据状态
+    /// 注入 prompt cache 计量模拟句柄，用于运行时切换总开关。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
+    ) -> Self {
+        self.cache_meter = Some(cache_meter);
+        self
+    }
+
+    /// 注入自定义响应头管理器
+    pub fn with_custom_headers(
+        mut self,
+        custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    ) -> Self {
+        self.custom_headers = custom_headers;
+        self
+    }
+
+    /// 查询 prompt cache 计量模拟配置与运行指标。
+    ///
+    /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
+    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致，`stats` 为 `null`。
+    pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
+        use crate::anthropic::cache_metering::CacheMeter;
+
+        if let Some(meter) = self.cache_meter.as_ref() {
+            let stats = meter.stats_total();
+            return CacheMeteringConfigResponse {
+                enabled: meter.is_enabled(),
+                capacity: meter.capacity(),
+                persist_enabled: meter.persist_enabled(),
+                flush_interval_secs: meter.flush_interval_secs(),
+                miss_diagnostics: meter.miss_diagnostics(),
+                stats: Some(CacheMeteringStatsResponse {
+                    entries_len: meter.len(),
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    miss_no_entry: stats.miss_no_entry,
+                    miss_expired: stats.miss_expired,
+                    miss_evicted: stats.miss_evicted,
+                    miss_no_breakpoint: stats.miss_no_breakpoint,
+                    miss_no_seed: stats.miss_no_seed,
+                    evicted_total: stats.evicted_total,
+                    expired_total: stats.expired_total,
+                    tombstone_clears: stats.tombstone_clears,
+                }),
+            };
+        }
+
+        let config = self.token_manager.config();
+        CacheMeteringConfigResponse {
+            enabled: config
+                .cache_metering_enabled
+                .or_else(CacheMeter::metering_enabled_from_env)
+                .unwrap_or(true),
+            capacity: CacheMeter::resolve_capacity(
+                config.cache_metering_capacity,
+                CacheMeter::capacity_from_env(),
+            ),
+            persist_enabled: config
+                .cache_metering_persist_enabled
+                .or_else(CacheMeter::persist_enabled_from_env)
+                .unwrap_or(false),
+            flush_interval_secs: CacheMeter::resolve_flush_interval_secs(
+                config.cache_metering_flush_interval_secs,
+                CacheMeter::flush_interval_from_env(),
+            ),
+            miss_diagnostics: config
+                .cache_metering_miss_diagnostics
+                .or_else(CacheMeter::miss_diagnostics_from_env)
+                .unwrap_or(true),
+            stats: None,
+        }
+    }
+
+    /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
+    pub fn set_cache_metering_config(
+        &self,
+        req: SetCacheMeteringConfigRequest,
+    ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "请提供 enabled 字段".to_string(),
+            ));
+        };
+
+        if let Some(meter) = &self.cache_meter {
+            meter.set_enabled(enabled);
+        }
+        if let Err(e) = self
+            .token_manager
+            .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
+        {
+            tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
+        }
+
+        Ok(self.get_cache_metering_config())
+    }
+
+    /// 获取所有凭据状态（兼容旧接口，不分页）
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        self.get_credentials_paged(&CredentialsQuery::default())
+    }
+
+    /// 分页、过滤、排序获取凭据状态
+    pub fn get_credentials_paged(&self, query: &CredentialsQuery) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
             0
@@ -748,7 +894,10 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
-        let mut credentials: Vec<CredentialStatusItem> = snapshot
+        let total = snapshot.total;
+        let available = snapshot.available;
+
+        let credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
@@ -764,6 +913,7 @@ impl AdminService {
                     priority: entry.priority,
                     rpm_limit: entry.rpm_limit,
                     rpm_current: entry.rpm_current,
+                    load_factor: entry.load_factor,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -772,6 +922,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
+                    profile_arn: entry.profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
@@ -781,9 +932,11 @@ impl AdminService {
                     total_credits: entry.total_credits,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
+                    proxy_temporary_direct: entry.proxy_temporary_direct,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    throttled_remaining_secs: entry.throttled_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
@@ -796,15 +949,245 @@ impl AdminService {
             })
             .collect();
 
-        // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
-        credentials.sort_by_key(|c| (c.priority, c.id));
+        // 全量各状态统计（不受分页和筛选影响，供前端状态账条展示全局概览）
+        let credential_state = |credential: &CredentialStatusItem| {
+            if credential.disabled {
+                match credential.disabled_reason.as_deref() {
+                    Some("QuotaExceeded") => "quota",
+                    Some("Suspended") => "suspended",
+                    _ => "dead",
+                }
+            } else if credential.throttled_remaining_secs.unwrap_or(0) > 0 {
+                "throttled"
+            } else if credential.balance.as_ref().is_some_and(|balance| balance.remaining <= 0.0 || balance.usage_percentage >= 100.0) {
+                "quota"
+            } else {
+                "healthy"
+            }
+        };
+        let mut healthy_count = 0;
+        let mut throttled_count = 0;
+        let mut quota_count = 0;
+        let mut dead_count = 0;
+        let mut suspended_count = 0;
+        for c in &credentials {
+            match credential_state(c) {
+                "healthy" => healthy_count += 1,
+                "throttled" => throttled_count += 1,
+                "quota" => quota_count += 1,
+                "suspended" => suspended_count += 1,
+                _ => dead_count += 1,
+            }
+        }
+        let state_counts = CredentialStateCounts {
+            healthy: healthy_count,
+            throttled: throttled_count,
+            quota: quota_count,
+            dead: dead_count,
+            suspended: suspended_count,
+            total: credentials.len(),
+        };
+
+        // 1. 过滤
+        let mut filtered: Vec<CredentialStatusItem> = credentials
+            .into_iter()
+            .filter(|c| {
+                // 搜索过滤
+                if let Some(search) = query.effective_search() {
+                    let q = search.to_lowercase();
+                    let match_email = c
+                        .email
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_channel = c
+                        .source_channel
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_key = c
+                        .masked_api_key
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_id = c.id.to_string().contains(&q);
+                    let match_endpoint = c.endpoint.to_lowercase().contains(&q);
+                    if !match_email && !match_channel && !match_key && !match_id && !match_endpoint
+                    {
+                        return false;
+                    }
+                }
+
+                // 分组过滤
+                if let Some(group) = query.effective_group() {
+                    if group == "__none__" {
+                        if !c.groups.is_empty() {
+                            return false;
+                        }
+                    } else if !c.groups.iter().any(|g| g == group) {
+                        return false;
+                    }
+                }
+
+                // 状态过滤 (healthy / available, cooling / throttled, disabled / dead, overage / quota)
+                if let Some(status) = query.effective_status() {
+                    match status {
+                        "all" => {}
+                        "healthy" | "available" if credential_state(c) != "healthy" => return false,
+                        "cooling" | "throttled" if credential_state(c) != "throttled" => return false,
+                        "disabled" if !c.disabled => return false,
+                        "dead" if credential_state(c) != "dead" => return false,
+                        "overage" | "quota" if credential_state(c) != "quota" => return false,
+                        "suspended" if credential_state(c) != "suspended" => return false,
+                        _ => {}
+                    }
+                }
+
+                // 等级过滤（与前端 detectTier 的取值保持一致）
+                if let Some(tier) = query.effective_tier() {
+                    let t = c.subscription_title.as_deref().unwrap_or("").to_lowercase();
+                    let is_pro_plus = t.contains("pro+") || t.contains("pro plus");
+                    let is_pro = t.contains("pro");
+                    let is_power = t.contains("power");
+                    let is_free = t.contains("free");
+                    let is_student = t.contains("student");
+                    match tier {
+                        "pro" if !is_pro || is_pro_plus => return false,
+                        "pro_plus" if !is_pro_plus => return false,
+                        "power" if !is_power => return false,
+                        "student" if !is_student => return false,
+                        "free" if !is_free => return false,
+                        "unknown" if is_pro || is_power || is_free || is_student => {
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        let filtered_total = filtered.len();
+
+        // 2. 排序
+        let sort_dir_asc = query.effective_sort_dir().eq_ignore_ascii_case("asc");
+        let sort_field = query.effective_sort_field().unwrap_or("manual");
+
+        if sort_field == "manual" {
+            let invert = self.token_manager.get_invert_priority();
+            filtered.sort_by_key(|credential| (priority_key(credential.priority, invert), credential.id));
+        } else {
+            filtered.sort_by(|a, b| {
+                let cmp = match sort_field {
+                    "priority" => a.priority.cmp(&b.priority),
+                    "successCount" | "success_count" => a.success_count.cmp(&b.success_count),
+                    "totalFailureCount" | "total_failure_count" => {
+                        a.total_failure_count.cmp(&b.total_failure_count)
+                    }
+                    "id" => a.id.cmp(&b.id),
+                    "name" => {
+                        let na = a
+                            .email
+                            .as_deref()
+                            .or(a.source_channel.as_deref())
+                            .unwrap_or("");
+                        let nb = b
+                            .email
+                            .as_deref()
+                            .or(b.source_channel.as_deref())
+                            .unwrap_or("");
+                        na.to_lowercase().cmp(&nb.to_lowercase())
+                    }
+                    "status" => {
+                        let rank = |c: &CredentialStatusItem| -> u8 {
+                            if c.disabled {
+                                3
+                            } else if c.throttled_remaining_secs.unwrap_or(0) > 0 {
+                                2
+                            } else if c.is_current {
+                                0
+                            } else {
+                                1
+                            }
+                        };
+                        rank(a).cmp(&rank(b))
+                    }
+                    "lastUsedAt" | "last_used_at" => match (&a.last_used_at, &b.last_used_at) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(ta), Some(tb)) => ta.cmp(tb),
+                    },
+                    "createdAt" | "created_at" => match (&a.created_at, &b.created_at) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(ta), Some(tb)) => ta.cmp(tb),
+                    },
+                    "balance" => {
+                        let rem_a = a.balance.as_ref().map(|b| b.remaining);
+                        let rem_b = b.balance.as_ref().map(|b| b.remaining);
+                        match (rem_a, rem_b) {
+                            (Some(ra), Some(rb)) => {
+                                ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => {
+                                let pct_a = a.balance.as_ref().map(|b| b.usage_percentage);
+                                let pct_b = b.balance.as_ref().map(|b| b.usage_percentage);
+                                match (pct_a, pct_b) {
+                                    (Some(pa), Some(pb)) => {
+                                        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                    _ => std::cmp::Ordering::Equal,
+                                }
+                            }
+                        }
+                    }
+                    _ => a.priority.cmp(&b.priority),
+                };
+
+                let ordered_cmp = if sort_dir_asc { cmp } else { cmp.reverse() };
+                if ordered_cmp == std::cmp::Ordering::Equal {
+                    a.id.cmp(&b.id)
+                } else {
+                    ordered_cmp
+                }
+            });
+        }
+
+        // 3. 分页
+        let page_size = query.effective_page_size();
+        let (page, page_size_opt, result_credentials) = if page_size > 0 {
+            let page = query.effective_page();
+            let start = page.saturating_sub(1).saturating_mul(page_size);
+            let paged = filtered.into_iter().skip(start).take(page_size).collect();
+            (Some(page), Some(page_size), paged)
+        } else {
+            (None, None, filtered)
+        };
 
         CredentialsStatusResponse {
-            total: snapshot.total,
-            available: snapshot.available,
+            total,
+            filtered_total: if page_size > 0
+                || query.effective_search().is_some()
+                || query.effective_group().is_some()
+                || query.effective_status().is_some()
+                || query.effective_tier().is_some()
+            {
+                Some(filtered_total)
+            } else {
+                None
+            },
+            available,
+            page,
+            page_size: page_size_opt,
             current_id: exposed_current_id,
+            state_counts: Some(state_counts),
             metadata_schema,
-            credentials,
+            credentials: result_credentials,
         }
     }
 
@@ -843,7 +1226,13 @@ impl AdminService {
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
         }
-        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
+        let invert = self.token_manager.get_invert_priority();
+        credentials.sort_by_key(|c| {
+            (
+                priority_key(c.priority, invert),
+                c.id.unwrap_or(u64::MAX),
+            )
+        });
 
         let accounts = credentials
             .into_iter()
@@ -913,6 +1302,85 @@ impl AdminService {
         }
     }
 
+    /// 通过历史请求日志排查封号凭据并标记为 Suspended
+    pub fn audit_suspended_credentials(
+        &self,
+        req: Option<AuditSuspendedRequest>,
+    ) -> Result<AuditSuspendedResponse, AdminServiceError> {
+        let trace_store = self.trace_store.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("未启用链路追踪存储，无法查询历史日志".to_string())
+        })?;
+
+        let req = req.unwrap_or_default();
+        let only_disabled = req.only_disabled.unwrap_or(true);
+
+        // 确定待扫描的目标凭据候选集合
+        let snapshot = self.token_manager.snapshot();
+        let requested_ids = req.credential_ids.filter(|ids| !ids.is_empty())
+            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
+        let candidate_creds: HashSet<u64> = snapshot.entries.iter()
+            .filter(|entry| (!only_disabled || entry.disabled)
+                && requested_ids.as_ref().is_none_or(|ids| ids.contains(&entry.id)))
+            .map(|entry| entry.id)
+            .collect();
+
+        let scanned_count = candidate_creds.len();
+        if candidate_creds.is_empty() {
+            return Ok(AuditSuspendedResponse {
+                scanned_count: 0,
+                banned_count: 0,
+                updated_count: 0,
+                updated_ids: Vec::new(),
+                banned_ids: Vec::new(),
+            });
+        }
+
+        // 从 trace 存储拉取各凭据的错误日志与结果分类
+        let error_logs = trace_store.query_credential_error_logs()
+            .map_err(|error| AdminServiceError::InternalError(format!("查询封禁历史日志失败: {error}")))?;
+
+        // 匹配封号检查逻辑
+        let mut banned_ids: HashSet<u64> = HashSet::new();
+        for (cred_id, outcome, snippet) in error_logs {
+            if !candidate_creds.contains(&cred_id) {
+                continue;
+            }
+            let is_banned = outcome == crate::admin::trace_db::outcome::ACCOUNT_SUSPENDED
+                || snippet.as_deref().is_some_and(|body| {
+                    crate::kiro::endpoint::default_is_account_suspended(body)
+                        || self.token_manager.matches_suspended_ban_keywords(body)
+                });
+            if is_banned {
+                banned_ids.insert(cred_id);
+            }
+        }
+
+        let banned_count = banned_ids.len();
+        let banned_vec: Vec<u64> = banned_ids.into_iter().collect();
+
+        // 批量更新为 Suspended 并持久化
+        let updated_ids = self
+            .token_manager
+            .batch_mark_suspended(&banned_vec)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let updated_count = updated_ids.len();
+
+        tracing::info!(
+            "历史日志排查封号完成: 扫描 {} 个凭据，命中 {} 个封号特征，新标记 {} 个凭据为 Suspended",
+            scanned_count,
+            banned_count,
+            updated_count
+        );
+
+        Ok(AuditSuspendedResponse {
+            scanned_count,
+            banned_count,
+            updated_count,
+            updated_ids,
+            banned_ids: banned_vec,
+        })
+    }
+
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
@@ -934,6 +1402,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据负载因子（均衡模式下的调度权重）
+    pub fn set_load_factor(&self, id: u64, load_factor: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_load_factor(id, load_factor)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -971,7 +1446,7 @@ impl AdminService {
         }
 
         // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
+        let (balance, _) = self.fetch_balance(id).await?;
 
         // 更新缓存
         {
@@ -990,15 +1465,17 @@ impl AdminService {
     }
 
     /// 从上游获取余额（无缓存）
-    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+    async fn fetch_balance(&self, id: u64) -> Result<(BalanceResponse, Option<f64>), AdminServiceError> {
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
+        let now = Utc::now().timestamp() as f64;
+        let (current_usage, usage_limit) = usage
+            .credit_totals_at(now)
+            .ok_or(AdminServiceError::InvalidBalance { id })?;
         // 允许 remaining 显示为负值：开启超额后实际使用可能超过限额，
         // 直接保留差值便于在 UI 中体现"已欠多少"。
         let remaining = usage_limit - current_usage;
@@ -1009,21 +1486,24 @@ impl AdminService {
             0.0
         };
 
-        Ok(BalanceResponse {
-            id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-            overage_enabled: usage.overage_enabled(),
-            overage_capable: usage.overage_capable(),
-            overage_capability_raw: usage
-                .subscription_info
-                .as_ref()
-                .and_then(|s| s.overage_capability.clone()),
-        })
+        Ok((
+            BalanceResponse {
+                id,
+                subscription_title: usage.subscription_title().map(|s| s.to_string()),
+                current_usage,
+                usage_limit,
+                remaining,
+                usage_percentage,
+                next_reset_at: usage.next_reset_at(),
+                overage_enabled: usage.overage_enabled(),
+                overage_capable: usage.overage_capable(),
+                overage_capability_raw: usage
+                    .subscription_info
+                    .as_ref()
+                    .and_then(|s| s.overage_capability.clone()),
+            },
+            usage.credit_expiry_at(now),
+        ))
     }
 
     /// 获取指定凭据当前可用的模型列表（实时查询上游，成功后更新共享模型缓存）
@@ -1176,16 +1656,60 @@ impl AdminService {
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
+        let mut alert_round = BalanceRound::default();
         let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp() as f64;
+        let quota_recovery_enabled = self.token_manager.quota_reset_recovery_enabled();
+        // 优先使用凭据自身缓存的上游 nextResetAt。极少数没有本地余额缓存的
+        // QuotaExceeded 凭据，才回退使用同一计费周期中其它凭据的 reset 时间。
+        // 这让到期探测按凭据进行，不会因为一个账号到期而查询全部禁用账号。
+        // 普通 UI/读取路径仍各自执行 5 分钟 TTL 校验。
+        let quota_reset_times: HashMap<u64, Option<f64>> = {
+            let cache = self.balance_cache.lock();
+            let fallback = cache.values().find_map(|cached| cached.data.next_reset_at);
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                })
+                .map(|entry| {
+                    let reset_at = quota_recovery_reset_at(&cache, entry.id, fallback);
+                    (entry.id, reset_at)
+                })
+                .collect()
+        };
         let mut success = 0_usize;
         let mut failure = 0_usize;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            let quota_recovery_probe = quota_recovery_enabled
+                && entry.disabled
+                && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                && quota_reset_times
+                    .get(&entry.id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|reset_at| quota_reset_is_due(Some(reset_at), now_ts));
+            if entry.disabled && !quota_recovery_probe {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
-                Ok(balance) => {
+                Ok((balance, valid_until)) => {
+                    alert_round.balances.insert(
+                        entry.id,
+                        BalanceSample {
+                            queried_at: Utc::now().timestamp(),
+                            balance: Some(balance.clone()),
+                            valid_until,
+                            invalid_quota: false,
+                        },
+                    );
+                    // 此路径只恢复此前因额度耗尽而被禁用的账号。即使超额开关
+                    // 仍为开启，也不能证明超额额度尚未耗尽；只有订阅额度在新
+                    // 计费周期恢复为正数时才重新加入调度。
+                    let quota_recovered = quota_recovery_probe && balance.remaining > 0.0;
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -1196,10 +1720,37 @@ impl AdminService {
                             },
                         );
                     }
+                    if quota_recovered {
+                        match self.token_manager.recover_quota_exceeded(entry.id) {
+                            Ok(true) => tracing::info!(
+                                credential_id = entry.id,
+                                remaining,
+                                "上游计费周期已重置，QuotaExceeded 凭据已恢复可用"
+                            ),
+                            Ok(false) => tracing::debug!(
+                                credential_id = entry.id,
+                                "额度恢复探测期间凭据状态已变化，跳过自动恢复"
+                            ),
+                            Err(error) => tracing::warn!(
+                                credential_id = entry.id,
+                                error = %error,
+                                "额度恢复探测确认余额可用，但恢复凭据失败"
+                            ),
+                        }
+                    }
                     success += 1;
                 }
                 Err(e) => {
                     tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
+                    alert_round.balances.insert(
+                        entry.id,
+                        BalanceSample {
+                            queried_at: Utc::now().timestamp(),
+                            balance: None,
+                            valid_until: None,
+                            invalid_quota: matches!(e, AdminServiceError::InvalidBalance { .. }),
+                        },
+                    );
                     failure += 1;
                 }
             }
@@ -1210,15 +1761,28 @@ impl AdminService {
         if success > 0 {
             self.save_balance_cache();
         }
+        alert_round.completed_at = Utc::now().timestamp();
+        if let Ok(alerts) = &self.quota_alerts {
+            alerts.submit(alert_round);
+        }
         (success, failure)
     }
 
     /// 启动余额后台刷新调度器
     ///
-    /// - 启动后立刻执行一次刷新
-    /// - 之后按 `interval` 周期循环刷新
+    /// - `interval` 为 0 时不启动任务，包括首次刷新
+    /// - 启动后等待 3 秒执行首次刷新
+    /// - 每轮刷新完成后等待 `interval` 再启动下一轮
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
+        if interval.is_zero() {
+            tracing::info!("余额后台刷新已关闭，仍可通过面板/API 按需查询");
+            return;
+        }
+        tracing::info!(
+            "余额后台刷新已启用，每轮完成后等待 {} 秒",
+            interval.as_secs()
+        );
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             // 启动后稍等片刻，让上游/Token Manager 准备就绪
@@ -1250,8 +1814,9 @@ impl AdminService {
     /// 启动代理池后台健康检查调度器
     ///
     /// - 启动后稍等片刻再执行首次探测
-    /// - 之后按 `interval` 周期循环，对所有已启用代理并发探测
-    /// - 连续探测失败达阈值的代理由 `check_all` 内部自动禁用
+    /// - 之后按 `interval` 周期循环，执行「自动检测 → 探测 → 自动轮换」完整巡检
+    /// - 连续探测失败达阈值的代理自动禁用，恢复连通后自动重新启用
+    /// - 使用不可用代理的凭据按配置自动轮换或回退直连
     pub fn start_proxy_health_checker(self: &Arc<Self>, interval: std::time::Duration) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
@@ -1259,14 +1824,30 @@ impl AdminService {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             loop {
                 let started = std::time::Instant::now();
-                let summary = svc.proxy_pool.check_all().await;
+                let result = svc.check_all_proxies().await;
                 tracing::info!(
-                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
-                    summary.healthy,
-                    summary.unhealthy,
-                    summary.auto_disabled,
+                    "代理池巡检完成：健康 {}，异常 {}，自动禁用 {}，自动恢复 {}，新检测 {}，耗时 {:.1}s",
+                    result.healthy,
+                    result.unhealthy,
+                    result.auto_disabled,
+                    result.auto_recovered,
+                    result.detected,
                     started.elapsed().as_secs_f32()
                 );
+                let rotation = &result.rotation;
+                if rotation.rotated > 0
+                    || rotation.switched_to_direct > 0
+                    || rotation.restored_to_proxy > 0
+                    || rotation.unresolved > 0
+                {
+                    tracing::info!(
+                        "凭据代理自动轮换：轮换 {}，回退直连 {}，改回代理 {}，无可用代理 {}",
+                        rotation.rotated,
+                        rotation.switched_to_direct,
+                        rotation.restored_to_proxy,
+                        rotation.unresolved
+                    );
+                }
                 tokio::time::sleep(interval).await;
             }
         });
@@ -1448,6 +2029,7 @@ impl AdminService {
             priority: req.priority,
             rpm_limit: req.rpm_limit,
             credit_limit: req.credit_limit,
+            load_factor: req.load_factor.max(1),
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -1457,6 +2039,8 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1482,8 +2066,7 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
-        // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
         if fetch_balance {
             if let Err(e) = self.get_balance(credential_id).await {
@@ -1608,6 +2191,7 @@ impl AdminService {
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.rpm_limit,
                 req.metadata,
+                req.load_factor,
             )
             .map_err(|e| self.classify_error(e, id))?;
         // 改代理会让 token_manager 失效该凭据的模型缓存，不重建就退回 Unknown，
@@ -1737,10 +2321,14 @@ impl AdminService {
                     i + 1,
                 )));
             }
-            if backend_id.is_empty() || backend_id.len() > 256 || backend_id.chars().any(char::is_control) {
+            if backend_id.is_empty()
+                || backend_id.len() > 256
+                || backend_id.chars().any(char::is_control)
+            {
                 return Err(AdminServiceError::InvalidCredential(format!(
                     "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
-                    i + 1, id,
+                    i + 1,
+                    id,
                 )));
             }
             if let Some(value) = m.context_window {
@@ -1800,6 +2388,104 @@ impl AdminService {
         self.token_manager.invalidate_all_model_caches();
 
         Ok(self.get_custom_models())
+    }
+
+    /// 获取当前配置的自定义响应头列表
+    pub fn get_custom_headers(&self) -> CustomHeadersConfigResponse {
+        let headers = if let Some(mgr) = &self.custom_headers {
+            mgr.get_rules().into_iter().map(Into::into).collect()
+        } else {
+            crate::model::custom_headers::default_custom_headers()
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        };
+        CustomHeadersConfigResponse { headers }
+    }
+
+    /// 批量替换自定义响应头配置（校验 → 持久化 config.json → 热更新内存规则）
+    pub fn set_custom_headers(
+        &self,
+        req: SetCustomHeadersRequest,
+    ) -> Result<CustomHeadersConfigResponse, AdminServiceError> {
+        if req.headers.len() > 50 {
+            return Err(AdminServiceError::InvalidCredential(
+                "自定义响应头最多支持配置 50 条".to_string(),
+            ));
+        }
+
+        let mut seen_keys = HashSet::new();
+        for (i, h) in req.headers.iter().enumerate() {
+            let key = h.key.trim();
+            if key.is_empty() || key.len() > 128 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Name 必须为 1-128 个字符",
+                    i + 1
+                )));
+            }
+
+            // 严格校验是否符合标准 HTTP Header 名称规范
+            if axum::http::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Name（{}）不符合标准 HTTP 规范",
+                    i + 1,
+                    key
+                )));
+            }
+
+            // 校验 Value 不含换行符，防止 HTTP Header 注入
+            if h.value.contains('\r') || h.value.contains('\n') {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Value 不能包含回车或换行符",
+                    i + 1
+                )));
+            }
+
+            if axum::http::header::HeaderValue::from_str(&h.value).is_err() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Value 包含无效字符", i + 1
+                )));
+            }
+
+            if h.value.len() > 1024 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Value 长度不能超过 1024 个字符",
+                    i + 1
+                )));
+            }
+
+            let lower_key = key.to_ascii_lowercase();
+            if !seen_keys.insert(lower_key) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "自定义响应头 Header Name 不能重复（不区分大小写）: {}",
+                    key
+                )));
+            }
+        }
+
+        let rules: Vec<crate::model::custom_headers::CustomHeaderRule> = req
+            .headers
+            .into_iter()
+            .map(|item| crate::model::custom_headers::CustomHeaderRule {
+                key: item.key.trim().to_string(),
+                value: item.value.trim().to_string(),
+                enabled: item.enabled,
+            })
+            .collect();
+
+        let _update_guard = self.custom_headers_update_lock.lock();
+        let rules_for_config = rules.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.custom_headers = rules_for_config;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        if let Some(mgr) = &self.custom_headers {
+            mgr.set_rules(rules);
+        }
+
+        Ok(self.get_custom_headers())
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
@@ -1875,7 +2561,7 @@ impl AdminService {
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
-                self.token_manager.proxy().map(|p| p.url.clone()),
+                self.token_manager.proxy(),
                 runtime.github_token.clone(),
             )
         };
@@ -1889,7 +2575,7 @@ impl AdminService {
         if !reused {
             super::binary_update::download_release_binary(
                 &version,
-                proxy.as_deref(),
+                proxy.as_ref(),
                 token.as_deref(),
                 &staged,
             )
@@ -1923,7 +2609,7 @@ impl AdminService {
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
-                self.token_manager.proxy().map(|p| p.url.clone()),
+                self.token_manager.proxy(),
                 runtime.github_token.clone(),
             )
         };
@@ -1936,7 +2622,7 @@ impl AdminService {
         if !reused {
             super::binary_update::download_release_binary(
                 &version,
-                proxy.as_deref(),
+                proxy.as_ref(),
                 token.as_deref(),
                 &staged,
             )
@@ -2113,7 +2799,9 @@ impl AdminService {
             GITHUB_RELEASES_REPO
         );
         let token = self.update_config.lock().github_token.clone();
-        let mut req = reqwest::Client::new()
+        let proxy = self.token_manager.proxy();
+        let client = super::binary_update::build_http_client(proxy.as_ref())?;
+        let mut req = client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -2187,8 +2875,8 @@ impl AdminService {
             });
         let authenticated = token.is_some();
 
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
-        let client = match super::binary_update::build_http_client(proxy.as_deref()) {
+        let proxy = self.token_manager.proxy();
+        let client = match super::binary_update::build_http_client(proxy.as_ref()) {
             Ok(c) => c,
             Err(e) => {
                 return GitHubRateLimitInfo {
@@ -2345,33 +3033,77 @@ impl AdminService {
             .map(|s| s.to_string())
     }
 
-    /// 获取负载均衡模式
+    /// 获取负载均衡模式与优先级反转
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
+            invert_priority: self.token_manager.get_invert_priority(),
         }
     }
 
-    /// 设置负载均衡模式
+    /// 设置负载均衡模式与优先级反转
     pub fn set_load_balancing_mode(
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode.is_none() && req.invert_priority.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要提供 mode 或 invertPriority 之一".to_string(),
+            ));
+        }
+
+        if let Some(ref mode) = req.mode
+            && mode != "priority"
+            && mode != "balanced"
+        {
             return Err(AdminServiceError::InvalidCredential(
                 "mode 必须是 'priority' 或 'balanced'".to_string(),
             ));
         }
 
         self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
+            .update_load_balancing_settings(req.mode.as_deref(), req.invert_priority)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(self.get_load_balancing_mode())
     }
 
-    /// 获取账号级风控故障转移配置
+    /// 获取对话 / MCP 上游域名
+    pub fn get_api_domain(&self) -> ApiDomainConfig {
+        ApiDomainConfig {
+            domain: self.token_manager.api_domain(),
+        }
+    }
+
+    /// 设置对话 / MCP 上游域名（运行时生效 + 持久化 config.json）
+    pub fn set_api_domain(
+        &self,
+        req: ApiDomainConfig,
+    ) -> Result<ApiDomainConfig, AdminServiceError> {
+        self.token_manager
+            .set_api_domain(req.domain)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(self.get_api_domain())
+    }
+
+    pub fn get_tool_compatibility_mode(&self) -> ToolCompatibilityConfig {
+        ToolCompatibilityConfig {
+            mode: self.token_manager.tool_compatibility_mode(),
+        }
+    }
+
+    pub fn set_tool_compatibility_mode(
+        &self,
+        req: ToolCompatibilityConfig,
+    ) -> Result<ToolCompatibilityConfig, AdminServiceError> {
+        let mode = self
+            .token_manager
+            .set_tool_compatibility_mode(req.mode)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(ToolCompatibilityConfig { mode })
+    }
+
+    /// 获取账号级 429 限流故障转移配置
     pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
@@ -2379,7 +3111,7 @@ impl AdminService {
         }
     }
 
-    /// 更新账号级风控故障转移配置
+    /// 更新账号级 429 限流故障转移配置
     pub fn set_account_throttle_config(
         &self,
         req: SetAccountThrottleConfigRequest,
@@ -2526,6 +3258,25 @@ impl AdminService {
         Ok(self.get_short_speed_config())
     }
 
+    /// 获取普通模型 API 429 自动重试配置
+    pub fn get_model_api_retry_config(&self) -> ModelApiRetryConfigResponse {
+        ModelApiRetryConfigResponse {
+            enabled: self.token_manager.get_model_api_429_retry_enabled(),
+        }
+    }
+
+    /// 更新普通模型 API 429 自动重试配置
+    pub fn set_model_api_retry_config(
+        &self,
+        req: SetModelApiRetryConfigRequest,
+    ) -> Result<ModelApiRetryConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_api_429_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_api_retry_config())
+    }
+
     /// 获取单账号 RPM 限流配置
     pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
         let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
@@ -2550,6 +3301,29 @@ impl AdminService {
         Ok(self.get_account_rpm_limit_config())
     }
 
+    /// 获取月度额度重置后自动恢复配置。
+    pub fn get_quota_reset_recovery_config(&self) -> QuotaResetRecoveryConfigResponse {
+        QuotaResetRecoveryConfigResponse {
+            enabled: self.token_manager.quota_reset_recovery_enabled(),
+        }
+    }
+
+    /// 更新月度额度重置后自动恢复配置。
+    pub fn set_quota_reset_recovery_config(
+        &self,
+        req: SetQuotaResetRecoveryConfigRequest,
+    ) -> Result<QuotaResetRecoveryConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "必须提供 enabled 字段".to_string(),
+            ));
+        };
+        self.token_manager
+            .set_quota_reset_recovery_enabled(enabled)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(self.get_quota_reset_recovery_config())
+    }
+
     /// 获取自愈治理配置
     pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
         let (
@@ -2562,6 +3336,7 @@ impl AdminService {
         ) = self.token_manager.get_self_heal_config();
         SelfHealConfigResponse {
             suspended_detection_enabled,
+            suspended_ban_keywords: self.token_manager.get_suspended_ban_keywords(),
             enabled,
             min_interval_secs,
             max_consecutive_rounds,
@@ -2576,12 +3351,13 @@ impl AdminService {
         req: SetSelfHealConfigRequest,
     ) -> Result<SelfHealConfigResponse, AdminServiceError> {
         if req.suspended_detection_enabled.is_none()
+            && req.suspended_ban_keywords.is_none()
             && req.enabled.is_none()
             && req.min_interval_secs.is_none()
             && req.max_consecutive_rounds.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
+                "至少提供 suspendedDetectionEnabled / suspendedBanKeywords / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
                     .to_string(),
             ));
         }
@@ -2589,6 +3365,7 @@ impl AdminService {
         self.token_manager
             .set_self_heal_config(
                 req.suspended_detection_enabled,
+                req.suspended_ban_keywords,
                 req.enabled,
                 req.min_interval_secs,
                 req.max_consecutive_rounds,
@@ -2847,16 +3624,12 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                // 缓存的新鲜度仍由调用方按 TTL 判断。这里保留过期条目，以便
+                // 服务重启后还能在 nextResetAt 到达时复查 QuotaExceeded 凭据。
+                Some((id, v))
             })
             .collect()
     }
@@ -2916,6 +3689,7 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    auto_detected: p.auto_detected,
                 }
             })
             .collect();
@@ -2947,6 +3721,7 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            auto_detected: entry.auto_detected,
         })
     }
 
@@ -2969,6 +3744,7 @@ impl AdminService {
                 last_checked_at: e.last_checked_at,
                 consecutive_failures: e.consecutive_failures,
                 auto_disabled: e.auto_disabled,
+                auto_detected: e.auto_detected,
             })
             .collect();
         (result, errors)
@@ -3012,6 +3788,12 @@ impl AdminService {
                             proxy_id
                         )));
                     }
+                    GetUrlResult::NotShareable => {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "代理 #{} 的认证信息不可共享，请在代理池中显式配置后再分配",
+                            proxy_id
+                        )));
+                    }
                 };
                 Some(url)
             }
@@ -3029,6 +3811,7 @@ impl AdminService {
                 None,            // source_channel 不修改
                 None,            // rpm_limit 不修改
                 None,            // metadata 不修改
+                None,            // load_factor 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -3057,14 +3840,217 @@ impl AdminService {
         })
     }
 
-    /// 触发全部代理的健康检查
+    /// 执行一轮完整的代理健康巡检：自动检测 → 探测 → 自动轮换。
+    ///
+    /// 三步顺序固定，缺一步会让后续判定失去依据：
+    /// 1. 把凭据实际在用、但未登记到池内的代理（含全局代理）登记进池，否则这些
+    ///    地址永远没有探测记录，不可用也无从发现；
+    /// 2. 全量探测（含此前自动禁用的条目，用于自动恢复），刷新可用性判定；
+    /// 3. 按最新判定轮换凭据代理。
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
+        let detected = self.detect_credential_proxies();
         let summary = self.proxy_pool.check_all().await;
+        let rotation = self.rotate_unavailable_credential_proxies();
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
             auto_disabled: summary.auto_disabled,
+            auto_recovered: summary.auto_recovered,
+            detected,
+            rotation,
         }
+    }
+
+    /// 把凭据实际在用、但尚未登记到代理池的代理登记进池，纳入健康检查范围。
+    ///
+    /// 覆盖全局代理与凭据级代理；显式直连（`proxy_url == "direct"`）的凭据不产生
+    /// 待检测地址。返回新登记的条目数。
+    fn detect_credential_proxies(&self) -> usize {
+        let mut in_use: Vec<ProxyConfig> = Vec::new();
+
+        // 全局代理即使当前没有凭据回退到它，也纳入检测：它是新增凭据的默认出口
+        if let Some(proxy) = self.token_manager.proxy() {
+            in_use.push(proxy);
+        }
+        for cred in self.token_manager.credential_proxy_snapshot() {
+            for proxy in [cred.in_use_proxy, cred.recovery_proxy].into_iter().flatten() {
+                if !in_use.contains(&proxy) {
+                    in_use.push(proxy);
+                }
+            }
+        }
+
+        self.proxy_pool.register_detected(&in_use)
+    }
+
+    /// 按代理池最新可用性判定轮换凭据代理。
+    ///
+    /// 处理三类凭据：
+    /// - 在用代理被判定不可用：改为池内其它可用代理；无可用代理时，按
+    ///   `proxy_direct_fallback_enabled` 决定回退直连或保持原配置；
+    /// - 此前被自动回退直连、当前池内已有可用代理：改回代理；
+    /// - 其余凭据（代理可用、未登记、或用户显式直连）不做改动。
+    ///
+    /// `proxy_auto_rotate_enabled` 关闭时直接返回空结果，不做任何改写。
+    fn rotate_unavailable_credential_proxies(&self) -> ProxyRotationResponse {
+        let (auto_rotate_enabled, direct_fallback_enabled) =
+            self.token_manager.get_proxy_failover_config();
+        if !auto_rotate_enabled {
+            return ProxyRotationResponse::default();
+        }
+
+        let available = self.proxy_pool.assignable_urls();
+        let credentials = self.token_manager.credential_proxy_snapshot();
+
+        let mut result = ProxyRotationResponse::default();
+        let mut updates: Vec<ProxyRotationUpdate> = Vec::new();
+        // 轮换目标在可用代理间轮转，避免所有凭据挤到同一个代理上
+        let mut cursor = 0usize;
+        // 无可用代理的凭据汇总后只记一条日志：这类凭据可能成批出现（例如整批账号
+        // 共用一个失效代理），逐条打 ERROR 会把日志刷满
+        let mut unresolved_ids: Vec<u64> = Vec::new();
+
+        for cred in &credentials {
+            // 已禁用的凭据不参与调度，轮换它的代理没有意义，也不该产生告警
+            if cred.disabled {
+                continue;
+            }
+            let update = |target| ProxyRotationUpdate {
+                id: cred.id,
+                target,
+                generation: cred.generation,
+                global_generation: cred.global_generation,
+            };
+
+            let current_url = match &cred.in_use_proxy_url {
+                Some(url) => url.clone(),
+                None => {
+                    if cred.temporary_direct && cred.recovery_proxy.as_ref().is_some_and(|proxy| self.proxy_pool.availability_for_proxy(proxy) == ProxyAvailability::Available) {
+                        updates.push(update(None));
+                        result.restored_to_proxy += 1;
+                        continue;
+                    }
+                    // 当前直连。仅回收「自动回退直连」的凭据，用户显式配置的直连不动
+                    if cred.explicit_direct && cred.auto_assigned && !available.is_empty() {
+                        let target = available[cursor % available.len()].clone();
+                        cursor += 1;
+                        tracing::info!(
+                            "凭据 #{} 此前因无可用代理回退直连，准备改回代理: {}",
+                            cred.id,
+                            mask_proxy_url(&target)
+                        );
+                        updates.push(update(Some(target)));
+                        result.restored_to_proxy += 1;
+                    }
+                    continue;
+                }
+            };
+
+            // 未登记的代理没有探测记录，不做可用性推断
+            if cred.in_use_proxy.as_ref().is_none_or(|proxy| self.proxy_pool.availability_for_proxy(proxy) != ProxyAvailability::Unavailable) {
+                continue;
+            }
+
+            // 从 cursor 起找第一个不等于当前地址的可用代理；命中后把 cursor 推到它之后，
+            // 让后续凭据继续往下轮转，避免都落到同一个代理上
+            let target = (0..available.len()).find_map(|offset| {
+                let index = (cursor + offset) % available.len();
+                (available[index] != current_url).then(|| (index, available[index].clone()))
+            });
+
+            match target {
+                Some((index, url)) => {
+                    cursor = index + 1;
+                    tracing::warn!(
+                        "凭据 #{} 在用代理不可用，准备轮换: {} -> {}",
+                        cred.id,
+                        mask_proxy_url(&current_url),
+                        mask_proxy_url(&url)
+                    );
+                    updates.push(update(Some(url)));
+                    result.rotated += 1;
+                }
+                None if direct_fallback_enabled => {
+                    tracing::warn!(
+                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理，准备按配置回退直连",
+                        cred.id,
+                        mask_proxy_url(&current_url)
+                    );
+                    updates.push(update(Some(KiroCredentials::PROXY_DIRECT.to_string())));
+                    result.switched_to_direct += 1;
+                }
+                None => {
+                    unresolved_ids.push(cred.id);
+                    result.unresolved += 1;
+                }
+            }
+        }
+
+        if !unresolved_ids.is_empty() {
+            // 只列前若干个 id，避免单行日志过长
+            const MAX_LISTED: usize = 10;
+            let listed: Vec<String> = unresolved_ids
+                .iter()
+                .take(MAX_LISTED)
+                .map(u64::to_string)
+                .collect();
+            let suffix = if unresolved_ids.len() > MAX_LISTED {
+                format!(" 等 {} 个", unresolved_ids.len())
+            } else {
+                String::new()
+            };
+            tracing::error!(
+                "{} 个启用中的凭据在用代理不可用且无其它可用代理；直连回退未开启，保持原配置（凭据 #{}{}）",
+                unresolved_ids.len(),
+                listed.join(", #"),
+                suffix
+            );
+        }
+
+        if !updates.is_empty()
+            && let Err(e) = self.token_manager.apply_proxy_rotation(&updates)
+        {
+            tracing::error!("代理自动轮换结果持久化失败: {}", e);
+            return ProxyRotationResponse {
+                unresolved: result.unresolved + updates.len(),
+                ..ProxyRotationResponse::default()
+            };
+        }
+
+        result
+    }
+
+    /// 读取代理故障转移配置
+    pub fn get_proxy_failover_config(&self) -> ProxyFailoverConfigResponse {
+        let (auto_rotate_enabled, direct_fallback_enabled) =
+            self.token_manager.get_proxy_failover_config();
+        ProxyFailoverConfigResponse {
+            auto_rotate_enabled,
+            direct_fallback_enabled,
+        }
+    }
+
+    /// 更新代理故障转移配置
+    pub fn set_proxy_failover_config(
+        &self,
+        req: SetProxyFailoverConfigRequest,
+    ) -> Result<ProxyFailoverConfigResponse, AdminServiceError> {
+        if req.auto_rotate_enabled.is_none() && req.direct_fallback_enabled.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 autoRotateEnabled / directFallbackEnabled 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_proxy_failover_config(req.auto_rotate_enabled, req.direct_fallback_enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_proxy_failover_config())
+    }
+
+    /// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+    pub fn rotate_credential_proxies(&self) -> ProxyRotationResponse {
+        self.rotate_unavailable_credential_proxies()
     }
 
     /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
@@ -3102,6 +4088,7 @@ impl AdminService {
                     *cred_id,
                     None,
                     Some(Some(url)),
+                    None,
                     None,
                     None,
                     None,
@@ -3834,6 +4821,25 @@ impl AdminService {
     }
 }
 
+/// `nextResetAt` 是上游 Usage Limits 响应的 Unix 秒时间戳。只有到期后才对
+/// QuotaExceeded 凭据发起一次恢复探测，避免把被禁用账号持续查询上游。
+fn quota_reset_is_due(reset_at: Option<f64>, now_ts: f64) -> bool {
+    reset_at.is_some_and(|reset_at| reset_at <= now_ts)
+}
+
+/// 返回某个 QuotaExceeded 凭据的恢复检查时间。优先取它自己的
+/// `nextResetAt`；只有完全没有时才使用调用方提供的同周期备用时间。
+fn quota_recovery_reset_at(
+    cache: &HashMap<u64, CachedBalance>,
+    credential_id: u64,
+    fallback: Option<f64>,
+) -> Option<f64> {
+    cache
+        .get(&credential_id)
+        .and_then(|cached| cached.data.next_reset_at)
+        .or(fallback)
+}
+
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
     error
         .downcast_ref::<UpstreamRateLimitError>()
@@ -3845,6 +4851,57 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_recovery_probe_waits_for_upstream_reset_time() {
+        let balance = |next_reset_at| BalanceResponse {
+            id: 1,
+            subscription_title: None,
+            current_usage: 100.0,
+            usage_limit: 100.0,
+            remaining: 0.0,
+            usage_percentage: 100.0,
+            next_reset_at,
+            overage_enabled: Some(false),
+            overage_capable: None,
+            overage_capability_raw: None,
+        };
+
+        assert!(quota_reset_is_due(
+            balance(Some(100.0)).next_reset_at,
+            100.0
+        ));
+        assert!(quota_reset_is_due(balance(Some(99.0)).next_reset_at, 100.0));
+        assert!(!quota_reset_is_due(
+            balance(Some(101.0)).next_reset_at,
+            100.0
+        ));
+        assert!(!quota_reset_is_due(balance(None).next_reset_at, 100.0));
+    }
+
+    #[test]
+    fn quota_recovery_uses_own_reset_time_before_fallback() {
+        let balance = |next_reset_at| CachedBalance {
+            cached_at: 1.0,
+            data: BalanceResponse {
+                id: 1,
+                subscription_title: None,
+                current_usage: 0.0,
+                usage_limit: 100.0,
+                remaining: 100.0,
+                usage_percentage: 0.0,
+                next_reset_at,
+                overage_enabled: None,
+                overage_capable: None,
+                overage_capability_raw: None,
+            },
+        };
+        let cache = HashMap::from([(1, balance(Some(200.0))), (2, balance(Some(100.0)))]);
+
+        assert_eq!(quota_recovery_reset_at(&cache, 1, Some(100.0)), Some(200.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, Some(100.0)), Some(100.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, None), None);
+    }
 
     #[test]
     fn available_models_response_preserves_both_token_limits() {
@@ -3904,6 +4961,413 @@ mod tests {
         assert_eq!(region.title, "区域");
         assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
         assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    /// 构造一个带代理池、可控开关的测试 service。
+    ///
+    /// `credentials` 的 `proxy_url` 决定各凭据在用代理；`global_proxy` 为未显式配置
+    /// 代理的凭据提供回退出口。
+    fn proxy_rotation_service(
+        credentials: Vec<KiroCredentials>,
+        global_proxy: Option<&str>,
+        auto_rotate: bool,
+        direct_fallback: bool,
+    ) -> AdminService {
+        let mut config = Config::default();
+        config.proxy_auto_rotate_enabled = auto_rotate;
+        config.proxy_direct_fallback_enabled = direct_fallback;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                credentials,
+                global_proxy.map(ProxyConfig::new),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        AdminService::new(manager, Vec::new())
+    }
+
+    /// 把代理池内指定 URL 置为「探测失败」状态（模拟健康检查判定不可用）。
+    fn mark_proxy_unhealthy(service: &AdminService, url: &str) {
+        let entry = service
+            .proxy_pool
+            .list()
+            .into_iter()
+            .find(|e| e.url == url)
+            .expect("代理应已登记在池内");
+        service.proxy_pool.set_enabled(entry.id, false).unwrap();
+    }
+
+    fn credential_proxy_url(service: &AdminService, id: u64) -> Option<String> {
+        service
+            .token_manager
+            .credential_proxy_snapshot()
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("凭据应存在")
+            .in_use_proxy_url
+    }
+
+    #[tokio::test]
+    async fn detect_registers_global_and_credential_proxies() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service =
+            proxy_rotation_service(vec![cred], Some("http://10.0.0.1:8080"), true, false);
+
+        let detected = service.detect_credential_proxies();
+
+        assert_eq!(detected, 2);
+        let urls: Vec<String> = service.proxy_pool.list().into_iter().map(|e| e.url).collect();
+        assert!(urls.contains(&"http://10.0.0.1:8080".to_string()));
+        assert!(urls.contains(&"socks5://10.0.0.2:1080".to_string()));
+        assert!(service.proxy_pool.list().iter().all(|e| e.auto_detected));
+
+        // 再次检测不重复登记
+        assert_eq!(service.detect_credential_proxies(), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_proxy_recovers_after_temporary_direct_fallback() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let healthy = Arc::new(AtomicBool::new(false));
+        let state = healthy.clone();
+        let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("user:password"));
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let state = state.clone();
+            let expected = expected.clone();
+            async move {
+                if state.load(Ordering::Relaxed) && headers.get("proxy-authorization").and_then(|value| value.to_str().ok()) == Some(expected.as_str()) {
+                    axum::http::StatusCode::NO_CONTENT
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let credential = KiroCredentials {
+            proxy_url: Some(format!("http://{address}")),
+            proxy_username: Some("user".into()),
+            proxy_password: Some("password".into()),
+            ..Default::default()
+        };
+        let service = proxy_rotation_service(vec![credential], None, true, true);
+        assert_eq!(service.detect_credential_proxies(), 1);
+        assert_eq!(service.proxy_pool.check_all_for_url("http://example.test/health").await.unhealthy, 1);
+        assert_eq!(service.rotate_unavailable_credential_proxies().switched_to_direct, 1);
+        let direct = service.token_manager.clone_credential(1).unwrap();
+        assert!(direct.proxy_temporary_direct);
+        assert!(service.get_all_credentials().credentials[0].proxy_temporary_direct);
+        assert_eq!(direct.proxy_password.as_deref(), Some("password"));
+        healthy.store(true, Ordering::Relaxed);
+        service.detect_credential_proxies();
+        assert_eq!(service.proxy_pool.check_all_for_url("http://example.test/health").await.healthy, 1);
+        assert_eq!(service.rotate_unavailable_credential_proxies().restored_to_proxy, 1);
+        let restored = service.token_manager.clone_credential(1).unwrap();
+        assert!(!restored.proxy_temporary_direct);
+        assert_eq!(restored.effective_proxy(None).unwrap().password.as_deref(), Some("password"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_disabled_credentials() {
+        // 已禁用的凭据不参与调度，代理不可用也不该被轮换或计入告警
+        let enabled = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let disabled = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            disabled: true,
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![enabled, disabled], None, true, false);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        // 只有启用中的那个凭据计入 unresolved
+        assert_eq!(result.unresolved, 1);
+        assert_eq!(result.rotated, 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_spreads_credentials_across_available_proxies() {
+        let creds: Vec<KiroCredentials> = (0..4)
+            .map(|_| KiroCredentials {
+                proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+                ..KiroCredentials::default()
+            })
+            .collect();
+        let service = proxy_rotation_service(creds, None, true, false);
+        for port in [3, 4] {
+            service
+                .proxy_pool
+                .add(format!("socks5://10.0.0.{port}:1080"), None)
+                .unwrap();
+        }
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        assert_eq!(service.rotate_unavailable_credential_proxies().rotated, 4);
+
+        // 4 个凭据应均摊到 2 个可用代理上，而非全部挤在同一个
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for cred in service.token_manager.credential_proxy_snapshot() {
+            *counts.entry(cred.in_use_proxy_url.unwrap()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 2);
+        assert!(counts.values().all(|&c| c == 2), "分布不均: {counts:?}");
+    }
+
+    #[tokio::test]
+    async fn rotation_clears_stale_credential_proxy_auth() {
+        // 轮换前的认证信息属于旧代理，套到新代理上只会认证失败
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            proxy_username: Some("old-user".to_string()),
+            proxy_password: Some("old-pass".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, false);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        assert_eq!(service.rotate_unavailable_credential_proxies().rotated, 1);
+
+        let creds = service.token_manager.clone_all_credentials();
+        assert_eq!(
+            creds[0].proxy_url.as_deref(),
+            Some("socks5://10.0.0.3:1080")
+        );
+        assert!(creds[0].proxy_username.is_none());
+        assert!(creds[0].proxy_password.is_none());
+    }
+
+    #[tokio::test]
+    async fn rotation_moves_credential_off_unavailable_proxy() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, false);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 1);
+        assert_eq!(result.switched_to_direct, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.3:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_falls_back_to_direct_only_when_enabled() {
+        let make = |direct_fallback: bool| {
+            let cred = KiroCredentials {
+                proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+                ..KiroCredentials::default()
+            };
+            let service = proxy_rotation_service(vec![cred], None, true, direct_fallback);
+            service.detect_credential_proxies();
+            mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+            service
+        };
+
+        // 关闭直连回退：保持原代理，计入 unresolved
+        let service = make(false);
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.unresolved, 1);
+        assert_eq!(result.switched_to_direct, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+
+        // 开启直连回退：改为 direct
+        let service = make(true);
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.switched_to_direct, 1);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
+    }
+
+    #[tokio::test]
+    async fn rotation_restores_auto_direct_credential_when_proxy_recovers() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+        assert_eq!(
+            service.rotate_unavailable_credential_proxies().switched_to_direct,
+            1
+        );
+
+        // 池内重新出现可用代理后，自动回退直连的凭据改回代理
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.9:1080".to_string(), None)
+            .unwrap();
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.restored_to_proxy, 1);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.9:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_leaves_user_configured_direct_credential_untouched() {
+        let cred = KiroCredentials {
+            proxy_url: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.restored_to_proxy, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_untracked_proxy_without_probe_record() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        // 不调用 detect：该代理没有任何探测记录
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_disabled_switch_makes_no_change() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, false, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rewrites_credential_relying_on_unavailable_global_proxy() {
+        // 凭据未配置代理，实际走全局代理；全局代理不可用时也应被轮换
+        let service = proxy_rotation_service(
+            vec![KiroCredentials::default()],
+            Some("http://10.0.0.1:8080"),
+            true,
+            false,
+        );
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "http://10.0.0.1:8080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 1);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.3:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_proxy_edit_clears_auto_assigned_flag() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+        service.rotate_unavailable_credential_proxies();
+
+        let snapshot = service.token_manager.credential_proxy_snapshot();
+        assert!(snapshot[0].auto_assigned);
+
+        // 用户手动改为直连后，自动轮换不再把它改回代理
+        service
+            .token_manager
+            .update_credential(
+                1,
+                None,
+                Some(Some(KiroCredentials::PROXY_DIRECT.to_string())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,                None,
+            )
+            .unwrap();
+        assert!(!service.token_manager.credential_proxy_snapshot()[0].auto_assigned);
+
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.7:1080".to_string(), None)
+            .unwrap();
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.restored_to_proxy, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
     }
 
     #[tokio::test]
@@ -3970,6 +5434,185 @@ mod tests {
         assert_eq!(response.current_id, 1);
         assert!(response.credentials[0].is_current);
         assert!(!response.credentials[1].is_current);
+    }
+
+    fn paged_credentials_service() -> AdminService {
+        let credentials = vec![
+            KiroCredentials {
+                priority: 0,
+                email: Some("alpha@example.com".to_string()),
+                groups: vec!["team-a".to_string()],
+                ..KiroCredentials::default()
+            },
+            KiroCredentials {
+                priority: 1,
+                email: Some("beta@example.com".to_string()),
+                groups: vec!["team-b".to_string()],
+                ..KiroCredentials::default()
+            },
+            KiroCredentials {
+                priority: 2,
+                email: Some("gamma@example.com".to_string()),
+                disabled: true,
+                disabled_reason: Some("Manual".to_string()),
+                ..KiroCredentials::default()
+            },
+        ];
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap(),
+        );
+        AdminService::new(manager, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn credentials_without_query_params_keep_legacy_shape() {
+        let service = paged_credentials_service();
+        let response = service.get_all_credentials();
+
+        // 不传任何参数时行为与旧接口一致：全量、按 priority/id 排序、不返回分页字段
+        assert_eq!(response.total, 3);
+        assert_eq!(response.credentials.len(), 3);
+        assert!(response.filtered_total.is_none());
+        assert!(response.page.is_none());
+        assert!(response.page_size.is_none());
+        assert_eq!(
+            response
+                .credentials
+                .iter()
+                .map(|c| c.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_pagination_returns_page_and_filtered_total() {
+        let service = paged_credentials_service();
+        let query = CredentialsQuery {
+            page: Some(2),
+            page_size: Some(2),
+            ..CredentialsQuery::default()
+        };
+        let response = service.get_credentials_paged(&query);
+
+        assert_eq!(response.total, 3);
+        assert_eq!(response.filtered_total, Some(3));
+        assert_eq!(response.page, Some(2));
+        assert_eq!(response.page_size, Some(2));
+        assert_eq!(response.credentials.len(), 1);
+        assert_eq!(response.credentials[0].priority, 2);
+    }
+
+    #[tokio::test]
+    async fn credentials_pagination_with_overflowing_offset_returns_empty_page() {
+        let service = paged_credentials_service();
+        let response = service.get_credentials_paged(&CredentialsQuery {
+            page: Some(usize::MAX),
+            page_size: Some(2),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(response.filtered_total, Some(3));
+        assert!(response.credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_state_counts_and_filters_distinguish_suspension_and_quota() {
+        let service = paged_credentials_service();
+        service.token_manager.report_suspended_for_request(1, None, None);
+        service.token_manager.report_quota_exhausted_for_request(2, None, None);
+        let response = service.get_credentials_paged(&CredentialsQuery::default());
+        let counts = response.state_counts.unwrap();
+        assert_eq!(counts.suspended, 1);
+        assert_eq!(counts.quota, 1);
+        for (status, expected_id) in [("suspended", 1), ("quota", 2)] {
+            let filtered = service.get_credentials_paged(&CredentialsQuery {
+                status: Some(status.to_string()), ..CredentialsQuery::default()
+            });
+            assert_eq!(filtered.credentials.len(), 1);
+            assert_eq!(filtered.credentials[0].id, expected_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_audit_respects_only_disabled_for_explicit_ids() {
+        let mut service = paged_credentials_service();
+        service.trace_store = Some(Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap()));
+        let result = service.audit_suspended_credentials(Some(AuditSuspendedRequest {
+            credential_ids: Some(vec![1]),
+            only_disabled: Some(true),
+        })).unwrap();
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.updated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn credentials_search_and_status_filters_are_applied() {
+        let service = paged_credentials_service();
+
+        let search = service.get_credentials_paged(&CredentialsQuery {
+            search: Some("ALPHA".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(search.filtered_total, Some(1));
+        assert_eq!(search.credentials.len(), 1);
+        assert_eq!(
+            search.credentials[0].email.as_deref(),
+            Some("alpha@example.com")
+        );
+
+        // dead 是 disabled 的别名
+        let dead = service.get_credentials_paged(&CredentialsQuery {
+            status: Some("dead".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(dead.filtered_total, Some(1));
+        assert!(dead.credentials[0].disabled);
+
+        // healthy 排除被禁用的凭据
+        let healthy = service.get_credentials_paged(&CredentialsQuery {
+            status: Some("healthy".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(healthy.filtered_total, Some(2));
+        assert!(healthy.credentials.iter().all(|c| !c.disabled));
+
+        // 状态统计始终基于全量
+        let counts = healthy.state_counts.expect("应返回全量状态统计");
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.dead, 1);
+    }
+
+    #[tokio::test]
+    async fn credentials_group_and_tier_filters_are_applied() {
+        let service = paged_credentials_service();
+
+        let team_a = service.get_credentials_paged(&CredentialsQuery {
+            group: Some("team-a".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(team_a.filtered_total, Some(1));
+        assert_eq!(
+            team_a.credentials[0].email.as_deref(),
+            Some("alpha@example.com")
+        );
+
+        // 未分组：只有第三条（gamma）没有绑定分组
+        let ungrouped = service.get_credentials_paged(&CredentialsQuery {
+            group: Some("__none__".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(ungrouped.filtered_total, Some(1));
+        assert_eq!(
+            ungrouped.credentials[0].email.as_deref(),
+            Some("gamma@example.com")
+        );
+
+        // 没有订阅等级时归入 unknown
+        let unknown = service.get_credentials_paged(&CredentialsQuery {
+            tier: Some("unknown".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(unknown.filtered_total, Some(3));
     }
 
     #[test]
@@ -4089,5 +5732,291 @@ mod tests {
             headroom >= 90,
             "TTL 余量仅 {headroom}s，不足以覆盖一轮刷新耗时（实测可达 66s）"
         );
+    }
+}
+
+#[cfg(test)]
+mod balance_refresher_tests {
+    use super::*;
+
+    fn service() -> Arc<AdminService> {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        Arc::new(AdminService::new(manager, Vec::new()))
+    }
+
+    #[tokio::test]
+    async fn balance_refresher_zero_does_not_spawn_task() {
+        let service = service();
+        service.start_balance_refresher(std::time::Duration::ZERO);
+        assert_eq!(Arc::strong_count(&service), 1);
+        let weak = Arc::downgrade(&service);
+        drop(service);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn balance_refresher_positive_interval_spawns_task() {
+        let service = service();
+        service.start_balance_refresher(std::time::Duration::from_secs(1800));
+        assert_eq!(Arc::strong_count(&service), 2);
+    }
+}
+
+#[cfg(test)]
+mod cache_metering_config_tests {
+    use super::*;
+    use crate::anthropic::cache_metering::CacheMeter;
+
+    fn service_with(config: Config) -> AdminService {
+        let manager =
+            Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap());
+        AdminService::new(manager, Vec::new())
+    }
+
+    /// Review Focus 4：句柄缺失时 stats 为 null、配置回落到 config/env/默认，不得 panic。
+    #[tokio::test]
+    async fn config_falls_back_without_cache_meter_handle() {
+        let service = service_with(Config::default());
+        let resp = service.get_cache_metering_config();
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["capacity"], 262_144, "回落到内置默认容量");
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["flushIntervalSecs"], 300);
+        assert_eq!(json["missDiagnostics"], true);
+        assert!(json["stats"].is_null(), "句柄缺失时 stats 必须是 null");
+    }
+
+    /// config.json 显式值在句柄缺失时也要生效（而不是永远吐默认值）。
+    #[tokio::test]
+    async fn config_explicit_values_win_without_handle() {
+        let mut config = Config::default();
+        config.cache_metering_capacity = Some(4_096);
+        config.cache_metering_persist_enabled = Some(true);
+        config.cache_metering_flush_interval_secs = Some(600);
+        config.cache_metering_miss_diagnostics = Some(false);
+
+        let json = serde_json::to_value(service_with(config).get_cache_metering_config()).unwrap();
+        assert_eq!(json["capacity"], 4_096);
+        assert_eq!(json["persistEnabled"], true);
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert!(json["stats"].is_null());
+    }
+
+    /// 有句柄时一律以运行时真实值为准，config.json 里写什么都不算数。
+    #[tokio::test]
+    async fn runtime_handle_overrides_config_values() {
+        let mut config = Config::default();
+        // 故意和句柄对着写，验证优先级
+        config.cache_metering_capacity = Some(262_144);
+        config.cache_metering_flush_interval_secs = Some(300);
+        config.cache_metering_miss_diagnostics = Some(true);
+
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_miss_diagnostics(false)
+                .with_flush_interval_secs(600),
+        );
+        meter.record_entry(1, 10, 300);
+        assert_eq!(meter.lookup_and_renew(1), Some(10));
+        assert_eq!(meter.lookup_and_renew(2), None);
+
+        let service = service_with(config).with_cache_meter(meter);
+        let json = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+
+        assert_eq!(json["capacity"], 4_096, "以句柄为准");
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["stats"]["entriesLen"], 1);
+        assert_eq!(json["stats"]["hits"], 1);
+        assert_eq!(json["stats"]["missNoEntry"], 1);
+    }
+
+    /// PUT 只改 `enabled`，其余只读字段必须原样保留（回归：别被顺手覆写成默认值）。
+    #[tokio::test]
+    async fn put_only_toggles_enabled() {
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_flush_interval_secs(600)
+                .with_miss_diagnostics(false),
+        );
+        let service = service_with(Config::default()).with_cache_meter(meter);
+
+        let before = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+        let resp = service
+            .set_cache_metering_config(SetCacheMeteringConfigRequest {
+                enabled: Some(false),
+            })
+            .expect("PUT 应成功");
+        let after = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(after["enabled"], false, "enabled 必须被改掉");
+        for key in [
+            "capacity",
+            "flushIntervalSecs",
+            "missDiagnostics",
+            "persistEnabled",
+        ] {
+            assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_service_custom_headers() {
+        use crate::admin::types::CustomHeaderItem;
+
+        let custom_headers = crate::model::custom_headers::CustomHeadersManager::new(
+            crate::model::custom_headers::default_custom_headers(),
+        );
+        let service =
+            service_with(Config::default()).with_custom_headers(Some(custom_headers.clone()));
+
+        // 默认配置
+        let res = service.get_custom_headers();
+        assert_eq!(res.headers.len(), 2);
+        assert_eq!(res.headers[0].key, "X-Oneapi-Request-Id");
+        assert_eq!(res.headers[0].value, "{trace_id}");
+
+        // 校验非法 key
+        let invalid_key_req = SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "Invalid Header Name With Space".to_string(),
+                value: "val".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(service.set_custom_headers(invalid_key_req).is_err());
+
+        // 校验 CRLF 注入
+        let crlf_req = SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "X-Trace-Id".to_string(),
+                value: "abc\r\nInjected-Header: bad".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(service.set_custom_headers(crlf_req).is_err());
+
+        let nul_req = SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "X-Trace-Id".to_string(),
+                value: "invalid\0value".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(service.set_custom_headers(nul_req).is_err());
+
+        // 校验重复 Header Name
+        let dup_req = SetCustomHeadersRequest {
+            headers: vec![
+                CustomHeaderItem {
+                    key: "x-custom-key".to_string(),
+                    value: "1".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-CUSTOM-KEY".to_string(),
+                    value: "2".to_string(),
+                    enabled: true,
+                },
+            ],
+        };
+        assert!(service.set_custom_headers(dup_req).is_err());
+
+        // 合法配置与热更新
+        let valid_req = SetCustomHeadersRequest {
+            headers: vec![
+                CustomHeaderItem {
+                    key: "X-Oneapi-Request-Id".to_string(),
+                    value: "{trace_id}".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-Upstream-Model".to_string(),
+                    value: "{model}".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-Custom-Group".to_string(),
+                    value: "{group}".to_string(),
+                    enabled: false,
+                },
+            ],
+        };
+        let updated = service.set_custom_headers(valid_req).unwrap();
+        assert_eq!(updated.headers.len(), 3);
+        assert_eq!(updated.headers[1].key, "X-Upstream-Model");
+        assert_eq!(updated.headers[1].value, "{model}");
+        assert!(!updated.headers[2].enabled);
+
+        // 验证内存规则也同步热更新
+        let active_names = custom_headers.get_active_header_names();
+        assert_eq!(active_names.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_admin_service_load_balancing_and_invert_priority() {
+        let first = KiroCredentials {
+            priority: 10,
+            refresh_token: Some("rt1".to_string()),
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            priority: 90,
+            refresh_token: Some("rt2".to_string()),
+            ..KiroCredentials::default()
+        };
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        // 默认状态
+        let initial_lb = service.get_load_balancing_mode();
+        assert_eq!(initial_lb.mode, "priority");
+        assert!(!initial_lb.invert_priority);
+
+        // 默认排序：priority=10 在前，priority=90 在后
+        let list1 = service.get_all_credentials();
+        assert_eq!(list1.credentials[0].priority, 10);
+        assert_eq!(list1.credentials[1].priority, 90);
+
+        // 切换 invert_priority = true
+        let updated = service
+            .set_load_balancing_mode(SetLoadBalancingModeRequest {
+                mode: None,
+                invert_priority: Some(true),
+            })
+            .unwrap();
+        assert_eq!(updated.mode, "priority");
+        assert!(updated.invert_priority);
+
+        // 导出顺序反转：数值大的（rt2）排在前面
+        let exported = service.export_credentials(None);
+        assert_eq!(
+            exported.accounts[0].credentials.refresh_token.as_deref(),
+            Some("rt2")
+        );
+        assert_eq!(
+            exported.accounts[1].credentials.refresh_token.as_deref(),
+            Some("rt1")
+        );
+
+        // 只改 mode 不影响 invert_priority
+        let updated_mode = service
+            .set_load_balancing_mode(SetLoadBalancingModeRequest {
+                mode: Some("balanced".to_string()),
+                invert_priority: None,
+            })
+            .unwrap();
+        assert_eq!(updated_mode.mode, "balanced");
+        assert!(updated_mode.invert_priority);
     }
 }
