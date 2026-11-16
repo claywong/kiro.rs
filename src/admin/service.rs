@@ -45,7 +45,7 @@ use super::types::{
     AuditSuspendedRequest, AuditSuspendedResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
     BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
     CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
-    CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
+    CredentialRpmSummary, CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
     CredentialsStatusResponse, CustomHeadersConfigResponse, CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult,
     ExportedAccount, ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelApiRetryConfigResponse,
@@ -970,7 +970,16 @@ impl AdminService {
         let mut quota_count = 0;
         let mut dead_count = 0;
         let mut suspended_count = 0;
+        let mut rpm_summary = CredentialRpmSummary::default();
         for c in &credentials {
+            if !c.disabled {
+                rpm_summary.current += u64::from(c.rpm_current);
+                if c.rpm_limit == 0 {
+                    rpm_summary.unlimited_count += 1;
+                } else {
+                    rpm_summary.limit += u64::from(c.rpm_limit);
+                }
+            }
             match credential_state(c) {
                 "healthy" => healthy_count += 1,
                 "throttled" => throttled_count += 1,
@@ -1186,6 +1195,7 @@ impl AdminService {
             page_size: page_size_opt,
             current_id: exposed_current_id,
             state_counts: Some(state_counts),
+            rpm_summary: Some(rpm_summary),
             metadata_schema,
             credentials: result_credentials,
         }
