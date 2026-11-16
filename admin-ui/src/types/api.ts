@@ -15,6 +15,14 @@ export interface CredentialRpmSummary {
   unlimitedCount: number
 }
 
+/** 额度全量汇总：未禁用凭据的缓存余额之和，covered/active 为采样覆盖率 */
+export interface CredentialQuotaSummary {
+  remaining: number
+  limit: number
+  covered: number
+  active: number
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -31,6 +39,7 @@ export interface CredentialsStatusResponse {
   stateCounts?: CredentialStateCounts
   /** RPM 全量汇总（不受分页/筛选影响） */
   rpmSummary?: CredentialRpmSummary
+  quotaSummary?: CredentialQuotaSummary
   /** 描述 metadata 字段、值类型和选项的 JSON Schema */
   metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]

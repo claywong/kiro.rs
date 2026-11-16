@@ -2336,8 +2336,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           />
         )}
 
-        {/* 额度信息：汇总额度 / 整体使用率 / 有效个数 / RPM，全量统计，不受列表筛选影响 */}
-        {(data?.total ?? 0) > 0 && <QuotaOverviewSummary rpm={data?.rpmSummary} />}
+        {/* 额度信息：剩余额度 / 整体使用率 / 采样个数 / RPM，后端全量汇总，不受列表分页和筛选影响 */}
+        {(data?.total ?? 0) > 0 && <QuotaOverviewSummary rpm={data?.rpmSummary} quota={data?.quotaSummary} />}
 
         {/* 缓存汇总覆盖全部调用账号，不受列表筛选影响；筛选为空时也要保留 */}
         {(data?.total ?? 0) > 0 && (

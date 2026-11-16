@@ -1,30 +1,27 @@
-import { useQuery } from '@tanstack/react-query'
 import { Gauge } from 'lucide-react'
-import { getQuotaAlerts } from '@/api/credentials'
 import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
-import type { CredentialRpmSummary } from '@/types/api'
+import type { CredentialQuotaSummary, CredentialRpmSummary } from '@/types/api'
 
 /**
- * 账号池额度信息：剩余额度 / 整体使用率 / 有效个数 / RPM 汇总。
+ * 账号池额度信息：剩余额度 / 整体使用率 / 采样个数 / RPM 汇总。
  *
- * 额度三项直接复用额度告警的 overview（与「设置 → 额度告警 → 账号池概况」同一口径：
- * 基于最近完整余额轮次，汇总已用 ÷ 汇总额度，过期数据不参与）；RPM 来自凭据列表
- * 接口的全量 rpmSummary。
+ * 额度来自凭据列表接口的 quotaSummary：后端对全部未禁用凭据的缓存余额求和，
+ * 与列表每行显示的余额同源，新增凭据查到余额后随列表刷新立即计入，
+ * 不必等后台整轮余额刷新。没有缓存余额的凭据不计入总量，用「采样」标出覆盖率。
+ * 额度告警仍按完整余额轮次计算，口径独立。
  */
-export function QuotaOverviewSummary({ rpm }: { rpm?: CredentialRpmSummary }) {
-  // 与设置页共用 queryKey，两处数据同源、互相复用缓存
-  const { data, isPending, isError } = useQuery({
-    queryKey: ['quota-alerts'],
-    queryFn: getQuotaAlerts,
-    refetchInterval: 30_000,
-  })
-  const overview = data?.overview
-  const pct = overview?.percentage ?? null
-  const placeholder = isPending ? '…' : '—'
-  // 重启后首轮余额刷新完成前，overview 为空壳（0 / 0），显示为「统计中」而非误导性的 0
-  const noRound = overview?.completedAt == null
-  const shown = noRound ? undefined : overview
+export function QuotaOverviewSummary({
+  rpm,
+  quota,
+}: {
+  rpm?: CredentialRpmSummary
+  quota?: CredentialQuotaSummary
+}) {
+  const hasData = quota != null && quota.limit > 0
+  const used = hasData ? Math.max(quota.limit - quota.remaining, 0) : 0
+  const pct = hasData ? (used / quota.limit) * 100 : null
+  const partial = quota != null && quota.covered < quota.active
 
   const fmt = (v: number) => v.toLocaleString('en-US', { maximumFractionDigits: 0 })
 
@@ -41,13 +38,11 @@ export function QuotaOverviewSummary({ rpm }: { rpm?: CredentialRpmSummary }) {
           <div className="min-w-0">
             <h2 className="text-sm font-semibold">额度信息</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              {isError
-                ? '额度数据加载失败'
-                : overview && overview.completedAt == null
-                  ? '首轮余额刷新进行中（服务重启后约需 5 分钟）'
-                  : overview && !overview.complete
-                    ? '仅有效数据小计（非完整池统计）'
-                    : '启用账号 · 最近完整余额轮次'}
+              {!quota
+                ? '额度数据加载中'
+                : partial
+                  ? '部分凭据尚未查到余额，总量偏小'
+                  : '启用账号 · 实时缓存余额'}
             </p>
           </div>
         </div>
@@ -66,7 +61,7 @@ export function QuotaOverviewSummary({ rpm }: { rpm?: CredentialRpmSummary }) {
                       : 'text-primary',
               )}
             >
-              {pct != null ? `${pct.toFixed(2)}%` : noRound && overview ? '统计中' : placeholder}
+              {pct != null ? `${pct.toFixed(2)}%` : '—'}
             </strong>
             {pct != null && <Progress value={Math.min(pct, 100)} className="h-1.5 w-16" />}
           </div>
@@ -74,28 +69,35 @@ export function QuotaOverviewSummary({ rpm }: { rpm?: CredentialRpmSummary }) {
 
         <Metric
           label="剩余额度"
-          title={shown ? `剩余 = 总额度 − 已用（credits）\n已用 ${fmt(shown.used)} / 总额度 ${fmt(shown.limit)}` : '剩余 = 总额度 − 已用（credits）'}
+          title={
+            hasData
+              ? `剩余 = 总额度 − 已用（credits，单个账号超额按 0 计）\n已用 ${fmt(used)} / 总额度 ${fmt(quota.limit)}`
+              : '剩余 = 总额度 − 已用（credits）'
+          }
         >
           <span className="font-mono text-sm font-semibold tabular-nums">
-            {shown ? (
+            {hasData ? (
               <>
-                <span className={shown.limit - shown.used < 0 ? 'text-red-600 dark:text-red-400' : undefined}>
-                  {fmt(shown.limit - shown.used)}
-                </span>
-                <span className="text-muted-foreground"> / {fmt(shown.limit)}</span>
+                {fmt(quota.remaining)}
+                <span className="text-muted-foreground"> / {fmt(quota.limit)}</span>
               </>
-            ) : noRound && overview ? '统计中' : placeholder}
+            ) : '—'}
           </span>
         </Metric>
 
-        <Metric label="有效个数" title="余额数据有效的账号 / 启用账号">
-          <span className="font-mono text-sm font-semibold tabular-nums">
-            {shown ? (
+        <Metric label="采样个数" title="已查到余额的未禁用凭据 / 未禁用凭据；未查到余额的不计入总量">
+          <span
+            className={cn(
+              'font-mono text-sm font-semibold tabular-nums',
+              partial && 'text-amber-600 dark:text-amber-400',
+            )}
+          >
+            {quota ? (
               <>
-                {shown.validAccounts}
-                <span className="text-muted-foreground"> / {shown.enabledAccounts}</span>
+                {quota.covered}
+                <span className="text-muted-foreground"> / {quota.active}</span>
               </>
-            ) : noRound && overview ? '统计中' : placeholder}
+            ) : '—'}
           </span>
         </Metric>
 

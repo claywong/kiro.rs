@@ -45,7 +45,7 @@ use super::types::{
     AuditSuspendedRequest, AuditSuspendedResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
     BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
     CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
-    CredentialRpmSummary, CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
+    CredentialQuotaSummary, CredentialRpmSummary, CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
     CredentialsStatusResponse, CustomHeadersConfigResponse, CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult,
     ExportedAccount, ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelApiRetryConfigResponse,
@@ -971,8 +971,17 @@ impl AdminService {
         let mut dead_count = 0;
         let mut suspended_count = 0;
         let mut rpm_summary = CredentialRpmSummary::default();
+        let mut quota_summary = CredentialQuotaSummary::default();
         for c in &credentials {
             if !c.disabled {
+                quota_summary.active += 1;
+                if let Some(b) = c.balance.as_ref().filter(|b| {
+                    b.usage_limit > 0.0 && b.usage_limit.is_finite() && b.remaining.is_finite()
+                }) {
+                    quota_summary.covered += 1;
+                    quota_summary.limit += b.usage_limit;
+                    quota_summary.remaining += b.remaining.max(0.0);
+                }
                 rpm_summary.current += u64::from(c.rpm_current);
                 if c.rpm_limit == 0 {
                     rpm_summary.unlimited_count += 1;
@@ -1196,6 +1205,7 @@ impl AdminService {
             current_id: exposed_current_id,
             state_counts: Some(state_counts),
             rpm_summary: Some(rpm_summary),
+            quota_summary: Some(quota_summary),
             metadata_schema,
             credentials: result_credentials,
         }

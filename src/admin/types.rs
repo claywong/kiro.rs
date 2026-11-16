@@ -37,6 +37,9 @@ pub struct CredentialsStatusResponse {
     /// RPM 全量汇总（不受分页和筛选影响）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_summary: Option<CredentialRpmSummary>,
+    /// 额度全量汇总（不受分页和筛选影响，基于余额缓存，实时反映新增/刷新的凭据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_summary: Option<CredentialQuotaSummary>,
     /// 凭据 metadata 的 JSON Schema
     pub metadata_schema: serde_json::Value,
     /// 各凭据状态列表（当前页数据）
@@ -67,6 +70,24 @@ pub struct CredentialRpmSummary {
     pub limit: u64,
     /// 未禁用且 RPM 不限的凭据数
     pub unlimited_count: usize,
+}
+
+/// 凭据额度汇总
+///
+/// 只统计未禁用凭据，余额取自 `balance_cache`（与列表每行显示的余额同源），
+/// 所以新增凭据查到余额后立即计入，不必等后台整轮刷新。没有缓存余额的凭据
+/// 不计入总量，用 `covered / active` 表示采样覆盖率。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialQuotaSummary {
+    /// 剩余额度之和（单个账号超额为负时按 0 计，避免抵消其它账号）
+    pub remaining: f64,
+    /// 总额度之和
+    pub limit: f64,
+    /// 有缓存余额的未禁用凭据数
+    pub covered: usize,
+    /// 未禁用凭据数
+    pub active: usize,
 }
 
 /// 凭据列表查询参数（支持分页、搜索、分组、状态、排序）
