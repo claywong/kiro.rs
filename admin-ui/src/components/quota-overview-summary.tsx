@@ -1,27 +1,39 @@
 import { Gauge } from 'lucide-react'
 import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
-import type { CredentialQuotaSummary, CredentialRpmSummary } from '@/types/api'
+import type { CredentialQuotaSummary, CredentialRpmSummary, RecentSpendResponse } from '@/types/api'
 
 /**
- * 账号池额度信息：剩余额度 / 整体使用率 / 采样个数 / RPM 汇总。
+ * 账号池额度信息：剩余额度 / 整体使用率 / 采样个数 / RPM / 近 1 分钟消耗汇总。
  *
  * 额度来自凭据列表接口的 quotaSummary：后端对全部未禁用凭据的缓存余额求和，
  * 与列表每行显示的余额同源，新增凭据查到余额后随列表刷新立即计入，
  * 不必等后台整轮余额刷新。没有缓存余额的凭据不计入总量，用「采样」标出覆盖率。
  * 额度告警仍按完整余额轮次计算，口径独立。
+ *
+ * 消耗来自 recent-spend 接口（全部凭据，不分页），按窗口线性外推每小时消耗。
  */
 export function QuotaOverviewSummary({
   rpm,
   quota,
+  spend,
 }: {
   rpm?: CredentialRpmSummary
   quota?: CredentialQuotaSummary
+  spend?: RecentSpendResponse
 }) {
   const hasData = quota != null && quota.limit > 0
   const used = hasData ? Math.max(quota.limit - quota.remaining, 0) : 0
   const pct = hasData ? (used / quota.limit) * 100 : null
   const partial = quota != null && quota.covered < quota.active
+
+  const windowSecs = spend?.windowSecs && spend.windowSecs > 0 ? spend.windowSecs : 60
+  const spendTotal = spend
+    ? Object.values(spend.spend).reduce((sum, v) => (Number.isFinite(v) && v > 0 ? sum + v : sum), 0)
+    : null
+  const spendPerHour = spendTotal != null ? (spendTotal / windowSecs) * 3600 : null
+  const fmtCredits = (v: number) =>
+    v.toLocaleString('en-US', { maximumFractionDigits: v < 10 ? 2 : v < 100 ? 1 : 0 })
 
   const fmt = (v: number) => v.toLocaleString('en-US', { maximumFractionDigits: 0 })
 
@@ -117,6 +129,21 @@ export function QuotaOverviewSummary({
                 )}
               </>
             ) : '—'}
+          </span>
+        </Metric>
+
+        <Metric
+          label={`近 ${windowSecs} 秒消耗`}
+          title="全部凭据在窗口内消耗的 credits 之和（上游 credits 计量）"
+        >
+          <span className="font-mono text-sm font-semibold tabular-nums">
+            {spendTotal != null ? fmtCredits(spendTotal) : '—'}
+          </span>
+        </Metric>
+
+        <Metric label="推算每小时" title="按当前窗口消耗线性外推，仅供粗略参考">
+          <span className="font-mono text-sm font-semibold tabular-nums">
+            {spendPerHour != null ? `≈ ${fmtCredits(spendPerHour)}` : '—'}
           </span>
         </Metric>
       </div>
