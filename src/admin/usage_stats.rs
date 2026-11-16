@@ -184,6 +184,10 @@ pub struct BucketStats {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    /// 成功请求按 Anthropic 标准 API 价格折算的金额（美元）
+    pub standard_cost_usd: f64,
+    /// 成功但模型未收录价格、未计入金额的请求数
+    pub unpriced_calls: u64,
 }
 
 impl BucketStats {
@@ -196,6 +200,17 @@ impl BucketStats {
         self.calls += 1;
         if rec.status != "success" {
             self.errors += 1;
+        } else {
+            match super::api_pricing::standard_cost_usd(
+                &rec.model,
+                rec.input_tokens,
+                rec.output_tokens,
+                rec.cache_creation_tokens,
+                rec.cache_read_tokens,
+            ) {
+                Some(cost) => self.standard_cost_usd += cost,
+                None => self.unpriced_calls += 1,
+            }
         }
     }
 
@@ -208,6 +223,8 @@ impl BucketStats {
         self.credits += other.credits;
         self.calls += other.calls;
         self.errors += other.errors;
+        self.standard_cost_usd += other.standard_cost_usd;
+        self.unpriced_calls += other.unpriced_calls;
     }
 }
 
@@ -331,6 +348,10 @@ pub struct CredentialDistribution {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub errors: u64,
+    /// 成功请求按标准 API 价格折算的金额（美元），失败请求不计
+    pub standard_cost_usd: f64,
+    /// 成功但模型未收录价格的请求数
+    pub unpriced_calls: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -626,6 +647,8 @@ impl UsageAggregator {
                 cache_creation_tokens: stats.cache_creation_tokens,
                 cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
+                standard_cost_usd: stats.standard_cost_usd,
+                unpriced_calls: stats.unpriced_calls,
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));

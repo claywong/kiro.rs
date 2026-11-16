@@ -11,8 +11,10 @@ import { cn, formatNumber, maskEmail } from '@/lib/utils'
 import {
   cacheHitRate,
   formatCacheHitRate,
+  formatUsd,
   hasCacheCounters,
   sumCacheUsage,
+  sumStandardCost,
 } from '@/lib/cache-statistics'
 import type { CredentialDistribution, StatsRange } from '@/types/api'
 
@@ -23,8 +25,8 @@ export const CACHE_RANGE_LABELS: Record<StatsRange, string> = {
   '30d': '近30天',
 }
 
-export const CACHE_COUNTING_NOTE =
-  '缓存读取 ÷（普通输入 + 缓存写入 + 缓存读取），先汇总 Token 再计算。包含成功与失败请求的用量记录，可能包含本地缓存估算，不等同于上游真实命中率。缺少上游用量的失败请求可能按估算输入计入，使命中率偏低。时间范围按小时或天汇总。'
+const STANDARD_COST_NOTE =
+  '按 Anthropic 标准 API 价格估算，仅计成功请求；缓存写入按 5 分钟价（输入价 × 1.25）'
 const CACHE_STALE_NOTE = '刷新失败，显示上次数据'
 const CACHE_UNAVAILABLE_NOTE =
   '缓存用量缺失或无效，暂无法计算；请确认后端版本及统计数据。'
@@ -69,7 +71,7 @@ export function CredentialCacheMetric({
     >
       <summary
         className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2.5 text-xs [&::-webkit-details-marker]:hidden"
-        title={rate === null ? unavailable : CACHE_COUNTING_NOTE}
+        title={rate === null ? unavailable : undefined}
       >
         <Database
           className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
@@ -117,6 +119,7 @@ export function CredentialCacheMetric({
                 accent
               />
             </dl>
+            <StandardCostLine stats={stats} />
             <p className="mt-2 text-[11px] text-muted-foreground">
               {empty ? '暂无调用' : callCountLabel(stats.calls, stats.errors)}
             </p>
@@ -134,11 +137,29 @@ export function CredentialCacheMetric({
             {CACHE_STALE_NOTE}
           </p>
         )}
-        <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-          {CACHE_COUNTING_NOTE}
-        </p>
       </div>
     </details>
+  )
+}
+
+function StandardCostLine({ stats }: { stats: CredentialDistribution }) {
+  const cost = sumStandardCost([stats])
+  if (!cost) return null
+  return (
+    <p
+      className="mt-2 flex flex-wrap items-baseline gap-x-2 text-[11px]"
+      title={STANDARD_COST_NOTE}
+    >
+      <span className="text-muted-foreground">标准 API 计费</span>
+      <strong className="font-mono font-semibold tabular-nums">
+        {formatUsd(cost.usd)}
+      </strong>
+      {cost.unpricedCalls > 0 && (
+        <span className="text-muted-foreground">
+          {formatNumber(cost.unpricedCalls)} 次调用的模型未计价
+        </span>
+      )}
+    </p>
   )
 }
 
@@ -185,6 +206,7 @@ export function AccountCacheSummary({
   const [expanded, setExpanded] = useState(false)
   const panelId = useId()
   const usage = sumCacheUsage(rows)
+  const cost = !loading && !failed ? sumStandardCost(rows) : undefined
   const rate = !loading && !failed ? cacheHitRate(usage) : null
   const calls = rows.reduce((sum, row) => sum + row.calls, 0)
   const errors = rows.reduce((sum, row) => sum + row.errors, 0)
@@ -222,22 +244,34 @@ export function AccountCacheSummary({
             </p>
           )}
         </div>
-        <div
-          className="flex items-baseline gap-2 sm:ml-2"
-          title={CACHE_COUNTING_NOTE}
-        >
+        <div className="flex items-baseline gap-2 sm:ml-2">
           <span className="text-[11px] text-muted-foreground">加权命中率</span>
           <strong className="font-mono text-xl font-semibold tabular-nums tracking-tight text-primary">
             {formatCacheHitRate(rate)}
           </strong>
         </div>
+        {cost && (
+          <div
+            className="flex items-baseline gap-2 sm:ml-2"
+            title={
+              cost.unpricedCalls > 0
+                ? `${STANDARD_COST_NOTE}；${formatNumber(cost.unpricedCalls)} 次调用的模型未计价`
+                : STANDARD_COST_NOTE
+            }
+          >
+            <span className="text-[11px] text-muted-foreground">标准 API 计费</span>
+            <strong className="font-mono text-xl font-semibold tabular-nums tracking-tight">
+              {formatUsd(cost.usd)}
+            </strong>
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
           <div
             role="group"
             className="inline-flex rounded-lg bg-secondary/65 p-0.5"
             aria-label="缓存统计时间范围"
           >
-            {(['24h', '7d', '30d'] as const).map((value) => (
+            {(['today', '24h', '7d', '30d'] as const).map((value) => (
               <Button
                 key={value}
                 type="button"
@@ -251,7 +285,13 @@ export function AccountCacheSummary({
                 aria-pressed={range === value}
                 onClick={() => onRangeChange(value)}
               >
-                {value === '24h' ? '24小时' : value === '7d' ? '7天' : '30天'}
+                {value === 'today'
+                  ? '今天'
+                  : value === '24h'
+                    ? '24小时'
+                    : value === '7d'
+                      ? '7天'
+                      : '30天'}
               </Button>
             ))}
           </div>
@@ -305,7 +345,7 @@ export function AccountCacheSummary({
           ) : (
             <>
               <div
-                className="hidden grid-cols-[minmax(0,1.5fr)_repeat(5,minmax(0,1fr))] gap-3 bg-secondary/20 px-4 py-2.5 text-right text-[11px] text-muted-foreground lg:grid"
+                className="hidden grid-cols-[minmax(0,1.5fr)_repeat(6,minmax(0,1fr))] gap-3 bg-secondary/20 px-4 py-2.5 text-right text-[11px] text-muted-foreground lg:grid"
                 aria-hidden="true"
               >
                 <span className="text-left">账号</span>
@@ -314,6 +354,7 @@ export function AccountCacheSummary({
                 <span>缓存写入</span>
                 <span>缓存读取</span>
                 <span>命中率</span>
+                <span title={STANDARD_COST_NOTE}>标准 API 计费</span>
               </div>
               <ul className="divide-y divide-border/60">
                 {rows.map((row) => {
@@ -322,7 +363,7 @@ export function AccountCacheSummary({
                   return (
                     <li
                       key={row.credentialId}
-                      className="grid grid-cols-2 items-center gap-3 px-4 py-3 text-xs sm:grid-cols-3 lg:grid-cols-[minmax(0,1.5fr)_repeat(5,minmax(0,1fr))]"
+                      className="grid grid-cols-2 items-center gap-3 px-4 py-3 text-xs sm:grid-cols-3 lg:grid-cols-[minmax(0,1.5fr)_repeat(6,minmax(0,1fr))]"
                     >
                       <div className="col-span-2 min-w-0 sm:col-span-3 lg:col-span-1">
                         <p
@@ -370,6 +411,15 @@ export function AccountCacheSummary({
                         value={formatCacheHitRate(rowRate)}
                         accent
                       />
+                      <SummaryCell
+                        label="标准 API 计费"
+                        value={formatUsd(row.standardCostUsd)}
+                        note={
+                          row.unpricedCalls
+                            ? `${formatNumber(row.unpricedCalls)} 次未计价`
+                            : undefined
+                        }
+                      />
                     </li>
                   )
                 })}
@@ -378,7 +428,7 @@ export function AccountCacheSummary({
           )}
           <p className="flex items-start gap-1.5 border-t border-border/60 bg-secondary/15 px-4 py-3 text-[11px] leading-relaxed text-muted-foreground">
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span>{CACHE_COUNTING_NOTE}账号筛选不影响本汇总。</span>
+            <span>账号筛选不影响本汇总。</span>
           </p>
         </div>
       )}

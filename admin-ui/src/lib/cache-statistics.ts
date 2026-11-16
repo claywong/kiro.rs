@@ -53,3 +53,29 @@ export function sumCacheUsage(
   }
   return hasCacheCounters(total) ? total : undefined
 }
+
+export interface StandardCostUsage {
+  standardCostUsd?: number
+  unpricedCalls?: number
+}
+
+/** undefined means the server did not report cost (older backend). */
+export function sumStandardCost(
+  rows: readonly StandardCostUsage[],
+): { usd: number; unpricedCalls: number } | undefined {
+  let usd = 0
+  let unpricedCalls = 0
+  for (const row of rows) {
+    if (typeof row.standardCostUsd !== 'number' || !Number.isFinite(row.standardCostUsd))
+      return undefined
+    usd += row.standardCostUsd
+    unpricedCalls += row.unpricedCalls ?? 0
+  }
+  return { usd, unpricedCalls }
+}
+
+export function formatUsd(usd: number | undefined): string {
+  if (usd === undefined || !Number.isFinite(usd) || usd < 0) return '—'
+  if (usd > 0 && usd < 0.01) return '<$0.01'
+  return `$${usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}

@@ -690,6 +690,10 @@ export interface CredentialDistribution {
   cacheCreationTokens?: number
   cacheReadTokens?: number
   errors: number
+  /** 成功请求按 Anthropic 标准 API 价格折算的金额（美元）；旧版后端没有该字段 */
+  standardCostUsd?: number
+  /** 成功但模型未收录价格、未计入金额的请求数 */
+  unpricedCalls?: number
 }
 
 export interface KeyDistribution {

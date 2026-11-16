@@ -86,11 +86,21 @@ export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   })
 }
 
+/** 「今天」走本地 0 点起的自然日窗口，其余走滚动窗口。 */
+function credentialCacheWindow(range: StatsRange) {
+  if (range === 'today') {
+    const d = new Date()
+    const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    return { startDate: today, endDate: today, granularity: 'hour' as const }
+  }
+  return { range, granularity: range === '30d' ? ('day' as const) : ('hour' as const) }
+}
+
 /** One shared request supplies the summary and every credential card. */
 export function useCredentialCacheStats(range: StatsRange) {
   return useQuery({
     queryKey: ['stats', 'credential-cache', range],
-    queryFn: () => getByCredential({ range, granularity: range === '30d' ? 'day' : 'hour' }),
+    queryFn: () => getByCredential(credentialCacheWindow(range)),
     staleTime: 25_000,
     refetchInterval: 30_000,
     refetchOnWindowFocus: false,
