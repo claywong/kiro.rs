@@ -579,6 +579,11 @@ const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 /// 复读熔断触发后返回给客户端的错误（L5）。措辞让客户端按「流中断、可重试」处理。
 pub(crate) const REPEAT_GUARD_ERROR_MESSAGE: &str = "Upstream response stream was interrupted: the model output degenerated into a repeated-token loop. Retry the request.";
 
+/// 上游空响应（HTTP 200、流正常结束，但没有任何正文 / thinking / 工具调用）返回给客户端的错误。
+/// 用 overloaded_error 让客户端按可重试处理，而不是把空的 end_turn 当作本轮结束。
+pub(crate) const EMPTY_RESPONSE_ERROR_MESSAGE: &str =
+    "Upstream returned an empty response with no content. Retry the request.";
+
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
 /// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
@@ -1667,6 +1672,8 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
+    /// 上游空响应：流正常结束但没有任何输出，收尾时改发 overloaded_error。
+    empty_response: bool,
     /// 工具调用 JSON 校验器：按 tool_use_id 累积，`stop` 时整体解析。
     tool_json_accumulator: ToolJsonAccumulator,
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
@@ -1730,6 +1737,12 @@ impl StreamContext {
         self.repeat_guard_tripped.then_some(REPEAT_GUARD_ERROR_MESSAGE)
     }
 
+    /// 上游空响应时返回给客户端的错误信息；正常响应返回 `None`。
+    /// 只在 [`Self::generate_final_events`] 之后有意义。
+    pub fn empty_response_error_message(&self) -> Option<&'static str> {
+        self.empty_response.then_some(EMPTY_RESPONSE_ERROR_MESSAGE)
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1766,6 +1779,7 @@ impl StreamContext {
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
+            empty_response: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_stream_refused: false,
@@ -1798,6 +1812,21 @@ impl StreamContext {
     /// - 没有原生信号时，contextUsage 100% 仍回退为 `model_context_window_exceeded`（原行为）。
     ///
     /// 拒答等已设置的终态由 `set_stop_reason` 自身保护。
+    /// 本轮是否完全没有输出。上游明确报了截断（max_tokens / 上下文满）时不算空响应，
+    /// 保留原有终止语义。
+    fn is_empty_response(&self) -> bool {
+        let truncated = self.context_window_full
+            || self.native_stop_reason.as_deref().is_some_and(|reason| {
+                reason.eq_ignore_ascii_case("MAX_TOKENS")
+                    || reason.eq_ignore_ascii_case("MODEL_CONTEXT_WINDOW_EXCEEDED")
+            });
+        self.output_tokens == 0
+            && self.resolved_output_tokens() == 0
+            && self.tool_block_indices.is_empty()
+            && !self.state_manager.has_tool_use
+            && !truncated
+    }
+
     fn apply_native_stop_reason(&mut self) {
         let native = self.native_stop_reason.as_deref().map(str::to_ascii_uppercase);
         match native.as_deref() {
@@ -2783,6 +2812,20 @@ impl StreamContext {
         // L5：复读熔断触发过，本轮输出不完整，以可重试的 api_error 终止，不能当正常结束。
         if self.repeat_guard_tripped {
             events.extend(self.generate_error_events("api_error", REPEAT_GUARD_ERROR_MESSAGE));
+            return events;
+        }
+
+        // 上游空响应：流正常结束，但没有任何正文 / thinking / 工具调用。照常发 end_turn
+        // 会让客户端（Claude Code）以为本轮结束而停住，改发可重试的 overloaded_error。
+        // 本轮所有输出路径都会累加 output_tokens；本地估算与上游 metadata 都为 0 才判空。
+        if leftover.is_empty() && self.is_empty_response() {
+            self.empty_response = true;
+            tracing::warn!(
+                model = %self.model,
+                credits = self.credits,
+                "上游返回空响应（无正文 / thinking / 工具调用），改发 overloaded_error"
+            );
+            events.extend(self.generate_error_events("overloaded_error", EMPTY_RESPONSE_ERROR_MESSAGE));
             return events;
         }
 
@@ -4811,6 +4854,76 @@ mod tests {
         assert_eq!(terminal.data["delta"]["stop_reason"], "max_tokens");
     }
 
+    /// 上游空响应（HTTP 200、只有 metadata、没有任何内容）：以 overloaded_error 结束，
+    /// 不能发出正常的 message_delta / message_stop。
+    #[test]
+    fn empty_upstream_response_ends_with_overloaded_error() {
+        for thinking_enabled in [false, true] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "claude-sonnet-5-5",
+                100,
+                thinking_enabled,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            let _ = ctx.generate_initial_events();
+            ctx.process_kiro_event(&Event::Metadata(
+                serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+            ));
+            let events = ctx.generate_final_events();
+            let error = events
+                .iter()
+                .find(|e| e.event == "error")
+                .unwrap_or_else(|| panic!("thinking={thinking_enabled} 应发出 error 事件"));
+            assert_eq!(error.data["error"]["type"], json!("overloaded_error"));
+            assert!(!events.iter().any(|e| e.event == "message_delta" || e.event == "message_stop"));
+            assert_eq!(
+                ctx.empty_response_error_message(),
+                Some(EMPTY_RESPONSE_ERROR_MESSAGE)
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_responses_are_not_flagged_as_empty() {
+        // 正文
+        let mut ctx = StreamContext::new_with_thinking("m", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("hi");
+        let events = ctx.generate_final_events();
+        assert!(ctx.empty_response_error_message().is_none());
+        assert_eq!(events.last().unwrap().event, "message_stop");
+
+        // 只有 thinking
+        let mut ctx = StreamContext::new_with_thinking("m", 100, true, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("thinking".to_string()),
+                ..Default::default()
+            },
+        ));
+        let _ = ctx.generate_final_events();
+        assert!(ctx.empty_response_error_message().is_none());
+
+        // 无参工具调用
+        let mut ctx = StreamContext::new_with_thinking("m", 100, false, HashMap::new(), test_known_tools())
+            .with_invoke_tool_schemas(test_tool_schemas());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false)));
+        let _ = ctx.generate_final_events();
+        assert!(ctx.empty_response_error_message().is_none());
+
+        // 上游明确报 max_tokens 截断：保留原语义
+        let mut ctx = StreamContext::new_with_thinking("m", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "max_tokens");
+        assert!(ctx.empty_response_error_message().is_none());
+    }
+
     fn final_stop_reason(ctx: &mut StreamContext) -> serde_json::Value {
         let events = ctx.generate_final_events();
         let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
@@ -5911,6 +6024,7 @@ mod tests {
             unit_plural: "credits".into(),
             usage: 0.42,
         }));
+        ctx.process_assistant_response("ok");
 
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -5936,6 +6050,7 @@ mod tests {
         )
         .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("ok");
         let final_events = ctx.generate_final_events();
         let delta = final_events
             .iter()

@@ -225,6 +225,8 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// 仅用作 record.error_type：上游 HTTP 200 且流正常结束，但没有任何正文 / thinking / 工具调用
+    pub const EMPTY_RESPONSE: &str = "empty_response";
     /// 仅用作 record.error_type：上游响应头未到达前请求即被取消。不含原因判断——SLB 等头
     /// 超时、客户端读超时、用户主动中断在这一层无法区分，需结合 duration_ms 与下游日志。
     /// 走不到显式 finalize，靠 RequestTracer 的 Drop 兜底；指纹 total_attempts=0。

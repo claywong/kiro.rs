@@ -1724,6 +1724,14 @@ fn create_sse_stream(
                                     Some(message),
                                     None,
                                 );
+                            } else if let Some(message) = ctx.empty_response_error_message() {
+                                settlement.finish(
+                                    "error",
+                                    "error",
+                                    Some(outcome::EMPTY_RESPONSE),
+                                    Some(message),
+                                    None,
+                                );
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
