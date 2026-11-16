@@ -1,10 +1,13 @@
 import {
   Cpu,
+  FolderTree,
   Gauge,
   Globe,
+  KeyRound,
   ScrollText,
   PackageOpen,
   ShieldCheck,
+  Store,
   Tags,
   Bell,
 } from 'lucide-react'
@@ -12,6 +15,7 @@ import { PageHeader } from '@/components/console/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useUrlState } from '@/hooks/use-url-state'
+import { useVendorUnackedCount } from '@/hooks/use-vendor'
 import { cn } from '@/lib/utils'
 import { DispatchSection } from '@/components/settings/dispatch-section'
 import { NetworkSection } from '@/components/settings/network-section'
@@ -21,6 +25,9 @@ import { SecuritySection } from '@/components/settings/security-section'
 import { MetadataSection } from '@/components/settings/metadata-section'
 import { ModelsSection } from '@/components/settings/models-section'
 import { QuotaAlertsSection } from '@/components/settings/quota-alerts-section'
+import { GroupsPage } from '@/components/groups-page'
+import { ClientKeysPage } from '@/components/client-keys-page'
+import { VendorPage } from '@/components/vendor-page'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -33,7 +40,21 @@ import { QuotaAlertsSection } from '@/components/settings/quota-alerts-section'
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security' | 'alerts'
+type SectionKey =
+  | 'dispatch'
+  | 'metadata'
+  | 'network'
+  | 'log'
+  | 'models'
+  | 'system'
+  | 'security'
+  | 'alerts'
+  | 'groups'
+  | 'keys'
+  | 'vendor'
+
+/** 页面级分区：渲染整页组件（自带 PageHeader 与布局），不套设置卡片的壳 */
+const PAGE_SECTIONS: SectionKey[] = ['groups', 'keys', 'vendor']
 
 const SECTIONS: {
   key: SectionKey
@@ -80,6 +101,21 @@ const SECTIONS: {
     label: '安全',
     icon: <ShieldCheck className="h-4 w-4" />,
   },
+  {
+    key: 'groups',
+    label: '分组管理',
+    icon: <FolderTree className="h-4 w-4" />,
+  },
+  {
+    key: 'keys',
+    label: '客户端 Key',
+    icon: <KeyRound className="h-4 w-4" />,
+  },
+  {
+    key: 'vendor',
+    label: '供应商',
+    icon: <Store className="h-4 w-4" />,
+  },
 ]
 
 export function SettingsPage() {
@@ -87,11 +123,17 @@ export function SettingsPage() {
   const active = (SECTIONS.some((x) => x.key === urlState.s)
     ? urlState.s
     : 'dispatch') as SectionKey
+  // 供应商分区搬进来后，「未确认事件」红点跟着挂到侧栏该分区上
+  const { data: vendorUnacked } = useVendorUnackedCount()
+
+  // 页面级分区自带 PageHeader，设置页自己的页头此时不再叠一个
+  const isPageSection = PAGE_SECTIONS.includes(active)
 
   const activeMeta = SECTIONS.find((s) => s.key === active) ?? SECTIONS[0]
 
   return (
     <div className="console-scope space-y-4">
+      {!isPageSection && (
       <PageHeader
         breadcrumbs={[
           { label: '控制台' },
@@ -107,6 +149,7 @@ export function SettingsPage() {
           </Badge>
         }
       />
+      )}
 
       {/* 窄屏设备横向滚动的子菜单导航栏（桌面端由左侧全局侧边栏接管） */}
       <nav
@@ -129,12 +172,24 @@ export function SettingsPage() {
           >
             {s.icon}
             <span className="whitespace-nowrap">{s.label}</span>
+            {s.key === 'vendor' && vendorUnacked ? (
+              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-medium leading-none text-destructive-foreground">
+                {vendorUnacked}
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
 
       <div className="flex flex-col gap-4">
 
+        {isPageSection ? (
+          <div className="min-w-0 flex-1">
+            {active === 'groups' && <GroupsPage />}
+            {active === 'keys' && <ClientKeysPage />}
+            {active === 'vendor' && <VendorPage />}
+          </div>
+        ) : (
         <Card className="min-w-0 flex-1">
           <CardContent className="p-4 sm:p-5">
             {active === 'dispatch' && <DispatchSection />}
@@ -147,6 +202,7 @@ export function SettingsPage() {
             {active === 'security' && <SecuritySection />}
           </CardContent>
         </Card>
+        )}
       </div>
     </div>
   )

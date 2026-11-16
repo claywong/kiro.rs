@@ -102,8 +102,7 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        // 上游 MCP 同样强制要求 profileArn（缺失 → 400 profileArn is required），
-        // 与对话请求一致：BuilderID 占位符账号也要带上占位符
+        // 同 ide.rs：BuilderID 占位符 ARN 也必须发送，否则 MCP 返回 400。
         if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }

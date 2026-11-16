@@ -21,7 +21,7 @@ import {
   Bell,
 } from "lucide-react";
 // 本地独有：卖家面板入口与未处理事件角标
-import { Store } from "lucide-react";
+import { Store, ShoppingBag } from "lucide-react";
 import { useVendorUnackedCount } from "@/hooks/use-vendor";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -37,10 +37,8 @@ import type { ThemeId, ThemeMode, ThemeSelection } from "@/lib/theme";
 export type TabKey =
   | "overview"
   | "credentials"
-  | "keys"
-  | "groups"
   | "traces"
-  | "vendor"
+  | "kiroshop"
   | "settings";
 
 export interface SubMenuItem {
@@ -71,28 +69,16 @@ export const TABS: readonly TabItem[] = [
     icon: Server,
   },
   {
-    key: "keys",
-    label: "客户端 Key",
-    description: "下游入口密钥、模型配额与速率限制",
-    icon: KeyRound,
-  },
-  {
-    key: "groups",
-    label: "分组管理",
-    description: "组织架构隔离、路由组与流量分配策略",
-    icon: FolderTree,
-  },
-  {
     key: "traces",
     label: "请求日志",
     description: "端到端审计追踪、耗时分析与异常排查",
     icon: ScrollText,
   },
   {
-    key: "vendor",
-    label: "供应商",
-    description: "卖家 / Key 供应商对接、库存与自动提取",
-    icon: Store,
+    key: "kiroshop",
+    label: "KiroShop",
+    description: "KiroShop 商城对接、订单与自动补货",
+    icon: ShoppingBag,
   },
   {
     key: "settings",
@@ -108,6 +94,10 @@ export const TABS: readonly TabItem[] = [
       { key: "log", label: "日志治理", icon: ScrollText },
       { key: "system", label: "系统更新", icon: PackageOpen },
       { key: "security", label: "安全防护", icon: ShieldCheck },
+      // 分组 / 客户端 Key / 供应商收进设置页（mine 801d108），旧 #keys/#groups/#vendor 由 App 重定向
+      { key: "groups", label: "分组管理", icon: FolderTree },
+      { key: "keys", label: "客户端 Key", icon: KeyRound },
+      { key: "vendor", label: "供应商", icon: Store },
     ],
   },
 ] as const;
@@ -296,7 +286,7 @@ export function AppLayout({
                 {(!collapsed || mobileOpen) && (
                   <>
                     <span className="truncate flex-1 text-left">{item.label}</span>
-                    {item.key === "vendor" && vendorUnacked != null && vendorUnacked > 0 && (
+                    {item.key === "settings" && vendorUnacked != null && vendorUnacked > 0 && (
                       <span
                         className="rounded-full bg-destructive px-1.5 text-[10px] font-semibold leading-4 text-destructive-foreground"
                         title={`${vendorUnacked} 条未处理`}
@@ -392,6 +382,14 @@ export function AppLayout({
                             }`}
                           />
                           <span className="truncate">{child.label}</span>
+                          {child.key === "vendor" && vendorUnacked != null && vendorUnacked > 0 && (
+                            <span
+                              className="ml-auto rounded-full bg-destructive px-1.5 text-[10px] font-semibold leading-4 text-destructive-foreground"
+                              title={`${vendorUnacked} 条未处理`}
+                            >
+                              {vendorUnacked > 99 ? "99+" : vendorUnacked}
+                            </span>
+                          )}
                         </button>
                       );
                     })}

@@ -17,6 +17,7 @@ import {
 import type { CredentialDistribution, StatsRange } from '@/types/api'
 
 export const CACHE_RANGE_LABELS: Record<StatsRange, string> = {
+  today: '今天',
   '24h': '近24小时',
   '7d': '近7天',
   '30d': '近30天',

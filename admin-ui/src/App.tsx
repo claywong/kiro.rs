@@ -22,25 +22,14 @@ const OverviewPage = lazy(() =>
     default: m.OverviewPage,
   })),
 );
-const ClientKeysPage = lazy(() =>
-  import("@/components/client-keys-page").then((m) => ({
-    default: m.ClientKeysPage,
-  })),
-);
 const TraceLogPage = lazy(() =>
   import("@/components/trace-log-page").then((m) => ({
     default: m.TraceLogPage,
   })),
 );
-const GroupsPage = lazy(() =>
-  import("@/components/groups-page").then((m) => ({
-    default: m.GroupsPage,
-  })),
-);
-// 本地独有：卖家 / Key 供应商面板
-const VendorPage = lazy(() =>
-  import("@/components/vendor-page").then((m) => ({
-    default: m.VendorPage,
+const KiroshopPage = lazy(() =>
+  import("@/components/kiroshop-page").then((m) => ({
+    default: m.KiroshopPage,
   })),
 );
 const SettingsPage = lazy(() =>
@@ -54,13 +43,22 @@ function readTabFromHash(): Tab {
   // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
   // 直接全等比较会认不出 Tab。
   const h = tabFromHash();
+  // 分组管理 / 客户端 Key / 供应商已收进设置页：旧链接重定向到对应设置分区。
+  // 用 replaceState 改写（不触发 hashchange，避免路由循环），
+  // 设置页挂载时从 ?s= 读到分区。
+  if (h === "keys" || h === "groups" || h === "vendor") {
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}#/settings?s=${h}`,
+    );
+    return "settings";
+  }
   if (
     h === "credentials" ||
-    h === "keys" ||
-    h === "groups" ||
     h === "overview" ||
     h === "traces" ||
-    h === "vendor" ||
+    h === "kiroshop" ||
     h === "settings"
   )
     return h;
@@ -209,10 +207,8 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
     >
       {tab === "overview" && <OverviewPage />}
       {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
-      {tab === "keys" && <ClientKeysPage />}
-      {tab === "groups" && <GroupsPage />}
       {tab === "traces" && <TraceLogPage />}
-      {tab === "vendor" && <VendorPage />}
+      {tab === "kiroshop" && <KiroshopPage />}
       {tab === "settings" && <SettingsPage />}
     </Suspense>
   );

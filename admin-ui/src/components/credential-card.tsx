@@ -1345,6 +1345,7 @@ function CredentialCardImpl({
                   <RotateCcw className="size-3 shrink-0 text-muted-foreground" />
                 </button>
               </div>
+
             </div>
 
             {/* 本地扩展：RPM 限额 / 近 1 分钟消耗 / 累计 credit / TTFT */}

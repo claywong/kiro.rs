@@ -1478,12 +1478,14 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
 
 fn credential_matches_request(
     credentials: &KiroCredentials,
-    _model: Option<&str>,
+    model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
-    // 模型隔离完全交给 `cached_model_support` 的三态缓存（上游 59b6d48）：
-    // Confirmed 优先调度、Unsupported 跳过、Unknown 放行。不再按订阅名称硬过滤 Opus，
-    // 这里只剩分组匹配；保留 `model` 参数是为了不改动本地调用方签名。
+    // 模型隔离不再按订阅名做硬闸门：KIRO FREE 现已开放 Opus。
+    // 某账号是否支持某模型，交由 `cached_model_support` 的三态缓存判定：
+    // Confirmed 优先调度、Unsupported 跳过、Unknown 放行（由上游给出最终答案）。
+    let _ = model;
+
     group_matches(&credentials.groups, group)
 }
 
@@ -10229,6 +10231,56 @@ mod tests {
         assert!(manager.select_next_credential(None, None).is_some());
     }
 
+    #[test]
+    fn test_select_next_credential_does_not_filter_opus_by_subscription() {
+        // 不再按订阅名拦截 Opus：KIRO FREE 现已开放 Opus。
+        // 具体模型支持与否由 model_cache 三态判定，不在此层过滤。
+        let mut free_cred = grouped_cred("free", &[]);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+        let mut pro_cred = grouped_cred("pro", &[]);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+        pro_cred.priority = 10;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 请求 opus：Free(id=1) 不再被订阅名挡掉，按优先级仍落到 Free
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-opus-4.6"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "Free 订阅账号应能承接 Opus 请求"
+        );
+        // 非 opus 模型：按优先级落到 Free(id=1)
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "非 Opus 模型不受订阅闸门限制"
+        );
+        // 未知模型：无缓存亦放行（由上游给出最终答案）
+        assert!(
+            manager
+                .select_next_credential(Some("future-model"), None)
+                .is_some(),
+            "未知模型应放行透传，而非本地拒绝"
+        );
+        // 请求未指定模型（None）→ 不按模型过滤，可选到最靠前账号
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "未指定模型时不做模型过滤"
+        );
+    }
+
     #[tokio::test]
     async fn test_priority_mode_ignores_stale_current_id() {
         let mut first = grouped_cred("first", &[]);
@@ -10356,11 +10408,16 @@ mod tests {
         seed_model_cache(&manager, 1, &["claude-sonnet-4.6"]);
         seed_model_cache(&manager, 2, &["claude-sonnet-4.6", "claude-opus-4.6"]);
 
-        // 预热 current_id 到最高优先级的 Free 账号。
+        // 预热 current_id 到最高优先级的账号（id=1）。
         let current = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
-        // 请求 opus：黏性的 current 不满足订阅要求，必须跳过。
+        // 订阅名不再拦截 Opus（KIRO FREE 已开放），是否支持只看模型缓存。
+        // 这里让缓存表明 Free(id=1) 不含 opus、Pro(id=2) 含 opus。
+        seed_model_cache(&manager, 1, &["claude-sonnet-5"]);
+        seed_model_cache(&manager, 2, &["claude-sonnet-5", "claude-opus-4.6"]);
+
+        // 请求 opus：黏性的 current 在缓存里被判 Unsupported，必须跳过。
         let opus = manager
             .acquire_context(Some("claude-opus-4.6"), None)
             .await

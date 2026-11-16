@@ -467,6 +467,20 @@ IDE UA 断言同时校验版本号与 SDK 版本，防止只改一处。
 - 上游 `usage_api_attempts` / `is_builder_id_unsupported` / `should_retry_usage_api_without_profile_arn` 的测试因函数不存在而未带入；
   `test_usage_rest_urls_omit_builder_id_placeholder` 是上游测试，断言与本地「BuilderID 必须带占位符」相反，取本地。
 
+### 2026-11-16 拉取 mine/master（与上面的上游合并并行开发的提交）
+
+- **thinking 解析：用 mine 的多段规则（用户拍板）。** 上游 M1 是「只有回复开头的 `<thinking>` 才是思考块」，
+  mine 的 `cbd41cf` 是「一条回复内可有多段，第二段起也识别」。取 mine：流式去掉了 M1 的开头限制，
+  `extract_thinking_from_complete_text` 返回交替片段 `Vec<(bool, String)>`（结束标签剥离沿用上游的
+  `thinking_end_tag_strip_len`，保住上游 L1 的单个 `\n` 情形）。上游测试
+  `fixresp_m1_literal_thinking_mid_text_stays_text` 断言的正是 M1，已删除；
+  `fixresp_l1_single_newline_after_thinking_end` 只改了返回值形态的断言。
+- Opus 订阅闸门：mine 的 `3663bf2` 与上游 `59b6d48` 殊途同归，取 mine 的注释与新增测试。
+- 前端：保留上游 `AppLayout`，标签集合以 mine 为准（概览 / 凭据 / 请求日志 / KiroShop / 设置），
+  分组 / 客户端 Key / 供应商收进设置页；供应商未处理角标挂在设置菜单与子菜单上。
+  凭证卡指标区沿用合并后的「核心指标 + 本地扩展」两行，没有采用 mine 的 3×2 网格。
+- 新模块 `src/kiroshop/`、`pick_random_proxy_url`（卖家入库随机代理）无冲突，原样带入。
+
 ## 四、降低未来冲突的约定
 
 1. **本地新增的 `use` 名字单独成行**，不要插进上游按字母排序的 `use {...}` 块中间。
