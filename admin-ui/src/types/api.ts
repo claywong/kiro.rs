@@ -8,6 +8,13 @@ export interface CredentialStateCounts {
   total: number
 }
 
+/** 凭据 RPM 全量汇总（仅未禁用凭据；不限的凭据不计入 limit，单独计数） */
+export interface CredentialRpmSummary {
+  current: number
+  limit: number
+  unlimitedCount: number
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -22,6 +29,8 @@ export interface CredentialsStatusResponse {
   currentId: number
   /** 各状态凭据全量统计 */
   stateCounts?: CredentialStateCounts
+  /** RPM 全量汇总（不受分页/筛选影响） */
+  rpmSummary?: CredentialRpmSummary
   /** 描述 metadata 字段、值类型和选项的 JSON Schema */
   metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]

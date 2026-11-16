@@ -877,6 +877,8 @@ function CredentialCardImpl({
           <CredentialLabel id={credential.id} email={displayEmail} />
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden [&>*]:shrink-0">
+          {subscriptionBadge}
+          <SalePriceBadge credential={credential} />
           {statusBadges}
           {privacyMode && groups.length > 0 ? <Badge variant="secondary">分组已隐藏</Badge> : groups.map((g) => (
             <span
@@ -899,6 +901,11 @@ function CredentialCardImpl({
         <MetadataSummary credential={credential} privacyMode={privacyMode} />
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
           {activityStats}
+          <span title="各模型首字延迟 EWMA 均值">
+            TTFT <span className="tabular-nums text-foreground/80">
+              {credential.ttftEwmaMs != null ? `${(credential.ttftEwmaMs / 1000).toFixed(1)}s` : "—"}
+            </span>
+          </span>
         </div>
         <div className="mt-2 select-text"><CredentialCacheMetric stats={cacheStats} range={cacheRange} loading={loadingCacheStats} failed={cacheStatsError} stale={cacheStatsStale} compact /></div>
       </div>
@@ -1040,35 +1047,29 @@ function CredentialCardImpl({
           </button>
         </div>
 
-        {/* 本地扩展：RPM 限额 / 近 1 分钟消耗 / 累计 credit / TTFT */}
-        <div className="w-16 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">RPM</div>
+        {/* 本地扩展：RPM 限额与近 1 分钟消耗合并为一列（上下两行） */}
+        <div className="w-20 text-center">
           <div
-            className="mt-0.5 text-sm font-medium tabular-nums"
-            title="当前 60 秒已用请求数 / 每分钟上限"
+            className="text-sm font-medium tabular-nums leading-5"
+            title="RPM：当前 60 秒已用请求数 / 每分钟上限"
           >
+            <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">RPM</span>
             {credential.rpmLimit === 0 ? "不限" : `${credential.rpmCurrent}/${credential.rpmLimit}`}
           </div>
-        </div>
-        <div className="w-16 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">1分钟耗</div>
           <div
-            className="mt-0.5 text-sm font-medium tabular-nums"
+            className="text-sm font-medium tabular-nums leading-5"
             title="最近 60 秒内该凭据消耗的额度（上游 credits 计量）"
           >
+            <span className="mr-1 text-[10px] text-muted-foreground">1分钟</span>
             {formatRecentSpend(recentSpend)}
           </div>
         </div>
-        <CredentialCreditUsage credits={credential.totalCredits} />
-        <div className="w-16 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
-          <div className="mt-0.5 text-sm font-medium tabular-nums" title="各模型首字延迟 EWMA 均值">
-            {credential.ttftEwmaMs != null ? `${(credential.ttftEwmaMs / 1000).toFixed(1)}s` : "—"}
-          </div>
+        <div className="w-16">
+          <CredentialCreditUsage credits={credential.totalCredits} />
         </div>
       </div>
 
-      <div className="hidden w-44 shrink-0 xl:block">
+      <div className="hidden w-28 shrink-0 xl:block">
         {loadingBalance ? (
           <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1094,7 +1095,7 @@ function CredentialCardImpl({
                 {balance.usagePercentage.toFixed(0)}%
               </span>
             </div>
-            <Progress value={balance.usagePercentage} className="mt-1 h-1.5" />
+            <Progress value={balance.usagePercentage} className="ml-auto mt-1 h-1 w-14" />
           </div>
         ) : (
           <div className="text-center text-[11px] text-muted-foreground/70">

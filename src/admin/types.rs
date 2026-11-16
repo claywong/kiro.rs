@@ -34,6 +34,9 @@ pub struct CredentialsStatusResponse {
     /// 各状态凭据统计（全量）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_counts: Option<CredentialStateCounts>,
+    /// RPM 全量汇总（不受分页和筛选影响）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_summary: Option<CredentialRpmSummary>,
     /// 凭据 metadata 的 JSON Schema
     pub metadata_schema: serde_json::Value,
     /// 各凭据状态列表（当前页数据）
@@ -50,6 +53,20 @@ pub struct CredentialStateCounts {
     pub dead: usize,
     pub suspended: usize,
     pub total: usize,
+}
+
+/// 凭据 RPM 全量汇总（额度汇总见 quota_alerts 的 PoolOverview，不在此重复）
+///
+/// 只统计未禁用凭据；`rpm_limit == 0`（不限）的凭据不计入上限总值，单独计数。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRpmSummary {
+    /// 未禁用凭据当前 60 秒已用请求数之和
+    pub current: u64,
+    /// 未禁用且设了上限的凭据 RPM 上限之和
+    pub limit: u64,
+    /// 未禁用且 RPM 不限的凭据数
+    pub unlimited_count: usize,
 }
 
 /// 凭据列表查询参数（支持分页、搜索、分组、状态、排序）
