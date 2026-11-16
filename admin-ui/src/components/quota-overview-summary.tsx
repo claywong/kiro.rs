@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 import type { CredentialRpmSummary } from '@/types/api'
 
 /**
- * 账号池额度信息：汇总额度 / 整体使用率 / 有效个数 / RPM 汇总。
+ * 账号池额度信息：剩余额度 / 整体使用率 / 有效个数 / RPM 汇总。
  *
  * 额度三项直接复用额度告警的 overview（与「设置 → 额度告警 → 账号池概况」同一口径：
  * 基于最近完整余额轮次，汇总已用 ÷ 汇总额度，过期数据不参与）；RPM 来自凭据列表
@@ -72,11 +72,16 @@ export function QuotaOverviewSummary({ rpm }: { rpm?: CredentialRpmSummary }) {
           </div>
         </Metric>
 
-        <Metric label="汇总额度" title="已用 / 总额度（credits）">
+        <Metric
+          label="剩余额度"
+          title={shown ? `剩余 = 总额度 − 已用（credits）\n已用 ${fmt(shown.used)} / 总额度 ${fmt(shown.limit)}` : '剩余 = 总额度 − 已用（credits）'}
+        >
           <span className="font-mono text-sm font-semibold tabular-nums">
             {shown ? (
               <>
-                {fmt(shown.used)}
+                <span className={shown.limit - shown.used < 0 ? 'text-red-600 dark:text-red-400' : undefined}>
+                  {fmt(shown.limit - shown.used)}
+                </span>
                 <span className="text-muted-foreground"> / {fmt(shown.limit)}</span>
               </>
             ) : noRound && overview ? '统计中' : placeholder}
