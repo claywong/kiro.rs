@@ -82,6 +82,16 @@ use super::types::{
 /// 可能是 7.5 分钟前的 —— 余额本就是分钟级粒度的参考值，宽限一轮不影响扩容判断。
 const BALANCE_CACHE_TTL_SECS: i64 = 450;
 
+/// 列表展示余额的最长保留时间（秒），30 分钟。仅用于面板展示，不用于任何决策。
+///
+/// 后台刷新是串行的，凭据增长到 150+ 后一轮要 380～590s，超过 [`BALANCE_CACHE_TTL_SECS`]，
+/// 每个凭据在下一次被刷到之前就过期，面板出现「余额未查询」的滚动缺失带。
+/// 展示侧单独放宽：宁可显示几分钟前的余额（前端可用 `balanceUpdatedAt` 判断新旧），
+/// 也不让面板变空。凭据长期刷新失败时超过本时限仍会回到「未查询」。
+///
+/// 一键禁用超额、一键开超额、`get_balance` 命中判断仍用 TTL，避免拿陈旧余额做操作。
+const BALANCE_DISPLAY_MAX_AGE_SECS: i64 = 1800;
+
 /// 余额后台刷新周期的默认值（秒），5 分钟。TTL 必须比它宽，理由见 [`BALANCE_CACHE_TTL_SECS`]。
 /// 实际周期由上游的 `balanceRefreshIntervalSecs` 配置决定（main 里解析），本常量现在
 /// 只剩测试在引用。
@@ -903,7 +913,7 @@ impl AdminService {
             .map(|entry| {
                 let (balance, balance_updated_at) = balance_snapshot
                     .get(&entry.id)
-                    .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
+                    .filter(|c| (now_ts - c.cached_at) < BALANCE_DISPLAY_MAX_AGE_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
                 let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
@@ -5743,6 +5753,12 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    /// 展示用的最长保留时间必须不短于决策用 TTL，否则列表会比决策路径更早丢余额。
+    #[test]
+    fn balance_display_max_age_not_shorter_than_ttl() {
+        assert!(BALANCE_DISPLAY_MAX_AGE_SECS >= BALANCE_CACHE_TTL_SECS);
     }
 
     /// 余额缓存 TTL 必须显著宽于后台刷新周期，否则每轮末尾必然空窗。

@@ -162,7 +162,7 @@ export interface CredentialStatusItem {
   ttftEwmaMs?: number
   /** 已关联描述与当前值的凭据 metadata。 */
   metadata: CredentialStatusMetadata
-  /** 后端缓存的最近一次余额（5 分钟内） */
+  /** 后端缓存的最近一次余额（最长保留 30 分钟，新旧见 balanceUpdatedAt） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
