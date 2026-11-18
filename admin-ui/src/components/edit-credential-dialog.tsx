@@ -21,7 +21,7 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
-import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useUpdateCredential, useSetPriority, useLoadBalancingMode } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl, cn } from '@/lib/utils'
@@ -65,6 +65,7 @@ export function EditCredentialDialog({
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [rpmLimit, setRpmLimit] = useState(String(credential.rpmLimit))
   const [loadFactor, setLoadFactor] = useState<number>(credential.loadFactor ?? 10)
+  const [priority, setPriority] = useState(String(credential.priority))
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
@@ -90,6 +91,7 @@ export function EditCredentialDialog({
       setSourceChannel(credential.sourceChannel ?? '')
       setRpmLimit(String(credential.rpmLimit))
       setLoadFactor(credential.loadFactor ?? 10)
+      setPriority(String(credential.priority))
       setMetadata({
         ...metadataDefaults(metadataSchema),
         ...metadataValues(credential.metadata),
@@ -98,7 +100,11 @@ export function EditCredentialDialog({
     }
   }, [open, credential, metadataSchema])
 
-  const { mutate, isPending } = useUpdateCredential()
+  const { mutate, isPending: isUpdating } = useUpdateCredential()
+  const setPriorityMutation = useSetPriority()
+  const isPending = isUpdating || setPriorityMutation.isPending
+  const { data: lbData } = useLoadBalancingMode()
+  const balanced = lbData?.mode === 'balanced'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -109,6 +115,29 @@ export function EditCredentialDialog({
       return
     }
 
+    const parsedPriority = Number(priority)
+    if (priority.trim() === '' || !Number.isInteger(parsedPriority) || parsedPriority < 0) {
+      toast.error('优先级必须是大于等于 0 的整数')
+      return
+    }
+
+    // 优先级走独立接口：有改动时先保存优先级，成功后再提交其余字段
+    if (parsedPriority !== credential.priority) {
+      setPriorityMutation.mutate(
+        { id: credential.id, priority: parsedPriority },
+        {
+          onSuccess: () => submitUpdate(parsedRpmLimit),
+          onError: (error: unknown) => {
+            toast.error(`优先级更新失败: ${extractErrorMessage(error)}`)
+          },
+        }
+      )
+      return
+    }
+    submitUpdate(parsedRpmLimit)
+  }
+
+  const submitUpdate = (parsedRpmLimit: number) => {
     mutate(
       {
         id: credential.id,
@@ -249,6 +278,29 @@ export function EditCredentialDialog({
                     required
                   />
                   <p className="text-xs text-muted-foreground">0 表示不限速</p>
+                </div>
+
+                {/* 优先级（优先级模式下的调度顺序） */}
+                <div className="space-y-2">
+                  <label htmlFor="priority" className="text-sm font-medium">
+                    优先级
+                  </label>
+                  <Input
+                    id="priority"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={priority}
+                    onChange={(e) => setPriority(e.target.value)}
+                    disabled={isPending}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {lbData?.invertPriority
+                      ? '数值越大越优先被调度。'
+                      : '数值越小越优先被调度，0 为最高优先级。'}
+                    {balanced && '当前为均衡负载模式，优先级暂不生效，仅保存。'}
+                  </p>
                 </div>
 
                 {/* 负载因子（均衡模式下的调度权重） */}
