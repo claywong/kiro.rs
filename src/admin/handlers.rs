@@ -1782,6 +1782,7 @@ pub async fn stats_by_credential(
                 "cacheCreationTokens": d.cache_creation_tokens,
                 "cacheReadTokens": d.cache_read_tokens,
                 "errors": d.errors,
+                "credits": d.credits,
                 "standardCostUsd": d.standard_cost_usd,
                 "unpricedCalls": d.unpriced_calls,
             })

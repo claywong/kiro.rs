@@ -14,6 +14,7 @@ import {
   formatUsd,
   hasCacheCounters,
   sumCacheUsage,
+  sumCredits,
   sumStandardCost,
 } from '@/lib/cache-statistics'
 import type { CredentialDistribution, StatsRange } from '@/types/api'
@@ -207,6 +208,7 @@ export function AccountCacheSummary({
   const panelId = useId()
   const usage = sumCacheUsage(rows)
   const cost = !loading && !failed ? sumStandardCost(rows) : undefined
+  const credits = !loading && !failed ? sumCredits(rows) : undefined
   const rate = !loading && !failed ? cacheHitRate(usage) : null
   const calls = rows.reduce((sum, row) => sum + row.calls, 0)
   const errors = rows.reduce((sum, row) => sum + row.errors, 0)
@@ -245,22 +247,33 @@ export function AccountCacheSummary({
           )}
         </div>
         <div className="flex items-baseline gap-2 sm:ml-2">
-          <span className="text-[11px] text-muted-foreground">加权命中率</span>
+          <span className="text-[11px] text-muted-foreground">缓存</span>
           <strong className="font-mono text-xl font-semibold tabular-nums tracking-tight text-primary">
             {formatCacheHitRate(rate)}
           </strong>
         </div>
+        {credits !== undefined && (
+          <div
+            className="flex items-baseline gap-1.5 whitespace-nowrap sm:ml-2"
+            title="所选时间内上游计量的 credit 消耗"
+          >
+            <span className="text-[11px] text-muted-foreground">消耗 Credit</span>
+            <strong className="font-mono text-sm font-semibold tabular-nums tracking-tight">
+              {Math.round(credits).toLocaleString('en-US')}
+            </strong>
+          </div>
+        )}
         {cost && (
           <div
-            className="flex items-baseline gap-2 sm:ml-2"
+            className="flex items-baseline gap-1.5 whitespace-nowrap sm:ml-2"
             title={
               cost.unpricedCalls > 0
                 ? `${STANDARD_COST_NOTE}；${formatNumber(cost.unpricedCalls)} 次调用的模型未计价`
                 : STANDARD_COST_NOTE
             }
           >
-            <span className="text-[11px] text-muted-foreground">标准 API 计费</span>
-            <strong className="font-mono text-xl font-semibold tabular-nums tracking-tight">
+            <span className="text-[11px] text-muted-foreground">API计费</span>
+            <strong className="font-mono text-sm font-semibold tabular-nums tracking-tight">
               {formatUsd(cost.usd)}
             </strong>
           </div>

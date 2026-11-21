@@ -74,6 +74,19 @@ export function sumStandardCost(
   return { usd, unpricedCalls }
 }
 
+/** undefined means the server did not report credits (older backend). */
+export function sumCredits(
+  rows: readonly { credits?: number }[],
+): number | undefined {
+  let total = 0
+  for (const row of rows) {
+    if (typeof row.credits !== 'number' || !Number.isFinite(row.credits))
+      return undefined
+    total += row.credits
+  }
+  return total
+}
+
 export function formatUsd(usd: number | undefined): string {
   if (usd === undefined || !Number.isFinite(usd) || usd < 0) return '—'
   if (usd > 0 && usd < 0.01) return '<$0.01'

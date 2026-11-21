@@ -348,6 +348,8 @@ pub struct CredentialDistribution {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub errors: u64,
+    /// 上游计量的 credit 消耗
+    pub credits: f64,
     /// 成功请求按标准 API 价格折算的金额（美元），失败请求不计
     pub standard_cost_usd: f64,
     /// 成功但模型未收录价格的请求数
@@ -647,6 +649,7 @@ impl UsageAggregator {
                 cache_creation_tokens: stats.cache_creation_tokens,
                 cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
+                credits: stats.credits,
                 standard_cost_usd: stats.standard_cost_usd,
                 unpriced_calls: stats.unpriced_calls,
             })
