@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { ExternalLink, Copy, Loader2, CheckCircle, Check } from 'lucide-react'
 import {
@@ -12,7 +13,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { RegionSelect } from '@/components/region-select'
-import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
+import { startIdcLogin, pollIdcLogin, getProxyPool } from '@/api/credentials'
 import type { StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -41,6 +42,17 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
   const [session, setSession] = useState<StartIdcLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 代理池：代理留空时从中随机分配一个，与 KAM 导入的行为一致。
+  // 只取已启用且健康检查未失败的条目，避免随机到已知不可用的出口。
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    enabled: open,
+  })
+  const assignableProxies = (proxyPool?.proxies ?? []).filter(
+    (p) => p.enabled && p.health !== 'unhealthy',
+  )
 
   // 清理轮询定时器
   useEffect(() => {
@@ -75,6 +87,14 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
     }
   }
 
+  /** 显式填写的值优先（"direct" 表示不使用代理）；留空且代理池有可用代理时随机取一个 */
+  const resolveProxyUrl = (): string | undefined => {
+    const explicit = proxyUrl.trim()
+    if (explicit) return explicit
+    if (assignableProxies.length === 0) return undefined
+    return assignableProxies[Math.floor(Math.random() * assignableProxies.length)].url
+  }
+
   const handleStart = async () => {
     if (!region.trim()) {
       toast.error('请填写 SSO 区域')
@@ -102,7 +122,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
         email: email.trim() || undefined,
         rpmLimit: parsedRpmLimit,
         priority: parsedPriority,
-        proxyUrl: proxyUrl.trim() || undefined,
+        proxyUrl: resolveProxyUrl(),
       })
       setSession(resp)
       setStep('waiting')
@@ -262,11 +282,20 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
               </label>
               <Input
                 id="idc-proxy"
-                placeholder='留空使用全局配置，"direct" 不使用代理'
+                placeholder={
+                  assignableProxies.length > 0
+                    ? `留空则从代理池随机分配（当前 ${assignableProxies.length} 个可用）`
+                    : '留空使用全局配置，"direct" 不使用代理'
+                }
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isStarting}
               />
+              <p className="text-xs text-muted-foreground">
+                {assignableProxies.length > 0
+                  ? '填了就用这个代理，不再走代理池随机分配。输入 "direct" 可显式不使用代理（也不用全局代理）'
+                  : '代理池没有可用代理，留空时使用全局配置。输入 "direct" 可显式不使用代理'}
+              </p>
             </div>
           </div>
         )}
