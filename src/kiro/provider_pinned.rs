@@ -10,10 +10,12 @@
 //!
 //! @author wangzhong
 
+use crate::kiro::create_response;
 use crate::kiro::endpoint::RequestContext;
 use crate::kiro::machine_id;
 use crate::kiro::provider::{KiroCallResult, KiroProvider};
 use crate::kiro::token_manager::CallContext;
+use crate::model::config::CreateResponseMode;
 
 impl KiroProvider {
     /// 向【指定凭据】发送一次非流式 API 请求，不做凭据选择、不做故障转移。
@@ -57,11 +59,21 @@ impl KiroProvider {
             api_domain: self.token_manager().api_domain(),
         };
 
+        let client = self.client_for(&ctx.credentials)?;
+        let mode = self.create_response_mode();
+
+        // always：直接走 CreateResponse，失败即失败（与「测试必须可归因」的目标一致）。
+        if mode == CreateResponseMode::Always {
+            let request =
+                self.create_response_request(&client, &ctx.credentials, &ctx.token, request_body)?;
+            let response = client.execute(request).await?;
+            return Self::pinned_result(response, credential_id, true).await;
+        }
+
         let url = endpoint.api_url(&rctx);
         let body = endpoint.transform_api_body(request_body, &rctx);
 
-        let base = self
-            .client_for(&ctx.credentials)?
+        let base = client
             .post(&url)
             .body(body)
             .header("content-type", endpoint.content_type())
@@ -69,11 +81,51 @@ impl KiroProvider {
         let response = endpoint.decorate_api(base, &rctx).send().await?;
 
         let status = response.status();
+        if status.is_success() {
+            return Self::pinned_result(response, credential_id, false).await;
+        }
+        let detail = response.text().await.unwrap_or_default();
+
+        // auto：用户级限流时改走 CreateResponse，与调度路径行为一致。
+        if mode == CreateResponseMode::Auto
+            && create_response::is_user_rate_exceeded(status.as_u16(), &detail)
+        {
+            if let Some(response) = self
+                .send_create_response_fallback(
+                    &client,
+                    &ctx.credentials,
+                    &ctx.token,
+                    request_body,
+                    credential_id,
+                )
+                .await
+            {
+                return Ok(KiroCallResult {
+                    response,
+                    credential_id,
+                    _in_flight: None,
+                });
+            }
+        }
+        anyhow::bail!("凭据 #{credential_id} 请求失败: {status} {detail}");
+    }
+
+    /// 校验响应状态并包装结果；`from_create_response` 为真时先把 SSE 转写成 event-stream。
+    async fn pinned_result(
+        response: reqwest::Response,
+        credential_id: u64,
+        from_create_response: bool,
+    ) -> anyhow::Result<KiroCallResult> {
+        let status = response.status();
         if !status.is_success() {
             let detail = response.text().await.unwrap_or_default();
             anyhow::bail!("凭据 #{credential_id} 请求失败: {status} {detail}");
         }
-
+        let response = if from_create_response {
+            create_response::transcode_response(response)
+        } else {
+            response
+        };
         Ok(KiroCallResult {
             response,
             credential_id,

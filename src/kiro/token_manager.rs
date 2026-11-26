@@ -29,7 +29,7 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::{ApiDomain, Config, ToolCompatibilityMode};
+use crate::model::config::{ApiDomain, Config, CreateResponseMode, ToolCompatibilityMode};
 
 #[cfg(test)]
 #[path = "token_manager_tool_compatibility_tests.rs"]
@@ -1320,6 +1320,8 @@ pub struct MultiTokenManager {
     /// 对话 / MCP 上游域名（运行时可修改）
     api_domain: Mutex<ApiDomain>,
     tool_compatibility_mode: Mutex<ToolCompatibilityMode>,
+    /// CreateResponse 接口使用策略（运行期可由 Admin 修改）。
+    create_response_mode: Mutex<CreateResponseMode>,
     /// 账号级 429 限流故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级 429 限流冷却时长（秒，运行时可修改）
@@ -1817,6 +1819,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let api_domain = config.api_domain;
         let tool_compatibility_mode = config.tool_compatibility_mode;
+        let create_response_mode = config.create_response_mode;
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let same_cred_retries = config.rate_limit_same_credential_retries.clone();
@@ -1863,6 +1866,7 @@ impl MultiTokenManager {
             group_manager: RwLock::new(None),
             api_domain: Mutex::new(api_domain),
             tool_compatibility_mode: Mutex::new(tool_compatibility_mode),
+            create_response_mode: Mutex::new(create_response_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             rate_limit_same_credential_retries: Mutex::new(same_cred_retries),
@@ -5714,6 +5718,24 @@ impl MultiTokenManager {
         self.update_config_file(|config| config.tool_compatibility_mode = mode)?;
         *self.tool_compatibility_mode.lock() = mode;
         tracing::info!(?mode, "工具兼容模式已保存，对后续请求生效");
+        Ok(mode)
+    }
+
+    pub fn create_response_mode(&self) -> CreateResponseMode {
+        *self.create_response_mode.lock()
+    }
+
+    pub fn set_create_response_mode(
+        &self,
+        mode: CreateResponseMode,
+    ) -> anyhow::Result<CreateResponseMode> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        if self.config.config_path().is_none() {
+            anyhow::bail!("配置文件路径未知，无法保存 CreateResponse 模式");
+        }
+        self.update_config_file(|config| config.create_response_mode = mode)?;
+        *self.create_response_mode.lock() = mode;
+        tracing::info!(?mode, "CreateResponse 模式已保存，对后续请求生效");
         Ok(mode)
     }
 

@@ -22,7 +22,9 @@ use crate::kiro::error::{
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{CredentialType, KiroCredentials};
 use crate::kiro::token_manager::{AffinityOutcome, InFlightGuard, MultiTokenManager};
-use crate::model::config::TlsBackend;
+use crate::kiro::create_response;
+use crate::kiro::provider_create_response::CREATE_RESPONSE_ENDPOINT;
+use crate::model::config::{CreateResponseMode, TlsBackend};
 use parking_lot::Mutex;
 
 #[cfg(test)]
@@ -163,6 +165,9 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 测试专用：把 CreateResponse 请求指到本地桩服务（生产构建里不存在该字段）。
+    #[cfg(test)]
+    pub(super) create_response_url_override: Mutex<Option<String>>,
 }
 
 impl KiroProvider {
@@ -208,6 +213,8 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            create_response_url_override: Mutex::new(None),
         }
     }
 
@@ -1089,22 +1096,45 @@ impl KiroProvider {
                 api_domain: self.token_manager.api_domain(),
             };
 
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(&effective_body, &rctx);
-
-            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
-
             // 一次尝试使用同一个 Client；热更新在下一次请求或重试时生效。
             let client = self.client_for(&ctx.credentials)?;
-            let base = client
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type());
-            let request = endpoint.decorate_api(base, &rctx);
+
+            // CreateResponse：always 模式下聊天请求直接走新接口；构造失败时退回原端点。
+            let cr_mode = self.create_response_mode();
+            let cr_request = if cr_mode == CreateResponseMode::Always {
+                match self.create_response_request(&client, &ctx.credentials, &ctx.token, &effective_body) {
+                    Ok(request) => Some(request),
+                    Err(e) => {
+                        tracing::warn!("凭据 #{} 无法改走 CreateResponse，退回原端点: {}", ctx.id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let use_cr = cr_request.is_some();
+            let endpoint_name = if use_cr { CREATE_RESPONSE_ENDPOINT } else { endpoint_name };
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
-            let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+            let request = match cr_request {
+                Some(request) => request,
+                None => {
+                    let url = endpoint.api_url(&rctx);
+                    let body = endpoint.transform_api_body(&effective_body, &rctx);
+
+                    tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
+                    tracing::debug!("实际发送请求体: {}", body);
+
+                    let base = client
+                        .post(&url)
+                        .body(body)
+                        .header("content-type", endpoint.content_type());
+                    endpoint
+                        .decorate_api(base, &rctx)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?
+                }
+            };
             if tracing::enabled!(tracing::Level::DEBUG) {
                 for (k, v) in request.headers() {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
@@ -1207,6 +1237,11 @@ impl KiroProvider {
                 );
                 self.token_manager
                     .report_success_for_request(ctx.id, model.as_deref());
+                let response = if use_cr {
+                    create_response::transcode_response(response)
+                } else {
+                    response
+                };
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -1229,6 +1264,40 @@ impl KiroProvider {
                     return Err(error.into());
                 }
             };
+
+            // auto 模式：generateAssistantResponse 被用户级限流时，在同一凭据上改走
+            // CreateResponse。失败则落回下面原有的 429 处理（原号重试 / 换号）。
+            if !use_cr
+                && cr_mode == CreateResponseMode::Auto
+                && create_response::is_user_rate_exceeded(status.as_u16(), &body)
+            {
+                tracing::warn!(
+                    "凭据 #{} 触发 USER_REQUEST_RATE_EXCEEDED，回退到 CreateResponse",
+                    ctx.id
+                );
+                if let Some(response) = self
+                    .send_create_response_fallback(
+                        &client,
+                        &ctx.credentials,
+                        &ctx.token,
+                        &effective_body,
+                        ctx.id,
+                    )
+                    .await
+                {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, CREATE_RESPONSE_ENDPOINT, Some(200),
+                        outcome::SUCCESS, None, attempt_start,
+                    );
+                    self.token_manager
+                        .report_success_for_request(ctx.id, model.as_deref());
+                    return Ok(KiroCallResult {
+                        response,
+                        credential_id: ctx.id,
+                        _in_flight: ctx._in_flight.clone(),
+                    });
+                }
+            }
 
             if status.is_server_error()
                 && serde_json::from_str::<serde_json::Value>(&body)

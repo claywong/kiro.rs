@@ -60,6 +60,24 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 上游 CreateResponse 接口（`runtime.<region>.kiro.dev/v1/responses`）的使用策略。
+///
+/// 官方 Kiro IDE 1.4 起主聊天改走 CreateResponse，`generateAssistantResponse` 只留给后台
+/// 辅助调用，上游对后者单独限流（429 `USER_REQUEST_RATE_EXCEEDED`），与账号额度无关。
+///
+/// - `Off`：只用 `generateAssistantResponse`。
+/// - `Auto`（默认）：先走 `generateAssistantResponse`，仅当返回 429
+///   `USER_REQUEST_RATE_EXCEEDED` 时在同一凭据上回退到 CreateResponse。
+/// - `Always`：聊天请求一律走 CreateResponse。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CreateResponseMode {
+    Off,
+    #[default]
+    Auto,
+    Always,
+}
+
 /// 自定义模型定义。
 ///
 /// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
@@ -927,6 +945,10 @@ pub struct Config {
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
+    /// CreateResponse 接口使用策略，默认 `auto`（见 [`CreateResponseMode`]）。
+    #[serde(default)]
+    pub create_response_mode: CreateResponseMode,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -1321,6 +1343,7 @@ impl Default for Config {
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
+            create_response_mode: CreateResponseMode::default(),
             default_endpoint: default_endpoint(),
             api_domain: ApiDomain::default(),
             cache_metering_enabled: None,
@@ -1485,6 +1508,24 @@ mod tests {
         assert_eq!(super::ToolCompatibilityMode::default(), super::ToolCompatibilityMode::Raw);
         let explicit: Config = serde_json::from_str(r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
         assert_eq!(explicit.tool_compatibility_mode, super::ToolCompatibilityMode::ClaudeCode);
+    }
+
+    #[test]
+    fn create_response_mode_defaults_to_auto_and_parses_explicit_values() {
+        use super::CreateResponseMode;
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.create_response_mode, CreateResponseMode::Auto);
+        }
+        for (raw, expected) in [
+            ("off", CreateResponseMode::Off),
+            ("auto", CreateResponseMode::Auto),
+            ("always", CreateResponseMode::Always),
+        ] {
+            let json = format!(r#"{{"createResponseMode":"{raw}"}}"#);
+            let config: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.create_response_mode, expected);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), format!("\"{raw}\""));
+        }
     }
 
     #[test]
