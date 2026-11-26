@@ -59,7 +59,7 @@ use super::types::{
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    ToolCompatibilityConfig, UpdateRefreshTokenRequest,
+    CreateResponseConfig, ToolCompatibilityConfig, UpdateRefreshTokenRequest,
 };
 // 本地新增类型单独成行，避免上游改动该块时反复冲突。
 use super::types::{
@@ -3131,6 +3131,23 @@ impl AdminService {
             .set_tool_compatibility_mode(req.mode)
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         Ok(ToolCompatibilityConfig { mode })
+    }
+
+    pub fn get_create_response_mode(&self) -> CreateResponseConfig {
+        CreateResponseConfig {
+            mode: self.token_manager.create_response_mode(),
+        }
+    }
+
+    pub fn set_create_response_mode(
+        &self,
+        req: CreateResponseConfig,
+    ) -> Result<CreateResponseConfig, AdminServiceError> {
+        let mode = self
+            .token_manager
+            .set_create_response_mode(req.mode)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(CreateResponseConfig { mode })
     }
 
     /// 获取账号级 429 限流故障转移配置

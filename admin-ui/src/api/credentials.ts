@@ -550,6 +550,22 @@ export async function setToolCompatibilityMode(mode: ToolCompatibilityMode): Pro
   return data
 }
 
+export type CreateResponseMode = 'off' | 'auto' | 'always'
+
+export interface CreateResponseConfig {
+  mode: CreateResponseMode
+}
+
+export async function getCreateResponseMode(): Promise<CreateResponseConfig> {
+  const { data } = await api.get<CreateResponseConfig>('/config/create-response')
+  return data
+}
+
+export async function setCreateResponseMode(mode: CreateResponseMode): Promise<CreateResponseConfig> {
+  const { data } = await api.put<CreateResponseConfig>('/config/create-response', { mode })
+  return data
+}
+
 // 获取上游域名
 export async function getApiDomain(): Promise<{ domain: ApiDomain }> {
   const { data } = await api.get<{ domain: ApiDomain }>('/config/api-domain')

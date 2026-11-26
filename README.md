@@ -720,6 +720,20 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 结构化输出的校验最多执行 100,000 步；超限后停止提取，并返回此前已找到的合规值，若没有则保留原始回复并记录告警。
 
+### CreateResponse 接口
+
+官方 Kiro IDE 1.4 起主聊天改走 `runtime.<region>.kiro.dev/v1/responses`（CreateResponse），旧的 `generateAssistantResponse` 只留给后台辅助调用，上游会对它单独限流：返回 429 `USER_REQUEST_RATE_EXCEEDED`，与账号额度无关，也和 UA 版本、endpoint 无关。
+
+`createResponseMode` 控制是否使用新接口，默认 `auto`：
+
+- `auto`：先走旧接口，仅当返回 429 `USER_REQUEST_RATE_EXCEEDED` 时在同一凭据上回退到 CreateResponse；回退失败再按原有逻辑原号重试或换号。
+- `always`：聊天请求一律走 CreateResponse，被限流的账号少一次无效往返。
+- `off`：只用旧接口。
+
+在管理后台「系统设置 → 模型 → CreateResponse 接口」切换，保存后写入 `config.json` 并对后续请求立即生效，无需重启。管理接口为 `GET/PUT /api/admin/config/create-response`，请求体为 `{"mode":"auto"}`、`{"mode":"always"}` 或 `{"mode":"off"}`。后台「模型测试」遵循同一开关。
+
+CreateResponse 对同一账号有并发窗口，连发时偶尔会 429，回退路径会等待 1.5 秒后重试一次。网关把它的 SSE 响应转写成与旧接口相同的 event-stream 帧，文本、思考（含签名）、工具调用、credit 用量和上下文占比都已支持；图片输入已按协议转换，但尚未用真实流量验证。
+
 ### Tool Use
 
 `toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。

@@ -21,6 +21,8 @@ import {
   setApiDomain,
   getToolCompatibilityMode,
   setToolCompatibilityMode,
+  getCreateResponseMode,
+  setCreateResponseMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getRateLimitSameCredentialConfig,
@@ -351,6 +353,24 @@ export function useSetToolCompatibilityMode() {
     onSuccess: async (data) => {
       await queryClient.cancelQueries({ queryKey: ['toolCompatibilityMode'] })
       queryClient.setQueryData(['toolCompatibilityMode'], data)
+    },
+  })
+}
+
+export function useCreateResponseMode() {
+  return useQuery({
+    queryKey: ['createResponseMode'],
+    queryFn: getCreateResponseMode,
+  })
+}
+
+export function useSetCreateResponseMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCreateResponseMode,
+    onSuccess: async (data) => {
+      await queryClient.cancelQueries({ queryKey: ['createResponseMode'] })
+      queryClient.setQueryData(['createResponseMode'], data)
     },
   })
 }

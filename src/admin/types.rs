@@ -10,6 +10,13 @@ pub struct ToolCompatibilityConfig {
     pub mode: crate::model::config::ToolCompatibilityMode,
 }
 
+/// CreateResponse 接口使用策略（`off` / `auto` / `always`）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateResponseConfig {
+    pub mode: crate::model::config::CreateResponseMode,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应

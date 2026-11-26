@@ -36,7 +36,7 @@ use super::{
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        ToolCompatibilityConfig, UpdateRefreshTokenRequest,
+        CreateResponseConfig, ToolCompatibilityConfig, UpdateRefreshTokenRequest,
         SetCustomHeadersRequest,
         SetCustomModelsRequest,
     },
@@ -663,6 +663,22 @@ pub async fn set_tool_compatibility_mode(
     Json(payload): Json<ToolCompatibilityConfig>,
 ) -> impl IntoResponse {
     match state.service.set_tool_compatibility_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/create-response
+pub async fn get_create_response_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_create_response_mode())
+}
+
+/// PUT /api/admin/config/create-response
+pub async fn set_create_response_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateResponseConfig>,
+) -> impl IntoResponse {
+    match state.service.set_create_response_mode(payload) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

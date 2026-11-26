@@ -10,6 +10,7 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
   "toolCompatibilityMode": "raw",
+  "createResponseMode": "auto",
   "apiDomain": "amazonaws",
   "updateAutoApply": false,
   "updateAutoApplyTime": "03:00",
