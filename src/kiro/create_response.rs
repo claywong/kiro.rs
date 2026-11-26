@@ -233,6 +233,9 @@ struct Transcoder {
     calls: HashMap<String, (String, String)>,
     /// 已经流式输出过参数的 item id，用来决定 done 事件里要不要补发完整参数。
     streamed: HashSet<String>,
+    /// 上游拒答说明。旧接口把它放在 metadataEvent.stopDetails 里而不是正文，这里同样
+    /// 先缓存，等 `response.incomplete(content_filter)` 到来时再一并发出。
+    refusal: String,
 }
 
 impl Transcoder {
@@ -275,9 +278,20 @@ impl Transcoder {
                 .to_string()
         };
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
-            "response.output_text.delta" | "response.refusal.delta" => {
+            "response.output_text.delta" => {
                 if let Some(text) = delta.filter(|t| !t.is_empty()) {
                     out.extend(encode_event("assistantResponseEvent", &json!({"content": text})));
+                }
+            }
+            "response.refusal.delta" => {
+                if let Some(text) = delta {
+                    self.refusal.push_str(text);
+                }
+            }
+            "response.refusal.done" => {
+                // done 带完整文本，以它为准（delta 可能在中途断开）。
+                if let Some(text) = event.get("refusal").and_then(Value::as_str) {
+                    self.refusal = text.to_string();
                 }
             }
             "response.reasoning_text.delta" | "response.reasoning.delta" => {
@@ -305,7 +319,7 @@ impl Transcoder {
                 }
             }
             "response.output_item.done" => self.handle_item_done(item, out),
-            "response.completed" | "response.incomplete" => Self::handle_finished(event, out),
+            "response.completed" | "response.incomplete" => self.handle_finished(event, out),
             "response.failed" | "error" => {
                 let error = event
                     .get("error")
@@ -347,7 +361,7 @@ impl Transcoder {
         }
     }
 
-    fn handle_finished(event: &Value, out: &mut Vec<u8>) {
+    fn handle_finished(&mut self, event: &Value, out: &mut Vec<u8>) {
         let response = event.get("response");
         let usage = response.and_then(|r| r.get("usage"));
         if let Some(credits) = usage.and_then(|u| u.get("kiro:credits")) {
@@ -369,8 +383,25 @@ impl Transcoder {
         let reason = response
             .and_then(|r| r.pointer("/incomplete_details/reason"))
             .and_then(Value::as_str);
-        if reason == Some("max_output_tokens") {
-            out.extend(encode_event("metadataEvent", &json!({"stopReason": "MAX_TOKENS"})));
+        match reason {
+            Some("max_output_tokens") => {
+                out.extend(encode_event("metadataEvent", &json!({"stopReason": "MAX_TOKENS"})));
+            }
+            Some("content_filter") => {
+                // 与旧接口一致：stopReason=CONTENT_FILTERED，说明放进 stopDetails.refusal，
+                // 下游据此把 stop_reason 设为 refusal 并丢弃未完成的工具调用。
+                let explanation = std::mem::take(&mut self.refusal);
+                let refusal = if explanation.is_empty() {
+                    json!({})
+                } else {
+                    json!({"explanation": explanation})
+                };
+                out.extend(encode_event(
+                    "metadataEvent",
+                    &json!({"stopReason": "CONTENT_FILTERED", "stopDetails": {"refusal": refusal}}),
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -525,6 +556,61 @@ mod tests {
             .filter_map(|e| if let Event::ToolUse(t) = e { Some(t.input.clone()) } else { None })
             .collect();
         assert_eq!(inputs.concat(), "{\"a\":1}");
+    }
+
+    /// 真实样本（2026-11-26 在 Enterprise 账号上对 claude-opus-5.5 实测）：
+    /// refusal.delta → refusal.done → response.incomplete(content_filter)，usage 无 credit。
+    #[test]
+    fn content_filter_becomes_refusal_metadata_not_body_text() {
+        let text = "The selected model cannot continue this conversation.";
+        let events = [
+            json!({"type": "response.refusal.delta", "delta": "The selected model "}),
+            json!({"type": "response.refusal.delta", "delta": "cannot continue this conversation."}),
+            json!({"type": "response.refusal.done", "refusal": text}),
+            json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "usage": {"kiro:context_usage_percentage": 0.19}}}),
+        ];
+        let mut transcoder = Transcoder::default();
+        let decoded = decode(&transcoder.feed(&sse(&events)));
+
+        assert!(
+            !decoded.iter().any(|e| matches!(e, Event::AssistantResponse(_))),
+            "拒答说明不能混进正文"
+        );
+        let metadata = decoded
+            .iter()
+            .find_map(|e| if let Event::Metadata(m) = e { Some(m) } else { None })
+            .expect("应发出 metadataEvent");
+        assert_eq!(metadata.content_filter_refusal().as_deref(), Some(text));
+    }
+
+    #[test]
+    fn content_filter_without_refusal_text_still_reports_filtered() {
+        let events = [json!({"type": "response.incomplete", "response": {
+            "incomplete_details": {"reason": "content_filter"}}})];
+        let mut transcoder = Transcoder::default();
+        let decoded = decode(&transcoder.feed(&sse(&events)));
+        let metadata = decoded
+            .iter()
+            .find_map(|e| if let Event::Metadata(m) = e { Some(m) } else { None })
+            .unwrap();
+        assert_eq!(metadata.content_filter_refusal().as_deref(), Some("CONTENT_FILTERED"));
+    }
+
+    #[test]
+    fn max_output_tokens_still_maps_to_max_tokens() {
+        let events = [json!({"type": "response.incomplete", "response": {
+            "incomplete_details": {"reason": "max_output_tokens"}}})];
+        let mut transcoder = Transcoder::default();
+        let decoded = decode(&transcoder.feed(&sse(&events)));
+        let metadata = decoded
+            .iter()
+            .find_map(|e| if let Event::Metadata(m) = e { Some(m) } else { None })
+            .unwrap();
+        assert_eq!(metadata.truncation_stop_reason(), Some("max_tokens"));
+        assert!(metadata.content_filter_refusal().is_none());
     }
 
     #[test]
