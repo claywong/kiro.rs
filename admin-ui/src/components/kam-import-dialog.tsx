@@ -428,6 +428,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             proxyPassword: defs.proxyPassword,
             rpmLimit: defs.rpmLimit,
             priority: defs.priority,
+            sourceChannel: defs.sourceChannel,
           },
         })
       }
@@ -663,6 +664,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               onChange={setDefaults}
               disabled={importing}
               enabledProxyCount={proxyPool?.proxies.filter(p => p.enabled).length ?? 0}
+              showSourceChannel
             />
           )}
 

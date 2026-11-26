@@ -19,6 +19,8 @@ export interface ImportDefaults {
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
+  /** 账号来源渠道（纯备注），仅 KAM 导入使用 */
+  sourceChannel: string
 }
 
 export const EMPTY_IMPORT_DEFAULTS: ImportDefaults = {
@@ -27,6 +29,7 @@ export const EMPTY_IMPORT_DEFAULTS: ImportDefaults = {
   proxyUrl: '',
   proxyUsername: '',
   proxyPassword: '',
+  sourceChannel: '',
 }
 
 /** 解析结果：未填的项为 undefined，交由调用方回退到各自的兜底值 */
@@ -36,6 +39,7 @@ export interface ResolvedImportDefaults {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  sourceChannel?: string
 }
 
 /**
@@ -70,6 +74,7 @@ export function resolveImportDefaults(
   resolved.proxyUrl = d.proxyUrl.trim() || undefined
   resolved.proxyUsername = d.proxyUsername.trim() || undefined
   resolved.proxyPassword = d.proxyPassword.trim() || undefined
+  resolved.sourceChannel = d.sourceChannel.trim() || undefined
 
   return { resolved }
 }
@@ -80,6 +85,8 @@ interface Props {
   disabled?: boolean
   /** 代理池里可用条目数，用于说明留空时的行为 */
   enabledProxyCount?: number
+  /** 是否显示「账号来源渠道」输入框（仅导入流程会把它写入凭据的对话框才开启） */
+  showSourceChannel?: boolean
 }
 
 /** 三项默认值的输入区。受控组件，状态由调用方持有。 */
@@ -88,6 +95,7 @@ export function ImportDefaultsFields({
   onChange,
   disabled,
   enabledProxyCount = 0,
+  showSourceChannel = false,
 }: Props) {
   const set = <K extends keyof ImportDefaults>(key: K, v: ImportDefaults[K]) =>
     onChange({ ...value, [key]: v })
@@ -131,6 +139,24 @@ export function ImportDefaultsFields({
       <p className="text-xs text-muted-foreground">
         RPM 填 0 表示不限速；优先级数值越小越优先，仅「优先级」调度模式下生效
       </p>
+
+      {showSourceChannel && (
+        <div className="space-y-1.5">
+          <label htmlFor="importDefaultSourceChannel" className="text-xs text-muted-foreground">
+            账号来源渠道（备注）
+          </label>
+          <Input
+            id="importDefaultSourceChannel"
+            placeholder="例: 官方, 转售商A, 采购平台X"
+            value={value.sourceChannel}
+            onChange={(e) => set('sourceChannel', e.target.value)}
+            disabled={disabled}
+          />
+          <p className="text-xs text-muted-foreground">
+            纯备注，标记这批账号的购买来源，便于追踪；留空则不记录
+          </p>
+        </div>
+      )}
 
       <div className="space-y-2">
         <label htmlFor="importDefaultProxy" className="text-xs text-muted-foreground">
